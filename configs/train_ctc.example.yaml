@@ -1,0 +1,34 @@
+output_dir: runs/exp001
+webdataset_root: /home/yueyulin/data/voxbox/wenetasr
+webdataset_index_path: /home/yueyulin/data/voxbox/wenetasr/webdataset_index.json
+webdataset_split: train
+webdataset_eval_ratio: 0.01
+webdataset_hash_seed: 0
+device: cuda
+batch_size: 8
+num_workers: 4
+epochs: 10
+save_every: 500
+
+input_dim: 80
+n_embd: 512
+dim_att: 512
+dim_ff: 2048
+num_layers: 12
+head_size: 64
+conv_kernel_size: 31
+dropout: 0.1
+frontend_type: conv2d6
+cmvn_is_json: true
+
+lr: 0.0004
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.99
+eps: 1.0e-8
+
+direction_variant: drop_both
+p_start: 0.2
+p_max: 0.2
+warmup_steps: 0
+ramp_steps: 0

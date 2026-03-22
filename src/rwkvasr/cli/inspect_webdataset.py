@@ -1,0 +1,38 @@
+from __future__ import annotations
+
+import argparse
+import json
+
+from rwkvasr.data import StableHashSplitConfig, inspect_webdataset
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Inspect a WebDataset root and write shard/sample split metadata.")
+    parser.add_argument("--webdataset-root", required=True)
+    parser.add_argument("--output-path", default=None)
+    parser.add_argument("--shard-pattern", default="*.tar")
+    parser.add_argument("--utt-id-key", default="sid")
+    parser.add_argument("--eval-ratio", default=0.01, type=float)
+    parser.add_argument("--hash-seed", default=0, type=int)
+    parser.add_argument("--split-by", default="shard_name", choices=["sample_id", "shard_name"])
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    result = inspect_webdataset(
+        args.webdataset_root,
+        shard_pattern=args.shard_pattern,
+        split_config=StableHashSplitConfig(
+            eval_ratio=args.eval_ratio,
+            hash_seed=args.hash_seed,
+            utt_id_key=args.utt_id_key,
+            split_by=args.split_by,
+        ),
+        output_path=args.output_path,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=False))
+
+
+if __name__ == "__main__":
+    main()

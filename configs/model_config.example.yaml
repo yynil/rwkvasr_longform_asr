@@ -1,0 +1,13 @@
+input_dim: 80
+n_embd: 512
+dim_att: 512
+dim_ff: 2048
+num_layers: 12
+vocab_size: 50257
+head_size: 64
+conv_kernel_size: 31
+dropout: 0.1
+blank_id: 0
+frontend_type: conv2d6
+cmvn_file: runs/exp001/global_cmvn.json
+cmvn_is_json: true

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rwkvasr-longform-asr"
+version = "0.1.0"
+description = "Long-form and streaming ASR with RWKV-7 TimeMixer and CTC."
+readme = "Spec.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "torch>=2.10,<2.11",
+  "torchaudio>=2.10,<2.11",
+  "deepspeed>=0.18",
+  "einops>=0.8",
+  "numpy>=2.0",
+  "openai-whisper>=20250625",
+  "pyyaml>=6.0",
+  "rich>=14.0",
+  "safetensors>=0.6",
+  "sentencepiece>=0.2",
+  "soundfile>=0.13",
+  "tensorboard>=2.19",
+]
+
+[project.scripts]
+rwkvasr-overfit = "rwkvasr.training.synthetic:main"
+rwkvasr-compute-cmvn = "rwkvasr.cli.compute_cmvn:main"
+rwkvasr-inspect-webdataset = "rwkvasr.cli.inspect_webdataset:main"
+rwkvasr-inspect-webdataset-lengths = "rwkvasr.cli.inspect_webdataset_lengths:main"
+rwkvasr-train-ctc = "rwkvasr.cli.train_ctc:main"
+rwkvasr-train-ctc-deepspeed = "rwkvasr.cli.train_ctc_deepspeed:main"
+rwkvasr-eval-ctc = "rwkvasr.cli.eval_ctc:main"
+rwkvasr-predict-ctc = "rwkvasr.cli.predict_ctc:main"
+rwkvasr-export-safetensors = "rwkvasr.cli.export_checkpoint_safetensors:main"
+rwkvasr-export-ctc-logits = "rwkvasr.cli.export_ctc_logits:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.11",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rwkvasr"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
