@@ -193,6 +193,8 @@ flowchart TD
 - hotword biasing via weighted finite-state context graph
 - benchmark scripts for throughput and memory
 
+Public roadmap and task breakdown live in [ROADMAP.md](./ROADMAP.md).
+
 ## 7. Current Training Summary
 
 This repository does **not** include training artifacts, checkpoints, DeepSpeed states, or data shards. The numbers below document current progress only.

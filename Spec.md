@@ -384,6 +384,7 @@ YAML config policy:
   - `train_config.yaml`
 - public repository packaging must:
   - keep `README.md` aligned with the current implemented slices and open gaps
+  - keep `ROADMAP.md` aligned with the public GitHub task breakdown for remaining milestones
   - document latest public training summary without committing checkpoints or run artifacts
   - exclude `runs/`, DeepSpeed states, exported weights, and local datasets from version control
 - training CLI should also accept a YAML config file as the primary launch interface
