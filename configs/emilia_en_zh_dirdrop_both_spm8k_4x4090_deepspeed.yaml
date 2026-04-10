@@ -21,6 +21,7 @@ target_gpu_memory_gib: 22.0
 skip_oversized_samples: true
 num_workers: 8
 decoded_batch_prefetch: 2
+max_open_shards_per_worker: 8
 epochs: 3
 save_every: 1000
 log_every: 20
