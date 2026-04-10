@@ -30,6 +30,25 @@ class ASRBatch:
     target_lengths: Tensor
     utt_ids: list[str]
 
+    def prefix(self, num_samples: int) -> "ASRBatch":
+        num_samples = int(num_samples)
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive")
+        batch_size = int(self.features.size(0))
+        if num_samples >= batch_size:
+            return self
+        feature_lengths = self.feature_lengths[:num_samples]
+        max_feature_length = int(feature_lengths.max().item())
+        target_lengths = self.target_lengths[:num_samples]
+        total_targets = int(target_lengths.sum().item())
+        return ASRBatch(
+            features=self.features[:num_samples, :max_feature_length].contiguous(),
+            feature_lengths=feature_lengths.contiguous(),
+            targets=self.targets[:total_targets].contiguous(),
+            target_lengths=target_lengths.contiguous(),
+            utt_ids=self.utt_ids[:num_samples],
+        )
+
     def to(
         self,
         device: torch.device | str,
@@ -92,7 +111,11 @@ class WhisperMultilingualTokenizer:
         return [int(token_id) for token_id in token_ids]
 
     def decode(self, token_ids: list[int]) -> str:
-        return str(self.processor.decode(token_ids))
+        token_ids = [int(token_id) for token_id in token_ids if int(token_id) < self._text_vocab_size]
+        if hasattr(self.processor.encoding, "decode_bytes"):
+            raw_bytes = self.processor.encoding.decode_bytes(token_ids)
+            return raw_bytes.decode("utf-8", errors="ignore")
+        return str(self.processor.decode(token_ids)).replace("\ufffd", "")
 
     @property
     def vocab_size(self) -> int:
@@ -244,6 +267,7 @@ class ASRManifestDataset(Dataset[dict[str, Any]]):
             "feature_length": features.size(0),
             "targets": targets,
             "target_length": targets.numel(),
+            "text": entry.text,
         }
 
 

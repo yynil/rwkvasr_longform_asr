@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from rwkvasr.modules import (
     BidirectionalRWKVTimeMixer,
@@ -11,7 +12,8 @@ from rwkvasr.modules import (
     build_last_n_bidirectional_mask,
     reverse_time,
 )
-from rwkvasr.modules.rwkv7_time_mixer import pad_to_chunk_length
+from rwkvasr.modules.rwkv7_cuda import fused_wkv7
+from rwkvasr.modules.rwkv7_time_mixer import _native_wkv7, pad_to_chunk_length
 
 
 def _build_config(layer_id: int) -> RWKV7TimeMixerConfig:
@@ -71,6 +73,29 @@ def test_pad_to_chunk_length() -> None:
 
     assert padded.shape == (2, 32, 128)
     assert pad == 14
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for fused RWKV-7")
+def test_fused_wkv7_matches_native_forward_on_cuda() -> None:
+    torch.manual_seed(9)
+    bsz, tsz, hidden, head_size = 2, 17, 128, 64
+    n_head = hidden // head_size
+    q, w, k, v, z, a = [
+        torch.randn(bsz, tsz, hidden, device="cuda", dtype=torch.bfloat16).contiguous()
+        for _ in range(6)
+    ]
+
+    native_y, _ = _native_wkv7(
+        q.view(bsz, tsz, n_head, head_size),
+        w.view(bsz, tsz, n_head, head_size),
+        k.view(bsz, tsz, n_head, head_size),
+        v.view(bsz, tsz, n_head, head_size),
+        z.view(bsz, tsz, n_head, head_size),
+        a.view(bsz, tsz, n_head, head_size),
+    )
+    fused_y = fused_wkv7(q, w, k, v, z, a, head_size=head_size, chunk_len=16)
+
+    assert torch.allclose(fused_y.float(), native_y.view_as(fused_y).float(), atol=3e-2, rtol=3e-2)
 
 
 def test_bidirectional_merge_matches_branch_outputs() -> None:

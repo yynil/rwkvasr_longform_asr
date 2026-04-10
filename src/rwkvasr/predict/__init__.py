@@ -1,5 +1,7 @@
 from .ctc import (
+    CTCDecodeDebug,
     CTCPrefixBeamHypothesis,
+    CTCLabeledPrediction,
     CTCPrediction,
     CTCTokenAlignment,
     ExportedLogitsIndex,
@@ -10,12 +12,16 @@ from .ctc import (
     ctc_forced_align,
     ctc_prefix_beam_search,
     export_ctc_logits,
+    predict_ctc_labeled,
     predict_ctc,
+    write_labeled_predictions_jsonl,
     write_predictions_jsonl,
 )
 
 __all__ = [
     "CTCPrefixBeamHypothesis",
+    "CTCDecodeDebug",
+    "CTCLabeledPrediction",
     "CTCPrediction",
     "CTCTokenAlignment",
     "ExportedLogitsIndex",
@@ -26,6 +32,8 @@ __all__ = [
     "ctc_forced_align",
     "ctc_prefix_beam_search",
     "export_ctc_logits",
+    "predict_ctc_labeled",
     "predict_ctc",
+    "write_labeled_predictions_jsonl",
     "write_predictions_jsonl",
 ]

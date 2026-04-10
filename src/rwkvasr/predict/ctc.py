@@ -14,7 +14,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 
-from rwkvasr.data import WenetFbankFeatureExtractor, WebDatasetConfig, build_text_tokenizer
+from rwkvasr.data import ASRManifestDataset, WenetFbankFeatureExtractor, WebDatasetASRIterableDataset, WebDatasetConfig, build_text_tokenizer
+from rwkvasr.data.webdataset_common import AUDIO_SUFFIXES
 from rwkvasr.data.webdataset_index import StableHashSplitConfig, resolve_sample_id, sample_in_split, shard_in_split
 from rwkvasr.modules import RWKVCTCModel, RWKVCTCModelConfig, build_inference_direction_mask
 from rwkvasr.training.checkpoint import load_checkpoint
@@ -30,6 +31,17 @@ def _log_addexp(a: float, b: float) -> float:
     if a > b:
         return a + math.log1p(math.exp(b - a))
     return b + math.log1p(math.exp(a - b))
+
+
+def _hypothesis_sort_score(
+    blank_score: float,
+    non_blank_score: float,
+    *,
+    token_count: int,
+    length_bonus: float,
+    insertion_bonus: float,
+) -> float:
+    return _log_addexp(blank_score, non_blank_score) + (length_bonus + insertion_bonus) * float(token_count)
 
 
 @dataclass(frozen=True)
@@ -48,6 +60,7 @@ class CTCPrediction:
     score: float
     mode: str
     alignments: list["CTCTokenAlignment"]
+    debug: "CTCDecodeDebug | None" = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +73,29 @@ class CTCTokenAlignment:
     end_frame: int
     start_ms: float
     end_ms: float
+
+
+@dataclass(frozen=True)
+class CTCLabeledPrediction:
+    utt_id: str
+    pred_token_ids: list[int]
+    ref_token_ids: list[int]
+    pred_text: str | None
+    ref_text: str | None
+    score: float
+    mode: str
+    alignments: list[CTCTokenAlignment]
+    debug: "CTCDecodeDebug | None" = None
+
+
+@dataclass(frozen=True)
+class CTCDecodeDebug:
+    feature_length: int
+    logit_length: int
+    pred_token_count: int
+    ref_token_count: int | None
+    blank_top1_ratio: float
+    avg_blank_prob: float
 
 
 @dataclass(frozen=True)
@@ -83,6 +119,9 @@ class PredictionConfig:
     tokenizer_task: str | None = None
     num_workers: int = 0
     frame_shift_ms: float = 10.0
+    length_bonus: float = 0.0
+    insertion_bonus: float = 0.0
+    save_debug_lengths: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +148,38 @@ class ExportedLogitsIndex:
     parts: list[ExportedLogitsPart]
 
 
+def _build_decode_debug(
+    frame_log_probs: Tensor,
+    *,
+    blank_id: int,
+    feature_length: int,
+    logit_length: int,
+    pred_token_count: int,
+    ref_token_count: int | None,
+) -> CTCDecodeDebug:
+    if logit_length <= 0:
+        return CTCDecodeDebug(
+            feature_length=int(feature_length),
+            logit_length=int(logit_length),
+            pred_token_count=int(pred_token_count),
+            ref_token_count=None if ref_token_count is None else int(ref_token_count),
+            blank_top1_ratio=0.0,
+            avg_blank_prob=0.0,
+        )
+
+    frame_top = frame_log_probs.argmax(dim=-1)
+    blank_top1_ratio = float((frame_top == blank_id).float().mean().item())
+    avg_blank_prob = float(frame_log_probs[:, blank_id].exp().mean().item())
+    return CTCDecodeDebug(
+        feature_length=int(feature_length),
+        logit_length=int(logit_length),
+        pred_token_count=int(pred_token_count),
+        ref_token_count=None if ref_token_count is None else int(ref_token_count),
+        blank_top1_ratio=blank_top1_ratio,
+        avg_blank_prob=avg_blank_prob,
+    )
+
+
 @dataclass
 class PredictionBatch:
     features: Tensor
@@ -128,6 +199,34 @@ class PredictionBatch:
             features=features,
             feature_lengths=self.feature_lengths.to(device),
             utt_ids=self.utt_ids,
+        )
+
+
+@dataclass
+class LabeledPredictionBatch:
+    features: Tensor
+    feature_lengths: Tensor
+    targets: Tensor
+    target_lengths: Tensor
+    utt_ids: list[str]
+    texts: list[str | None]
+
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        feature_dtype: torch.dtype | None = None,
+    ) -> "LabeledPredictionBatch":
+        features = self.features.to(device)
+        if feature_dtype is not None and features.is_floating_point():
+            features = features.to(dtype=feature_dtype)
+        return LabeledPredictionBatch(
+            features=features,
+            feature_lengths=self.feature_lengths.to(device),
+            targets=self.targets.to(device),
+            target_lengths=self.target_lengths.to(device),
+            utt_ids=self.utt_ids,
+            texts=self.texts,
         )
 
 
@@ -154,6 +253,49 @@ class PredictionCollator:
             features=features,
             feature_lengths=feature_lengths,
             utt_ids=utt_ids,
+        )
+
+
+class LabeledPredictionCollator:
+    def __call__(self, samples: list[dict[str, Any]]) -> LabeledPredictionBatch:
+        if not samples:
+            raise ValueError("samples must not be empty")
+
+        batch_size = len(samples)
+        feat_dim = samples[0]["features"].size(-1)
+        max_frames = max(int(sample["feature_length"]) for sample in samples)
+        total_targets = sum(int(sample["target_length"]) for sample in samples)
+
+        features = torch.zeros(batch_size, max_frames, feat_dim, dtype=samples[0]["features"].dtype)
+        feature_lengths = torch.zeros(batch_size, dtype=torch.long)
+        targets = torch.zeros(total_targets, dtype=torch.long)
+        target_lengths = torch.zeros(batch_size, dtype=torch.long)
+        utt_ids: list[str] = []
+        texts: list[str | None] = []
+
+        target_offset = 0
+        for idx, sample in enumerate(samples):
+            feat = sample["features"]
+            feature_len = int(sample["feature_length"])
+            features[idx, :feature_len] = feat
+            feature_lengths[idx] = feature_len
+
+            target = sample["targets"]
+            target_len = int(sample["target_length"])
+            targets[target_offset : target_offset + target_len] = target
+            target_lengths[idx] = target_len
+            target_offset += target_len
+
+            utt_ids.append(str(sample["utt_id"]))
+            texts.append(sample.get("text"))
+
+        return LabeledPredictionBatch(
+            features=features,
+            feature_lengths=feature_lengths,
+            targets=targets,
+            target_lengths=target_lengths,
+            utt_ids=utt_ids,
+            texts=texts,
         )
 
 
@@ -313,14 +455,17 @@ class PredictionWebDataset(IterableDataset[dict[str, Any]]):
                     continue
                 key, suffix = name.rsplit(".", 1)
                 suffix = suffix.lower()
-                if suffix not in {"wav", "json"}:
+                if suffix != "json" and suffix not in AUDIO_SUFFIXES:
                     continue
                 extracted = archive.extractfile(member)
                 if extracted is None:
                     continue
                 sample = pending.setdefault(key, {})
-                sample[suffix] = extracted.read()
-                if "wav" not in sample or "json" not in sample:
+                if suffix == "json":
+                    sample["json"] = extracted.read()
+                else:
+                    sample["audio"] = extracted.read()
+                if "audio" not in sample or "json" not in sample:
                     continue
                 metadata = json.loads(sample["json"].decode("utf-8"))
                 include_sample = True
@@ -335,7 +480,7 @@ class PredictionWebDataset(IterableDataset[dict[str, Any]]):
                 if include_sample:
                     yield decode_prediction_webdataset_sample(
                         key=key,
-                        audio_bytes=sample["wav"],
+                        audio_bytes=sample["audio"],
                         metadata_bytes=sample["json"],
                         feature_extractor=self.feature_extractor,
                         utt_id_key=self.config.utt_id_key,
@@ -378,6 +523,41 @@ def _build_prediction_loader(config: PredictionConfig) -> DataLoader:
     )
 
 
+def _build_labeled_prediction_loader(config: PredictionConfig) -> DataLoader:
+    has_manifest = config.manifest_path is not None
+    has_webdataset = config.webdataset_root is not None
+    if has_manifest == has_webdataset:
+        raise ValueError("Exactly one of manifest_path or webdataset_root must be provided for prediction.")
+
+    if has_manifest:
+        dataset = ASRManifestDataset(str(config.manifest_path))
+        return DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            collate_fn=LabeledPredictionCollator(),
+        )
+
+    dataset = WebDatasetASRIterableDataset(
+        str(config.webdataset_root),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            split=config.webdataset_split,
+            eval_ratio=config.webdataset_eval_ratio,
+            hash_seed=config.webdataset_hash_seed,
+            split_by=config.webdataset_split_by,
+            partition_by_rank=False,
+        ),
+    )
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        collate_fn=LabeledPredictionCollator(),
+    )
+
+
 def _load_prediction_model(
     config: PredictionConfig,
     *,
@@ -400,6 +580,8 @@ def ctc_prefix_beam_search(
     blank_id: int,
     beam_size: int,
     token_prune_topk: int | None = None,
+    length_bonus: float = 0.0,
+    insertion_bonus: float = 0.0,
 ) -> list[CTCPrefixBeamHypothesis]:
     if frame_log_probs.dim() != 2:
         raise ValueError(f"Expected [T, V] log-probs, got shape {tuple(frame_log_probs.shape)}")
@@ -450,7 +632,13 @@ def ctc_prefix_beam_search(
         beams = dict(
             sorted(
                 next_beams.items(),
-                key=lambda item: _log_addexp(item[1][0], item[1][1]),
+                key=lambda item: _hypothesis_sort_score(
+                    item[1][0],
+                    item[1][1],
+                    token_count=len(item[0]),
+                    length_bonus=length_bonus,
+                    insertion_bonus=insertion_bonus,
+                ),
                 reverse=True,
             )[:beam_size]
         )
@@ -458,13 +646,25 @@ def ctc_prefix_beam_search(
     return [
         CTCPrefixBeamHypothesis(
             token_ids=prefix,
-            score=_log_addexp(prefix_blank, prefix_non_blank),
+            score=_hypothesis_sort_score(
+                prefix_blank,
+                prefix_non_blank,
+                token_count=len(prefix),
+                length_bonus=length_bonus,
+                insertion_bonus=insertion_bonus,
+            ),
             blank_score=prefix_blank,
             non_blank_score=prefix_non_blank,
         )
         for prefix, (prefix_blank, prefix_non_blank) in sorted(
             beams.items(),
-            key=lambda item: _log_addexp(item[1][0], item[1][1]),
+            key=lambda item: _hypothesis_sort_score(
+                item[1][0],
+                item[1][1],
+                token_count=len(item[0]),
+                length_bonus=length_bonus,
+                insertion_bonus=insertion_bonus,
+            ),
             reverse=True,
         )
     ]
@@ -477,6 +677,8 @@ def batched_ctc_prefix_beam_search(
     blank_id: int,
     beam_size: int,
     token_prune_topk: int | None = None,
+    length_bonus: float = 0.0,
+    insertion_bonus: float = 0.0,
 ) -> list[list[CTCPrefixBeamHypothesis]]:
     if logits.dim() != 3:
         raise ValueError(f"Expected [B, T, V] logits, got shape {tuple(logits.shape)}")
@@ -496,6 +698,8 @@ def batched_ctc_prefix_beam_search(
                 blank_id=blank_id,
                 beam_size=beam_size,
                 token_prune_topk=token_prune_topk,
+                length_bonus=length_bonus,
+                insertion_bonus=insertion_bonus,
             )
         )
     return results
@@ -663,10 +867,22 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
                     blank_id=model.config.blank_id,
                     beam_size=config.beam_size,
                     token_prune_topk=config.token_prune_topk,
+                    length_bonus=config.length_bonus,
+                    insertion_bonus=config.insertion_bonus,
                 )
                 best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
                 token_ids = [int(token_id) for token_id in best.token_ids]
                 text = str(decode_fn(token_ids)) if callable(decode_fn) else None
+                debug = None
+                if config.save_debug_lengths:
+                    debug = _build_decode_debug(
+                        log_probs[batch_idx, :length],
+                        blank_id=model.config.blank_id,
+                        feature_length=int(batch.feature_lengths[batch_idx].item()),
+                        logit_length=length,
+                        pred_token_count=len(token_ids),
+                        ref_token_count=None,
+                    )
                 alignments = build_token_alignments(
                     log_probs[batch_idx, :length],
                     token_ids,
@@ -683,6 +899,7 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
                         score=float(best.score),
                         mode=config.mode,
                         alignments=alignments,
+                        debug=debug,
                     )
                 )
     return predictions
@@ -788,6 +1005,129 @@ def export_ctc_logits(
     return export_index
 
 
+def predict_ctc_labeled(
+    config: PredictionConfig,
+    *,
+    limit: int | None = None,
+) -> list[CTCLabeledPrediction]:
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be >= 1 when provided.")
+
+    device = torch.device(config.device)
+    model, feature_dtype = _load_prediction_model(config, device=device)
+    tokenizer = build_text_tokenizer(
+        config.tokenizer_type,
+        model_path=config.tokenizer_model_path,
+        language=config.tokenizer_language,
+        task=config.tokenizer_task,
+    )
+    decode_fn = getattr(tokenizer, "decode", None)
+    loader = _build_labeled_prediction_loader(config)
+
+    predictions: list[CTCLabeledPrediction] = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device, feature_dtype=feature_dtype)
+            mask = build_inference_direction_mask(
+                model.config.num_layers,
+                mode=config.mode,
+                device=batch.features.device,
+            )
+            logits, logit_lengths, _ = model(
+                batch.features,
+                batch.feature_lengths,
+                direction_mask=mask,
+            )
+            log_probs = logits.detach().float().log_softmax(dim=-1).cpu()
+            if logit_lengths is None:
+                lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long)
+            else:
+                lengths = logit_lengths.detach().to(dtype=torch.long, device="cpu")
+
+            target_offset = 0
+            for batch_idx, utt_id in enumerate(batch.utt_ids):
+                length = int(lengths[batch_idx].item())
+                hypotheses = ctc_prefix_beam_search(
+                    log_probs[batch_idx, :length],
+                    blank_id=model.config.blank_id,
+                    beam_size=config.beam_size,
+                    token_prune_topk=config.token_prune_topk,
+                    length_bonus=config.length_bonus,
+                    insertion_bonus=config.insertion_bonus,
+                )
+                best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
+                pred_token_ids = [int(token_id) for token_id in best.token_ids]
+
+                target_length = int(batch.target_lengths[batch_idx].item())
+                ref_token_ids = batch.targets[target_offset : target_offset + target_length].tolist()
+                target_offset += target_length
+
+                pred_text = str(decode_fn(pred_token_ids)) if callable(decode_fn) else None
+                ref_text = batch.texts[batch_idx]
+                if ref_text is None and callable(decode_fn):
+                    ref_text = str(decode_fn(ref_token_ids))
+
+                debug = None
+                if config.save_debug_lengths:
+                    debug = _build_decode_debug(
+                        log_probs[batch_idx, :length],
+                        blank_id=model.config.blank_id,
+                        feature_length=int(batch.feature_lengths[batch_idx].item()),
+                        logit_length=length,
+                        pred_token_count=len(pred_token_ids),
+                        ref_token_count=target_length,
+                    )
+                alignments = build_token_alignments(
+                    log_probs[batch_idx, :length],
+                    pred_token_ids,
+                    blank_id=model.config.blank_id,
+                    frontend_type=model.config.frontend_type,
+                    frame_shift_ms=config.frame_shift_ms,
+                    decode_fn=decode_fn,
+                )
+                predictions.append(
+                    CTCLabeledPrediction(
+                        utt_id=str(utt_id),
+                        pred_token_ids=pred_token_ids,
+                        ref_token_ids=[int(token_id) for token_id in ref_token_ids],
+                        pred_text=pred_text,
+                        ref_text=ref_text,
+                        score=float(best.score),
+                        mode=config.mode,
+                        alignments=alignments,
+                        debug=debug,
+                    )
+                )
+                if limit is not None and len(predictions) >= limit:
+                    return predictions
+    return predictions
+
+
+def write_labeled_predictions_jsonl(path: str | Path, predictions: list[CTCLabeledPrediction]) -> Path:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for prediction in predictions:
+            handle.write(
+                json.dumps(
+                    {
+                        "utt_id": prediction.utt_id,
+                        "pred_token_ids": prediction.pred_token_ids,
+                        "ref_token_ids": prediction.ref_token_ids,
+                        "pred_text": prediction.pred_text,
+                        "ref_text": prediction.ref_text,
+                        "score": prediction.score,
+                        "mode": prediction.mode,
+                        "alignments": [asdict(alignment) for alignment in prediction.alignments],
+                        "debug": None if prediction.debug is None else asdict(prediction.debug),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    return output_path
+
+
 def write_predictions_jsonl(path: str | Path, predictions: list[CTCPrediction]) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -802,6 +1142,7 @@ def write_predictions_jsonl(path: str | Path, predictions: list[CTCPrediction]) 
                         "score": prediction.score,
                         "mode": prediction.mode,
                         "alignments": [asdict(alignment) for alignment in prediction.alignments],
+                        "debug": None if prediction.debug is None else asdict(prediction.debug),
                     },
                     ensure_ascii=False,
                 )

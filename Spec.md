@@ -78,7 +78,11 @@ Important implementation constraints extracted from upstream:
 - Support offline full-utterance training and chunked streaming-style inference from the same checkpoint.
 - Support variable-length batches and long-form utterances.
 - Support Whisper multilingual BPE text targets.
+- Support configurable text tokenizers:
+  - Whisper multilingual BPE
+  - SentencePiece Unigram via external `.model`
 - Save and load model architecture via YAML config files for training and prediction workflows.
+- Save and load tokenizer settings via a separate `tokenizer_config.yaml` so prediction defaults stay aligned with the training checkpoint.
 - Export inference-friendly `safetensors` weights from `.pt` checkpoints for deployment-oriented prediction workflows.
 - Export Rust-consumable `CTC logits + lengths + utt_ids` artifacts from Python model forward passes so the first Candle predictor can be validated before full RWKV Rust forward parity exists.
 - Expose inference modes:
@@ -137,7 +141,19 @@ Adaptation rules:
 - We preserve `v_first` propagation across encoder layers.
 - We define two execution backends:
   - `native`: pure PyTorch reference implementation
-  - `fused`: upstream-compatible CUDA extension path
+  - `cuda`: upstream-compatible fused CUDA extension path using RWKV-7 `wind_backstepping`
+
+CUDA backend rules:
+- Source is vendored from `BlinkDL/RWKV-LM/RWKV-v7/train_temp/cuda` under Apache-2.0 with local attribution.
+- The first CUDA backend target is training full-sequence `state=None` TimeMixer calls.
+- Streaming / chunked inference with an incoming recurrent state remains on the native backend until a stateful fused kernel wrapper is added.
+- Runtime requirements:
+  - CUDA tensors
+  - bf16 contiguous `w/q/k/v/z/a` tensors
+  - `head_size = 64`
+  - `chunk_len = 16`
+- If the CUDA backend is requested but these requirements are not met, training must fail loudly or fall back only for explicitly unsupported stateful inference paths; it must not silently run the slow native path for the main training loop.
+- Before large training runs, validate the active CUDA toolchain with `rwkvasr-check-rwkv7-cuda` or `python -m rwkvasr.cli.check_rwkv7_cuda`; this compiles the extension and compares fused output against the native reference on a small tensor.
 
 Directional design:
 - Each encoder block contains:
@@ -152,8 +168,9 @@ Directional design:
   - only the last `N` blocks bidirectional
 
 Current implementation status:
-- only the single-direction native TimeMixer core is implemented
-- bidirectional wrapper and merge logic are the next milestone
+- native TimeMixer core is implemented and is the correctness reference
+- bidirectional wrapper, Direction Dropout, CTC training, WebDataset bucketing, and prediction are implemented
+- fused CUDA TimeMixer is being added as the primary Emilia-scale training backend because native recurrence is too slow for multi-million-hour-step schedules
 
 ### 5.3 Direction Dropout
 
@@ -185,7 +202,15 @@ Head:
 - greedy decode for lightweight evaluation sanity checks
 - standalone `CTC prefix beam search` for prediction and later hotword-bias integration
 - beam size must be configurable from the prediction CLI and YAML-driven model reconstruction path
+- prediction CLI should expose decode-time insertion / length bonus so CTC deletion bias can be inspected without retraining
 - prediction outputs must support token-level CTC time alignment, not only token ids / text
+- labeled prediction outputs should optionally include decode diagnostics:
+  - input feature length
+  - encoder / logit length
+  - predicted token count
+  - reference token count
+  - blank-top1 ratio
+  - average blank probability
 
 Why CTC first:
 - simpler than RNN-T
@@ -234,6 +259,7 @@ Expected pipeline:
 - on-the-fly fbank extraction
 - optional SpecAugment
 - Whisper multilingual tokenization
+- optional SentencePiece Unigram tokenization with externally provided `.model`
 
 WeNet `examples/gigaspeech/s0` alignment:
 - resample to `16k`
@@ -250,6 +276,17 @@ Default frontend contract:
 - project default frontend is `WeNet-style fbank -> global_cmvn -> conv2d6 -> RWKV encoder`
 - `linear` frontend remains only as an explicit fallback for debugging, unit tests, and ablations
 - train / eval CLI defaults must use `conv2d6`
+
+Tokenizer contract:
+- tokenizer choice must be explicit in training config through:
+  - `tokenizer_type`
+  - `tokenizer_model_path`
+  - `tokenizer_language`
+  - `tokenizer_task`
+- `vocab_size` may be inferred from the tokenizer; for SentencePiece, an explicit `vocab_size` must match the model's actual vocab size
+- training outputs must save `tokenizer_config.yaml` next to `model_config.yaml`
+- prediction CLIs should automatically reuse `tokenizer_config.yaml` when explicit tokenizer flags are not passed
+- multilingual SentencePiece candidate preparation should support a `FLORES-200 dev+devtest -> unigram 4k/8k` path for controlled tokenizer comparisons
 
 Global CMVN policy:
 - `global_cmvn` statistics are computed on the training split only
@@ -313,6 +350,87 @@ WebDataset support:
   - split each global batch evenly across ranks so all ranks see a similar length band on the same step
 - runtime fallback `B -> B'` token-budget shrinking remains only as a safety valve for residual text-length variance or rare outliers; it must not be the primary batching mechanism
 - one epoch must cover the whole train split across all supported lengths; it is invalid to dedicate an epoch to only one length band
+- current Python in-memory length-bucketing path is only valid for moderate `webdataset_lengths.jsonl` sizes
+- when the length index grows beyond practical in-memory limits, training must:
+  - avoid full JSONL loads during startup
+  - log an explicit warning
+  - fall back to the plain streaming WebDataset loader
+  - compute `steps_per_epoch` from split sample counts instead of the offline length index
+- exact large-scale length bucketing for Emilia-sized corpora requires a future binary / external-memory sampler; do not pretend the current in-memory JSONL sampler scales to tens of millions of utterances
+- large-scale replacement for the current in-memory sampler:
+  - Rust preprocessing should build a `bucket manifest` from the large length index
+  - bucket id is derived from `num_frames // bucket_width`
+  - default `bucket_width = 80` frames
+  - output layout should be:
+    - one compact manifest JSON
+    - many small bucket part files capped by `entries_per_part`
+  - each part file should preserve source shard order so samples from the same tar stay contiguous as much as possible
+  - training must read only:
+    - the small manifest during startup
+    - the current bucket part while iterating
+  - training must not load all bucket entries into memory at once
+  - per-step bucket policy:
+    - all ranks use the same bucket on the same step
+    - each rank consumes a disjoint slice from that bucket's next global batch
+    - local batch size is derived from the bucket's upper frame bound and the configured frame budget
+  - each epoch must still cover the full train split across all buckets, with shuffled bucket-step order rather than single-bucket epochs
+  - runtime parallelism constraint:
+    - bucket-manifest training must preserve strict step ordering across ranks
+    - do not let asynchronous worker scheduling reorder bucket steps, or distributed collectives can desynchronize
+  - bucket-manifest runtime parallelism should therefore be implemented as:
+    - one deterministic per-rank step iterator
+    - thread-parallel local sample decode inside the current step
+    - a small bounded prefetch queue for upcoming decoded batches
+    - decoded prefetch must include tar reads, audio decode, feature extraction, tokenization, and collate, not only JSONL entry lookup
+    - optional thread-local tar readers so repeated reads from the same shard reuse file handles safely
+  - `num_workers` on the bucket-manifest path is interpreted as local decode / prefetch worker count, not as a generic DataLoader worker pool
+- inspected Emilia Chinese dataset root: `/media/usbhd/training_data/asr/emilia/Emilia/ZH/Emilia/ZH`
+- Emilia current observed structure:
+  - flat directory of `.tar` shards, total size about `1.2T`
+  - member pairs are `json + mp3`
+  - json metadata already includes:
+    - `id`
+    - `wav`
+    - `text`
+    - `duration`
+    - `speaker`
+    - `language`
+    - `dnsmos`
+- Emilia-specific read policy:
+  - do not unpack the dataset
+  - do not build the training path around Python `tarfile.extractfile()` random member lookups
+  - preferred path is:
+    - Rust multi-threaded offline scan of tar headers plus json metadata only
+    - infer `num_frames` directly from metadata `duration`
+    - record `audio_member`, `audio_format`, `audio_offset`, `audio_size`, `json_offset`, and `json_size`
+    - at training time, open each tar shard as a binary file and read members by byte offset rather than by tar-name rescans
+  - this preserves the current length-bucketing design while avoiding a full audio decode during indexing and avoiding Python tar random-access overhead during training
+- Emilia multilingual mixing policy:
+  - if language-specific shard names are already unique, prefer building a virtual mixed root from symlinks rather than adding a bespoke multi-root training path
+  - current observed shard naming is safe for this approach:
+    - Chinese: `ZH-B*.tar`
+    - English: `EN-B*.tar`
+  - the mixed root should contain symlinks to both language directories and then reuse the normal single-root WebDataset workflow:
+    - `inspect_webdataset`
+    - Rust `webdataset_lengths.jsonl`
+    - `global_cmvn`
+    - standard training / eval configs
+  - this keeps split logic, length bucketing, and checkpoint bookkeeping identical to the monolingual path
+  - preprocessing and training must use the same `utt_id_key`
+  - Emilia datasets use metadata key `id`, so:
+    - `inspect_webdataset`
+    - `inspect_webdataset_lengths`
+    - `compute_cmvn`
+    - training / eval configs
+    must all set `webdataset_utt_id_key: id`
+  - it is invalid to let training fall back to the project default `sid` once an index was built with `id`
+- WebDataset length-index schema should no longer assume `.wav` audio:
+  - audio entries must be generic `audio_member`
+  - current minimum supported audio formats are:
+    - `wav`
+    - `mp3`
+    - `flac`
+  - old indexes that only store `wav_member` should remain readable for backward compatibility
 - on the target `4 x RTX 4090` setup, default DeepSpeed ZeRO-2 configs should not offload optimizer state to CPU unless explicitly requested for an ablation; current model sizes and observed bf16 activation footprints leave enough GPU headroom, and CPU offload reduces utilization
 - for 4090 training configs, prefer:
   - larger `max_local_batch` upper bounds
@@ -321,9 +439,43 @@ WebDataset support:
 - training outputs must be epoch-centric in addition to step-centric:
   - compute mean `train_loss` for each epoch
   - run one `eval_loss` pass on the eval split at the end of each epoch
+  - support `max_eval_samples` so large eval splits can use a capped subset on intermediate epochs
+  - when `epochs` is specified and `max_eval_samples` is set, the final epoch must still run full eval
   - save `epoch-N` checkpoints
   - track and export the current `best` checkpoint based on lowest eval loss
   - persist epoch history so checkpoint selection can be done after training without parsing logs
+- experiment tracking:
+  - support optional `wandb` logging for both single-process and DeepSpeed training
+  - DeepSpeed logging must be rank-0 only
+  - tracked metrics should include:
+    - periodic train loss / data time / step time / rate
+    - progress-equivalent fields that mirror the terminal view closely enough for remote monitoring: progress fraction, ETA, effective batch size, token counts, and peak memory
+    - epoch train/eval loss
+    - step-checkpoint sampled eval loss
+    - checkpoint selection metadata
+  - `wandb` project name and run name must be configurable from YAML / CLI
+  - `wandb` base URL and init timeout must be configurable from YAML / CLI so self-hosted and cloud deployments can both work
+  - `wandb` initialization failure must not block training startup; log the failure and continue without experiment tracking unless the user explicitly chooses strict failure behavior in a later spec revision
+- step-level checkpoint policy:
+  - support a configurable `step_eval_samples` subset for periodic step checkpoints
+  - support a configurable `step_eval_every` cadence; if unset, reuse the step checkpoint save cadence
+  - periodic step eval must use a randomized eval subset rather than always the first `N` samples
+  - randomized step eval must still preserve offline length bucketing when a bucket manifest or offline length index is available; do not fall back to an unbucketed eval loader just to shuffle sample order
+  - eval and step-eval batch sizes should be independently configurable from the train batch size so CTC `log_softmax` does not OOM on long eval batches
+  - keep only the best `top_k_step_checkpoints` according to sampled `eval_loss`
+  - track step-checkpoint selection metadata in a dedicated YAML so later manual checkpoint inspection does not require parsing logs
+  - epoch checkpoints and the final epoch-level `best` checkpoint remain separate from step-checkpoint retention
+- tokenizer switching rule:
+  - changing tokenizer type or vocabulary size changes the CTC target space and output head shape
+  - training cannot resume across tokenizer changes; a new run must start from step 0
+- large-scale multilingual CTC preference:
+  - for Emilia-scale multilingual training, prefer `SentencePiece Unigram 8k` over Whisper multilingual BPE as the default efficiency-oriented tokenizer
+  - rationale:
+    - much smaller CTC head
+    - lower logits / `log_softmax` memory pressure
+    - lower eval OOM risk
+    - fewer total training steps needed once the larger local batch becomes feasible
+  - Whisper multilingual BPE remains a baseline / compatibility tokenizer, not the default efficiency choice
 - continue-training support should prioritize epoch checkpoints:
   - single-process training may resume from exported `.pt` checkpoints
   - DeepSpeed training should resume from `ds_checkpoints/` plus `resume_tag`, typically `epoch-N` or `best`
@@ -331,6 +483,7 @@ WebDataset support:
 - v0 Rust preprocessing scope:
   - `webdataset_lengths.jsonl` generation from tar metadata
   - multi-threaded per-shard scanning
+  - record optional tar member offsets and sizes for zero-copy-style random-access reads from plain `.tar` shards
   - summary JSON with split counts and frame bucket histogram
   - future offline CMVN / manifest materialization may also move under `tools/`, but that is not required for the first slice
 - v0 Rust prediction scope:
@@ -393,6 +546,13 @@ YAML config policy:
 - training YAML may embed a `deepspeed` mapping directly instead of forcing a separate JSON file
 - prediction / evaluation should prefer reconstructing model architecture from YAML rather than repeated CLI shape arguments
 - standalone prediction should live under a separate `predict` module / CLI and must not depend on training-loop entrypoints
+- repository should also provide a labeled prediction CLI for dev/eval inspection:
+  - consume manifest or WebDataset eval samples with references
+  - run configurable CTC prefix beam search
+  - support decode-time insertion / length bonus ablations
+  - save `pred_text`, `ref_text`, token ids, and token-level alignments to JSONL
+  - optionally save per-utterance decode diagnostics so short-hypothesis failures can be distinguished from frontend truncation bugs
+  - support a small-sample preview workflow before running full WER/CER
 - Rust deployment tooling should live under `tools/`; the first `Candle` predictor may target exported `CTC logits + lengths` rather than full RWKV encoder parity
 - exported inference checkpoints should support:
   - `.pt` for training resume

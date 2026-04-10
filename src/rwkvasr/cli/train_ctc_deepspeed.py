@@ -14,20 +14,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--webdataset-root", default=None)
     parser.add_argument("--webdataset-index-path", default=None)
     parser.add_argument("--webdataset-length-index-path", default=None)
+    parser.add_argument("--webdataset-bucket-manifest-path", default=None)
     parser.add_argument("--webdataset-split", default=None)
     parser.add_argument("--webdataset-eval-ratio", default=None, type=float)
     parser.add_argument("--webdataset-hash-seed", default=None, type=int)
     parser.add_argument("--webdataset-split-by", default=None)
+    parser.add_argument("--webdataset-utt-id-key", default=None)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--vocab-size", default=None, type=int)
+    parser.add_argument("--tokenizer-type", default=None)
+    parser.add_argument("--tokenizer-model-path", default=None)
+    parser.add_argument("--tokenizer-language", default=None)
+    parser.add_argument("--tokenizer-task", default=None)
     parser.add_argument("--batch-size", default=None, type=int)
+    parser.add_argument("--backend", default=None)
     parser.add_argument("--max-steps", default=None, type=int)
     parser.add_argument("--epochs", default=None, type=int)
     parser.add_argument("--save-every", default=None, type=int)
     parser.add_argument("--num-workers", default=None, type=int)
+    parser.add_argument("--decoded-batch-prefetch", default=None, type=int)
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--resume-tag", default=None)
+    parser.add_argument("--wandb-enabled", dest="wandb_enabled", action="store_true", default=None)
+    parser.add_argument("--no-wandb", dest="wandb_enabled", action="store_false")
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--wandb-base-url", default=None)
+    parser.add_argument("--wandb-init-timeout-sec", default=None, type=float)
     parser.add_argument("--eval-mode", default=None)
+    parser.add_argument("--max-eval-samples", default=None, type=int)
+    parser.add_argument("--eval-batch-size", default=None, type=int)
+    parser.add_argument("--step-eval-batch-size", default=None, type=int)
+    parser.add_argument("--step-eval-every", default=None, type=int)
+    parser.add_argument("--step-eval-samples", default=None, type=int)
+    parser.add_argument("--top-k-step-checkpoints", default=None, type=int)
     parser.add_argument("--local-rank", default=None, type=int)
     parser.add_argument("--gradient-checkpointing", dest="gradient_checkpointing", action="store_true", default=None)
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
@@ -50,20 +71,40 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "webdataset_root",
         "webdataset_index_path",
         "webdataset_length_index_path",
+        "webdataset_bucket_manifest_path",
         "webdataset_split",
         "webdataset_eval_ratio",
         "webdataset_hash_seed",
         "webdataset_split_by",
+        "webdataset_utt_id_key",
         "output_dir",
+        "vocab_size",
+        "tokenizer_type",
+        "tokenizer_model_path",
+        "tokenizer_language",
+        "tokenizer_task",
         "batch_size",
+        "backend",
         "max_steps",
         "epochs",
         "save_every",
         "num_workers",
+        "decoded_batch_prefetch",
         "device",
         "resume_from",
         "resume_tag",
+        "wandb_enabled",
+        "wandb_project",
+        "wandb_run_name",
+        "wandb_base_url",
+        "wandb_init_timeout_sec",
         "eval_mode",
+        "max_eval_samples",
+        "eval_batch_size",
+        "step_eval_batch_size",
+        "step_eval_every",
+        "step_eval_samples",
+        "top_k_step_checkpoints",
         "local_rank",
         "gradient_checkpointing",
         "batch_token_budget",

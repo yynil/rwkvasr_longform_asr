@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from .manifest import FeatureCollator, TokenizerLike, WenetFbankFeatureExtractor, build_text_tokenizer
+from .webdataset_common import AUDIO_SUFFIXES
 from .webdataset_index import StableHashSplitConfig, resolve_sample_id, sample_in_split, shard_in_split
 
 
@@ -33,6 +34,7 @@ class WebDatasetConfig:
     use_length_bucketing: bool = False
     length_bucket_drop_last: bool = True
     length_bucket_frame_budget: int | None = None
+    decoded_batch_prefetch: int = 2
 
 
 def decode_webdataset_sample(
@@ -143,14 +145,17 @@ class WebDatasetASRIterableDataset(IterableDataset[dict[str, Any]]):
                     continue
                 key, suffix = name.rsplit(".", 1)
                 suffix = suffix.lower()
-                if suffix not in {"wav", "json"}:
+                if suffix != "json" and suffix not in AUDIO_SUFFIXES:
                     continue
                 extracted = archive.extractfile(member)
                 if extracted is None:
                     continue
                 sample = pending.setdefault(key, {})
-                sample[suffix] = extracted.read()
-                if "wav" in sample and "json" in sample:
+                if suffix == "json":
+                    sample["json"] = extracted.read()
+                else:
+                    sample["audio"] = extracted.read()
+                if "audio" in sample and "json" in sample:
                     metadata = json.loads(sample["json"].decode("utf-8"))
                     include_sample = True
                     if self.split_config.split_by == "sample_id":
@@ -162,7 +167,7 @@ class WebDatasetASRIterableDataset(IterableDataset[dict[str, Any]]):
                             shard_name=shard_path.name,
                         )
                     if include_sample:
-                        yield self._decode_sample(key, sample["wav"], sample["json"], metadata=metadata)
+                        yield self._decode_sample(key, sample["audio"], sample["json"], metadata=metadata)
                     pending.pop(key, None)
 
     def _decode_sample(

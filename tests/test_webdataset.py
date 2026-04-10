@@ -13,13 +13,16 @@ from rwkvasr.data import (
     StableHashSplitConfig,
     WebDatasetASRIterableDataset,
     WebDatasetConfig,
+    build_bucketed_webdataset_loader,
     assign_split,
     estimate_length_bucketed_steps,
+    estimate_bucket_manifest_steps,
     build_webdataset_dataloader,
     build_length_bucketed_webdataset_dataloader,
     inspect_webdataset,
     inspect_webdataset_lengths,
     load_webdataset_index,
+    load_webdataset_bucket_manifest,
     load_webdataset_length_entries,
 )
 
@@ -76,6 +79,22 @@ def _write_shard(tmp_path: Path, shard_name: str, samples: list[tuple[str, str, 
     return shard_path
 
 
+def _write_mp3_named_shard(tmp_path: Path, shard_name: str, samples: list[tuple[str, str, str]]) -> Path:
+    shard_path = tmp_path / shard_name
+    with tarfile.open(shard_path, "w") as archive:
+        for key, text, sid in samples:
+            audio_bytes = _make_wav_bytes(16000)
+            audio_info = tarfile.TarInfo(name=f"{key}.mp3")
+            audio_info.size = len(audio_bytes)
+            archive.addfile(audio_info, io.BytesIO(audio_bytes))
+
+            json_bytes = _write_json_bytes(text, sid)
+            info = tarfile.TarInfo(name=f"{key}.json")
+            info.size = len(json_bytes)
+            archive.addfile(info, io.BytesIO(json_bytes))
+    return shard_path
+
+
 def _build_root(tmp_path: Path) -> Path:
     _write_shard(
         tmp_path,
@@ -93,6 +112,65 @@ def _build_root(tmp_path: Path) -> Path:
         ],
     )
     return tmp_path
+
+
+def _write_bucket_manifest(
+    tmp_path: Path,
+    *,
+    root: Path,
+    entries_by_part: list[tuple[str, list[dict[str, object]]]],
+    bucket_width: int = 80,
+) -> Path:
+    bucket_root = tmp_path / "webdataset_buckets"
+    bucket_root.mkdir(parents=True, exist_ok=True)
+    parts = []
+    bucket_counts: dict[int, int] = {}
+    for relative_path, entries in entries_by_part:
+        part_path = bucket_root / relative_path
+        part_path.parent.mkdir(parents=True, exist_ok=True)
+        with part_path.open("w", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                bucket_id = int(entry["num_frames"]) // bucket_width
+                bucket_counts[bucket_id] = bucket_counts.get(bucket_id, 0) + 1
+        parts.append((relative_path, entries))
+
+    grouped: dict[int, list[tuple[str, list[dict[str, object]]]]] = {}
+    for relative_path, entries in parts:
+        bucket_id = int(entries[0]["num_frames"]) // bucket_width
+        grouped.setdefault(bucket_id, []).append((relative_path, entries))
+
+    manifest = {
+        "version": 1,
+        "root": str(root),
+        "source_length_index_path": str(tmp_path / "webdataset_lengths.jsonl"),
+        "bucket_width": bucket_width,
+        "entries_per_part": 100000,
+        "splits": {
+            "train": {
+                "num_samples": sum(bucket_counts.values()),
+                "buckets": [
+                    {
+                        "bucket_id": bucket_id,
+                        "num_samples": bucket_counts[bucket_id],
+                        "parts": [
+                            {
+                                "path": relative_path,
+                                "num_samples": len(entries),
+                                "first_shard": str(entries[0]["shard_name"]),
+                                "last_shard": str(entries[-1]["shard_name"]),
+                            }
+                            for relative_path, entries in grouped[bucket_id]
+                        ],
+                    }
+                    for bucket_id in sorted(grouped)
+                ],
+            }
+        },
+    }
+    manifest_path = bucket_root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return manifest_path
 
 
 def _install_fake_whisper(monkeypatch) -> None:
@@ -325,6 +403,42 @@ def test_inspect_webdataset_lengths_writes_per_sample_entries(tmp_path: Path) ->
     assert summary_path.exists()
     assert len(entries) == 3
     assert all(entry.num_frames == 100 for entry in entries)
+    assert all(entry.audio_offset is not None for entry in entries)
+    assert all(entry.audio_size is not None for entry in entries)
+    assert all(entry.json_offset is not None for entry in entries)
+    assert all(entry.json_size is not None for entry in entries)
+
+
+def test_webdataset_supports_mp3_audio_members_and_random_access_length_reads(tmp_path: Path) -> None:
+    root = tmp_path / "mp3_root"
+    root.mkdir()
+    _write_mp3_named_shard(
+        root,
+        "shard_00000000.tar",
+        [
+            ("0000000001", "你好世界", "sid-1"),
+            ("0000000002", "双向语音", "sid-2"),
+        ],
+    )
+    index_path = tmp_path / "mp3_lengths.jsonl"
+    inspect_webdataset_lengths(root, output_path=index_path)
+    entries = load_webdataset_length_entries(index_path)
+
+    assert len(entries) == 2
+    assert all(entry.audio_format == "mp3" for entry in entries)
+
+    loader, _ = build_length_bucketed_webdataset_dataloader(
+        root,
+        length_index_path=index_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(shuffle_shards=False, length_bucket_frame_budget=250),
+        batch_size=2,
+        num_workers=0,
+    )
+    batch = next(iter(loader))
+
+    assert batch.features.shape[0] >= 1
+    assert batch.features.shape[2] == 80
 
 
 def test_length_bucketed_batch_sampler_splits_global_batches_across_ranks() -> None:
@@ -456,3 +570,155 @@ def test_length_bucketed_webdataset_dataloader_reads_similar_length_batches(tmp_
     assert batch.features.size(0) == 2
     assert max(batch.feature_lengths.tolist()) - min(batch.feature_lengths.tolist()) <= 20
     assert [candidate.features.size(0) for candidate in batches] == [2, 1, 1]
+
+
+def test_bucket_manifest_step_estimation_and_loading(tmp_path: Path) -> None:
+    root = tmp_path / "bucket_manifest_root"
+    root.mkdir()
+    root = _build_root(root)
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[
+            (
+                "train/bucket_0000/part_000000.jsonl",
+                [
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": "0000000001",
+                        "utt_id": "sid-1",
+                        "split": "train",
+                        "num_frames": 40,
+                        "audio_member": "0000000001.wav",
+                        "audio_format": "wav",
+                        "json_member": "0000000001.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": "0000000002",
+                        "utt_id": "sid-2",
+                        "split": "train",
+                        "num_frames": 50,
+                        "audio_member": "0000000002.wav",
+                        "audio_format": "wav",
+                        "json_member": "0000000002.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                ],
+            ),
+            (
+                "train/bucket_0001/part_000000.jsonl",
+                [
+                    {
+                        "shard_name": "shard_00000001.tar",
+                        "key": "0000000003",
+                        "utt_id": "sid-3",
+                        "split": "train",
+                        "num_frames": 120,
+                        "audio_member": "0000000003.wav",
+                        "audio_format": "wav",
+                        "json_member": "0000000003.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                ],
+            ),
+        ],
+    )
+
+    manifest = load_webdataset_bucket_manifest(manifest_path)
+
+    assert estimate_bucket_manifest_steps(
+        manifest,
+        split="train",
+        batch_size=4,
+        world_size=1,
+        frame_budget=160,
+        drop_last=True,
+    ) == 2
+
+
+def test_bucketed_webdataset_loader_splits_same_bucket_across_ranks(tmp_path: Path) -> None:
+    root = tmp_path / "bucket_loader_root"
+    root.mkdir()
+    root = _build_root(root)
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[
+            (
+                "train/bucket_0000/part_000000.jsonl",
+                [
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": "0000000001",
+                        "utt_id": "sid-1",
+                        "split": "train",
+                        "num_frames": 40,
+                        "audio_member": "0000000001.wav",
+                        "audio_format": "wav",
+                        "json_member": "0000000001.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": "0000000002",
+                        "utt_id": "sid-2",
+                        "split": "train",
+                        "num_frames": 50,
+                        "audio_member": "0000000002.wav",
+                        "audio_format": "wav",
+                        "json_member": "0000000002.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                ],
+            ),
+        ],
+    )
+
+    config = WebDatasetConfig(
+        shuffle_shards=False,
+        split="train",
+        length_bucket_frame_budget=80,
+    )
+    loader_rank0 = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=config,
+        batch_size=4,
+        num_workers=2,
+        rank=0,
+        world_size=2,
+    )
+    loader_rank1 = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=config,
+        batch_size=4,
+        num_workers=2,
+        rank=1,
+        world_size=2,
+    )
+
+    batch0 = next(iter(loader_rank0))
+    batch1 = next(iter(loader_rank1))
+
+    assert batch0.utt_ids == ["sid-1"]
+    assert batch1.utt_ids == ["sid-2"]

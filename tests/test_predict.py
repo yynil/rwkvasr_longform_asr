@@ -12,12 +12,16 @@ from safetensors.torch import load_file
 from rwkvasr.eval import ctc_greedy_decode
 from rwkvasr.modules import RWKVCTCModel, RWKVCTCModelConfig
 from rwkvasr.predict import (
+    CTCDecodeDebug,
+    CTCLabeledPrediction,
     PredictionConfig,
     batched_ctc_prefix_beam_search,
     build_token_alignments,
     ctc_forced_align,
     export_ctc_logits,
+    predict_ctc_labeled,
     predict_ctc,
+    write_labeled_predictions_jsonl,
     write_predictions_jsonl,
 )
 from rwkvasr.training.checkpoint import export_checkpoint_to_safetensors, save_checkpoint
@@ -25,6 +29,13 @@ from rwkvasr.training.checkpoint import export_checkpoint_to_safetensors, save_c
 
 class _FakeWhisperProcessor:
     eot = 50000
+
+    class _FakeEncoding:
+        @staticmethod
+        def decode_bytes(token_ids: list[int]) -> bytes:
+            return f"decoded:{','.join(str(token_id) for token_id in token_ids)}".encode("utf-8")
+
+    encoding = _FakeEncoding()
 
     def encode(self, text: str) -> list[int]:
         return [101, 102]
@@ -143,6 +154,32 @@ def test_ctc_prefix_beam_search_aggregates_paths_beyond_greedy() -> None:
     assert beam2[0][0].token_ids == (1,)
 
 
+def test_ctc_prefix_beam_search_length_bonus_can_reduce_deletion_bias() -> None:
+    logits = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.9, 0.1],
+                    [0.9, 0.1],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+    )
+
+    no_bonus = batched_ctc_prefix_beam_search(logits, torch.tensor([2]), blank_id=0, beam_size=2)
+    with_bonus = batched_ctc_prefix_beam_search(
+        logits,
+        torch.tensor([2]),
+        blank_id=0,
+        beam_size=2,
+        length_bonus=5.0,
+    )
+
+    assert no_bonus[0][0].token_ids == ()
+    assert with_bonus[0][0].token_ids == (1,)
+
+
 def test_ctc_forced_align_returns_monotonic_token_spans() -> None:
     log_probs = torch.log(
         torch.tensor(
@@ -252,6 +289,85 @@ def test_predict_ctc_supports_unlabeled_webdataset(tmp_path: Path, monkeypatch) 
     assert all(prediction.token_ids and set(prediction.token_ids) == {1} for prediction in predictions)
     assert all(prediction.text and prediction.text.startswith("decoded:") for prediction in predictions)
     assert all(len(prediction.alignments) == len(prediction.token_ids) for prediction in predictions)
+
+
+def test_predict_ctc_labeled_supports_manifest(tmp_path: Path, monkeypatch) -> None:
+    _install_fake_whisper(monkeypatch)
+    model = _build_constant_ctc_model()
+    checkpoint = tmp_path / "model.pt"
+    save_checkpoint(checkpoint, model=model, step=0)
+    manifest = tmp_path / "predict_manifest_labeled.jsonl"
+    with manifest.open("w", encoding="utf-8") as handle:
+        for idx in range(2):
+            feat = torch.randn(12 + idx, 80)
+            feat_path = tmp_path / f"predict-labeled-feat-{idx}.pt"
+            torch.save(feat, feat_path)
+            handle.write(
+                json.dumps(
+                    {
+                        "utt_id": f"utt-{idx}",
+                        "feature_path": feat_path.name,
+                        "text": f"ref-text-{idx}",
+                        "token_ids": [1],
+                    }
+                )
+                + "\n"
+            )
+
+    predictions = predict_ctc_labeled(
+        PredictionConfig(
+            checkpoint_path=str(checkpoint),
+            batch_size=2,
+            manifest_path=str(manifest),
+            device="cpu",
+            mode="bi",
+            beam_size=4,
+            save_debug_lengths=True,
+            model_config=model.config,
+        ),
+        limit=2,
+    )
+
+    assert [prediction.utt_id for prediction in predictions] == ["utt-0", "utt-1"]
+    assert [prediction.ref_text for prediction in predictions] == ["ref-text-0", "ref-text-1"]
+    assert all(prediction.pred_text and prediction.pred_text.startswith("decoded:") for prediction in predictions)
+    assert all(len(prediction.alignments) == len(prediction.pred_token_ids) for prediction in predictions)
+    assert all(prediction.debug is not None for prediction in predictions)
+    assert all(prediction.debug and prediction.debug.feature_length > 0 for prediction in predictions)
+
+    output_path = write_labeled_predictions_jsonl(tmp_path / "labeled_predictions.jsonl", predictions)
+    lines = output_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+
+
+def test_write_labeled_predictions_jsonl_serializes_pairs(tmp_path: Path) -> None:
+    predictions = [
+        CTCLabeledPrediction(
+            utt_id="utt-0",
+            pred_token_ids=[1, 2],
+            ref_token_ids=[1, 3],
+            pred_text="pred",
+            ref_text="ref",
+            score=-1.0,
+            mode="bi",
+            alignments=[],
+            debug=CTCDecodeDebug(
+                feature_length=100,
+                logit_length=16,
+                pred_token_count=2,
+                ref_token_count=2,
+                blank_top1_ratio=0.75,
+                avg_blank_prob=0.6,
+            ),
+        )
+    ]
+    output_path = write_labeled_predictions_jsonl(tmp_path / "pairs.jsonl", predictions)
+    payload = json.loads(output_path.read_text(encoding="utf-8").strip())
+    assert payload["pred_text"] == "pred"
+    assert payload["ref_text"] == "ref"
+    assert payload["pred_token_ids"] == [1, 2]
+    assert payload["ref_token_ids"] == [1, 3]
+    assert payload["debug"]["feature_length"] == 100
 
 
 def test_export_ctc_logits_writes_rust_readable_parts(tmp_path: Path, monkeypatch) -> None:

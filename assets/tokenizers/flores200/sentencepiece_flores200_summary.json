@@ -1,0 +1,25 @@
+{
+  "source_archive": "/tmp/flores200dataset.tar.gz",
+  "source_url": "https://tinyurl.com/flores200dataset",
+  "corpus_path": "/home/yueyulin/github/rwkvasr_longform_asr/assets/tokenizers/flores200/flores200_dev_devtest_multilingual.txt",
+  "corpus_summary": {
+    "num_lines": 409836,
+    "num_files": 408,
+    "num_languages": 204
+  },
+  "model_type": "unigram",
+  "character_coverage": 0.9995,
+  "normalization_rule_name": "nmt_nfkc",
+  "artifacts": [
+    {
+      "vocab_size": 4000,
+      "model_path": "/home/yueyulin/github/rwkvasr_longform_asr/assets/tokenizers/flores200/flores200_unigram_4k.model",
+      "vocab_path": "/home/yueyulin/github/rwkvasr_longform_asr/assets/tokenizers/flores200/flores200_unigram_4k.vocab"
+    },
+    {
+      "vocab_size": 8000,
+      "model_path": "/home/yueyulin/github/rwkvasr_longform_asr/assets/tokenizers/flores200/flores200_unigram_8k.model",
+      "vocab_path": "/home/yueyulin/github/rwkvasr_longform_asr/assets/tokenizers/flores200/flores200_unigram_8k.vocab"
+    }
+  ]
+}

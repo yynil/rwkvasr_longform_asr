@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .rwkv7_cuda import fused_wkv7
+
 
 @dataclass
 class RWKV7TimeMixerConfig:
@@ -199,10 +201,33 @@ class RWKV7TimeMixer(nn.Module):
         a = a.view(a.size(0), a.size(1), self.n_head, self.head_size)
         b = b.view(b.size(0), b.size(1), self.n_head, self.head_size)
 
-        if self.config.backend != "native":
-            raise RuntimeError("Only the native backend is implemented in the current project stage.")
-
-        y, new_att_state = _native_wkv7(r, w, k, v, a, b, state=att_state)
+        backend = self.config.backend.lower()
+        if backend == "native" or (backend in {"cuda", "fused"} and state is not None):
+            y, new_att_state = _native_wkv7(r, w, k, v, a, b, state=att_state)
+        elif backend in {"cuda", "fused"}:
+            y = fused_wkv7(
+                r.view(r.size(0), r.size(1), -1),
+                w.view(w.size(0), w.size(1), -1),
+                k.view(k.size(0), k.size(1), -1),
+                v.view(v.size(0), v.size(1), -1),
+                a.view(a.size(0), a.size(1), -1),
+                b.view(b.size(0), b.size(1), -1),
+                head_size=self.head_size,
+                chunk_len=self.config.chunk_len,
+            ).view(r.size(0), r.size(1), self.n_head, self.head_size)
+            # The upstream fused training kernel does not accept or return an arbitrary
+            # recurrent state. Training paths ignore this state; stateful streaming
+            # calls are routed to the native backend above.
+            new_att_state = torch.empty(
+                r.size(0),
+                self.n_head,
+                self.head_size,
+                self.head_size,
+                dtype=torch.float32,
+                device=r.device,
+            )
+        else:
+            raise RuntimeError(f"Unsupported RWKV-7 TimeMixer backend: {self.config.backend}")
         return y.view(y.size(0), y.size(1), -1), new_att_state
 
     def forward(
