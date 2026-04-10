@@ -11,6 +11,13 @@ from rwkvasr.data import ASRManifestDataset, WhisperMultilingualTokenizer, build
 class _FakeWhisperProcessor:
     eot = 50000
 
+    class _FakeEncoding:
+        @staticmethod
+        def decode_bytes(token_ids: list[int]) -> bytes:
+            return f"decoded:{','.join(str(token_id) for token_id in token_ids)}".encode("utf-8")
+
+    encoding = _FakeEncoding()
+
     def encode(self, text: str) -> list[int]:
         if text == "<special>":
             return [50001]
@@ -77,3 +84,12 @@ def test_real_whisper_multilingual_tokenizer_encodes_text_when_dependency_is_ava
 
     assert token_ids
     assert all(int(token_id) < tokenizer.vocab_size for token_id in token_ids)
+
+
+def test_real_whisper_multilingual_tokenizer_decode_strips_invalid_utf8_fragments() -> None:
+    pytest.importorskip("whisper.tokenizer")
+
+    tokenizer = build_text_tokenizer("whisper_multilingual")
+    decoded = tokenizer.decode([126, 220])
+
+    assert "\ufffd" not in decoded

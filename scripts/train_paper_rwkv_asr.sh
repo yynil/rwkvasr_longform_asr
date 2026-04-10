@@ -19,7 +19,7 @@ EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    bi_baseline|dirdrop_both)
+    bi_baseline|bi_baseline_spm4k|bi_baseline_spm8k|dirdrop_both|emilia_zh_bi_baseline|emilia_zh_dirdrop_both|emilia_en_zh_bi_baseline|emilia_en_zh_dirdrop_both|emilia_en_zh_bi_baseline_spm8k|emilia_en_zh_dirdrop_both_spm8k)
       MODE="$1"
       shift
       ;;
@@ -51,8 +51,32 @@ if [[ -z "${CONFIG_YAML}" ]]; then
     bi_baseline)
       CONFIG_YAML="${REPO_ROOT}/configs/paper_bi_baseline_4x4090_deepspeed.yaml"
       ;;
+    bi_baseline_spm4k)
+      CONFIG_YAML="${REPO_ROOT}/configs/paper_bi_baseline_spm4k_4x4090_deepspeed.yaml"
+      ;;
+    bi_baseline_spm8k)
+      CONFIG_YAML="${REPO_ROOT}/configs/paper_bi_baseline_spm8k_4x4090_deepspeed.yaml"
+      ;;
     dirdrop_both)
       CONFIG_YAML="${REPO_ROOT}/configs/paper_dirdrop_both_4x4090_deepspeed.yaml"
+      ;;
+    emilia_zh_bi_baseline)
+      CONFIG_YAML="${REPO_ROOT}/configs/emilia_zh_bi_baseline_4x4090_deepspeed.yaml"
+      ;;
+    emilia_zh_dirdrop_both)
+      CONFIG_YAML="${REPO_ROOT}/configs/emilia_zh_dirdrop_both_4x4090_deepspeed.yaml"
+      ;;
+    emilia_en_zh_bi_baseline)
+      CONFIG_YAML="${REPO_ROOT}/configs/emilia_en_zh_bi_baseline_4x4090_deepspeed.yaml"
+      ;;
+    emilia_en_zh_dirdrop_both)
+      CONFIG_YAML="${REPO_ROOT}/configs/emilia_en_zh_dirdrop_both_4x4090_deepspeed.yaml"
+      ;;
+    emilia_en_zh_bi_baseline_spm8k)
+      CONFIG_YAML="${REPO_ROOT}/configs/emilia_en_zh_bi_baseline_spm8k_4x4090_deepspeed.yaml"
+      ;;
+    emilia_en_zh_dirdrop_both_spm8k)
+      CONFIG_YAML="${REPO_ROOT}/configs/emilia_en_zh_dirdrop_both_spm8k_4x4090_deepspeed.yaml"
       ;;
     *)
       echo "Unsupported mode: ${MODE}" >&2

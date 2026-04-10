@@ -27,8 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", default="bi", choices=["bi", "l2r", "r2l", "alt"])
     parser.add_argument("--beam-size", default=8, type=int)
     parser.add_argument("--token-prune-topk", default=None, type=int)
+    parser.add_argument("--length-bonus", default=0.0, type=float)
+    parser.add_argument("--insertion-bonus", default=0.0, type=float)
+    parser.add_argument("--save-debug-lengths", action="store_true")
     parser.add_argument("--output-path", default=None)
-    parser.add_argument("--tokenizer-type", default="whisper_multilingual")
+    parser.add_argument("--tokenizer-type", default=None)
     parser.add_argument("--tokenizer-model-path", default=None)
     parser.add_argument("--tokenizer-language", default=None)
     parser.add_argument("--tokenizer-task", default=None)
@@ -78,10 +81,36 @@ def _resolve_model_config(args: argparse.Namespace) -> RWKVCTCModelConfig:
     )
 
 
+def _resolve_tokenizer_config(args: argparse.Namespace) -> dict[str, str | None]:
+    resolved = {
+        "tokenizer_type": "whisper_multilingual",
+        "tokenizer_model_path": None,
+        "tokenizer_language": None,
+        "tokenizer_task": None,
+    }
+    default_yaml = Path(args.checkpoint_path).resolve().parent / "tokenizer_config.yaml"
+    if default_yaml.exists():
+        config_data = load_yaml(default_yaml)
+        resolved.update(
+            {
+                "tokenizer_type": config_data.get("tokenizer_type", resolved["tokenizer_type"]),
+                "tokenizer_model_path": config_data.get("tokenizer_model_path"),
+                "tokenizer_language": config_data.get("tokenizer_language"),
+                "tokenizer_task": config_data.get("tokenizer_task"),
+            }
+        )
+    for key in tuple(resolved.keys()):
+        value = getattr(args, key)
+        if value is not None:
+            resolved[key] = value
+    return resolved
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if (args.manifest_path is None) == (args.webdataset_root is None):
         raise ValueError("Exactly one of --manifest-path or --webdataset-root must be provided.")
+    tokenizer_config = _resolve_tokenizer_config(args)
 
     predictions = predict_ctc(
         PredictionConfig(
@@ -98,10 +127,13 @@ def main() -> None:
             mode=args.mode,
             beam_size=args.beam_size,
             token_prune_topk=args.token_prune_topk,
-            tokenizer_type=args.tokenizer_type,
-            tokenizer_model_path=args.tokenizer_model_path,
-            tokenizer_language=args.tokenizer_language,
-            tokenizer_task=args.tokenizer_task,
+            length_bonus=args.length_bonus,
+            insertion_bonus=args.insertion_bonus,
+            save_debug_lengths=args.save_debug_lengths,
+            tokenizer_type=str(tokenizer_config["tokenizer_type"]),
+            tokenizer_model_path=tokenizer_config["tokenizer_model_path"],
+            tokenizer_language=tokenizer_config["tokenizer_language"],
+            tokenizer_task=tokenizer_config["tokenizer_task"],
             num_workers=args.num_workers,
             frame_shift_ms=args.frame_shift_ms,
         )
@@ -121,6 +153,7 @@ def main() -> None:
                     "score": prediction.score,
                     "mode": prediction.mode,
                     "alignments": [asdict(alignment) for alignment in prediction.alignments],
+                    "debug": None if prediction.debug is None else asdict(prediction.debug),
                 },
                 ensure_ascii=False,
             )

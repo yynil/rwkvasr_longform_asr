@@ -6,13 +6,16 @@ import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, BinaryIO, Iterable
 
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .manifest import FeatureCollator, TokenizerLike, WenetFbankFeatureExtractor
 from .webdataset import WebDatasetConfig, decode_webdataset_sample
+from .webdataset_common import AUDIO_SUFFIXES
 from .webdataset_index import StableHashSplitConfig, assign_split, resolve_sample_id
+
+MAX_IN_MEMORY_LENGTH_INDEX_BYTES = 1 << 30
 
 
 def _log(message: str) -> None:
@@ -26,8 +29,21 @@ class WebDatasetLengthEntry:
     utt_id: str
     split: str
     num_frames: int
-    wav_member: str
+    audio_member: str
+    audio_format: str
     json_member: str
+    audio_offset: int | None = None
+    audio_size: int | None = None
+    json_offset: int | None = None
+    json_size: int | None = None
+
+    @property
+    def wav_member(self) -> str:
+        return self.audio_member
+
+
+def _member_audio_format(member_name: str) -> str:
+    return Path(member_name).suffix.lower().lstrip(".")
 
 
 def resolve_webdataset_length_index_path(shard_root: str | Path, index_path: str | Path | None = None) -> Path:
@@ -47,6 +63,23 @@ def resolve_webdataset_length_summary_path(
         return Path(summary_path)
     index_path = resolve_webdataset_length_index_path(shard_root)
     return index_path.with_suffix(".summary.json")
+
+
+def format_num_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.1f}{unit}"
+        value /= 1024.0
+    return f"{value:.1f}TiB"
+
+
+def can_load_webdataset_length_index_in_memory(
+    index_path: str | Path,
+    *,
+    max_bytes: int = MAX_IN_MEMORY_LENGTH_INDEX_BYTES,
+) -> bool:
+    return Path(index_path).stat().st_size <= int(max_bytes)
 
 
 def infer_num_frames_from_metadata(metadata: dict[str, Any]) -> int:
@@ -108,20 +141,25 @@ def inspect_webdataset_lengths(
                         continue
                     key, suffix = basename.rsplit(".", 1)
                     suffix = suffix.lower()
-                    if suffix not in {"wav", "json"}:
+                    if suffix != "json" and suffix not in AUDIO_SUFFIXES:
                         continue
 
                     sample = pending.setdefault(key, {})
-                    if suffix == "wav":
-                        sample["wav_member"] = member_name
+                    if suffix != "json":
+                        sample["audio_member"] = member_name
+                        sample["audio_format"] = suffix
+                        sample["audio_offset"] = int(member.offset_data)
+                        sample["audio_size"] = int(member.size)
                     else:
                         extracted = archive.extractfile(member)
                         if extracted is None:
                             continue
                         sample["json_member"] = member_name
+                        sample["json_offset"] = int(member.offset_data)
+                        sample["json_size"] = int(member.size)
                         sample["metadata"] = json.loads(extracted.read().decode("utf-8"))
 
-                    if "wav_member" not in sample or "metadata" not in sample or "json_member" not in sample:
+                    if "audio_member" not in sample or "metadata" not in sample or "json_member" not in sample:
                         continue
 
                     metadata = sample["metadata"]
@@ -137,8 +175,13 @@ def inspect_webdataset_lengths(
                         "utt_id": sample_id,
                         "split": split_name,
                         "num_frames": num_frames,
-                        "wav_member": sample["wav_member"],
+                        "audio_member": sample["audio_member"],
+                        "audio_format": sample["audio_format"],
                         "json_member": sample["json_member"],
+                        "audio_offset": sample["audio_offset"],
+                        "audio_size": sample["audio_size"],
+                        "json_offset": sample["json_offset"],
+                        "json_size": sample["json_size"],
                     }
                     handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -157,13 +200,14 @@ def inspect_webdataset_lengths(
             )
 
     summary = {
-        "version": 1,
+        "version": 2,
         "root": str(shard_root),
         "length_index_path": str(output_file),
         "num_shards": len(shards),
         "num_samples": total_samples,
         "min_frames": int(min_frames or 0),
         "max_frames": int(max_frames),
+        "audio_suffixes": sorted(AUDIO_SUFFIXES),
         "split": {
             "type": "stable_hash",
             "split_by": split_config.split_by,
@@ -199,18 +243,93 @@ def load_webdataset_length_entries(
             raw = json.loads(line)
             if split != "all" and raw["split"] != split:
                 continue
-            entries.append(
-                WebDatasetLengthEntry(
-                    shard_name=str(raw["shard_name"]),
-                    key=str(raw["key"]),
-                    utt_id=str(raw["utt_id"]),
-                    split=str(raw["split"]),
-                    num_frames=int(raw["num_frames"]),
-                    wav_member=str(raw["wav_member"]),
-                    json_member=str(raw["json_member"]),
-                )
-            )
+            entries.append(parse_webdataset_length_entry(raw))
     return entries
+
+
+def parse_webdataset_length_entry(raw: dict[str, Any]) -> WebDatasetLengthEntry:
+    return WebDatasetLengthEntry(
+        shard_name=str(raw["shard_name"]),
+        key=str(raw["key"]),
+        utt_id=str(raw["utt_id"]),
+        split=str(raw["split"]),
+        num_frames=int(raw["num_frames"]),
+        audio_member=str(raw.get("audio_member") or raw["wav_member"]),
+        audio_format=str(
+            raw.get("audio_format")
+            or _member_audio_format(str(raw.get("audio_member") or raw["wav_member"]))
+        ),
+        json_member=str(raw["json_member"]),
+        audio_offset=(
+            int(raw["audio_offset"])
+            if raw.get("audio_offset") is not None
+            else None
+        ),
+        audio_size=(
+            int(raw["audio_size"])
+            if raw.get("audio_size") is not None
+            else None
+        ),
+        json_offset=(
+            int(raw["json_offset"])
+            if raw.get("json_offset") is not None
+            else None
+        ),
+        json_size=(
+            int(raw["json_size"])
+            if raw.get("json_size") is not None
+            else None
+        ),
+    )
+
+
+class _TarShardReader:
+    def __init__(self, shard_path: Path):
+        self.shard_path = shard_path
+        self._binary: BinaryIO | None = None
+        self._archive: tarfile.TarFile | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {"shard_path": self.shard_path}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.shard_path = Path(state["shard_path"])
+        self._binary = None
+        self._archive = None
+
+    def close(self) -> None:
+        if self._archive is not None:
+            self._archive.close()
+            self._archive = None
+        if self._binary is not None:
+            self._binary.close()
+            self._binary = None
+
+    def _binary_handle(self) -> BinaryIO:
+        if self._binary is None:
+            self._binary = self.shard_path.open("rb")
+        return self._binary
+
+    def _archive_handle(self) -> tarfile.TarFile:
+        if self._archive is None:
+            self._archive = tarfile.open(self.shard_path, "r")
+        return self._archive
+
+    def read_member(self, member_name: str, *, offset: int | None, size: int | None) -> bytes:
+        if offset is not None and size is not None:
+            handle = self._binary_handle()
+            handle.seek(offset)
+            payload = handle.read(size)
+            if len(payload) != size:
+                raise EOFError(
+                    f"Short read for {self.shard_path.name}:{member_name}; expected {size} bytes got {len(payload)}"
+                )
+            return payload
+
+        extracted = self._archive_handle().extractfile(member_name)
+        if extracted is None:
+            raise FileNotFoundError(f"Missing tar member {self.shard_path.name}:{member_name}")
+        return extracted.read()
 
 
 class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
@@ -228,32 +347,40 @@ class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
         self.tokenizer = tokenizer
         self.feature_extractor = feature_extractor or WenetFbankFeatureExtractor()
         self.config = config or WebDatasetConfig()
-        self._tar_cache: dict[str, tarfile.TarFile] = {}
+        self._reader_cache: dict[str, _TarShardReader] = {}
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
-        state["_tar_cache"] = {}
+        state["_reader_cache"] = {}
         return state
+
+    def __del__(self) -> None:
+        for reader in self._reader_cache.values():
+            reader.close()
 
     def __len__(self) -> int:
         return len(self.entries)
 
-    def _archive(self, shard_name: str) -> tarfile.TarFile:
-        archive = self._tar_cache.get(shard_name)
-        if archive is None:
-            archive = tarfile.open(self.shard_root / shard_name, "r")
-            self._tar_cache[shard_name] = archive
-        return archive
+    def _reader(self, shard_name: str) -> _TarShardReader:
+        reader = self._reader_cache.get(shard_name)
+        if reader is None:
+            reader = _TarShardReader(self.shard_root / shard_name)
+            self._reader_cache[shard_name] = reader
+        return reader
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         entry = self.entries[index]
-        archive = self._archive(entry.shard_name)
-        wav_file = archive.extractfile(entry.wav_member)
-        json_file = archive.extractfile(entry.json_member)
-        if wav_file is None or json_file is None:
-            raise FileNotFoundError(f"Missing sample members for {entry.shard_name}:{entry.key}")
-        audio_bytes = wav_file.read()
-        metadata_bytes = json_file.read()
+        reader = self._reader(entry.shard_name)
+        audio_bytes = reader.read_member(
+            entry.audio_member,
+            offset=entry.audio_offset,
+            size=entry.audio_size,
+        )
+        metadata_bytes = reader.read_member(
+            entry.json_member,
+            offset=entry.json_offset,
+            size=entry.json_size,
+        )
         return decode_webdataset_sample(
             key=entry.key,
             audio_bytes=audio_bytes,

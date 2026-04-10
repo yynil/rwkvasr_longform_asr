@@ -6,6 +6,10 @@ webdataset_split: train
 webdataset_eval_ratio: 0.01
 webdataset_hash_seed: 0
 webdataset_split_by: shard_name
+tokenizer_type: whisper_multilingual
+tokenizer_model_path: null
+tokenizer_language: null
+tokenizer_task: null
 device: cuda
 batch_size: 160
 batch_token_budget: 90000

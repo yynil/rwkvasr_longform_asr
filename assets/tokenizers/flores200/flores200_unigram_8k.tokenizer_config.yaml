@@ -1,0 +1,5 @@
+tokenizer_type: sentencepiece
+tokenizer_model_path: /home/yueyulin/github/rwkvasr_longform_asr/assets/tokenizers/flores200/flores200_unigram_8k.model
+tokenizer_language: null
+tokenizer_task: null
+vocab_size: 8000

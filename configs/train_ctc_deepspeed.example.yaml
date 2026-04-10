@@ -4,6 +4,10 @@ webdataset_index_path: /home/yueyulin/data/voxbox/wenetasr/webdataset_index.json
 webdataset_split: train
 webdataset_eval_ratio: 0.01
 webdataset_hash_seed: 0
+tokenizer_type: whisper_multilingual
+tokenizer_model_path: null
+tokenizer_language: null
+tokenizer_task: null
 device: cuda
 batch_size: 8
 num_workers: 4
@@ -11,6 +15,7 @@ epochs: 10
 save_every: 500
 log_every: 10
 gradient_checkpointing: true
+max_eval_samples: null
 
 input_dim: 80
 n_embd: 512

@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--webdataset-eval-ratio", default=0.0, type=float)
     parser.add_argument("--webdataset-hash-seed", default=0, type=int)
     parser.add_argument("--webdataset-split-by", default="shard_name")
+    parser.add_argument("--webdataset-utt-id-key", default="sid")
     parser.add_argument("--output-path", required=True)
     return parser
 
@@ -59,6 +60,7 @@ def _resolve_webdataset_total_samples(
     eval_ratio: float,
     hash_seed: int,
     split_by: str,
+    utt_id_key: str,
 ) -> int | None:
     index_path = resolve_webdataset_index_path(root)
     if not index_path.exists():
@@ -69,6 +71,7 @@ def _resolve_webdataset_total_samples(
         split_config=StableHashSplitConfig(
             eval_ratio=eval_ratio,
             hash_seed=hash_seed,
+            utt_id_key=utt_id_key,
             split_by=split_by,
         ),
     )
@@ -95,6 +98,7 @@ def main() -> None:
                 eval_ratio=args.webdataset_eval_ratio,
                 hash_seed=args.webdataset_hash_seed,
                 split_by=args.webdataset_split_by,
+                utt_id_key=args.webdataset_utt_id_key,
                 partition_by_rank=False,
             ),
         )
@@ -104,6 +108,7 @@ def main() -> None:
             eval_ratio=args.webdataset_eval_ratio,
             hash_seed=args.webdataset_hash_seed,
             split_by=args.webdataset_split_by,
+            utt_id_key=args.webdataset_utt_id_key,
         )
         label = f"CMVN webdataset {Path(args.webdataset_root).name}"
 

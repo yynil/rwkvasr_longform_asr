@@ -1,4 +1,5 @@
 .venv/
+.codex
 __pycache__/
 .pytest_cache/
 .ruff_cache/
@@ -21,3 +22,4 @@ runs/
 outputs/
 checkpoints/
 tools/target/
+assets/tokenizers/flores200/flores200_dev_devtest_multilingual.txt

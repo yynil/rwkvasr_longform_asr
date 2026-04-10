@@ -50,8 +50,13 @@ struct Config {
 
 #[derive(Default)]
 struct PartialEntry {
-    wav_member: Option<String>,
+    audio_member: Option<String>,
+    audio_format: Option<String>,
+    audio_offset: Option<u64>,
+    audio_size: Option<u64>,
     json_member: Option<String>,
+    json_offset: Option<u64>,
+    json_size: Option<u64>,
     utt_id: Option<String>,
     num_frames: Option<u64>,
 }
@@ -83,6 +88,7 @@ struct TarHeader {
     member_name: String,
     file_size: u64,
     is_regular_file: bool,
+    payload_offset: u64,
 }
 
 fn main() {
@@ -427,11 +433,14 @@ fn inspect_shard(
         };
 
         match suffix.as_str() {
-            "wav" => {
+            audio_suffix if is_supported_audio_suffix(audio_suffix) => {
                 skip_entry(&mut reader, tar_header.file_size)
-                    .map_err(|err| format!("Failed to skip wav payload {}:{}: {err}", shard_name, tar_header.member_name))?;
+                    .map_err(|err| format!("Failed to skip audio payload {}:{}: {err}", shard_name, tar_header.member_name))?;
                 let entry = pending.entry(sample_key.clone()).or_default();
-                entry.wav_member = Some(tar_header.member_name);
+                entry.audio_member = Some(tar_header.member_name);
+                entry.audio_format = Some(audio_suffix.to_string());
+                entry.audio_offset = Some(tar_header.payload_offset);
+                entry.audio_size = Some(tar_header.file_size);
             }
             "json" => {
                 let payload = read_entry_bytes(&mut reader, tar_header.file_size).map_err(|err| {
@@ -451,6 +460,8 @@ fn inspect_shard(
                 })?;
                 let entry = pending.entry(sample_key.clone()).or_default();
                 entry.json_member = Some(tar_header.member_name);
+                entry.json_offset = Some(tar_header.payload_offset);
+                entry.json_size = Some(tar_header.file_size);
                 entry.utt_id = Some(metadata.utt_id);
                 entry.num_frames = Some(metadata.num_frames);
             }
@@ -463,8 +474,13 @@ fn inspect_shard(
         let should_emit = pending
             .get(&sample_key)
             .map(|entry| {
-                entry.wav_member.is_some()
+                entry.audio_member.is_some()
+                    && entry.audio_format.is_some()
+                    && entry.audio_offset.is_some()
+                    && entry.audio_size.is_some()
                     && entry.json_member.is_some()
+                    && entry.json_offset.is_some()
+                    && entry.json_size.is_some()
                     && entry.utt_id.is_some()
                     && entry.num_frames.is_some()
             })
@@ -486,12 +502,27 @@ fn inspect_shard(
             SplitBy::SampleId => assign_split(&utt_id, config.hash_seed, config.eval_ratio),
             SplitBy::ShardName => shard_split,
         };
-        let wav_member = complete
-            .wav_member
-            .ok_or_else(|| format!("Missing wav member for {}:{}.", shard_name, sample_key))?;
+        let audio_member = complete
+            .audio_member
+            .ok_or_else(|| format!("Missing audio member for {}:{}.", shard_name, sample_key))?;
+        let audio_format = complete
+            .audio_format
+            .ok_or_else(|| format!("Missing audio format for {}:{}.", shard_name, sample_key))?;
+        let audio_offset = complete
+            .audio_offset
+            .ok_or_else(|| format!("Missing audio offset for {}:{}.", shard_name, sample_key))?;
+        let audio_size = complete
+            .audio_size
+            .ok_or_else(|| format!("Missing audio size for {}:{}.", shard_name, sample_key))?;
         let json_member = complete
             .json_member
             .ok_or_else(|| format!("Missing json member for {}:{}.", shard_name, sample_key))?;
+        let json_offset = complete
+            .json_offset
+            .ok_or_else(|| format!("Missing json offset for {}:{}.", shard_name, sample_key))?;
+        let json_size = complete
+            .json_size
+            .ok_or_else(|| format!("Missing json size for {}:{}.", shard_name, sample_key))?;
         write_index_line(
             &mut part_writer,
             &shard_name,
@@ -499,8 +530,13 @@ fn inspect_shard(
             &utt_id,
             split,
             num_frames,
-            &wav_member,
+            &audio_member,
+            &audio_format,
             &json_member,
+            audio_offset,
+            audio_size,
+            json_offset,
+            json_size,
         )
         .map_err(|err| format!("Failed writing shard part {}: {err}", part_path.display()))?;
 
@@ -563,7 +599,7 @@ fn write_summary(
         .map_err(|err| format!("Failed to create {}: {err}", config.summary_path.display()))?;
     let mut writer = BufWriter::new(file);
     writeln!(writer, "{{").map_err(io_error)?;
-    writeln!(writer, "  \"version\": 1,").map_err(io_error)?;
+    writeln!(writer, "  \"version\": 2,").map_err(io_error)?;
     writeln!(
         writer,
         "  \"root\": {},",
@@ -580,6 +616,7 @@ fn write_summary(
     writeln!(writer, "  \"num_samples\": {num_samples},").map_err(io_error)?;
     writeln!(writer, "  \"min_frames\": {min_frames},").map_err(io_error)?;
     writeln!(writer, "  \"max_frames\": {max_frames},").map_err(io_error)?;
+    writeln!(writer, "  \"audio_suffixes\": [\"wav\", \"mp3\", \"flac\"],").map_err(io_error)?;
     writeln!(writer, "  \"split\": {{").map_err(io_error)?;
     writeln!(writer, "    \"type\": \"stable_hash\",").map_err(io_error)?;
     writeln!(writer, "    \"split_by\": {},", json_string(config.split_by.as_str())).map_err(io_error)?;
@@ -641,10 +678,12 @@ fn read_tar_header(reader: &mut BufReader<File>, block: &mut [u8; TAR_BLOCK_SIZE
     let file_size = parse_tar_octal(&block[124..136])?;
     let typeflag = block[156];
     let is_regular_file = typeflag == 0 || typeflag == b'0';
+    let payload_offset = reader.stream_position()?;
     Ok(Some(TarHeader {
         member_name,
         file_size,
         is_regular_file,
+        payload_offset,
     }))
 }
 
@@ -671,10 +710,14 @@ fn split_member_name(member_name: &str) -> Option<(String, String)> {
     let basename = member_name.rsplit('/').next()?;
     let (key, suffix) = basename.rsplit_once('.')?;
     let suffix = suffix.to_ascii_lowercase();
-    if suffix != "wav" && suffix != "json" {
+    if suffix != "json" && !is_supported_audio_suffix(&suffix) {
         return None;
     }
     Some((key.to_string(), suffix))
+}
+
+fn is_supported_audio_suffix(suffix: &str) -> bool {
+    matches!(suffix, "wav" | "mp3" | "flac")
 }
 
 fn skip_entry(reader: &mut BufReader<File>, file_size: u64) -> io::Result<()> {
@@ -842,19 +885,29 @@ fn write_index_line(
     utt_id: &str,
     split: &str,
     num_frames: u64,
-    wav_member: &str,
+    audio_member: &str,
+    audio_format: &str,
     json_member: &str,
+    audio_offset: u64,
+    audio_size: u64,
+    json_offset: u64,
+    json_size: u64,
 ) -> io::Result<()> {
     writeln!(
         writer,
-        "{{\"shard_name\":{},\"key\":{},\"utt_id\":{},\"split\":{},\"num_frames\":{},\"wav_member\":{},\"json_member\":{}}}",
+        "{{\"shard_name\":{},\"key\":{},\"utt_id\":{},\"split\":{},\"num_frames\":{},\"audio_member\":{},\"audio_format\":{},\"json_member\":{},\"audio_offset\":{},\"audio_size\":{},\"json_offset\":{},\"json_size\":{}}}",
         json_string(shard_name),
         json_string(key),
         json_string(utt_id),
         json_string(split),
         num_frames,
-        json_string(wav_member),
+        json_string(audio_member),
+        json_string(audio_format),
         json_string(json_member),
+        audio_offset,
+        audio_size,
+        json_offset,
+        json_size,
     )
 }
 
@@ -992,6 +1045,13 @@ mod tests {
     }
 
     #[test]
+    fn split_member_name_accepts_mp3_audio() {
+        let parsed = split_member_name("folder/example.mp3").expect("member");
+        assert_eq!(parsed.0, "example");
+        assert_eq!(parsed.1, "mp3");
+    }
+
+    #[test]
     fn inspect_single_shard_writes_length_index() {
         let temp_root = unique_temp_dir("rwkvasr_tools_tar_test");
         fs::create_dir_all(&temp_root).expect("mkdir");
@@ -1042,6 +1102,8 @@ mod tests {
         let index_text = fs::read_to_string(output_path).expect("read index");
         assert!(index_text.contains("\"utt_id\":\"utt-abc\""));
         assert!(index_text.contains("\"num_frames\":234"));
+        assert!(index_text.contains("\"audio_member\":\"abc.wav\""));
+        assert!(index_text.contains("\"audio_format\":\"wav\""));
         assert!(index_text.contains("\"utt_id\":\"utt-def\""));
         assert!(index_text.contains("\"num_frames\":125"));
 

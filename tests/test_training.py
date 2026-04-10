@@ -1,5 +1,10 @@
-import torch
+import sys
+import types
 
+import torch
+import sentencepiece as spm
+
+from rwkvasr.data import ASRBatch
 from rwkvasr.modules import (
     DirectionDropoutConfig,
     DirectionDropoutScheduler,
@@ -11,6 +16,9 @@ from rwkvasr.training import (
     RWKVDualModeCTCTrainer,
     build_rwkv_param_groups,
 )
+from rwkvasr.training.train_loop import TrainConfig, _resolve_vocab_size
+from rwkvasr.training.wandb_logger import finish_wandb, init_wandb_run, log_wandb
+from rwkvasr.data import can_load_webdataset_length_index_in_memory
 from rwkvasr.training.synthetic import (
     SyntheticOverfitConfig,
     make_synthetic_ctc_batch,
@@ -95,6 +103,24 @@ def test_ctc_batch_to_can_cast_feature_dtype() -> None:
     assert moved.targets.dtype == torch.long
 
 
+def test_asr_batch_prefix_truncates_feature_and_target_tensors() -> None:
+    batch = ASRBatch(
+        features=torch.randn(3, 9, 80),
+        feature_lengths=torch.tensor([9, 7, 5], dtype=torch.long),
+        targets=torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.long),
+        target_lengths=torch.tensor([2, 1, 3], dtype=torch.long),
+        utt_ids=["utt-0", "utt-1", "utt-2"],
+    )
+
+    trimmed = batch.prefix(2)
+
+    assert trimmed.features.shape == (2, 9, 80)
+    assert trimmed.feature_lengths.tolist() == [9, 7]
+    assert trimmed.targets.tolist() == [1, 2, 3]
+    assert trimmed.target_lengths.tolist() == [2, 1]
+    assert trimmed.utt_ids == ["utt-0", "utt-1"]
+
+
 def test_make_synthetic_ctc_batch_shapes() -> None:
     batch = make_synthetic_ctc_batch(SyntheticOverfitConfig(batch_size=3, target_len=5))
 
@@ -117,3 +143,91 @@ def test_synthetic_overfit_reduces_loss() -> None:
     )
 
     assert result["final_loss"] < result["initial_loss"]
+
+
+def test_resolve_vocab_size_uses_sentencepiece_model(tmp_path) -> None:
+    corpus_path = tmp_path / "corpus.txt"
+    corpus_path.write_text("hello world\nni hao shi jie\nbonjour le monde\n", encoding="utf-8")
+    model_prefix = tmp_path / "tiny_spm"
+    spm.SentencePieceTrainer.train(
+        input=str(corpus_path),
+        model_prefix=str(model_prefix),
+        model_type="unigram",
+        vocab_size=18,
+        character_coverage=1.0,
+        split_digits=True,
+        unk_id=0,
+        bos_id=-1,
+        eos_id=-1,
+        pad_id=-1,
+    )
+
+    config = TrainConfig(
+        output_dir=str(tmp_path / "out"),
+        manifest_path=str(corpus_path),
+        tokenizer_type="sentencepiece",
+        tokenizer_model_path=str(model_prefix.with_suffix(".model")),
+        vocab_size=None,
+    )
+    assert _resolve_vocab_size(config) == 18
+
+
+def test_can_load_webdataset_length_index_in_memory_respects_limit(tmp_path) -> None:
+    index_path = tmp_path / "lengths.jsonl"
+    index_path.write_text("x" * 32, encoding="utf-8")
+
+    assert can_load_webdataset_length_index_in_memory(index_path, max_bytes=64) is True
+    assert can_load_webdataset_length_index_in_memory(index_path, max_bytes=16) is False
+
+
+def test_wandb_logger_noops_when_disabled(tmp_path) -> None:
+    run = init_wandb_run(
+        enabled=False,
+        project="rwkvasr_longform_asr",
+        run_name="sp8k_4090",
+        output_dir=tmp_path,
+        config={"x": 1},
+    )
+    assert run is None
+    log_wandb(run, {"loss": 1.0}, step=1)
+    finish_wandb(run)
+
+
+def test_wandb_logger_falls_back_when_init_fails(tmp_path) -> None:
+    messages: list[str] = []
+
+    fake_wandb = types.SimpleNamespace()
+
+    class FakeSettings:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    def fake_init(**kwargs):
+        raise RuntimeError("init timeout")
+
+    fake_wandb.Settings = FakeSettings
+    fake_wandb.init = fake_init
+
+    previous = sys.modules.get("wandb")
+    sys.modules["wandb"] = fake_wandb
+    try:
+        run = init_wandb_run(
+            enabled=True,
+            project="rwkvasr_longform_asr",
+            run_name="sp8k_4090",
+            output_dir=tmp_path,
+            config={"x": 1},
+            base_url="https://api.wandb.ai",
+            init_timeout_sec=12.5,
+            logger=messages.append,
+        )
+    finally:
+        if previous is None:
+            sys.modules.pop("wandb", None)
+        else:
+            sys.modules["wandb"] = previous
+
+    assert run is None
+    assert messages
+    assert "wandb init failed" in messages[0]
+    assert "https://api.wandb.ai" in messages[0]

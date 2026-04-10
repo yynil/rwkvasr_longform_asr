@@ -13,6 +13,7 @@ dependencies = [
   "torchaudio>=2.10,<2.11",
   "deepspeed>=0.18",
   "einops>=0.8",
+  "ninja>=1.11",
   "numpy>=2.0",
   "openai-whisper>=20250625",
   "pyyaml>=6.0",
@@ -21,6 +22,7 @@ dependencies = [
   "sentencepiece>=0.2",
   "soundfile>=0.13",
   "tensorboard>=2.19",
+  "wandb>=0.20",
 ]
 
 [project.scripts]
@@ -32,8 +34,11 @@ rwkvasr-train-ctc = "rwkvasr.cli.train_ctc:main"
 rwkvasr-train-ctc-deepspeed = "rwkvasr.cli.train_ctc_deepspeed:main"
 rwkvasr-eval-ctc = "rwkvasr.cli.eval_ctc:main"
 rwkvasr-predict-ctc = "rwkvasr.cli.predict_ctc:main"
+rwkvasr-predict-ctc-labeled = "rwkvasr.cli.predict_ctc_labeled:main"
 rwkvasr-export-safetensors = "rwkvasr.cli.export_checkpoint_safetensors:main"
 rwkvasr-export-ctc-logits = "rwkvasr.cli.export_ctc_logits:main"
+rwkvasr-prepare-flores-sentencepiece = "rwkvasr.cli.prepare_flores_sentencepiece:main"
+rwkvasr-check-rwkv7-cuda = "rwkvasr.cli.check_rwkv7_cuda:main"
 
 [project.optional-dependencies]
 dev = [
@@ -44,6 +49,11 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rwkvasr"]
+artifacts = [
+  "src/rwkvasr/kernels/**/*.cpp",
+  "src/rwkvasr/kernels/**/*.cu",
+  "src/rwkvasr/kernels/**/NOTICE",
+]
 
 [tool.ruff]
 line-length = 100

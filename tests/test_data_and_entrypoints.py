@@ -21,6 +21,7 @@ from rwkvasr.data import (
 from rwkvasr.modules import load_wenet_cmvn
 from rwkvasr.training.checkpoint import load_checkpoint, save_checkpoint
 from rwkvasr.training.train_loop import TrainConfig, train_ctc_model
+from rwkvasr.training.train_loop import _resolve_max_steps as resolve_train_max_steps
 from rwkvasr.modules import RWKVCTCModel, RWKVCTCModelConfig
 from rwkvasr.training.optimizer import build_rwkv_optimizer, RWKVOptimizerConfig
 
@@ -55,7 +56,7 @@ def _make_wav_bytes(num_frames: int = 16000) -> bytes:
     return buffer.getvalue()
 
 
-def _write_webdataset_root(tmp_path: Path, num_examples: int = 2) -> Path:
+def _write_webdataset_root(tmp_path: Path, num_examples: int = 2, *, utt_id_key: str = "sid") -> Path:
     root = tmp_path / "webdataset"
     root.mkdir(parents=True, exist_ok=True)
     shard_path = root / "shard_00000000.tar"
@@ -69,7 +70,7 @@ def _write_webdataset_root(tmp_path: Path, num_examples: int = 2) -> Path:
 
             json_bytes = json.dumps(
                 {
-                    "sid": f"utt-{idx}",
+                    utt_id_key: f"utt-{idx}",
                     "text": "你好世界",
                     "token_ids": [1, 2, 3, 4],
                     "sample_rate": 16000,
@@ -185,6 +186,24 @@ def test_train_ctc_model_smoke(tmp_path: Path) -> None:
     assert load_yaml(out_dir / "model_config.yaml")["vocab_size"] == 8
 
 
+def test_resolve_train_config_accepts_max_eval_samples() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--output-dir",
+            "runs/test",
+            "--manifest-path",
+            "dummy.jsonl",
+            "--max-eval-samples",
+            "1234",
+        ]
+    )
+
+    config = _resolve_train_config(args)
+
+    assert config.max_eval_samples == 1234
+
+
 def test_compute_manifest_global_cmvn_matches_expected_stats(tmp_path: Path) -> None:
     manifest = _write_manifest(tmp_path, num_examples=2, base_frames=4)
     cmvn_path = tmp_path / "global_cmvn.json"
@@ -247,6 +266,36 @@ def test_train_ctc_model_supports_webdataset_root(tmp_path: Path) -> None:
     assert (out_dir / "train_config.yaml").exists()
     assert (out_dir / "step-1.pt").exists()
     assert load_yaml(out_dir / "train_config.yaml")["webdataset_root"] == str(webdataset_root)
+
+
+def test_train_max_steps_supports_webdataset_index_with_custom_utt_id_key(tmp_path: Path) -> None:
+    webdataset_root = _write_webdataset_root(tmp_path, num_examples=6, utt_id_key="id")
+    index_path = tmp_path / "webdataset_index.json"
+    split_config = StableHashSplitConfig(eval_ratio=0.25, hash_seed=5, split_by="shard_name", utt_id_key="id")
+    inspect_webdataset(
+        webdataset_root,
+        output_path=index_path,
+        split_config=split_config,
+    )
+
+    resolved_max_steps, steps_per_epoch = resolve_train_max_steps(
+        TrainConfig(
+            output_dir=str(tmp_path / "out"),
+            vocab_size=8,
+            webdataset_root=str(webdataset_root),
+            webdataset_index_path=str(index_path),
+            webdataset_split="train",
+            webdataset_eval_ratio=0.25,
+            webdataset_hash_seed=5,
+            webdataset_split_by="shard_name",
+            webdataset_utt_id_key="id",
+            batch_size=2,
+            epochs=2,
+        )
+    )
+
+    assert steps_per_epoch is not None
+    assert resolved_max_steps == steps_per_epoch * 2
 
 
 def test_train_ctc_model_supports_length_bucketed_webdataset_root(tmp_path: Path) -> None:
@@ -374,6 +423,43 @@ def test_train_ctc_model_records_epoch_metrics_and_supports_resume(tmp_path: Pat
     assert len(resumed_metrics["epochs"]) == 2
 
 
+def test_train_ctc_model_keeps_top_k_step_checkpoints(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path, num_examples=6, base_frames=40)
+    out_dir = tmp_path / "out_step_topk"
+
+    result = train_ctc_model(
+        TrainConfig(
+            output_dir=str(out_dir),
+            manifest_path=str(manifest),
+            vocab_size=8,
+            input_dim=80,
+            n_embd=128,
+            dim_att=128,
+            dim_ff=256,
+            num_layers=2,
+            head_size=32,
+            conv_kernel_size=5,
+            dropout=0.0,
+            batch_size=2,
+            max_steps=3,
+            save_every=1,
+            num_workers=0,
+            device="cpu",
+            p_start=0.0,
+            p_max=0.0,
+            step_eval_samples=2,
+            top_k_step_checkpoints=2,
+        )
+    )
+
+    assert result["steps"] == 3
+    step_metrics = load_yaml(out_dir / "step_checkpoint_metrics.yaml")
+    assert len(step_metrics["step_checkpoints"]) == 3
+    assert len(step_metrics["best"]) == 2
+    remaining = sorted(path.name for path in out_dir.glob("step-*.pt"))
+    assert len(remaining) == 2
+
+
 def test_train_ctc_model_resolves_epochs_from_webdataset_index(tmp_path: Path) -> None:
     webdataset_root = _write_webdataset_root_for_split(tmp_path, num_examples=12)
     index_path = tmp_path / "webdataset_index.json"
@@ -429,6 +515,7 @@ def test_train_cli_config_can_be_loaded_from_yaml_and_overridden(tmp_path: Path)
                 "batch_size: 8",
                 "max_steps: 100",
                 "frontend_type: conv2d6",
+                "webdataset_utt_id_key: id",
             ]
         ),
         encoding="utf-8",
@@ -442,6 +529,8 @@ def test_train_cli_config_can_be_loaded_from_yaml_and_overridden(tmp_path: Path)
             "2",
             "--max-steps",
             "4",
+            "--webdataset-utt-id-key",
+            "id",
         ]
     )
     resolved = _resolve_train_config(args)
@@ -452,4 +541,5 @@ def test_train_cli_config_can_be_loaded_from_yaml_and_overridden(tmp_path: Path)
         batch_size=2,
         max_steps=4,
         frontend_type="conv2d6",
+        webdataset_utt_id_key="id",
     )

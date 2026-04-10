@@ -27,6 +27,11 @@ def main() -> None:
             target_config = output_path.resolve().parent / "model_config.yaml"
             if source_config != target_config:
                 shutil.copy2(source_config, target_config)
+        source_tokenizer = checkpoint_path.resolve().parent / "tokenizer_config.yaml"
+        if source_tokenizer.exists():
+            target_tokenizer = output_path.resolve().parent / "tokenizer_config.yaml"
+            if source_tokenizer != target_tokenizer:
+                shutil.copy2(source_tokenizer, target_tokenizer)
 
     print(
         "export_checkpoint_safetensors "

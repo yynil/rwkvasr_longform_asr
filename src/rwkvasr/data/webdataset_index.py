@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .webdataset_common import AUDIO_SUFFIXES
+
 VALID_SPLIT_BY = {"sample_id", "shard_name"}
 
 
@@ -181,19 +183,19 @@ def inspect_webdataset(
                     continue
                 key, suffix = name.rsplit(".", 1)
                 suffix = suffix.lower()
-                if suffix not in {"wav", "json"}:
+                if suffix != "json" and suffix not in AUDIO_SUFFIXES:
                     continue
 
-                sample = pending.setdefault(key, {"has_wav": False, "metadata_bytes": None})
-                if suffix == "wav":
-                    sample["has_wav"] = True
+                sample = pending.setdefault(key, {"has_audio": False, "metadata_bytes": None})
+                if suffix != "json":
+                    sample["has_audio"] = True
                 else:
                     extracted = archive.extractfile(member)
                     if extracted is None:
                         continue
                     sample["metadata_bytes"] = extracted.read()
 
-                if sample["has_wav"] and sample["metadata_bytes"] is not None:
+                if sample["has_audio"] and sample["metadata_bytes"] is not None:
                     if split_config.split_by == "sample_id":
                         metadata = json.loads(sample["metadata_bytes"].decode("utf-8"))
                         sample_id = resolve_sample_id(key, metadata, utt_id_key=split_config.utt_id_key)

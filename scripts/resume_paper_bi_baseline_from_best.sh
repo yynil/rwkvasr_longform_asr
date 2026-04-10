@@ -10,7 +10,7 @@ if [[ ! -x "${TRAIN_SCRIPT}" ]]; then
   exit 1
 fi
 
-TARGET_EPOCHS="${TARGET_EPOCHS:-8}"
+TARGET_EPOCHS="${TARGET_EPOCHS:-15}"
 RESUME_FROM="${REPO_ROOT}/runs/paper_bi_baseline_4x4090/ds_checkpoints"
 RESUME_TAG="${RESUME_TAG:-best}"
 

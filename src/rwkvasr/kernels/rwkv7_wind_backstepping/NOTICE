@@ -1,0 +1,16 @@
+RWKV-7 wind_backstepping CUDA kernel
+
+The files wkv7_op.cpp and wkv7_cuda.cu in this directory are adapted from:
+  https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7/train_temp/cuda
+
+Upstream project:
+  BlinkDL/RWKV-LM
+
+License:
+  Apache License 2.0
+
+Local changes:
+  - Rename the TORCH_LIBRARY namespace from wind_backstepping to
+    rwkvasr_wind_backstepping to avoid extension-registration collisions.
+  - Keep the upstream kernel interface and compile-time _C_ / _CHUNK_LEN_
+    contract unchanged.

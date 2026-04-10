@@ -3,7 +3,8 @@
 Offline dataset preprocessing and deployment-oriented Rust utilities live here.
 
 Current tools:
-- default binary: multithreaded Rust WebDataset length indexer that scans tar metadata without decoding audio
+- `rwkvasr-tools` binary: multithreaded Rust WebDataset length indexer that scans tar metadata without decoding audio
+- `build_bucket_index` binary: Rust external-memory bucket manifest builder over a large `webdataset_lengths.jsonl`
 - `predict_ctc` binary: Rust + Candle CTC prefix-beam predictor over exported `safetensors logits + lengths`
 
 Recommended prediction/export workflow:
@@ -47,7 +48,7 @@ rwkvasr-export-ctc-logits \
 Build and run:
 
 ```bash
-cargo run --release --manifest-path tools/Cargo.toml -- \
+cargo run --release --manifest-path tools/Cargo.toml --bin rwkvasr-tools -- \
   --webdataset-root /home/yueyulin/data/voxbox/wenetasr \
   --output-path /home/yueyulin/data/voxbox/wenetasr/webdataset_lengths.jsonl \
   --summary-path /home/yueyulin/data/voxbox/wenetasr/webdataset_lengths.summary.json \
@@ -58,6 +59,33 @@ cargo run --release --manifest-path tools/Cargo.toml -- \
 ```
 
 The output format matches the Python loader in `src/rwkvasr/data/webdataset_lengths.py`, so training can consume the generated `webdataset_lengths.jsonl` directly.
+
+For very large corpora such as Emilia, the monolithic `webdataset_lengths.jsonl` is too large to load into Python memory. In that case, build a compact bucket manifest plus many small part files:
+
+```bash
+cargo run --release --manifest-path tools/Cargo.toml --bin build_bucket_index -- \
+  --shard-root /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH \
+  --length-index-path /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_lengths.jsonl \
+  --output-dir /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_buckets \
+  --manifest-path /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_buckets/manifest.json \
+  --bucket-width 80 \
+  --entries-per-part 100000
+```
+
+The Python training path will prefer `webdataset_bucket_manifest_path` over the old in-memory JSONL sampler. This keeps startup memory bounded while preserving same-bucket batching across ranks.
+
+For Emilia-style `json + mp3` shards, the same tool works without unpacking the dataset. It infers `num_frames` from metadata `duration` and records tar byte offsets so training can read members directly by `offset + size`:
+
+```bash
+cargo run --release --manifest-path tools/Cargo.toml --bin rwkvasr-tools -- \
+  --webdataset-root /media/usbhd/training_data/asr/emilia/Emilia/ZH/Emilia/ZH \
+  --output-path /tmp/emilia_zh_lengths.jsonl \
+  --summary-path /tmp/emilia_zh_lengths.summary.json \
+  --split-by shard_name \
+  --eval-ratio 0.01 \
+  --hash-seed 0 \
+  --utt-id-key id
+```
 
 CTC prefix-beam prediction:
 
