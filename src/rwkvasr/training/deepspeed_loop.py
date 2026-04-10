@@ -90,6 +90,7 @@ class DeepSpeedTrainConfig:
     save_every: int = 50
     num_workers: int = 0
     decoded_batch_prefetch: int = 2
+    max_open_shards_per_worker: int = 8
     lr: float = 4e-4
     weight_decay: float = 0.1
     beta1: float = 0.9
@@ -238,6 +239,7 @@ def _build_webdataset_config(
         length_index_path=config.webdataset_length_index_path,
         length_bucket_frame_budget=length_bucket_frame_budget,
         decoded_batch_prefetch=config.decoded_batch_prefetch,
+        max_open_shards_per_worker=config.max_open_shards_per_worker,
     )
 
 
@@ -798,6 +800,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"frame_budget={frame_budget} "
             f"decode_workers={max(1, config.num_workers)} "
             f"decoded_prefetch={max(0, config.decoded_batch_prefetch)} "
+            f"max_open_shards_per_worker={max(1, config.max_open_shards_per_worker)} "
             f"world_size={_world_size()}"
         )
     elif active_length_index_path is not None:

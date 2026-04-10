@@ -383,6 +383,7 @@ WebDataset support:
     - a small bounded prefetch queue for upcoming decoded batches
     - decoded prefetch must include tar reads, audio decode, feature extraction, tokenization, and collate, not only JSONL entry lookup
     - optional thread-local tar readers so repeated reads from the same shard reuse file handles safely
+    - all file-handle caches must be bounded; tar readers should use per-worker LRU eviction and bucket part readers should close between `take()` calls while preserving file offsets
   - `num_workers` on the bucket-manifest path is interpreted as local decode / prefetch worker count, not as a generic DataLoader worker pool
 - inspected Emilia Chinese dataset root: `/media/usbhd/training_data/asr/emilia/Emilia/ZH/Emilia/ZH`
 - Emilia current observed structure:
