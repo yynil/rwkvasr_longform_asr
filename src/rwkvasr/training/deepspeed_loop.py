@@ -586,13 +586,32 @@ def _prune_deepspeed_step_checkpoint_artifacts(
         checkpoint_path = record.get("checkpoint_path")
         if checkpoint_path is not None and str(checkpoint_path) not in keep_export_paths:
             path = Path(str(checkpoint_path))
-            if path.exists():
+            try:
                 path.unlink()
+            except FileNotFoundError:
+                pass
         ds_dir = record.get("deepspeed_checkpoint_dir")
         if ds_dir is not None and str(ds_dir) not in keep_ds_dirs:
             path = Path(str(ds_dir))
-            if path.exists():
+            try:
                 shutil.rmtree(path)
+            except FileNotFoundError:
+                pass
+
+
+def _step_checkpoint_record_is_retained(
+    *,
+    record: dict[str, Any],
+    top_records: list[dict[str, Any]],
+) -> bool:
+    checkpoint_path = record.get("checkpoint_path")
+    ds_dir = record.get("deepspeed_checkpoint_dir")
+    for top_record in top_records:
+        if checkpoint_path is not None and top_record.get("checkpoint_path") == checkpoint_path:
+            return True
+        if ds_dir is not None and top_record.get("deepspeed_checkpoint_dir") == ds_dir:
+            return True
+    return False
 
 
 def _init_deepspeed_runtime(config: DeepSpeedTrainConfig) -> tuple[int, torch.device]:
@@ -656,9 +675,11 @@ def _save_export_checkpoints(
     zero_stage: int,
     extra_state: dict[str, Any],
 ) -> dict[str, str | None]:
-    ds_checkpoint_dir = output_dir / "ds_checkpoints" / tag
+    ds_checkpoint_root = output_dir / "ds_checkpoints"
+    ds_checkpoint_root.mkdir(parents=True, exist_ok=True)
+    ds_checkpoint_dir = ds_checkpoint_root / tag
     engine.save_checkpoint(
-        str(output_dir / "ds_checkpoints"),
+        str(ds_checkpoint_root),
         tag=tag,
         client_state={"step": step, **extra_state},
     )
@@ -691,6 +712,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     output_dir = Path(config.output_dir)
     if _is_rank_zero():
         output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "ds_checkpoints").mkdir(parents=True, exist_ok=True)
     _maybe_barrier()
 
     resolved_vocab_size = _resolve_vocab_size(config)
@@ -1036,14 +1058,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         best_step_checkpoints = _sort_step_checkpoint_records(saved_step_records)[
                             : max(1, int(config.top_k_step_checkpoints))
                         ]
-                        _prune_deepspeed_step_checkpoint_artifacts(
+                        keep_current_step = _step_checkpoint_record_is_retained(
+                            record=step_record,
                             top_records=best_step_checkpoints,
-                            saved_records=saved_step_records,
                         )
-                        if Path(saved_artifacts["deepspeed_checkpoint_dir"]).exists() or (
-                            saved_artifacts.get("checkpoint_path")
-                            and Path(str(saved_artifacts["checkpoint_path"])).exists()
-                        ):
+                        if keep_current_step:
                             checkpoint_extra["step_checkpoint_history"] = step_checkpoint_history
                             checkpoint_extra["best_step_checkpoints"] = best_step_checkpoints
                             _save_export_checkpoints(
@@ -1055,6 +1074,13 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                 zero_stage=zero_stage,
                                 extra_state=checkpoint_extra,
                             )
+                        _maybe_barrier()
+                        if _is_rank_zero():
+                            _prune_deepspeed_step_checkpoint_artifacts(
+                                top_records=best_step_checkpoints,
+                                saved_records=saved_step_records,
+                            )
+                        _maybe_barrier()
                         if _is_rank_zero():
                             save_step_checkpoint_metrics(
                                 output_dir,

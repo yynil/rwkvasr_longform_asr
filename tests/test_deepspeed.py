@@ -11,7 +11,9 @@ from rwkvasr.training.deepspeed_loop import (
     DeepSpeedTrainConfig,
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
+    _prune_deepspeed_step_checkpoint_artifacts,
     _resolve_max_steps as resolve_deepspeed_max_steps,
+    _step_checkpoint_record_is_retained,
     train_ctc_model_deepspeed,
 )
 from rwkvasr.modules import RWKVCTCModel, RWKVCTCModelConfig
@@ -303,3 +305,66 @@ def test_build_deepspeed_optimizer_uses_adamw_when_offload_disabled() -> None:
 
     assert optimizer_name == "AdamW"
     assert isinstance(optimizer, torch.optim.AdamW)
+
+
+def test_prune_deepspeed_step_checkpoint_artifacts_ignores_missing_paths(tmp_path: Path) -> None:
+    kept_dir = tmp_path / "ds_checkpoints" / "step-2"
+    kept_dir.mkdir(parents=True)
+    kept_file = tmp_path / "step-2.pt"
+    kept_file.write_text("keep", encoding="utf-8")
+
+    removed_dir = tmp_path / "ds_checkpoints" / "step-1"
+    removed_dir.mkdir(parents=True)
+    (removed_dir / "meta.txt").write_text("x", encoding="utf-8")
+    removed_file = tmp_path / "step-1.pt"
+    removed_file.write_text("drop", encoding="utf-8")
+
+    saved_records = [
+        {
+            "step": 1,
+            "checkpoint_path": str(removed_file),
+            "deepspeed_checkpoint_dir": str(removed_dir),
+        },
+        {
+            "step": 2,
+            "checkpoint_path": str(kept_file),
+            "deepspeed_checkpoint_dir": str(kept_dir),
+        },
+    ]
+    top_records = [saved_records[1]]
+
+    _prune_deepspeed_step_checkpoint_artifacts(
+        top_records=top_records,
+        saved_records=saved_records,
+    )
+    _prune_deepspeed_step_checkpoint_artifacts(
+        top_records=top_records,
+        saved_records=saved_records,
+    )
+
+    assert not removed_file.exists()
+    assert not removed_dir.exists()
+    assert kept_file.exists()
+    assert kept_dir.exists()
+
+
+def test_step_checkpoint_record_is_retained_matches_by_file_or_dir() -> None:
+    top_records = [
+        {
+            "checkpoint_path": "/tmp/step-2.pt",
+            "deepspeed_checkpoint_dir": "/tmp/ds_checkpoints/step-2",
+        }
+    ]
+
+    assert _step_checkpoint_record_is_retained(
+        record={"checkpoint_path": "/tmp/step-2.pt"},
+        top_records=top_records,
+    )
+    assert _step_checkpoint_record_is_retained(
+        record={"deepspeed_checkpoint_dir": "/tmp/ds_checkpoints/step-2"},
+        top_records=top_records,
+    )
+    assert not _step_checkpoint_record_is_retained(
+        record={"checkpoint_path": "/tmp/step-3.pt"},
+        top_records=top_records,
+    )

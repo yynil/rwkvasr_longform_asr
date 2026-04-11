@@ -466,6 +466,8 @@ WebDataset support:
   - keep only the best `top_k_step_checkpoints` according to sampled `eval_loss`
   - track step-checkpoint selection metadata in a dedicated YAML so later manual checkpoint inspection does not require parsing logs
   - epoch checkpoints and the final epoch-level `best` checkpoint remain separate from step-checkpoint retention
+  - in distributed training, step-checkpoint artifact pruning must be single-writer and missing-path tolerant; do not let multiple ranks race on `rmtree`
+  - `ds_checkpoints/` root creation must be eager rather than relying on downstream checkpoint writers
 - tokenizer switching rule:
   - changing tokenizer type or vocabulary size changes the CTC target space and output head shape
   - training cannot resume across tokenizer changes; a new run must start from step 0
