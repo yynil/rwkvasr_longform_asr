@@ -483,6 +483,12 @@ WebDataset support:
   - single-process training may resume from exported `.pt` checkpoints
   - DeepSpeed training should resume from `ds_checkpoints/` plus `resume_tag`, typically `epoch-N` or `best`
   - checkpoint extra/client_state must persist `step`, `epoch`, epoch history, and current best metric state
+  - for stage-2 Direction Dropout post-training, DeepSpeed must also support `init_checkpoint_path`:
+    - load model weights from a plain `.pt` or `.safetensors` checkpoint before `deepspeed.initialize`
+    - start a fresh optimizer / ZeRO state in a new `output_dir`
+    - reset step / epoch counters unless a true DeepSpeed resume is explicitly requested
+    - `init_checkpoint_path` and `resume_from` are mutually exclusive
+  - in distributed Direction Dropout training, the sampled per-step direction mask must be identical on every rank; sample once and broadcast, do not let each rank sample independently
 - v0 Rust preprocessing scope:
   - `webdataset_lengths.jsonl` generation from tar metadata
   - multi-threaded per-shard scanning

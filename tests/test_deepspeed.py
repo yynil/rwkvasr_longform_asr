@@ -9,14 +9,17 @@ from rwkvasr.cli.train_ctc_deepspeed import _resolve_deepspeed_train_config, bui
 from rwkvasr.config import load_yaml
 from rwkvasr.training.deepspeed_loop import (
     DeepSpeedTrainConfig,
+    _maybe_load_initial_model_checkpoint,
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
     _prune_deepspeed_step_checkpoint_artifacts,
     _resolve_max_steps as resolve_deepspeed_max_steps,
+    _sample_direction_mask_distributed,
     _step_checkpoint_record_is_retained,
     train_ctc_model_deepspeed,
 )
-from rwkvasr.modules import RWKVCTCModel, RWKVCTCModelConfig
+from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, RWKVCTCModel, RWKVCTCModelConfig
+from rwkvasr.training.checkpoint import save_checkpoint
 
 
 def _write_manifest(tmp_path: Path, num_examples: int = 3, base_frames: int = 48) -> Path:
@@ -87,6 +90,38 @@ def test_deepspeed_cli_config_can_be_loaded_from_yaml_and_overridden(tmp_path: P
             "zero_optimization": {"stage": 0},
         },
     )
+
+
+def test_deepspeed_cli_accepts_init_checkpoint_override(tmp_path: Path) -> None:
+    config_path = tmp_path / "train_ds.yaml"
+    init_path = tmp_path / "init.pt"
+    config_path.write_text(
+        "\n".join(
+            [
+                f"output_dir: {tmp_path / 'out'}",
+                f"manifest_path: {tmp_path / 'manifest.jsonl'}",
+                "device: cpu",
+                "deepspeed:",
+                "  train_micro_batch_size_per_gpu: 8",
+                "  gradient_accumulation_steps: 1",
+                "  zero_optimization:",
+                "    stage: 0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--config-yaml",
+            str(config_path),
+            "--init-checkpoint-path",
+            str(init_path),
+        ]
+    )
+    resolved = _resolve_deepspeed_train_config(args)
+
+    assert resolved.init_checkpoint_path == str(init_path)
 
 
 def test_deepspeed_resolve_max_steps_supports_custom_utt_id_key(tmp_path: Path) -> None:
@@ -305,6 +340,73 @@ def test_build_deepspeed_optimizer_uses_adamw_when_offload_disabled() -> None:
 
     assert optimizer_name == "AdamW"
     assert isinstance(optimizer, torch.optim.AdamW)
+
+
+def test_maybe_load_initial_model_checkpoint_loads_weights_only(tmp_path: Path) -> None:
+    model_config = RWKVCTCModelConfig(
+        input_dim=80,
+        n_embd=64,
+        dim_att=64,
+        dim_ff=128,
+        num_layers=1,
+        vocab_size=8,
+        head_size=32,
+        conv_kernel_size=5,
+        dropout=0.0,
+        frontend_type="linear",
+    )
+    source_model = RWKVCTCModel(model_config)
+    checkpoint_path = tmp_path / "init.pt"
+    save_checkpoint(checkpoint_path, model=source_model, step=123)
+
+    target_model = RWKVCTCModel(model_config)
+    for parameter in target_model.parameters():
+        parameter.data.zero_()
+
+    restored = _maybe_load_initial_model_checkpoint(
+        target_model,
+        DeepSpeedTrainConfig(
+            output_dir=str(tmp_path / "out"),
+            manifest_path=str(tmp_path / "manifest.jsonl"),
+            device="cpu",
+            init_checkpoint_path=str(checkpoint_path),
+            deepspeed={
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {"stage": 2},
+            },
+        ),
+    )
+
+    assert restored is not None
+    assert restored["step"] == 123
+    for source_param, target_param in zip(source_model.parameters(), target_model.parameters(), strict=True):
+        assert torch.equal(source_param, target_param)
+
+
+def test_sample_direction_mask_distributed_falls_back_without_dist() -> None:
+    scheduler = DirectionDropoutScheduler(
+        DirectionDropoutConfig(
+            num_layers=4,
+            variant="drop_both",
+            p_start=0.2,
+            p_max=0.2,
+            warmup_steps=0,
+            ramp_steps=0,
+        )
+    )
+
+    mask = _sample_direction_mask_distributed(
+        scheduler,
+        step=0,
+        device=torch.device("cpu"),
+    )
+
+    assert mask.forward.dtype == torch.bool
+    assert mask.backward.dtype == torch.bool
+    assert mask.forward.shape == (4,)
+    assert mask.backward.shape == (4,)
+    assert torch.all(mask.forward | mask.backward)
 
 
 def test_prune_deepspeed_step_checkpoint_artifacts_ignores_missing_paths(tmp_path: Path) -> None:

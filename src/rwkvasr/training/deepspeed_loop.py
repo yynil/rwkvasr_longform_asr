@@ -33,9 +33,9 @@ from rwkvasr.data import (
     resolve_webdataset_index_path,
     validate_webdataset_index,
 )
-from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, RWKVCTCModel, RWKVCTCModelConfig
+from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, DirectionMask, RWKVCTCModel, RWKVCTCModelConfig
 
-from .checkpoint import save_checkpoint
+from .checkpoint import load_checkpoint, save_checkpoint
 from .batch_budget import ctc_batch_token_stats, estimate_token_budget_from_memory, select_ctc_batch_prefix_by_token_budget
 from .ctc_task import RWKVDualModeCTCTrainer
 from .epoch_metrics import save_epoch_metrics, save_step_checkpoint_metrics
@@ -102,6 +102,7 @@ class DeepSpeedTrainConfig:
     warmup_steps: int = 0
     ramp_steps: int = 0
     device: str = "cuda"
+    init_checkpoint_path: str | None = None
     resume_from: str | None = None
     resume_tag: str | None = None
     wandb_enabled: bool = False
@@ -123,6 +124,27 @@ class DeepSpeedTrainConfig:
     length_bucket_frame_budget: int | None = None
     target_gpu_memory_gib: float = 22.0
     skip_oversized_samples: bool = True
+
+
+def _maybe_load_initial_model_checkpoint(
+    model: RWKVCTCModel,
+    config: DeepSpeedTrainConfig,
+) -> dict[str, Any] | None:
+    if config.init_checkpoint_path is None:
+        return None
+    if config.resume_from is not None:
+        raise ValueError("`init_checkpoint_path` and `resume_from` cannot both be set.")
+    restored = load_checkpoint(
+        config.init_checkpoint_path,
+        model=model,
+        optimizer=None,
+        map_location="cpu",
+    )
+    _rank_zero_log(
+        "Loaded initial model weights from "
+        f"{config.init_checkpoint_path} step={int(restored.get('step', 0))}"
+    )
+    return restored
 
 
 def _rank() -> int:
@@ -149,6 +171,29 @@ def _maybe_barrier() -> None:
 def _rank_zero_log(message: str) -> None:
     if _is_rank_zero():
         print(f"[rwkvasr] {message}", flush=True)
+
+
+def _sample_direction_mask_distributed(
+    scheduler: DirectionDropoutScheduler,
+    *,
+    step: int,
+    device: torch.device,
+) -> DirectionMask:
+    if not (dist.is_available() and dist.is_initialized()):
+        return scheduler.sample_mask(step, device=device)
+
+    num_layers = scheduler.config.num_layers
+    if _is_rank_zero():
+        sampled = scheduler.sample_mask(step, device=device)
+        forward = sampled.forward.clone()
+        backward = sampled.backward.clone()
+    else:
+        forward = torch.empty(num_layers, dtype=torch.bool, device=device)
+        backward = torch.empty(num_layers, dtype=torch.bool, device=device)
+
+    dist.broadcast(forward, src=0)
+    dist.broadcast(backward, src=0)
+    return DirectionMask(forward=forward, backward=backward)
 
 
 def _normalize_deepspeed_config(config: DeepSpeedTrainConfig) -> dict[str, Any]:
@@ -771,6 +816,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
 
     model = RWKVCTCModel(model_config)
     model.enable_gradient_checkpointing(config.gradient_checkpointing)
+    _maybe_load_initial_model_checkpoint(model, config)
     _rank_zero_log("Model constructed. Initializing DeepSpeed engine...")
     optimizer, optimizer_name = _build_deepspeed_optimizer(model, config, ds_config)
     offload_device = _optimizer_offload_device(ds_config) or "none"
@@ -908,7 +954,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
 
                 step_start_time = time.perf_counter()
                 engine.zero_grad()
-                mask = scheduler.sample_mask(step, device=engine.device)
+                mask = _sample_direction_mask_distributed(
+                    scheduler,
+                    step=step,
+                    device=engine.device,
+                )
                 executed_token_stats = batch_stats
                 if engine.device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(engine.device)
