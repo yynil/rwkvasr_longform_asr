@@ -81,6 +81,7 @@ Important implementation constraints extracted from upstream:
 - Support configurable text tokenizers:
   - Whisper multilingual BPE
   - SentencePiece Unigram via external `.model`
+  - Qwen3 tokenizer via external `tokenizer.json`
 - Save and load model architecture via YAML config files for training and prediction workflows.
 - Save and load tokenizer settings via a separate `tokenizer_config.yaml` so prediction defaults stay aligned with the training checkpoint.
 - Export inference-friendly `safetensors` weights from `.pt` checkpoints for deployment-oriented prediction workflows.
@@ -539,6 +540,10 @@ Tokenizer policy:
   - no `<unk>` / OOV behavior for normal UTF-8 text
   - a tokenizer that is not tightly coupled to current training-set growth
   - a much smaller CTC head than Qwen / Gemma class LLM tokenizers
+- `Qwen3 tokenizer.json` support is allowed as an ablation / comparison path, but it is not the default:
+  - it uses a much larger CTC head than Whisper multilingual
+  - it tends to merge multiple Chinese characters into one token, which can hurt CTC timestamp granularity
+  - 4 x 4090 baseline configs must therefore start from a smaller token/frame budget than Whisper runs
 
 YAML config policy:
 - training must emit at least:

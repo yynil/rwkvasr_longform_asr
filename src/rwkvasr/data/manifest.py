@@ -122,6 +122,32 @@ class WhisperMultilingualTokenizer:
         return self._text_vocab_size
 
 
+class QwenTokenizer:
+    def __init__(self, model_path: str):
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as exc:
+            raise ImportError(
+                "Qwen tokenizer support requires the `tokenizers` package. "
+                "Run `uv sync` after updating dependencies."
+            ) from exc
+
+        self.processor = Tokenizer.from_file(model_path)
+        self._vocab_size = int(self.processor.get_vocab_size(with_added_tokens=True))
+
+    def encode(self, text: str) -> list[int]:
+        return [int(token_id) for token_id in self.processor.encode(text).ids]
+
+    def decode(self, token_ids: list[int]) -> str:
+        return str(
+            self.processor.decode([int(token_id) for token_id in token_ids], skip_special_tokens=True)
+        )
+
+    @property
+    def vocab_size(self) -> int:
+        return self._vocab_size
+
+
 def build_text_tokenizer(
     tokenizer_type: str,
     *,
@@ -135,6 +161,10 @@ def build_text_tokenizer(
         return SentencePieceTokenizer(model_path)
     if tokenizer_type in {"whisper", "whisper_multilingual"}:
         return WhisperMultilingualTokenizer(language=language, task=task)
+    if tokenizer_type in {"qwen", "qwen3"}:
+        if model_path is None:
+            raise ValueError("Qwen tokenizer requires model_path.")
+        return QwenTokenizer(model_path)
     raise ValueError(f"Unsupported tokenizer_type: {tokenizer_type}")
 
 

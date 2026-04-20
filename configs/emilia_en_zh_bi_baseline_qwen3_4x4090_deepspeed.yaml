@@ -1,0 +1,72 @@
+output_dir: runs/emilia_en_zh_bi_baseline_qwen3_4x4090
+webdataset_root: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH
+webdataset_index_path: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_index.json
+webdataset_length_index_path: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_lengths.jsonl
+webdataset_bucket_manifest_path: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_buckets/manifest.json
+webdataset_split: train
+webdataset_eval_ratio: 0.01
+webdataset_hash_seed: 0
+webdataset_split_by: shard_name
+webdataset_utt_id_key: id
+tokenizer_type: qwen3
+tokenizer_model_path: /home/yueyulin/github/rwkvasr_longform_asr/assets/tokenizers/qwen/qwen3_tokenizer.json
+tokenizer_language: null
+tokenizer_task: null
+vocab_size: 151669
+device: cuda
+wandb_enabled: true
+wandb_project: rwkvasr_longform_asr
+wandb_run_name: qwen3_4x4090
+wandb_base_url: https://api.wandb.ai
+wandb_init_timeout_sec: 30.0
+batch_size: 48
+batch_token_budget: 32000
+length_bucket_frame_budget: 28000
+target_gpu_memory_gib: 22.0
+skip_oversized_samples: true
+num_workers: 8
+decoded_batch_prefetch: 2
+max_open_shards_per_worker: 8
+epochs: 3
+save_every: 1000
+log_every: 20
+gradient_checkpointing: true
+eval_mode: bi
+max_eval_samples: 5000
+eval_batch_size: 4
+step_eval_batch_size: 4
+step_eval_every: 1000
+step_eval_samples: 256
+top_k_step_checkpoints: 3
+
+input_dim: 80
+n_embd: 512
+dim_att: 512
+dim_ff: 2048
+num_layers: 12
+head_size: 64
+backend: cuda
+conv_kernel_size: 31
+dropout: 0.1
+frontend_type: conv2d6
+cmvn_file: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/global_cmvn.json
+cmvn_is_json: true
+
+lr: 0.0005
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.99
+eps: 1.0e-8
+
+direction_variant: drop_both
+p_start: 0.0
+p_max: 0.0
+warmup_steps: 0
+ramp_steps: 0
+
+deepspeed:
+  train_micro_batch_size_per_gpu: 48
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  zero_optimization:
+    stage: 2
