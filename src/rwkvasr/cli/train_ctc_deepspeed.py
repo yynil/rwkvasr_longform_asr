@@ -33,7 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-every", default=None, type=int)
     parser.add_argument("--num-workers", default=None, type=int)
     parser.add_argument("--decoded-batch-prefetch", default=None, type=int)
+    parser.add_argument("--max-open-shards-per-worker", default=None, type=int)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--init-checkpoint-path", default=None)
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--resume-tag", default=None)
     parser.add_argument("--wandb-enabled", dest="wandb_enabled", action="store_true", default=None)
@@ -90,7 +92,9 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "save_every",
         "num_workers",
         "decoded_batch_prefetch",
+        "max_open_shards_per_worker",
         "device",
+        "init_checkpoint_path",
         "resume_from",
         "resume_tag",
         "wandb_enabled",

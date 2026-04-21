@@ -81,6 +81,7 @@ Important implementation constraints extracted from upstream:
 - Support configurable text tokenizers:
   - Whisper multilingual BPE
   - SentencePiece Unigram via external `.model`
+  - Qwen3 tokenizer via external `tokenizer.json`
 - Save and load model architecture via YAML config files for training and prediction workflows.
 - Save and load tokenizer settings via a separate `tokenizer_config.yaml` so prediction defaults stay aligned with the training checkpoint.
 - Export inference-friendly `safetensors` weights from `.pt` checkpoints for deployment-oriented prediction workflows.
@@ -383,6 +384,7 @@ WebDataset support:
     - a small bounded prefetch queue for upcoming decoded batches
     - decoded prefetch must include tar reads, audio decode, feature extraction, tokenization, and collate, not only JSONL entry lookup
     - optional thread-local tar readers so repeated reads from the same shard reuse file handles safely
+    - all file-handle caches must be bounded; tar readers should use per-worker LRU eviction and bucket part readers should close between `take()` calls while preserving file offsets
   - `num_workers` on the bucket-manifest path is interpreted as local decode / prefetch worker count, not as a generic DataLoader worker pool
 - inspected Emilia Chinese dataset root: `/media/usbhd/training_data/asr/emilia/Emilia/ZH/Emilia/ZH`
 - Emilia current observed structure:
@@ -465,6 +467,8 @@ WebDataset support:
   - keep only the best `top_k_step_checkpoints` according to sampled `eval_loss`
   - track step-checkpoint selection metadata in a dedicated YAML so later manual checkpoint inspection does not require parsing logs
   - epoch checkpoints and the final epoch-level `best` checkpoint remain separate from step-checkpoint retention
+  - in distributed training, step-checkpoint artifact pruning must be single-writer and missing-path tolerant; do not let multiple ranks race on `rmtree`
+  - `ds_checkpoints/` root creation must be eager rather than relying on downstream checkpoint writers
 - tokenizer switching rule:
   - changing tokenizer type or vocabulary size changes the CTC target space and output head shape
   - training cannot resume across tokenizer changes; a new run must start from step 0
@@ -480,6 +484,12 @@ WebDataset support:
   - single-process training may resume from exported `.pt` checkpoints
   - DeepSpeed training should resume from `ds_checkpoints/` plus `resume_tag`, typically `epoch-N` or `best`
   - checkpoint extra/client_state must persist `step`, `epoch`, epoch history, and current best metric state
+  - for stage-2 Direction Dropout post-training, DeepSpeed must also support `init_checkpoint_path`:
+    - load model weights from a plain `.pt` or `.safetensors` checkpoint before `deepspeed.initialize`
+    - start a fresh optimizer / ZeRO state in a new `output_dir`
+    - reset step / epoch counters unless a true DeepSpeed resume is explicitly requested
+    - `init_checkpoint_path` and `resume_from` are mutually exclusive
+  - in distributed Direction Dropout training, the sampled per-step direction mask must be identical on every rank; sample once and broadcast, do not let each rank sample independently
 - v0 Rust preprocessing scope:
   - `webdataset_lengths.jsonl` generation from tar metadata
   - multi-threaded per-shard scanning
@@ -530,6 +540,10 @@ Tokenizer policy:
   - no `<unk>` / OOV behavior for normal UTF-8 text
   - a tokenizer that is not tightly coupled to current training-set growth
   - a much smaller CTC head than Qwen / Gemma class LLM tokenizers
+- `Qwen3 tokenizer.json` support is allowed as an ablation / comparison path, but it is not the default:
+  - it uses a much larger CTC head than Whisper multilingual
+  - it tends to merge multiple Chinese characters into one token, which can hurt CTC timestamp granularity
+  - 4 x 4090 baseline configs must therefore start from a smaller token/frame budget than Whisper runs
 
 YAML config policy:
 - training must emit at least:

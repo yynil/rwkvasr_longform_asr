@@ -6,10 +6,11 @@ import math
 import random
 import tarfile
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Iterator
+from typing import Any, BinaryIO, Iterable, Iterator, TextIO
 
 from .manifest import ASRBatch, FeatureCollator, TokenizerLike, WenetFbankFeatureExtractor
 from .webdataset import WebDatasetConfig, decode_webdataset_sample
@@ -145,6 +146,10 @@ class _TarShardReader:
             self._binary.close()
             self._binary = None
 
+    @property
+    def is_open(self) -> bool:
+        return self._archive is not None or self._binary is not None
+
     def _binary_handle(self) -> BinaryIO:
         if self._binary is None:
             self._binary = self.shard_path.open("rb")
@@ -177,42 +182,56 @@ class _BucketEntryStream:
         self._manifest_path = manifest_path
         self._bucket = bucket
         self._part_index = 0
-        self._handle = None
+        self._file_pos = 0
+        self._handle: TextIO | None = None
 
     def reset(self) -> None:
+        self.close_idle()
+        self._part_index = 0
+        self._file_pos = 0
+
+    def close_idle(self) -> None:
         if self._handle is not None:
             self._handle.close()
             self._handle = None
-        self._part_index = 0
 
-    def _open_next_part(self):
+    def _open_current_part(self) -> TextIO | None:
         if self._part_index >= len(self._bucket.parts):
             return None
         part = self._bucket.parts[self._part_index]
-        self._part_index += 1
         self._handle = (self._manifest_path.parent / part.path).open("r", encoding="utf-8")
+        if self._file_pos:
+            self._handle.seek(self._file_pos)
         return self._handle
 
     def take(self, num_entries: int) -> list[WebDatasetLengthEntry]:
         entries: list[WebDatasetLengthEntry] = []
-        while len(entries) < num_entries:
-            if self._handle is None:
-                handle = self._open_next_part()
-                if handle is None:
-                    break
-            assert self._handle is not None
-            line = self._handle.readline()
-            if not line:
-                self._handle.close()
-                self._handle = None
-                continue
-            entries.append(parse_webdataset_length_entry(json.loads(line)))
-        return entries
+        try:
+            while len(entries) < num_entries:
+                if self._handle is None:
+                    handle = self._open_current_part()
+                    if handle is None:
+                        break
+                assert self._handle is not None
+                line = self._handle.readline()
+                if not line:
+                    self.close_idle()
+                    self._part_index += 1
+                    self._file_pos = 0
+                    continue
+                self._file_pos = self._handle.tell()
+                entries.append(parse_webdataset_length_entry(json.loads(line)))
+            return entries
+        finally:
+            # A shuffled bucket schedule may touch many buckets over an epoch. Keeping
+            # one JSONL part file open per bucket eventually exhausts per-process fds.
+            self.close_idle()
 
 
 class _ThreadLocalTarReaderPool:
-    def __init__(self, shard_root: Path):
+    def __init__(self, shard_root: Path, *, max_open_shards_per_worker: int = 8):
         self._shard_root = shard_root
+        self._max_open_shards_per_worker = max(1, int(max_open_shards_per_worker))
         self._local = threading.local()
         self._created: list[_TarShardReader] = []
         self._created_lock = threading.Lock()
@@ -220,7 +239,7 @@ class _ThreadLocalTarReaderPool:
     def get(self, shard_name: str) -> _TarShardReader:
         readers = getattr(self._local, "readers", None)
         if readers is None:
-            readers = {}
+            readers = OrderedDict()
             self._local.readers = readers
         reader = readers.get(shard_name)
         if reader is None:
@@ -228,6 +247,11 @@ class _ThreadLocalTarReaderPool:
             readers[shard_name] = reader
             with self._created_lock:
                 self._created.append(reader)
+            while len(readers) > self._max_open_shards_per_worker:
+                _, evicted = readers.popitem(last=False)
+                evicted.close()
+        else:
+            readers.move_to_end(shard_name)
         return reader
 
     def close(self) -> None:
@@ -262,6 +286,7 @@ class BucketedWebDatasetBatchLoader:
         self.batch_size = int(batch_size)
         self.num_workers = max(1, int(num_workers))
         self.decoded_batch_prefetch = max(0, int(self.config.decoded_batch_prefetch))
+        self.max_open_shards_per_worker = max(1, int(self.config.max_open_shards_per_worker))
         self.rank = int(rank)
         self.world_size = max(1, int(world_size))
         self.collator = FeatureCollator()
@@ -429,7 +454,10 @@ class BucketedWebDatasetBatchLoader:
             producer.join()
 
     def __iter__(self) -> Iterable[ASRBatch]:
-        reader_pool = _ThreadLocalTarReaderPool(self.shard_root)
+        reader_pool = _ThreadLocalTarReaderPool(
+            self.shard_root,
+            max_open_shards_per_worker=self.max_open_shards_per_worker,
+        )
         entry_batches = self._prefetch_local_entry_batches() if self.num_workers > 1 else self._iter_local_entry_batches()
         executor: ThreadPoolExecutor | None = None
         if self.num_workers > 1:

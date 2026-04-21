@@ -33,9 +33,9 @@ from rwkvasr.data import (
     resolve_webdataset_index_path,
     validate_webdataset_index,
 )
-from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, RWKVCTCModel, RWKVCTCModelConfig
+from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, DirectionMask, RWKVCTCModel, RWKVCTCModelConfig
 
-from .checkpoint import save_checkpoint
+from .checkpoint import load_checkpoint, save_checkpoint
 from .batch_budget import ctc_batch_token_stats, estimate_token_budget_from_memory, select_ctc_batch_prefix_by_token_budget
 from .ctc_task import RWKVDualModeCTCTrainer
 from .epoch_metrics import save_epoch_metrics, save_step_checkpoint_metrics
@@ -90,6 +90,7 @@ class DeepSpeedTrainConfig:
     save_every: int = 50
     num_workers: int = 0
     decoded_batch_prefetch: int = 2
+    max_open_shards_per_worker: int = 8
     lr: float = 4e-4
     weight_decay: float = 0.1
     beta1: float = 0.9
@@ -101,6 +102,7 @@ class DeepSpeedTrainConfig:
     warmup_steps: int = 0
     ramp_steps: int = 0
     device: str = "cuda"
+    init_checkpoint_path: str | None = None
     resume_from: str | None = None
     resume_tag: str | None = None
     wandb_enabled: bool = False
@@ -122,6 +124,27 @@ class DeepSpeedTrainConfig:
     length_bucket_frame_budget: int | None = None
     target_gpu_memory_gib: float = 22.0
     skip_oversized_samples: bool = True
+
+
+def _maybe_load_initial_model_checkpoint(
+    model: RWKVCTCModel,
+    config: DeepSpeedTrainConfig,
+) -> dict[str, Any] | None:
+    if config.init_checkpoint_path is None:
+        return None
+    if config.resume_from is not None:
+        raise ValueError("`init_checkpoint_path` and `resume_from` cannot both be set.")
+    restored = load_checkpoint(
+        config.init_checkpoint_path,
+        model=model,
+        optimizer=None,
+        map_location="cpu",
+    )
+    _rank_zero_log(
+        "Loaded initial model weights from "
+        f"{config.init_checkpoint_path} step={int(restored.get('step', 0))}"
+    )
+    return restored
 
 
 def _rank() -> int:
@@ -148,6 +171,29 @@ def _maybe_barrier() -> None:
 def _rank_zero_log(message: str) -> None:
     if _is_rank_zero():
         print(f"[rwkvasr] {message}", flush=True)
+
+
+def _sample_direction_mask_distributed(
+    scheduler: DirectionDropoutScheduler,
+    *,
+    step: int,
+    device: torch.device,
+) -> DirectionMask:
+    if not (dist.is_available() and dist.is_initialized()):
+        return scheduler.sample_mask(step, device=device)
+
+    num_layers = scheduler.config.num_layers
+    if _is_rank_zero():
+        sampled = scheduler.sample_mask(step, device=device)
+        forward = sampled.forward.clone()
+        backward = sampled.backward.clone()
+    else:
+        forward = torch.empty(num_layers, dtype=torch.bool, device=device)
+        backward = torch.empty(num_layers, dtype=torch.bool, device=device)
+
+    dist.broadcast(forward, src=0)
+    dist.broadcast(backward, src=0)
+    return DirectionMask(forward=forward, backward=backward)
 
 
 def _normalize_deepspeed_config(config: DeepSpeedTrainConfig) -> dict[str, Any]:
@@ -238,6 +284,7 @@ def _build_webdataset_config(
         length_index_path=config.webdataset_length_index_path,
         length_bucket_frame_budget=length_bucket_frame_budget,
         decoded_batch_prefetch=config.decoded_batch_prefetch,
+        max_open_shards_per_worker=config.max_open_shards_per_worker,
     )
 
 
@@ -584,13 +631,32 @@ def _prune_deepspeed_step_checkpoint_artifacts(
         checkpoint_path = record.get("checkpoint_path")
         if checkpoint_path is not None and str(checkpoint_path) not in keep_export_paths:
             path = Path(str(checkpoint_path))
-            if path.exists():
+            try:
                 path.unlink()
+            except FileNotFoundError:
+                pass
         ds_dir = record.get("deepspeed_checkpoint_dir")
         if ds_dir is not None and str(ds_dir) not in keep_ds_dirs:
             path = Path(str(ds_dir))
-            if path.exists():
+            try:
                 shutil.rmtree(path)
+            except FileNotFoundError:
+                pass
+
+
+def _step_checkpoint_record_is_retained(
+    *,
+    record: dict[str, Any],
+    top_records: list[dict[str, Any]],
+) -> bool:
+    checkpoint_path = record.get("checkpoint_path")
+    ds_dir = record.get("deepspeed_checkpoint_dir")
+    for top_record in top_records:
+        if checkpoint_path is not None and top_record.get("checkpoint_path") == checkpoint_path:
+            return True
+        if ds_dir is not None and top_record.get("deepspeed_checkpoint_dir") == ds_dir:
+            return True
+    return False
 
 
 def _init_deepspeed_runtime(config: DeepSpeedTrainConfig) -> tuple[int, torch.device]:
@@ -654,9 +720,11 @@ def _save_export_checkpoints(
     zero_stage: int,
     extra_state: dict[str, Any],
 ) -> dict[str, str | None]:
-    ds_checkpoint_dir = output_dir / "ds_checkpoints" / tag
+    ds_checkpoint_root = output_dir / "ds_checkpoints"
+    ds_checkpoint_root.mkdir(parents=True, exist_ok=True)
+    ds_checkpoint_dir = ds_checkpoint_root / tag
     engine.save_checkpoint(
-        str(output_dir / "ds_checkpoints"),
+        str(ds_checkpoint_root),
         tag=tag,
         client_state={"step": step, **extra_state},
     )
@@ -689,6 +757,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     output_dir = Path(config.output_dir)
     if _is_rank_zero():
         output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "ds_checkpoints").mkdir(parents=True, exist_ok=True)
     _maybe_barrier()
 
     resolved_vocab_size = _resolve_vocab_size(config)
@@ -747,6 +816,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
 
     model = RWKVCTCModel(model_config)
     model.enable_gradient_checkpointing(config.gradient_checkpointing)
+    _maybe_load_initial_model_checkpoint(model, config)
     _rank_zero_log("Model constructed. Initializing DeepSpeed engine...")
     optimizer, optimizer_name = _build_deepspeed_optimizer(model, config, ds_config)
     offload_device = _optimizer_offload_device(ds_config) or "none"
@@ -798,6 +868,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"frame_budget={frame_budget} "
             f"decode_workers={max(1, config.num_workers)} "
             f"decoded_prefetch={max(0, config.decoded_batch_prefetch)} "
+            f"max_open_shards_per_worker={max(1, config.max_open_shards_per_worker)} "
             f"world_size={_world_size()}"
         )
     elif active_length_index_path is not None:
@@ -883,7 +954,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
 
                 step_start_time = time.perf_counter()
                 engine.zero_grad()
-                mask = scheduler.sample_mask(step, device=engine.device)
+                mask = _sample_direction_mask_distributed(
+                    scheduler,
+                    step=step,
+                    device=engine.device,
+                )
                 executed_token_stats = batch_stats
                 if engine.device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(engine.device)
@@ -1033,14 +1108,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         best_step_checkpoints = _sort_step_checkpoint_records(saved_step_records)[
                             : max(1, int(config.top_k_step_checkpoints))
                         ]
-                        _prune_deepspeed_step_checkpoint_artifacts(
+                        keep_current_step = _step_checkpoint_record_is_retained(
+                            record=step_record,
                             top_records=best_step_checkpoints,
-                            saved_records=saved_step_records,
                         )
-                        if Path(saved_artifacts["deepspeed_checkpoint_dir"]).exists() or (
-                            saved_artifacts.get("checkpoint_path")
-                            and Path(str(saved_artifacts["checkpoint_path"])).exists()
-                        ):
+                        if keep_current_step:
                             checkpoint_extra["step_checkpoint_history"] = step_checkpoint_history
                             checkpoint_extra["best_step_checkpoints"] = best_step_checkpoints
                             _save_export_checkpoints(
@@ -1052,6 +1124,13 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                 zero_stage=zero_stage,
                                 extra_state=checkpoint_extra,
                             )
+                        _maybe_barrier()
+                        if _is_rank_zero():
+                            _prune_deepspeed_step_checkpoint_artifacts(
+                                top_records=best_step_checkpoints,
+                                saved_records=saved_step_records,
+                            )
+                        _maybe_barrier()
                         if _is_rank_zero():
                             save_step_checkpoint_metrics(
                                 output_dir,

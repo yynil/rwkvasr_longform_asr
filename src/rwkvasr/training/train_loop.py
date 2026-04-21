@@ -86,6 +86,7 @@ class TrainConfig:
     save_every: int = 50
     num_workers: int = 0
     decoded_batch_prefetch: int = 2
+    max_open_shards_per_worker: int = 8
     lr: float = 4e-4
     weight_decay: float = 0.1
     beta1: float = 0.9
@@ -181,6 +182,7 @@ def _build_webdataset_config(
         length_index_path=config.webdataset_length_index_path,
         length_bucket_frame_budget=length_bucket_frame_budget,
         decoded_batch_prefetch=config.decoded_batch_prefetch,
+        max_open_shards_per_worker=config.max_open_shards_per_worker,
     )
 
 

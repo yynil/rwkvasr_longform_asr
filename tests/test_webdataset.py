@@ -25,6 +25,12 @@ from rwkvasr.data import (
     load_webdataset_bucket_manifest,
     load_webdataset_length_entries,
 )
+from rwkvasr.data.webdataset_bucketed import (
+    _BucketEntryStream,
+    _ThreadLocalTarReaderPool,
+    WebDatasetBucket,
+    WebDatasetBucketPart,
+)
 
 
 class DummyTokenizer:
@@ -722,3 +728,75 @@ def test_bucketed_webdataset_loader_splits_same_bucket_across_ranks(tmp_path: Pa
 
     assert batch0.utt_ids == ["sid-1"]
     assert batch1.utt_ids == ["sid-2"]
+
+
+def test_bucket_entry_stream_closes_part_handle_between_takes(tmp_path: Path) -> None:
+    bucket_root = tmp_path / "webdataset_buckets"
+    bucket_root.mkdir()
+    part_path = bucket_root / "bucket-000000.jsonl"
+    with part_path.open("w", encoding="utf-8") as handle:
+        for idx in range(3):
+            key = f"{idx:010d}"
+            handle.write(
+                json.dumps(
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": key,
+                        "utt_id": key,
+                        "split": "train",
+                        "num_frames": 40,
+                        "audio_member": f"{key}.wav",
+                        "audio_format": "wav",
+                        "json_member": f"{key}.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    }
+                )
+                + "\n"
+            )
+    manifest_path = bucket_root / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    stream = _BucketEntryStream(
+        manifest_path,
+        WebDatasetBucket(
+            split="train",
+            bucket_id=0,
+            num_samples=3,
+            parts=(
+                WebDatasetBucketPart(
+                    path=part_path.name,
+                    num_samples=3,
+                    first_shard="shard_00000000.tar",
+                    last_shard="shard_00000000.tar",
+                ),
+            ),
+        ),
+    )
+
+    first = stream.take(1)
+    assert [entry.key for entry in first] == ["0000000000"]
+    assert stream._handle is None
+
+    rest = stream.take(2)
+    assert [entry.key for entry in rest] == ["0000000001", "0000000002"]
+    assert stream._handle is None
+    assert stream.take(1) == []
+
+
+def test_thread_local_tar_reader_pool_lru_closes_old_shards(tmp_path: Path) -> None:
+    readers = []
+    pool = _ThreadLocalTarReaderPool(tmp_path, max_open_shards_per_worker=2)
+    for idx in range(5):
+        shard_name = f"shard_{idx:08d}.tar"
+        (tmp_path / shard_name).write_bytes(b"x")
+        reader = pool.get(shard_name)
+        reader._binary_handle()
+        readers.append(reader)
+
+    assert [reader.is_open for reader in readers] == [False, False, False, True, True]
+    assert list(pool._local.readers.keys()) == ["shard_00000003.tar", "shard_00000004.tar"]
+
+    pool.close()
+    assert not any(reader.is_open for reader in readers)

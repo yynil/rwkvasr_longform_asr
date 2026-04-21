@@ -1,0 +1,73 @@
+output_dir: runs/emilia_en_zh_dirdrop_both_spm8k_stage2_from_best_4x4090
+webdataset_root: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH
+webdataset_index_path: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_index.json
+webdataset_length_index_path: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_lengths.jsonl
+webdataset_bucket_manifest_path: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_buckets/manifest.json
+webdataset_split: train
+webdataset_eval_ratio: 0.01
+webdataset_hash_seed: 0
+webdataset_split_by: shard_name
+webdataset_utt_id_key: id
+tokenizer_type: sentencepiece
+tokenizer_model_path: /home/yueyulin/github/rwkvasr_longform_asr/assets/tokenizers/flores200/flores200_unigram_8k.model
+tokenizer_language: null
+tokenizer_task: null
+vocab_size: 8000
+device: cuda
+wandb_enabled: true
+wandb_project: rwkvasr_longform_asr_dirdrop_stage2
+wandb_run_name: sp8k_4090_dirdrop_from_best
+wandb_base_url: https://api.wandb.ai
+wandb_init_timeout_sec: 30.0
+init_checkpoint_path: runs/emilia_en_zh_bi_baseline_spm8k_4x4090/best.pt
+batch_size: 160
+batch_token_budget: 140000
+length_bucket_frame_budget: 120000
+target_gpu_memory_gib: 22.0
+skip_oversized_samples: true
+num_workers: 8
+decoded_batch_prefetch: 2
+max_open_shards_per_worker: 8
+epochs: 1
+save_every: 1000
+log_every: 20
+gradient_checkpointing: true
+eval_mode: bi
+max_eval_samples: 10000
+eval_batch_size: 48
+step_eval_batch_size: 48
+step_eval_every: 1000
+step_eval_samples: 512
+top_k_step_checkpoints: 3
+
+input_dim: 80
+n_embd: 512
+dim_att: 512
+dim_ff: 2048
+num_layers: 12
+head_size: 64
+backend: cuda
+conv_kernel_size: 31
+dropout: 0.1
+frontend_type: conv2d6
+cmvn_file: /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/global_cmvn.json
+cmvn_is_json: true
+
+lr: 0.0005
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.99
+eps: 1.0e-8
+
+direction_variant: drop_both
+p_start: 0.2
+p_max: 0.2
+warmup_steps: 0
+ramp_steps: 0
+
+deepspeed:
+  train_micro_batch_size_per_gpu: 160
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  zero_optimization:
+    stage: 2

@@ -12,21 +12,29 @@ tokenizer_type: whisper_multilingual
 tokenizer_model_path: null
 tokenizer_language: null
 tokenizer_task: null
+vocab_size: 50257
 device: cuda
-batch_size: 128
-batch_token_budget: 110000
-length_bucket_frame_budget: 100000
+wandb_enabled: true
+wandb_project: rwkvasr_longform_asr
+wandb_run_name: whisper_4x4090
+wandb_base_url: https://api.wandb.ai
+wandb_init_timeout_sec: 30.0
+batch_size: 96
+batch_token_budget: 90000
+length_bucket_frame_budget: 80000
 target_gpu_memory_gib: 22.0
 skip_oversized_samples: true
 num_workers: 8
+decoded_batch_prefetch: 2
+max_open_shards_per_worker: 8
 epochs: 3
 save_every: 1000
 log_every: 20
 gradient_checkpointing: true
 eval_mode: bi
 max_eval_samples: 10000
-eval_batch_size: 24
-step_eval_batch_size: 24
+eval_batch_size: 12
+step_eval_batch_size: 12
 step_eval_every: 1000
 step_eval_samples: 512
 top_k_step_checkpoints: 3
@@ -37,6 +45,7 @@ dim_att: 512
 dim_ff: 2048
 num_layers: 12
 head_size: 64
+backend: cuda
 conv_kernel_size: 31
 dropout: 0.1
 frontend_type: conv2d6
@@ -56,7 +65,7 @@ warmup_steps: 0
 ramp_steps: 0
 
 deepspeed:
-  train_micro_batch_size_per_gpu: 128
+  train_micro_batch_size_per_gpu: 96
   gradient_accumulation_steps: 1
   gradient_clipping: 1.0
   zero_optimization:

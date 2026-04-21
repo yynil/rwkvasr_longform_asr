@@ -35,6 +35,7 @@ class WebDatasetConfig:
     length_bucket_drop_last: bool = True
     length_bucket_frame_budget: int | None = None
     decoded_batch_prefetch: int = 2
+    max_open_shards_per_worker: int = 8
 
 
 def decode_webdataset_sample(
