@@ -1,52 +1,73 @@
 # Architecture
-![Architecture](ConvRWKV_CTC_RWKV_ASR_Framework_EN.png "Conv-RWKV ASR")
-# rwkvasr_longform_asr
+![Architecture](ConvRWKV_CTC_RWKV_ASR_Framework_EN.png "ConvRWKV-CTC/RWKV ASR")
+# ConvRWKV-CTC/RWKV ASR
 
-Long-form ASR with `RWKV-7 TimeMixer`, `bidirectional RWKV + Direction Dropout`, and a `CTC` head for one-checkpoint dual-mode speech recognition.
+Streaming and Long-Form ASR: Architecture and Three-Stage Training Framework.
+
+ConvRWKV combines local convolutional acoustic modeling with RWKV-based long-context modeling. A `CTC` head provides fast base decoding and native time alignment, while a pretrained `RWKV-7` decoder head adds LM-aware autoregressive decoding for long-form and complex-text scenarios.
 
 ## 1. Project Goal
 
-This project targets a practical ASR stack with these constraints:
+This project targets a practical ASR stack with these capabilities:
 
-- replace encoder self-attention with `RWKV-7 TimeMixer`
-- keep the non-attention path Conformer-like
-  - FFN / MLP remains standard
-  - convolution module remains available
-- train a single checkpoint that supports both:
-  - offline bidirectional ASR
-  - streaming left-to-right ASR
-- use `CTC` as the main recognition head for efficiency, alignment, and on-device deployment
+| Capability | Description |
+|---|---|
+| **Streaming ASR** | Real-time, continuous encoding via RWKV's RNN-like recurrent property |
+| **Long Context** | RWKV models long-range context without chunking or context fragmentation |
+| **Time Alignment** | Native token-level timestamp output from the CTC head |
+| **Pretrained LM** | RWKV-7 0.4B decoder head for LM-aware, long-form autoregressive decoding |
+
+Core design constraints:
+
+- encoder: `ConvRWKV` — Conformer-inspired, combining a local convolutional module with `RWKV-7 TimeMixer` for long-context modeling
+- decoder heads from the same encoder checkpoint:
+  - `CTC Head`: base decoding + native time alignment
+  - `RWKV Head`: pretrained RWKV-7 0.4B, LM-aware autoregressive decoding
+- train through a **three-stage pipeline** that progresses from stable bidirectional pretraining to true streaming capability and finally dual-head joint training
 - support `4 x RTX 4090 + DeepSpeed + bf16` training
-
-The main paper-reproduction direction is:
-
-- `bidirectional RWKV encoder`
-- `Direction Dropout`
-- `fixed 20% DirDrop` for the strict paper-style setup
 
 ## 2. Core Design
 
 ### Model
 
 - encoder frontend: `global CMVN + WeNet-style conv2d6`
-- encoder body: `Conformer-style RWKV`
-  - `TimeMixer` replaces self-attention only
+- encoder body: `ConvRWKV`
+  - **Convolution** module: local acoustic modeling, minimal look-ahead
+  - **RWKV** (`TimeMixer`): long-context modeling, RNN-like streaming; replaces self-attention only
   - FFN stays standard
-  - conv module stays available
-- head: `CTC`
+- decoder heads (shared acoustic representation):
+  - **CTC Head**: base decoding, native time alignment
+  - **RWKV Head**: pretrained RWKV-7 0.4B, LM-aware autoregressive decoding
 - inference modes from the same checkpoint:
-  - `Bi`
-  - `L2R`
-  - `R2L`
-  - `Alt`
+  - **Streaming**: uni-directional RWKV encoding, low-latency continuous output
+  - **Long-form**: full bidirectional context + RWKV LM decoder for highest accuracy
 
-### Training
+### Three-Stage Training Pipeline
 
-- bf16 end-to-end on CUDA, fp32 only in numerically sensitive paths
-- DeepSpeed ZeRO-2
-- WebDataset audio shards
-- offline length indexing for stable bucketed batching
-- optional Rust tools for preprocessing and decode-stage deployment validation
+Training progresses through three stages, each building on the previous checkpoint:
+
+```
+Stage 1                    Stage 2                       Stage 3
+ConvRWKV-CTC          ─CK1─▶  Streaming Adaptation  ─CK2─▶  Dual-Head Training
+BiRWKV + CTC                  Continue CTC training         Add pretrained RWKV head
+Stable acoustic encoder       20% direction drop/step       Jointly optimize CTC + RWKV
+Base encoder checkpoint       Streaming encoder ckpt        Final dual-head model
+```
+
+**Stage 1 — Acoustic Pretraining** (`ConvRWKV-CTC / BiRWKV + CTC`)
+- *Objective*: establish a stable, reliable base speech encoder; learn the core acoustic mapping from speech to text
+- *Method*: use Conv + BiRWKV as the encoder; train with CTC head only; leverage bidirectional context to stabilize acoustic modeling
+- *Outcome*: base encoder checkpoint; strong initialization for streaming adaptation
+
+**Stage 2 — Streaming Adaptation** (`ConvRWKV-CTC / Uni-directional transition`)
+- *Objective*: reduce dependence on full bidirectional context; acquire uni-directional, real-time, continuous encoding
+- *Method*: continue training from stage-1 checkpoint; randomly drop 20% of RWKV directions at every step; force the encoder to function when one direction is unavailable
+- *Outcome*: requires only minimal Conv look-ahead; improves the latency/accuracy tradeoff over chunk-based ASR
+
+**Stage 3 — Joint Dual-Head Training** (`ConvRWKV-CTC/RWKV / CTC + RWKV`)
+- *Objective*: enhance final decoding while preserving streaming encoding; make both heads decode reliably
+- *Method*: initialize from stage-2 checkpoint; keep CTC head and attach pretrained RWKV-7 0.4B decoder; jointly optimize CTC + RWKV while continuing 20% direction drop
+- *Outcome*: CTC provides base decoding and native time alignment; RWKV provides stronger long-form and complex-text decoding; produces the final ConvRWKV-CTC/RWKV model
 
 ### Prediction
 
@@ -94,7 +115,16 @@ flowchart TD
 
 ## 4. Training
 
-### 4.1 Training Architecture
+### 4.1 Three-Stage Training Overview
+
+```mermaid
+flowchart LR
+    S1["Stage 1\nConvRWKV-CTC\nBiRWKV + CTC\nStable acoustic encoder"] -->|CK1 base encoder checkpoint| S2
+    S2["Stage 2\nStreaming Adaptation\nContinue CTC training\n20% direction drop/step"] -->|CK2 streaming encoder checkpoint| S3
+    S3["Stage 3\nDual-Head Training\nAdd pretrained RWKV-7 head\nJointly optimize CTC + RWKV"]
+```
+
+### 4.2 Stage 1 — Acoustic Pretraining
 
 ```mermaid
 flowchart LR
@@ -103,23 +133,51 @@ flowchart LR
     C --> D[Global CMVN]
     D --> E[Conv2dSubsampling6]
     E --> F[Bidirectional RWKV-7 TimeMixer blocks]
-    F --> G[Direction Dropout during training]
-    G --> H[CTC projection]
-    H --> I[CTC loss]
-    I --> J[DeepSpeed ZeRO-2 bf16 optimizer]
+    F --> G[CTC projection]
+    G --> H[CTC loss]
+    H --> I[DeepSpeed ZeRO-2 bf16 optimizer]
+    I --> J[Base encoder checkpoint CK1]
 ```
 
-### 4.2 Training Flow
+### 4.3 Stage 2 — Streaming Adaptation
+
+```mermaid
+flowchart LR
+    CK1[CK1 base encoder checkpoint] --> A
+    A[Fbank + CMVN + conv2d6] --> B[Bidirectional RWKV-7 TimeMixer blocks]
+    B --> C["Direction Dropout\n20% drop per step"]
+    C --> D[CTC projection]
+    D --> E[CTC loss]
+    E --> F[DeepSpeed ZeRO-2 bf16 optimizer]
+    F --> G[Streaming encoder checkpoint CK2]
+```
+
+### 4.4 Stage 3 — Joint Dual-Head Training
+
+```mermaid
+flowchart LR
+    CK2[CK2 streaming encoder checkpoint] --> A
+    A[Fbank + CMVN + conv2d6] --> B[ConvRWKV encoder with 20% direction drop]
+    B --> C[Shared Acoustic Representation]
+    C --> D[CTC Head\nBase decoding + time alignment]
+    C --> E["RWKV Head\nPretrained RWKV-7 0.4B\nLM-aware autoregressive decoding"]
+    D --> F[Joint CTC + RWKV loss]
+    E --> F
+    F --> G[DeepSpeed ZeRO-2 bf16 optimizer]
+    G --> H[Final ConvRWKV-CTC/RWKV model]
+```
+
+### 4.5 Training Flow
 
 ```mermaid
 flowchart TD
     A[Load length index] --> B[Length-bucketed batch assembly]
     B --> C[Online wav decode + fbank]
     C --> D[Apply CMVN + conv2d6]
-    D --> E[Forward through bidirectional RWKV encoder]
-    E --> F[Apply Direction Dropout mask]
+    D --> E[Forward through ConvRWKV encoder]
+    E --> F["Apply Direction Dropout mask\n(Stage 2+3: 20% per step)"]
     F --> G[Compute CTC logits]
-    G --> H[CTC loss]
+    G --> H["CTC loss\n(+ RWKV decoder loss in Stage 3)"]
     H --> I[DeepSpeed backward + optimizer step]
     I --> J[Per-epoch eval]
     J --> K[Save epoch checkpoint + best checkpoint]
@@ -131,16 +189,18 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    A[Checkpoint .pt / .safetensors] --> B[Python RWKV-CTC predictor]
-    B --> C[CTC prefix beam search]
-    C --> D[CTC forced alignment]
-    D --> E[JSONL predictions with token timestamps]
+    A["Checkpoint .pt / .safetensors"] --> B[ConvRWKV encoder forward]
+    B --> C[Shared Acoustic Representation]
+    C --> D["CTC Head\nPrefix beam search\nForced alignment\nToken timestamps"]
+    C --> E["RWKV Head\nLM-aware autoregressive decoding\nLong-form + complex text"]
+    D --> F[JSONL predictions with token timestamps]
+    E --> F
 
-    B --> F[Export logits + lengths + utt_ids]
-    F --> G[Rust Candle predictor]
-    G --> H[CTC prefix beam search]
-    H --> I[CTC forced alignment]
-    I --> J[JSONL predictions with token timestamps]
+    B --> G[Export logits + lengths + utt_ids]
+    G --> H[Rust Candle predictor]
+    H --> I[CTC prefix beam search]
+    I --> J[CTC forced alignment]
+    J --> K[JSONL predictions with token timestamps]
 ```
 
 ### 5.2 Prediction Flow
@@ -149,24 +209,38 @@ flowchart LR
 flowchart TD
     A[Load model config + checkpoint] --> B[Load audio/features]
     B --> C[Encoder forward]
-    C --> D[CTC logits]
-    D --> E[Prefix beam search]
-    E --> F[Best token sequence]
-    F --> G[CTC forced alignment]
-    G --> H[Project encoder steps to ms timestamps]
-    H --> I[Write JSONL result]
+    C --> D[Shared acoustic representation]
+    D --> E{Decode mode}
+    E -->|streaming / base| F[CTC prefix beam search]
+    E -->|long-form / LM| G[RWKV autoregressive decode]
+    F --> H[Best token sequence]
+    G --> H
+    H --> I[CTC forced alignment]
+    I --> J[Project encoder steps to ms timestamps]
+    J --> K[Write JSONL result]
 ```
 
-## 6. Implementation Status
+## 6. Why This Design Suits Streaming ASR
+
+| | Conventional Streaming ASR | ConvRWKV-CTC/RWKV |
+|---|---|---|
+| **Encoding** | Chunk-based, fragments context | RWKV's RNN-like recurrence: continuous, long-context, real-time |
+| **Latency** | Clear latency/accuracy tradeoff due to chunking | Minimal Conv look-ahead only; no chunk boundary artifacts |
+| **Output** | Typically text only | CTC native time alignment + LM-augmented decoding |
+| **LM integration** | External re-scoring | Pretrained RWKV-7 0.4B decoder baked in |
+
+> **ConvRWKV-CTC/RWKV** = streaming acoustic encoding + native time alignment + pretrained LM-augmented decoding
+
+## 7. Implementation Status
 
 ### Completed
 
 - `uv` project and training environment definition
 - `RWKV-7 TimeMixer` PyTorch implementation
-- bidirectional RWKV wrapper
-- `Direction Dropout`
-- Conformer-style RWKV encoder block
-- `CTC` model and loss path
+- bidirectional RWKV wrapper (`ConvRWKV` encoder)
+- `Direction Dropout` (Stage 2+3: 20% per step)
+- Conformer-style ConvRWKV encoder block
+- `CTC` head and loss path (Stage 1–3)
 - WeNet-style `fbank + CMVN + conv2d6` frontend
 - WebDataset online decode loader
 - Rust multithreaded WebDataset length indexer
@@ -174,7 +248,7 @@ flowchart TD
 - DeepSpeed ZeRO-2 multi-GPU training entrypoint
 - per-epoch eval and best-checkpoint selection
 - checkpoint export to `.safetensors`
-- Python full-model prediction
+- Python full-model prediction (CTC head)
 - Python token-level CTC time alignment
 - Rust + Candle decode-stage predictor
 - Rust token-level CTC time alignment
@@ -182,9 +256,10 @@ flowchart TD
 
 ### In Progress
 
-- longer training runs and checkpoint selection under paper-style configs
+- Stage 1 → Stage 2 → Stage 3 pipeline execution on target hardware
+- Stage 3 RWKV-7 0.4B decoder head integration and joint training
 - prediction/export workflow hardening for real eval runs
-- same-checkpoint `Bi / L2R / Alt` decode comparison
+- streaming vs. long-form decode comparison from the same checkpoint
 
 ### Planned
 
@@ -197,7 +272,7 @@ flowchart TD
 
 Public roadmap and task breakdown live in [ROADMAP.md](./ROADMAP.md).
 
-## 7. Current Training Summary
+## 8. Current Training Summary
 
 This repository does **not** include training artifacts, checkpoints, DeepSpeed states, or data shards. The numbers below document current progress only.
 
@@ -236,7 +311,7 @@ Current best:
 
 These are training-time selection metrics, not final `CER/WER`.
 
-## 8. Repository Layout
+## 9. Repository Layout
 
 ```text
 src/rwkvasr/
@@ -256,7 +331,7 @@ scripts/
   launch helpers
 ```
 
-## 9. Quick Start
+## 10. Quick Start
 
 ### Python / training side
 
@@ -317,7 +392,7 @@ cargo run --release --manifest-path tools/Cargo.toml --bin predict_ctc -- \
   --output-path runs/paper_bi_baseline_4x4090/rust_decode_inputs/part-00000.predictions.jsonl
 ```
 
-## 10. Notes
+## 11. Notes
 
 - This repository intentionally excludes:
   - checkpoints
