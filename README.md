@@ -1,3 +1,5 @@
+# Architecture
+![Architecture](ConvRWKV_CTC_RWKV_ASR_Framework_EN.png "Conv-RWKV ASR")
 # rwkvasr_longform_asr
 
 Long-form ASR with `RWKV-7 TimeMixer`, `bidirectional RWKV + Direction Dropout`, and a `CTC` head for one-checkpoint dual-mode speech recognition.
