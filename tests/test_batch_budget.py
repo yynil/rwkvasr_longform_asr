@@ -2,6 +2,8 @@ import torch
 
 from rwkvasr.training import ctc_batch_token_stats, estimate_token_budget_from_memory
 from rwkvasr.training.batch_budget import (
+    effective_batch_token_budget,
+    effective_padded_text_token_budget,
     iter_budgeted_ctc_batches,
     select_ctc_batch_prefix_by_token_budget,
     split_ctc_batch_by_token_budget,
@@ -29,7 +31,27 @@ def test_ctc_batch_token_stats_uses_padded_audio_plus_text() -> None:
     assert stats.max_audio_frames == 8
     assert stats.padded_audio_tokens == 24
     assert stats.text_tokens == 6
+    assert stats.padded_text_tokens == 9
+    assert stats.budget_tokens == 33
     assert stats.total_tokens == 30
+
+
+def test_effective_batch_token_budget_adds_decoder_text_overhead_tokens() -> None:
+    stats = ctc_batch_token_stats(_batch())
+
+    assert effective_batch_token_budget(stats) == 30
+    assert effective_batch_token_budget(
+        stats,
+        use_padded_text_tokens=True,
+        text_tokens_per_sample_extra=4,
+    ) == 45
+
+
+def test_effective_padded_text_token_budget_uses_batch_times_max_text() -> None:
+    stats = ctc_batch_token_stats(_batch())
+
+    assert effective_padded_text_token_budget(stats) == 9
+    assert effective_padded_text_token_budget(stats, text_tokens_per_sample_extra=4) == 21
 
 
 def test_estimate_token_budget_from_memory_scales_linearly() -> None:
@@ -95,3 +117,40 @@ def test_select_ctc_batch_prefix_by_token_budget_shrinks_batch_without_replaying
     assert result.dropped_tail_samples == 2
     assert result.skipped_samples == 0
     assert ctc_batch_token_stats(result.batch).total_tokens <= 18
+
+
+def test_select_ctc_batch_prefix_by_token_budget_accounts_for_decoder_text_overhead_tokens() -> None:
+    result = select_ctc_batch_prefix_by_token_budget(
+        _batch(),
+        token_budget=40,
+        skip_oversized_samples=False,
+        use_padded_text_tokens=True,
+        text_tokens_per_sample_extra=4,
+    )
+
+    assert result is not None
+    assert result.batch.features.size(0) == 2
+    assert result.dropped_tail_samples == 1
+    stats = ctc_batch_token_stats(result.batch)
+    assert effective_batch_token_budget(
+        stats,
+        use_padded_text_tokens=True,
+        text_tokens_per_sample_extra=4,
+    ) == 30
+
+
+def test_select_ctc_batch_prefix_by_token_budget_can_cap_padded_text_tokens() -> None:
+    result = select_ctc_batch_prefix_by_token_budget(
+        _batch(),
+        token_budget=100,
+        skip_oversized_samples=False,
+        use_padded_text_tokens=True,
+        text_tokens_per_sample_extra=0,
+        padded_text_token_budget=4,
+    )
+
+    assert result is not None
+    assert result.batch.features.size(0) == 1
+    assert result.dropped_tail_samples == 2
+    stats = ctc_batch_token_stats(result.batch)
+    assert effective_padded_text_token_budget(stats) == 3

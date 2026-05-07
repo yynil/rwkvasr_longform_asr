@@ -29,6 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-prune-topk", default=None, type=int)
     parser.add_argument("--length-bonus", default=0.0, type=float)
     parser.add_argument("--insertion-bonus", default=0.0, type=float)
+    parser.add_argument("--hotwords-path", default=None)
+    parser.add_argument("--hotword-weight", default=3.0, type=float)
+    parser.add_argument("--hotword-prefix-scale", default=0.3, type=float)
     parser.add_argument("--save-debug-lengths", action="store_true")
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--tokenizer-type", default=None)
@@ -129,6 +132,9 @@ def main() -> None:
             token_prune_topk=args.token_prune_topk,
             length_bonus=args.length_bonus,
             insertion_bonus=args.insertion_bonus,
+            hotwords_path=args.hotwords_path,
+            hotword_weight=args.hotword_weight,
+            hotword_prefix_scale=args.hotword_prefix_scale,
             save_debug_lengths=args.save_debug_lengths,
             tokenizer_type=str(tokenizer_config["tokenizer_type"]),
             tokenizer_model_path=tokenizer_config["tokenizer_model_path"],

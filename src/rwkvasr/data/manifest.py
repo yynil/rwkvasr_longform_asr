@@ -69,9 +69,13 @@ class ASRBatch:
 
 class TokenizerLike(Protocol):
     def encode(self, text: str) -> list[int]: ...
+    def decode(self, token_ids: list[int]) -> str: ...
 
     @property
     def vocab_size(self) -> int: ...
+
+    @property
+    def eos_token_id(self) -> int | None: ...
 
 
 class SentencePieceTokenizer:
@@ -89,6 +93,11 @@ class SentencePieceTokenizer:
     @property
     def vocab_size(self) -> int:
         return int(self.processor.vocab_size())
+
+    @property
+    def eos_token_id(self) -> int | None:
+        eos_id = int(self.processor.eos_id())
+        return None if eos_id < 0 else eos_id
 
 
 class WhisperMultilingualTokenizer:
@@ -121,6 +130,10 @@ class WhisperMultilingualTokenizer:
     def vocab_size(self) -> int:
         return self._text_vocab_size
 
+    @property
+    def eos_token_id(self) -> int | None:
+        return None
+
 
 class QwenTokenizer:
     def __init__(self, model_path: str):
@@ -147,6 +160,112 @@ class QwenTokenizer:
     def vocab_size(self) -> int:
         return self._vocab_size
 
+    @property
+    def eos_token_id(self) -> int | None:
+        return None
+
+
+class RWKVTokenizer:
+    OFFICIAL_VOCAB_SIZE = 65536
+    OFFICIAL_EOS_TOKEN_ID = 0
+
+    def __init__(self, model_path: str):
+        self.idx2token: dict[int, bytes] = {}
+        sorted_tokens: list[bytes] = []
+        lines = Path(model_path).read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            idx = int(line[: line.index(" ")])
+            token = eval(line[line.index(" ") : line.rindex(" ")])
+            token = token.encode("utf-8") if isinstance(token, str) else token
+            if not isinstance(token, bytes):
+                raise TypeError(f"RWKV vocab entry {idx} is not bytes: {type(token)}")
+            sorted_tokens.append(token)
+            self.idx2token[idx] = token
+
+        self.token2idx = {token: int(idx) for idx, token in self.idx2token.items()}
+        self._vocab_size = max(self.OFFICIAL_VOCAB_SIZE, (max(self.idx2token) + 1) if self.idx2token else 0)
+        self.table = [[[] for _ in range(256)] for _ in range(256)]
+        self.good = [set() for _ in range(256)]
+        self.wlen = [0 for _ in range(256)]
+
+        for token in reversed(sorted_tokens):
+            if len(token) < 2:
+                continue
+            s0 = int(token[0])
+            s1 = int(token[1])
+            self.table[s0][s1].append(token)
+            self.wlen[s0] = max(self.wlen[s0], len(token))
+            self.good[s0].add(s1)
+
+    def encode_bytes(self, src: bytes) -> list[int]:
+        src_len = len(src)
+        tokens: list[int] = []
+        i = 0
+        while i < src_len:
+            token = src[i : i + 1]
+            if i < src_len - 1:
+                s0 = int(src[i])
+                s1 = int(src[i + 1])
+                if s1 in self.good[s0]:
+                    candidate = src[i : i + self.wlen[s0]]
+                    try:
+                        token = next(filter(candidate.startswith, self.table[s0][s1]))
+                    except StopIteration:
+                        pass
+            tokens.append(self.token2idx[token])
+            i += len(token)
+        return tokens
+
+    def decode_bytes(self, token_ids: list[int]) -> bytes:
+        eos_id = self.eos_token_id
+        parts: list[bytes] = []
+        for token_id in token_ids:
+            token_id = int(token_id)
+            if eos_id is not None and token_id == eos_id:
+                continue
+            parts.append(self.idx2token.get(token_id, b""))
+        return b"".join(parts)
+
+    def encode(self, text: str) -> list[int]:
+        return self.encode_bytes(text.encode("utf-8"))
+
+    def decode(self, token_ids: list[int]) -> str:
+        return self.decode_bytes(token_ids).decode("utf-8", errors="ignore")
+
+    @property
+    def vocab_size(self) -> int:
+        return self._vocab_size
+
+    @property
+    def eos_token_id(self) -> int | None:
+        return self.OFFICIAL_EOS_TOKEN_ID
+
+
+def tokenizer_eos_token_id(tokenizer: TokenizerLike | None) -> int | None:
+    if tokenizer is None:
+        return None
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None:
+        return None
+    return int(eos_token_id)
+
+
+def maybe_append_eos_token_ids(
+    token_ids: list[int] | tuple[int, ...],
+    *,
+    append_eos: bool,
+    tokenizer: TokenizerLike | None = None,
+) -> list[int]:
+    normalized = [int(token_id) for token_id in token_ids]
+    if not append_eos:
+        return normalized
+    eos_token_id = tokenizer_eos_token_id(tokenizer)
+    if eos_token_id is None:
+        raise ValueError("append_eos=True requires a tokenizer with a defined eos_token_id.")
+    if normalized and normalized[-1] == eos_token_id:
+        return normalized
+    return [*normalized, eos_token_id]
+
 
 def build_text_tokenizer(
     tokenizer_type: str,
@@ -165,6 +284,10 @@ def build_text_tokenizer(
         if model_path is None:
             raise ValueError("Qwen tokenizer requires model_path.")
         return QwenTokenizer(model_path)
+    if tokenizer_type in {"rwkv", "rwkv_v20230424"}:
+        if model_path is None:
+            raise ValueError("RWKV tokenizer requires model_path.")
+        return RWKVTokenizer(model_path)
     raise ValueError(f"Unsupported tokenizer_type: {tokenizer_type}")
 
 
@@ -228,11 +351,13 @@ class ASRManifestDataset(Dataset[dict[str, Any]]):
         *,
         tokenizer: TokenizerLike | None = None,
         feature_extractor: LogMelFeatureExtractor | None = None,
+        append_eos: bool = False,
     ):
         self.manifest_path = Path(manifest_path)
         self.root = self.manifest_path.parent
         self.tokenizer = tokenizer
         self.feature_extractor = feature_extractor or WenetFbankFeatureExtractor()
+        self.append_eos = bool(append_eos)
         self.entries = self._load_entries()
 
     def _load_entries(self) -> list[ManifestEntry]:
@@ -251,10 +376,15 @@ class ASRManifestDataset(Dataset[dict[str, Any]]):
                     if self.tokenizer is None:
                         self.tokenizer = build_text_tokenizer("whisper_multilingual")
                     token_ids = self.tokenizer.encode(text)
+                token_ids = maybe_append_eos_token_ids(
+                    token_ids,
+                    append_eos=self.append_eos,
+                    tokenizer=self.tokenizer,
+                )
                 entries.append(
                     ManifestEntry(
                         utt_id=str(utt_id),
-                        token_ids=[int(token) for token in token_ids],
+                        token_ids=token_ids,
                         text=text,
                         feature_path=raw.get("feature_path"),
                         audio_filepath=raw.get("audio_filepath"),

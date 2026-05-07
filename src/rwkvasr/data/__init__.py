@@ -14,10 +14,13 @@ from .manifest import (
     LogMelFeatureExtractor,
     ManifestEntry,
     QwenTokenizer,
+    RWKVTokenizer,
     SentencePieceTokenizer,
     TokenizerLike,
     WhisperMultilingualTokenizer,
     build_text_tokenizer,
+    maybe_append_eos_token_ids,
+    tokenizer_eos_token_id,
     WenetFbankFeatureExtractor,
 )
 from .webdataset import WebDatasetASRIterableDataset, WebDatasetConfig, build_webdataset_dataloader
@@ -72,6 +75,7 @@ __all__ = [
     "LogMelFeatureExtractor",
     "ManifestEntry",
     "QwenTokenizer",
+    "RWKVTokenizer",
     "SentencePieceTokenizer",
     "StableHashSplitConfig",
     "TokenizerLike",
@@ -105,6 +109,7 @@ __all__ = [
     "load_webdataset_index",
     "load_webdataset_bucket_manifest",
     "load_webdataset_length_entries",
+    "maybe_append_eos_token_ids",
     "resolve_sample_id",
     "resolve_webdataset_bucket_manifest_path",
     "resolve_webdataset_length_index_path",
@@ -113,5 +118,6 @@ __all__ = [
     "sample_in_split",
     "shard_in_split",
     "validate_webdataset_index",
+    "tokenizer_eos_token_id",
     "write_wenet_cmvn_json",
 ]

@@ -85,15 +85,14 @@ class RWKVDualModeCTCTrainer:
                 device=batch.features.device,
                 generator=generator,
             )
-        logits, logit_lengths, _ = self.model(
+        losses = self.model.joint_losses(
             batch.features,
             batch.feature_lengths,
+            batch.targets,
+            batch.target_lengths,
             direction_mask=mask,
         )
-        if logit_lengths is None:
-            raise ValueError("CTC training requires feature lengths.")
-        loss = self.model.ctc_loss(logits, logit_lengths, batch.targets, batch.target_lengths)
-        return loss, mask
+        return losses["loss"], mask
 
     @torch.no_grad()
     def inference_logits(
@@ -119,11 +118,11 @@ class RWKVDualModeCTCTrainer:
         mode: str = "bi",
     ) -> Tensor:
         mask = self.eval_direction_mask(mode, device=batch.features.device)
-        logits, logit_lengths, _ = self.model(
+        losses = self.model.joint_losses(
             batch.features,
             batch.feature_lengths,
+            batch.targets,
+            batch.target_lengths,
             direction_mask=mask,
         )
-        if logit_lengths is None:
-            raise ValueError("CTC evaluation requires feature lengths.")
-        return self.model.ctc_loss(logits, logit_lengths, batch.targets, batch.target_lengths)
+        return losses["loss"]

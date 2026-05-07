@@ -23,3 +23,8 @@ outputs/
 checkpoints/
 tools/target/
 assets/tokenizers/flores200/flores200_dev_devtest_multilingual.txt
+tmp/
+third_party/RWKV-LM/
+third_party/RWKV-LM-sparse/
+third_party/benchdeps_tmp/
+third_party/qwen_tok_eval_tmp/

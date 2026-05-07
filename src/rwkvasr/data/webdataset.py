@@ -12,7 +12,13 @@ from typing import Any, Iterable
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from .manifest import FeatureCollator, TokenizerLike, WenetFbankFeatureExtractor, build_text_tokenizer
+from .manifest import (
+    FeatureCollator,
+    TokenizerLike,
+    WenetFbankFeatureExtractor,
+    build_text_tokenizer,
+    maybe_append_eos_token_ids,
+)
 from .webdataset_common import AUDIO_SUFFIXES
 from .webdataset_index import StableHashSplitConfig, resolve_sample_id, sample_in_split, shard_in_split
 
@@ -36,6 +42,7 @@ class WebDatasetConfig:
     length_bucket_frame_budget: int | None = None
     decoded_batch_prefetch: int = 2
     max_open_shards_per_worker: int = 8
+    append_eos: bool = False
 
 
 def decode_webdataset_sample(
@@ -48,6 +55,7 @@ def decode_webdataset_sample(
     text_key: str,
     utt_id_key: str,
     token_ids_key: str,
+    append_eos: bool,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import soundfile as sf
@@ -61,6 +69,11 @@ def decode_webdataset_sample(
         if tokenizer is None:
             tokenizer = build_text_tokenizer("whisper_multilingual")
         token_ids = tokenizer.encode(text)
+    token_ids = maybe_append_eos_token_ids(
+        token_ids,
+        append_eos=append_eos,
+        tokenizer=tokenizer,
+    )
 
     audio_buffer = io.BytesIO(audio_bytes)
     audio_array, sample_rate = sf.read(audio_buffer, dtype="float32", always_2d=True)
@@ -188,6 +201,7 @@ class WebDatasetASRIterableDataset(IterableDataset[dict[str, Any]]):
             text_key=self.config.text_key,
             utt_id_key=self.config.utt_id_key,
             token_ids_key=self.config.token_ids_key,
+            append_eos=self.config.append_eos,
             metadata=metadata,
         )
 

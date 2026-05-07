@@ -12,9 +12,12 @@ from .ctc_task import CTCBatch
 class BatchTokenStats:
     batch_size: int
     max_audio_frames: int
+    max_text_tokens: int
     sum_audio_frames: int
     padded_audio_tokens: int
     text_tokens: int
+    padded_text_tokens: int
+    budget_tokens: int
     total_tokens: int
 
 
@@ -31,25 +34,52 @@ def ctc_batch_token_stats(batch: CTCBatch) -> BatchTokenStats:
         return BatchTokenStats(
             batch_size=0,
             max_audio_frames=0,
+            max_text_tokens=0,
             sum_audio_frames=0,
             padded_audio_tokens=0,
             text_tokens=0,
+            padded_text_tokens=0,
+            budget_tokens=0,
             total_tokens=0,
         )
     feature_lengths = batch.feature_lengths.to(dtype=torch.long)
     target_lengths = batch.target_lengths.to(dtype=torch.long)
     max_audio_frames = int(feature_lengths.max().item())
+    max_text_tokens = int(target_lengths.max().item())
     sum_audio_frames = int(feature_lengths.sum().item())
     padded_audio_tokens = batch_size * max_audio_frames
     text_tokens = int(target_lengths.sum().item())
+    padded_text_tokens = batch_size * max_text_tokens
     return BatchTokenStats(
         batch_size=batch_size,
         max_audio_frames=max_audio_frames,
+        max_text_tokens=max_text_tokens,
         sum_audio_frames=sum_audio_frames,
         padded_audio_tokens=padded_audio_tokens,
         text_tokens=text_tokens,
+        padded_text_tokens=padded_text_tokens,
+        budget_tokens=padded_audio_tokens + padded_text_tokens,
         total_tokens=padded_audio_tokens + text_tokens,
     )
+
+
+def effective_batch_token_budget(
+    stats: BatchTokenStats,
+    *,
+    use_padded_text_tokens: bool = False,
+    text_tokens_per_sample_extra: int = 0,
+) -> int:
+    if not use_padded_text_tokens:
+        return stats.total_tokens
+    return stats.budget_tokens + stats.batch_size * max(0, int(text_tokens_per_sample_extra))
+
+
+def effective_padded_text_token_budget(
+    stats: BatchTokenStats,
+    *,
+    text_tokens_per_sample_extra: int = 0,
+) -> int:
+    return stats.batch_size * (stats.max_text_tokens + max(0, int(text_tokens_per_sample_extra)))
 
 
 def estimate_token_budget_from_memory(
@@ -69,6 +99,8 @@ def split_ctc_batch_by_token_budget(
     *,
     token_budget: int,
     skip_oversized_samples: bool,
+    use_padded_text_tokens: bool = False,
+    text_tokens_per_sample_extra: int = 0,
 ) -> tuple[list[CTCBatch], int]:
     if token_budget <= 0:
         return [batch], 0
@@ -92,6 +124,9 @@ def split_ctc_batch_by_token_budget(
     def _pending_total_tokens(next_feature_len: int, next_target_len: int) -> int:
         next_batch_size = len(pending_features) + 1
         next_max_frames = max([next_feature_len, *pending_feature_lengths], default=next_feature_len)
+        if use_padded_text_tokens:
+            next_max_text = max([next_target_len, *pending_target_lengths], default=next_target_len)
+            return next_batch_size * next_max_frames + next_batch_size * (next_max_text + text_tokens_per_sample_extra)
         return next_batch_size * next_max_frames + sum(pending_target_lengths) + next_target_len
 
     def _emit_pending() -> None:
@@ -139,9 +174,11 @@ def split_ctc_batch_by_token_budget(
         target_len = int(target_lengths[sample_idx].item())
         sample_features = batch.features[sample_idx, :feature_len]
         sample_target = sample_targets[sample_idx]
-        sample_tokens = feature_len + target_len
+        sample_tokens = feature_len + (
+            target_len + text_tokens_per_sample_extra if use_padded_text_tokens else target_len
+        )
 
-        if sample_tokens > token_budget and skip_oversized_samples:
+        if token_budget and sample_tokens > token_budget and skip_oversized_samples:
             skipped_samples += 1
             continue
 
@@ -214,6 +251,8 @@ def iter_budgeted_ctc_batches(
     token_budget: int | None,
     max_batch_size: int,
     skip_oversized_samples: bool,
+    use_padded_text_tokens: bool = False,
+    text_tokens_per_sample_extra: int = 0,
 ) -> Iterator[BudgetedBatchResult]:
     pending_samples: list[tuple[torch.Tensor, int, torch.Tensor, int]] = []
     skipped_samples = 0
@@ -221,6 +260,9 @@ def iter_budgeted_ctc_batches(
     def _pending_total_tokens(next_feature_len: int, next_target_len: int) -> int:
         next_batch_size = len(pending_samples) + 1
         next_max_frames = max([next_feature_len, *[feature_len for _, feature_len, _, _ in pending_samples]], default=next_feature_len)
+        if use_padded_text_tokens:
+            next_max_text = max([next_target_len, *[target_len for _, _, _, target_len in pending_samples]], default=next_target_len)
+            return next_batch_size * next_max_frames + next_batch_size * (next_max_text + text_tokens_per_sample_extra)
         next_text_tokens = sum(target_len for _, _, _, target_len in pending_samples) + next_target_len
         return next_batch_size * next_max_frames + next_text_tokens
 
@@ -237,7 +279,9 @@ def iter_budgeted_ctc_batches(
     for candidate_batch in candidate_batches:
         for sample in _iter_ctc_samples(candidate_batch):
             _, feature_len, _, target_len = sample
-            sample_tokens = feature_len + target_len
+            sample_tokens = feature_len + (
+                target_len + text_tokens_per_sample_extra if use_padded_text_tokens else target_len
+            )
             if token_budget and sample_tokens > token_budget and skip_oversized_samples:
                 skipped_samples += 1
                 continue
@@ -266,9 +310,13 @@ def select_ctc_batch_prefix_by_token_budget(
     *,
     token_budget: int | None,
     skip_oversized_samples: bool,
+    use_padded_text_tokens: bool = False,
+    text_tokens_per_sample_extra: int = 0,
+    padded_text_token_budget: int | None = None,
 ) -> BudgetedBatchResult | None:
     if not token_budget or token_budget <= 0:
-        return BudgetedBatchResult(batch=batch, skipped_samples=0, dropped_tail_samples=0)
+        if padded_text_token_budget is None or padded_text_token_budget <= 0:
+            return BudgetedBatchResult(batch=batch, skipped_samples=0, dropped_tail_samples=0)
 
     selected_samples: list[tuple[torch.Tensor, int, torch.Tensor, int]] = []
     skipped_samples = 0
@@ -276,21 +324,38 @@ def select_ctc_batch_prefix_by_token_budget(
 
     for sample_idx, sample in enumerate(_iter_ctc_samples(batch)):
         _, feature_len, _, target_len = sample
-        sample_tokens = feature_len + target_len
+        sample_tokens = feature_len + (
+            target_len + text_tokens_per_sample_extra if use_padded_text_tokens else target_len
+        )
+        sample_padded_text_tokens = target_len + max(0, int(text_tokens_per_sample_extra))
 
         if sample_tokens > token_budget and skip_oversized_samples:
+            skipped_samples += 1
+            continue
+        if padded_text_token_budget and sample_padded_text_tokens > padded_text_token_budget and skip_oversized_samples:
             skipped_samples += 1
             continue
 
         candidate_samples = [*selected_samples, sample]
         candidate_batch = _build_ctc_batch_from_samples(candidate_samples)
-        candidate_tokens = ctc_batch_token_stats(candidate_batch).total_tokens
-        if selected_samples and candidate_tokens > token_budget:
+        candidate_stats = ctc_batch_token_stats(candidate_batch)
+        candidate_tokens = effective_batch_token_budget(
+            candidate_stats,
+            use_padded_text_tokens=use_padded_text_tokens,
+            text_tokens_per_sample_extra=text_tokens_per_sample_extra,
+        )
+        candidate_padded_text_tokens = effective_padded_text_token_budget(
+            candidate_stats,
+            text_tokens_per_sample_extra=text_tokens_per_sample_extra,
+        )
+        over_total_budget = bool(token_budget) and candidate_tokens > token_budget
+        over_text_budget = bool(padded_text_token_budget) and candidate_padded_text_tokens > padded_text_token_budget
+        if selected_samples and (over_total_budget or over_text_budget):
             dropped_tail_samples = batch.features.size(0) - sample_idx
             break
 
         selected_samples.append(sample)
-        if candidate_tokens > token_budget:
+        if over_total_budget or over_text_budget:
             dropped_tail_samples = batch.features.size(0) - sample_idx - 1
             break
 

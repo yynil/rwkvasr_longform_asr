@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from rwkvasr.data import ASRManifestDataset, QwenTokenizer, WhisperMultilingualTokenizer, build_text_tokenizer
+from rwkvasr.data import (
+    ASRManifestDataset,
+    QwenTokenizer,
+    RWKVTokenizer,
+    WhisperMultilingualTokenizer,
+    build_text_tokenizer,
+    maybe_append_eos_token_ids,
+)
 
 
 class _FakeWhisperProcessor:
@@ -142,3 +149,85 @@ def test_real_whisper_multilingual_tokenizer_decode_strips_invalid_utf8_fragment
     decoded = tokenizer.decode([126, 220])
 
     assert "\ufffd" not in decoded
+
+
+def test_rwkv_tokenizer_uses_official_vocab_file_roundtrip() -> None:
+    vocab_path = (
+        Path(__file__).resolve().parents[1]
+        / "third_party"
+        / "RWKV-LM"
+        / "RWKV-v7"
+        / "rwkv_vocab_v20230424.txt"
+    )
+    if not vocab_path.exists():
+        pytest.skip(f"RWKV vocab not available at {vocab_path}")
+
+    tokenizer = RWKVTokenizer(str(vocab_path))
+    token_ids = tokenizer.encode("Hello 你好")
+
+    assert tokenizer.decode(token_ids) == "Hello 你好"
+    assert tokenizer.eos_token_id == 0
+    assert tokenizer.decode([0, *token_ids, 65535]) == "Hello 你好"
+    assert tokenizer.vocab_size == 65536
+
+
+def test_build_text_tokenizer_creates_rwkv_tokenizer() -> None:
+    vocab_path = (
+        Path(__file__).resolve().parents[1]
+        / "third_party"
+        / "RWKV-LM"
+        / "RWKV-v7"
+        / "rwkv_vocab_v20230424.txt"
+    )
+    if not vocab_path.exists():
+        pytest.skip(f"RWKV vocab not available at {vocab_path}")
+
+    tokenizer = build_text_tokenizer("rwkv", model_path=str(vocab_path))
+
+    assert isinstance(tokenizer, RWKVTokenizer)
+    assert tokenizer.vocab_size == 65536
+
+
+def test_maybe_append_eos_token_ids_is_idempotent_for_rwkv() -> None:
+    vocab_path = (
+        Path(__file__).resolve().parents[1]
+        / "third_party"
+        / "RWKV-LM"
+        / "RWKV-v7"
+        / "rwkv_vocab_v20230424.txt"
+    )
+    if not vocab_path.exists():
+        pytest.skip(f"RWKV vocab not available at {vocab_path}")
+
+    tokenizer = RWKVTokenizer(str(vocab_path))
+    token_ids = tokenizer.encode("Hello")
+
+    appended = maybe_append_eos_token_ids(token_ids, append_eos=True, tokenizer=tokenizer)
+    appended_twice = maybe_append_eos_token_ids(appended, append_eos=True, tokenizer=tokenizer)
+
+    assert appended[-1] == 0
+    assert appended_twice == appended
+
+
+def test_manifest_dataset_can_append_rwkv_eos(tmp_path: Path) -> None:
+    vocab_path = (
+        Path(__file__).resolve().parents[1]
+        / "third_party"
+        / "RWKV-LM"
+        / "RWKV-v7"
+        / "rwkv_vocab_v20230424.txt"
+    )
+    if not vocab_path.exists():
+        pytest.skip(f"RWKV vocab not available at {vocab_path}")
+
+    manifest_path = tmp_path / "manifest.jsonl"
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"utt_id": "utt-0", "text": "你好", "feature_path": "feat.pt"}) + "\n")
+
+    dataset = ASRManifestDataset(
+        manifest_path,
+        tokenizer=RWKVTokenizer(str(vocab_path)),
+        append_eos=True,
+    )
+
+    assert dataset.entries[0].token_ids[-1] == 0

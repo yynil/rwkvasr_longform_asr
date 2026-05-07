@@ -25,6 +25,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-model-path", default=None)
     parser.add_argument("--tokenizer-language", default=None)
     parser.add_argument("--tokenizer-task", default=None)
+    parser.add_argument("--tokenizer-append-eos", dest="tokenizer_append_eos", action="store_true", default=None)
+    parser.add_argument("--no-tokenizer-append-eos", dest="tokenizer_append_eos", action="store_false")
     parser.add_argument("--input-dim", default=None, type=int)
     parser.add_argument("--n-embd", default=None, type=int)
     parser.add_argument("--dim-att", default=None, type=int)
@@ -38,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cmvn-file", default=None)
     parser.add_argument("--cmvn-is-json", dest="cmvn_is_json", action="store_true", default=None)
     parser.add_argument("--cmvn-is-bin", dest="cmvn_is_json", action="store_false")
+    parser.add_argument("--blank-id", default=None, type=int)
     parser.add_argument("--batch-size", default=None, type=int)
     parser.add_argument("--max-steps", default=None, type=int)
     parser.add_argument("--epochs", default=None, type=int)
@@ -50,6 +53,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta1", default=None, type=float)
     parser.add_argument("--beta2", default=None, type=float)
     parser.add_argument("--eps", default=None, type=float)
+    parser.add_argument("--decoder-enabled", dest="decoder_enabled", action="store_true", default=None)
+    parser.add_argument("--no-decoder", dest="decoder_enabled", action="store_false")
+    parser.add_argument("--decoder-checkpoint-path", default=None)
+    parser.add_argument("--decoder-num-layers", default=None, type=int)
+    parser.add_argument("--decoder-n-embd", default=None, type=int)
+    parser.add_argument("--decoder-ffn-hidden-size", default=None, type=int)
+    parser.add_argument("--decoder-head-size", default=None, type=int)
+    parser.add_argument("--decoder-audio-conditioning", default=None)
+    parser.add_argument("--decoder-prefix-tokens", default=None, type=int)
+    parser.add_argument("--decoder-loss-chunk-size", default=None, type=int)
+    parser.add_argument("--decoder-text-token-budget", default=None, type=int)
+    parser.add_argument("--decoder-prompt-before-audio", default=None)
+    parser.add_argument("--decoder-prompt-after-audio", default=None)
+    parser.add_argument("--decoder-target-suffix", default=None)
+    parser.add_argument("--decoder-eos-token-id", default=None, type=int)
+    parser.add_argument("--ctc-loss-weight", default=None, type=float)
+    parser.add_argument("--decoder-loss-weight", default=None, type=float)
     parser.add_argument("--direction-variant", default=None)
     parser.add_argument("--p-start", default=None, type=float)
     parser.add_argument("--p-max", default=None, type=float)
@@ -104,6 +124,7 @@ def _resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "tokenizer_model_path",
         "tokenizer_language",
         "tokenizer_task",
+        "tokenizer_append_eos",
         "input_dim",
         "n_embd",
         "dim_att",
@@ -116,6 +137,7 @@ def _resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "frontend_type",
         "cmvn_file",
         "cmvn_is_json",
+        "blank_id",
         "batch_size",
         "max_steps",
         "epochs",
@@ -128,6 +150,22 @@ def _resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "beta1",
         "beta2",
         "eps",
+        "decoder_enabled",
+        "decoder_checkpoint_path",
+        "decoder_num_layers",
+        "decoder_n_embd",
+        "decoder_ffn_hidden_size",
+        "decoder_head_size",
+        "decoder_audio_conditioning",
+        "decoder_prefix_tokens",
+        "decoder_loss_chunk_size",
+        "decoder_text_token_budget",
+        "decoder_prompt_before_audio",
+        "decoder_prompt_after_audio",
+        "decoder_target_suffix",
+        "decoder_eos_token_id",
+        "ctc_loss_weight",
+        "decoder_loss_weight",
         "direction_variant",
         "p_start",
         "p_max",

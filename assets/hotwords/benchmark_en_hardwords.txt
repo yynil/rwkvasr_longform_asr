@@ -1,0 +1,13 @@
+# text<TAB>weight
+Bertie	5.0
+wizard	4.0
+curtain	3.5
+poverty	4.0
+comparative wealth	4.5
+viper	5.0
+scorpion	5.0
+centipede	5.0
+tarantula	5.0
+naturalist	4.0
+peppered flour	4.0
+fattened sauce	4.0

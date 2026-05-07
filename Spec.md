@@ -2,7 +2,7 @@
 
 ## 1. Goal
 
-Build an ASR system for long-form and real-time inference where the encoder replaces self-attention with the latest `RWKV-7 TimeMixer` design from `BlinkDL/RWKV-LM/RWKV-v7/train_temp`, while keeping the feed-forward path standard. The primary decoding head is `CTC`.
+Build an ASR system for long-form and real-time inference where the encoder replaces self-attention with the latest `RWKV-7 TimeMixer` design from `BlinkDL/RWKV-LM/RWKV-v7/train_temp`, while keeping the feed-forward path standard. The v1 decoding design is `joint CTC + RWKV autoregressive decoder training`.
 
 The primary product goal is not merely a fast causal ASR model. It is a `single-checkpoint dual-mode ASR system`:
 - `bidirectional` inference for higher-accuracy offline / non-streaming ASR
@@ -16,7 +16,7 @@ Primary target:
 - practical multi-GPU training on `4 x 4090` with `DeepSpeed`
 
 Non-goals for v0:
-- RNN-T or AED decoder
+- RNN-T decoder
 - replacing MLP with RWKV channel mixing
 - exact reproduction of the paper's WeNet + RNN-T setup
 
@@ -74,10 +74,10 @@ Important implementation constraints extracted from upstream:
 ## 4. Product Requirements
 
 ### Functional
-- Train a CTC ASR encoder-decoder system with RWKV-7 TimeMixer replacing self-attention.
+- Train a joint `CTC + RWKV decoder` ASR system with RWKV-7 TimeMixer replacing encoder self-attention.
 - Support offline full-utterance training and chunked streaming-style inference from the same checkpoint.
 - Support variable-length batches and long-form utterances.
-- Support Whisper multilingual BPE text targets.
+- Support an official RWKV tokenizer that is shared with the decoder checkpoint.
 - Support configurable text tokenizers:
   - Whisper multilingual BPE
   - SentencePiece Unigram via external `.model`
@@ -202,8 +202,21 @@ Head:
 - CTC loss during training
 - greedy decode for lightweight evaluation sanity checks
 - standalone `CTC prefix beam search` for prediction and later hotword-bias integration
+- standalone `CTC prefix beam search` must support optional decode-time hotword biasing
 - beam size must be configurable from the prediction CLI and YAML-driven model reconstruction path
 - prediction CLI should expose decode-time insertion / length bonus so CTC deletion bias can be inspected without retraining
+- prediction CLI should expose:
+  - `hotwords_path`
+  - default hotword weight
+  - partial-match / prefix hotword bonus scale
+- prediction should also support an optional `CTC n-best + RWKV decoder rescoring` branch for joint checkpoints:
+  - pure CTC remains the default baseline path
+  - rescoring is a decode-time comparison path and must not change training losses or checkpoint format
+  - initial combination rule should use token-length-normalized scores:
+    - `ctc_avg_score = ctc_beam_score / max(1, token_count)`
+    - `decoder_avg_score = autoregressive log-prob per target token`
+    - `combined_score = ctc_avg_score + decoder_rescore_weight * decoder_avg_score`
+  - rescoring should only reorder candidates inside the `CTC n-best`; it must not invent candidates outside the CTC beam
 - prediction outputs must support token-level CTC time alignment, not only token ids / text
 - labeled prediction outputs should optionally include decode diagnostics:
   - input feature length
@@ -212,6 +225,13 @@ Head:
   - reference token count
   - blank-top1 ratio
   - average blank probability
+- joint decoder checkpoints must also support a separate `direct RWKV decoder AR` prediction path:
+  - `encoder latents -> RWKV decoder -> token generation until EOS=0 or max_len`
+  - this path is distinct from CTC decode and must not depend on CTC hypotheses
+  - sidecar evaluation for joint decoder training must compare `pure CTC` against `pure RWKV decoder AR`
+  - the default sidecar cadence for the active joint run is `every 60 minutes`
+  - sidecar checkpoint comments must include aggregate metrics, CTC / AR text predictions, matching ground truth text, and a short per-sample interpretation so failure modes can be inspected without opening multiple preview files
+  - decode-time `CTC n-best + decoder rescoring` may remain as an auxiliary experiment, but it is not the mainline evaluation path for joint decoder checkpoints
 
 Why CTC first:
 - simpler than RNN-T
@@ -219,7 +239,86 @@ Why CTC first:
 - easier streaming path
 - easier profiling of encoder gains from RWKV replacement
 
-### 5.6 Dual-Mode Inference
+### 5.6 RWKV Decoder
+
+Primary decoder design:
+- use official `RWKV-7` decoder weights from `BlinkDL/rwkv7-g1`
+- first target checkpoint: `rwkv7-g1d-0.1b-20260129-ctx8192.pth`
+- use official RWKV tokenizer assets from the upstream RWKV-7 path so decoder token ids remain checkpoint-compatible
+
+Decoder role:
+- consume text targets autoregressively during training
+- consume acoustic encoder outputs through an encoder-to-decoder conditioning path
+- provide an auxiliary / joint autoregressive loss that complements CTC
+- provide a direct autoregressive inference path at evaluation time using the same conditioning path and EOS stop rule
+
+Compatibility rule:
+- the `CTC vocabulary` and the `RWKV decoder vocabulary` must be the same token id space
+- we must not reuse Whisper tokenizer for this path because the official RWKV decoder checkpoint would become unusable
+- CTC keeps the official tokenizer ids unchanged for text tokens and appends exactly one extra `blank` class outside the tokenizer range
+- the decoder path must not invent tokenizer-side BOS / EOS ids that collide with the official vocabulary
+- for `rwkv_vocab_v20230424`, upstream generation demos use `token_id == 0` as the stop / EOS condition even though the vocab text file itself does not auto-append EOS
+- therefore our ASR joint RWKV path must treat `0` as an explicit training-time EOS token and append it to every target sequence exactly once
+- the tokenizer itself remains a raw byte-piece encoder; EOS insertion is a dataset / training policy, not an implicit tokenizer side effect
+- direct decoder inference uses:
+  - acoustic prefix from encoder latents
+  - tokenizer-encoded instruction prompt around the acoustic prefix
+  - greedy token generation by default
+  - explicit stop when token `0` is emitted
+  - configurable `max_new_tokens` guard to avoid runaway decoding
+- the joint RWKV decoder must preserve the pretrained LM prompt distribution as much as possible:
+  - default prompt template:
+    - `User: Transcribe the audio to text in its own language.\n`
+    - `<_audio_>` is replaced by projected encoder latents
+    - `\nAssistant: `
+    - target text followed by `\n` and `EOS=0`
+  - AR loss labels are `-100` for all prompt positions, including the audio-latent replacement span
+  - AR loss is computed only on the target answer span: `TARGET TEXT + decoder_target_suffix + EOS`
+  - direct AR inference must use the same prompt template before generation
+
+Initial scope:
+- validate official RWKV code path and tokenizer first
+- integrate a minimal ASR decoder-conditioning path second
+- keep decoder size fixed to the official `0.1B` checkpoint for the first experiment
+
+Conditioning design for v1:
+- encoder produces acoustic states after the ASR frontend and RWKV encoder
+- every valid encoder time step is projected into the RWKV decoder hidden interface and inserted at the `<_audio_>` position in the prompt template
+- no temporal pooling, fixed-prefix compression, masked mean pooling, or learned resampling is allowed in the mainline AR decoder path because it discards acoustic detail and makes long utterance decoding worse
+- decoder training uses teacher forcing on text tokens after the full audio context and assistant prompt
+- teacher-forced decoder targets must include the explicit `EOS=0` token so the LM learns when to stop
+- logits and AR labels are trained only on the target answer span, not on prompt or audio-context positions
+- the implementation may compute decoder hidden states over the full prompt + audio + target sequence, but should apply the large vocabulary LM head only to loss / generation positions to avoid materializing unnecessary `B x audio_T x vocab` logits
+- this is preferred over adding cross-attention because:
+  - it preserves the official RWKV block structure
+  - it keeps checkpoint loading straightforward
+  - it keeps the pretrained LM's prompt-continuation interface intact while still conditioning on the complete audio sequence
+
+Autoregressive inference rule:
+- the mainline decoder inference path is `encoder latents -> RWKV decoder -> autoregressive generation until EOS or max_len`
+- `CTC n-best + decoder rescoring` may exist as an auxiliary experiment, but it is not the primary decoder design and must not be treated as the training-aligned decode path
+
+Full-audio AR conditioning rule:
+- `decoder_audio_conditioning: full` is the only supported joint-decoder mode
+- all valid encoder output frames must be sent to the RWKV decoder in temporal order
+- padded encoder frames must be excluded from the per-sample context via `encoded_lengths`
+- `decoder_prefix_tokens` is retained only as a backward-compatible config field and must not cause temporal compression in full-audio mode
+- direct AR inference uses the same full-audio prompt context before greedy token generation
+
+Hotword bias design for v0:
+- apply hotword bias only in decoding, not in training
+- hotwords are provided as text entries and tokenized with the checkpoint tokenizer
+- bias should affect beam ranking during prefix beam search so rare / difficult terms survive pruning
+- support complete-match bonus and lighter partial-prefix bonus
+- file format should stay simple:
+  - one hotword per line
+  - optional per-line weight via tab-separated `text<TAB>weight`
+- initial use cases:
+  - domain entities
+  - numerals / lexicalized number phrases
+  - benchmark hard words discovered from English / Chinese error analysis
+
+### 5.7 Dual-Mode Inference
 
 Target behavior:
 - `Bi` mode for non-streaming ASR with both directions enabled
@@ -230,7 +329,7 @@ Target behavior:
 Design rule:
 - Mode switching must not require weight conversion or checkpoint rewriting.
 
-### 5.7 Streaming Inference
+### 5.8 Streaming Inference
 
 Target behavior:
 - `L2R` mode consumes audio in chunks
@@ -258,6 +357,55 @@ Expected pipeline:
 - WebDataset tar-shard dataset
 - audio loading via `torchaudio`
 - on-the-fly fbank extraction
+
+### 6.2 Joint Objective
+
+Training objective for the first RWKV-decoder experiment:
+- `loss = 0.5 * ctc_loss + 0.5 * rwkv_ar_loss`
+
+Rules:
+- start from joint training directly instead of first training CTC-only and then adding the decoder
+- keep the encoder architecture unchanged while adding the decoder path
+- keep loss weights configurable, but default the first experiment to `0.5 / 0.5`
+- keep step checkpointing frequent enough that prediction can be run mid-epoch
+- keep the encoder hidden size independent from the decoder hidden size; v1 will use a learned projection from encoder hidden states to decoder hidden states
+- decoder text loss uses the official tokenizer vocabulary size, while the CTC head uses `text_vocab_size + 1` because of the extra blank
+- when the shared tokenizer is `rwkv_vocab_v20230424`, every training target sequence must be normalized to `text_tokens + [0]`
+- EOS appending must be idempotent so pre-tokenized manifests / metadata that already end with `0` are not double-appended
+
+Initial schedule:
+- first experiment may run for `1 epoch`
+- also save step checkpoints inside the epoch so the decoder path can be inspected before the full epoch ends
+- continuing training from any step checkpoint must stay supported
+
+Joint decoder batch-budget rule:
+- joint `CTC + RWKV decoder` training must not budget batches with `sum(target_lengths)` only
+- decoder-side text loss memory is driven by `batch_size * padded_text_length * vocab_size`
+- therefore the batch selector must use padded decoder text positions when decoder loss is enabled
+- full-audio conditioning length is represented by the audio-frame side of the budget; the selector should not add a synthetic fixed acoustic prefix term
+- joint decoder training must also support an explicit padded-text cap independent of audio, because a batch of many moderate-audio but long-text samples can still OOM even when the combined audio+text budget fits
+- in practice the batch selector should enforce both:
+  - a combined budget over audio + decoder text
+  - a separate decoder text budget over `batch_size * max_text_tokens` plus prompt / suffix / EOS text overhead
+
+Decoder loss memory rule:
+- decoder AR loss must not materialize a single full-sequence fp32 cross-entropy tensor when `vocab_size=65536`
+- decoder AR loss must also avoid a full `reshape(-1, vocab_size)` or other whole-logit contiguous copy before chunking
+- compute decoder cross-entropy in chunks over decoder time positions first, then evaluate CE on each chunk so memory scales with `batch_size * time_chunk * vocab_size`
+
+### 6.3 Official RWKV Hyperparameter Rule
+
+Decoder-side optimization and loading must follow upstream guidance:
+- use official RWKV code paths and parameter naming when loading the decoder checkpoint
+- reuse official tokenizer assets
+- keep official optimizer / LR-scaling conventions wherever decoder parameters are trained
+- do not silently swap to a different tokenizer or remap token ids
+
+Validation gate before ASR integration:
+- download the official checkpoint locally
+- run official `rwkv_v7_demo_fast.py` or an equivalent upstream-accurate script successfully
+- verify tokenizer encode/decode is consistent with the checkpoint
+- only then start ASR integration work
 - optional SpecAugment
 - Whisper multilingual tokenization
 - optional SentencePiece Unigram tokenization with externally provided `.model`
@@ -469,6 +617,21 @@ WebDataset support:
   - epoch checkpoints and the final epoch-level `best` checkpoint remain separate from step-checkpoint retention
   - in distributed training, step-checkpoint artifact pruning must be single-writer and missing-path tolerant; do not let multiple ranks race on `rmtree`
   - `ds_checkpoints/` root creation must be eager rather than relying on downstream checkpoint writers
+  - repository should also support a sidecar checkpoint watcher:
+    - watch newly exported `step-*.pt` checkpoints under a run directory
+    - polling cadence must be configurable; the default long-running sidecar cadence for background monitoring should be `3600s` so it behaves like an hourly reviewer rather than a tight loop
+    - wait until a checkpoint file is stable before evaluation
+    - run a small labeled prediction preview on CPU by default so training GPUs stay dedicated to training
+    - when CPU preview is used for a run trained with `backend: cuda`, force prediction to a temporary `backend: native` config override instead of trying to load fused CUDA kernels on CPU
+    - write preview text, JSONL predictions, watcher state, and a checkpoint-level comment file under the same run directory
+    - optionally capture the current `tmux` training pane tail into the watcher output for lightweight progress inspection
+    - sidecar comments should combine:
+      - sampled step-eval loss trend from `step_checkpoint_metrics.yaml`
+      - preview-level blank / length-collapse signals from labeled prediction debug output
+      - a short qualitative status such as `reasonable`, `slight regression`, or `needs attention`
+    - when the checkpoint has a decoder-enabled model config, the sidecar should also run a rescored branch and compare it against the pure CTC branch on the same preview slice
+    - sidecar comparison should report whether decoder rescoring improved or worsened preview-set token error relative to pure CTC
+    - comment generation must be idempotent and support backfilling already-evaluated checkpoints after watcher logic changes
 - tokenizer switching rule:
   - changing tokenizer type or vocabulary size changes the CTC target space and output head shape
   - training cannot resume across tokenizer changes; a new run must start from step 0

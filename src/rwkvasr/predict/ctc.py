@@ -61,6 +61,10 @@ class CTCPrediction:
     mode: str
     alignments: list["CTCTokenAlignment"]
     debug: "CTCDecodeDebug | None" = None
+    decode_strategy: str = "ctc"
+    ctc_score: float | None = None
+    decoder_score: float | None = None
+    combined_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +90,10 @@ class CTCLabeledPrediction:
     mode: str
     alignments: list[CTCTokenAlignment]
     debug: "CTCDecodeDebug | None" = None
+    decode_strategy: str = "ctc"
+    ctc_score: float | None = None
+    decoder_score: float | None = None
+    combined_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +104,13 @@ class CTCDecodeDebug:
     ref_token_count: int | None
     blank_top1_ratio: float
     avg_blank_prob: float
+
+
+@dataclass(frozen=True)
+class CTCHotword:
+    text: str
+    token_ids: tuple[int, ...]
+    weight: float
 
 
 @dataclass(frozen=True)
@@ -122,6 +137,12 @@ class PredictionConfig:
     length_bonus: float = 0.0
     insertion_bonus: float = 0.0
     save_debug_lengths: bool = False
+    hotwords_path: str | None = None
+    hotword_weight: float = 3.0
+    hotword_prefix_scale: float = 0.3
+    decoder_rescore_topk: int = 0
+    decoder_rescore_weight: float = 0.5
+    decoder_rescore_length_normalize: bool = True
 
 
 @dataclass(frozen=True)
@@ -574,6 +595,106 @@ def _load_prediction_model(
     return model, feature_dtype
 
 
+def _parse_hotword_line(raw_line: str, *, default_weight: float) -> tuple[str, float] | None:
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if "\t" not in line:
+        return line, float(default_weight)
+    text, maybe_weight = line.rsplit("\t", 1)
+    text = text.strip()
+    maybe_weight = maybe_weight.strip()
+    if not text:
+        return None
+    try:
+        return text, float(maybe_weight)
+    except ValueError:
+        return line, float(default_weight)
+
+
+def load_hotwords(
+    path: str | Path,
+    *,
+    tokenizer: Any,
+    default_weight: float,
+) -> list[CTCHotword]:
+    hotwords: list[CTCHotword] = []
+    seen: set[tuple[tuple[int, ...], float]] = set()
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        parsed = _parse_hotword_line(raw_line, default_weight=default_weight)
+        if parsed is None:
+            continue
+        text, weight = parsed
+        token_ids = tuple(int(token_id) for token_id in tokenizer.encode(text))
+        if not token_ids:
+            continue
+        key = (token_ids, float(weight))
+        if key in seen:
+            continue
+        seen.add(key)
+        hotwords.append(
+            CTCHotword(
+                text=text,
+                token_ids=token_ids,
+                weight=float(weight),
+            )
+        )
+    return hotwords
+
+
+def _count_subsequence_matches(sequence: tuple[int, ...], pattern: tuple[int, ...]) -> int:
+    if not pattern or len(sequence) < len(pattern):
+        return 0
+    matches = 0
+    last_start = len(sequence) - len(pattern)
+    for start in range(last_start + 1):
+        if sequence[start : start + len(pattern)] == pattern:
+            matches += 1
+    return matches
+
+
+def _longest_suffix_prefix_match(sequence: tuple[int, ...], pattern: tuple[int, ...]) -> int:
+    if not sequence or len(pattern) <= 1:
+        return 0
+    max_prefix = min(len(sequence), len(pattern) - 1)
+    for prefix_len in range(max_prefix, 0, -1):
+        if sequence[-prefix_len:] == pattern[:prefix_len]:
+            return prefix_len
+    return 0
+
+
+def _hotword_bonus(
+    prefix: tuple[int, ...],
+    *,
+    hotwords: tuple[CTCHotword, ...],
+    hotword_prefix_scale: float,
+    cache: dict[tuple[int, ...], float],
+) -> float:
+    if not hotwords or not prefix:
+        return 0.0
+    cached = cache.get(prefix)
+    if cached is not None:
+        return cached
+
+    complete_bonus = 0.0
+    partial_bonus = 0.0
+    for hotword in hotwords:
+        matches = _count_subsequence_matches(prefix, hotword.token_ids)
+        if matches > 0:
+            complete_bonus += hotword.weight * float(matches)
+        if hotword_prefix_scale > 0.0:
+            prefix_len = _longest_suffix_prefix_match(prefix, hotword.token_ids)
+            if prefix_len > 0:
+                partial_bonus = max(
+                    partial_bonus,
+                    hotword.weight * hotword_prefix_scale * (float(prefix_len) / float(len(hotword.token_ids))),
+                )
+
+    total_bonus = complete_bonus + partial_bonus
+    cache[prefix] = total_bonus
+    return total_bonus
+
+
 def ctc_prefix_beam_search(
     frame_log_probs: Tensor,
     *,
@@ -582,6 +703,8 @@ def ctc_prefix_beam_search(
     token_prune_topk: int | None = None,
     length_bonus: float = 0.0,
     insertion_bonus: float = 0.0,
+    hotwords: tuple[CTCHotword, ...] = (),
+    hotword_prefix_scale: float = 0.3,
 ) -> list[CTCPrefixBeamHypothesis]:
     if frame_log_probs.dim() != 2:
         raise ValueError(f"Expected [T, V] log-probs, got shape {tuple(frame_log_probs.shape)}")
@@ -591,6 +714,24 @@ def ctc_prefix_beam_search(
     log_probs = frame_log_probs.detach().to(dtype=torch.float32, device="cpu")
     num_tokens = int(log_probs.size(-1))
     beams: dict[tuple[int, ...], tuple[float, float]] = {(): (0.0, _LOG_ZERO)}
+    hotword_score_cache: dict[tuple[int, ...], float] = {}
+
+    def rank_score(prefix: tuple[int, ...], blank_score: float, non_blank_score: float) -> float:
+        score = _hypothesis_sort_score(
+            blank_score,
+            non_blank_score,
+            token_count=len(prefix),
+            length_bonus=length_bonus,
+            insertion_bonus=insertion_bonus,
+        )
+        if hotwords:
+            score += _hotword_bonus(
+                prefix,
+                hotwords=hotwords,
+                hotword_prefix_scale=hotword_prefix_scale,
+                cache=hotword_score_cache,
+            )
+        return score
 
     for time_idx in range(log_probs.size(0)):
         frame = log_probs[time_idx]
@@ -632,13 +773,7 @@ def ctc_prefix_beam_search(
         beams = dict(
             sorted(
                 next_beams.items(),
-                key=lambda item: _hypothesis_sort_score(
-                    item[1][0],
-                    item[1][1],
-                    token_count=len(item[0]),
-                    length_bonus=length_bonus,
-                    insertion_bonus=insertion_bonus,
-                ),
+                key=lambda item: rank_score(item[0], item[1][0], item[1][1]),
                 reverse=True,
             )[:beam_size]
         )
@@ -646,25 +781,13 @@ def ctc_prefix_beam_search(
     return [
         CTCPrefixBeamHypothesis(
             token_ids=prefix,
-            score=_hypothesis_sort_score(
-                prefix_blank,
-                prefix_non_blank,
-                token_count=len(prefix),
-                length_bonus=length_bonus,
-                insertion_bonus=insertion_bonus,
-            ),
+            score=rank_score(prefix, prefix_blank, prefix_non_blank),
             blank_score=prefix_blank,
             non_blank_score=prefix_non_blank,
         )
         for prefix, (prefix_blank, prefix_non_blank) in sorted(
             beams.items(),
-            key=lambda item: _hypothesis_sort_score(
-                item[1][0],
-                item[1][1],
-                token_count=len(item[0]),
-                length_bonus=length_bonus,
-                insertion_bonus=insertion_bonus,
-            ),
+            key=lambda item: rank_score(item[0], item[1][0], item[1][1]),
             reverse=True,
         )
     ]
@@ -679,6 +802,8 @@ def batched_ctc_prefix_beam_search(
     token_prune_topk: int | None = None,
     length_bonus: float = 0.0,
     insertion_bonus: float = 0.0,
+    hotwords: tuple[CTCHotword, ...] = (),
+    hotword_prefix_scale: float = 0.3,
 ) -> list[list[CTCPrefixBeamHypothesis]]:
     if logits.dim() != 3:
         raise ValueError(f"Expected [B, T, V] logits, got shape {tuple(logits.shape)}")
@@ -700,9 +825,46 @@ def batched_ctc_prefix_beam_search(
                 token_prune_topk=token_prune_topk,
                 length_bonus=length_bonus,
                 insertion_bonus=insertion_bonus,
+                hotwords=hotwords,
+                hotword_prefix_scale=hotword_prefix_scale,
             )
         )
     return results
+
+
+def _rescore_ctc_hypotheses_with_decoder(
+    *,
+    model: RWKVCTCModel,
+    encoded_sample: Tensor,
+    encoded_length: int,
+    hypotheses: list[CTCPrefixBeamHypothesis],
+    topk: int,
+    weight: float,
+    length_normalize: bool,
+) -> tuple[CTCPrefixBeamHypothesis, float | None, float | None]:
+    if topk <= 1 or model.decoder is None:
+        best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
+        return best, None, None
+    candidates = hypotheses[: max(1, min(int(topk), len(hypotheses)))]
+    token_sequences = [list(candidate.token_ids) for candidate in candidates]
+    encoded_lengths = torch.tensor([int(encoded_length)], dtype=torch.long, device=encoded_sample.device)
+    decoder_scores = model.decoder_sequence_scores(
+        encoded_sample.unsqueeze(0),
+        encoded_lengths,
+        token_sequences,
+        normalize_by_length=bool(length_normalize),
+    ).detach().to(dtype=torch.float32, device="cpu")
+
+    ranked: list[tuple[float, CTCPrefixBeamHypothesis, float, float]] = []
+    for candidate, decoder_score_tensor in zip(candidates, decoder_scores.tolist(), strict=True):
+        token_count = max(1, len(candidate.token_ids))
+        ctc_score = float(candidate.score) / float(token_count)
+        decoder_score = float(decoder_score_tensor)
+        combined = ctc_score + float(weight) * decoder_score
+        ranked.append((combined, candidate, ctc_score, decoder_score))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    best_combined, best_hypothesis, best_ctc_score, best_decoder_score = ranked[0]
+    return best_hypothesis, best_ctc_score, best_decoder_score
 
 
 def ctc_forced_align(
@@ -841,6 +1003,15 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
         task=config.tokenizer_task,
     )
     decode_fn = getattr(tokenizer, "decode", None)
+    hotwords: tuple[CTCHotword, ...] = ()
+    if config.hotwords_path is not None:
+        hotwords = tuple(
+            load_hotwords(
+                config.hotwords_path,
+                tokenizer=tokenizer,
+                default_weight=config.hotword_weight,
+            )
+        )
 
     loader = _build_prediction_loader(config)
     predictions: list[CTCPrediction] = []
@@ -849,16 +1020,17 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
         for batch in loader:
             batch = batch.to(device, feature_dtype=feature_dtype)
             mask = build_inference_direction_mask(model.config.num_layers, mode=config.mode, device=batch.features.device)
-            logits, logit_lengths, _ = model(
+            encoded, encoded_lengths, _ = model.encoder(
                 batch.features,
                 batch.feature_lengths,
                 direction_mask=mask,
             )
+            logits = model.ctc_head(encoded)
             log_probs = logits.detach().float().log_softmax(dim=-1).cpu()
-            if logit_lengths is None:
+            if encoded_lengths is None:
                 lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long)
             else:
-                lengths = logit_lengths.detach().to(dtype=torch.long, device="cpu")
+                lengths = encoded_lengths.detach().to(dtype=torch.long, device="cpu")
 
             for batch_idx, utt_id in enumerate(batch.utt_ids):
                 length = int(lengths[batch_idx].item())
@@ -869,8 +1041,26 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
                     token_prune_topk=config.token_prune_topk,
                     length_bonus=config.length_bonus,
                     insertion_bonus=config.insertion_bonus,
+                    hotwords=hotwords,
+                    hotword_prefix_scale=config.hotword_prefix_scale,
                 )
                 best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
+                decode_strategy = "ctc"
+                ctc_score = None
+                decoder_score = None
+                combined_score = None
+                if config.decoder_rescore_topk > 1 and model.decoder is not None and hypotheses:
+                    best, ctc_score, decoder_score = _rescore_ctc_hypotheses_with_decoder(
+                        model=model,
+                        encoded_sample=encoded[batch_idx, :length],
+                        encoded_length=length,
+                        hypotheses=hypotheses,
+                        topk=config.decoder_rescore_topk,
+                        weight=config.decoder_rescore_weight,
+                        length_normalize=config.decoder_rescore_length_normalize,
+                    )
+                    combined_score = float(ctc_score + config.decoder_rescore_weight * decoder_score)
+                    decode_strategy = "ctc_rwkv_rescore"
                 token_ids = [int(token_id) for token_id in best.token_ids]
                 text = str(decode_fn(token_ids)) if callable(decode_fn) else None
                 debug = None
@@ -896,10 +1086,14 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
                         utt_id=str(utt_id),
                         token_ids=token_ids,
                         text=text,
-                        score=float(best.score),
+                        score=float(combined_score if combined_score is not None else best.score),
                         mode=config.mode,
                         alignments=alignments,
                         debug=debug,
+                        decode_strategy=decode_strategy,
+                        ctc_score=ctc_score,
+                        decoder_score=decoder_score,
+                        combined_score=combined_score,
                     )
                 )
     return predictions
@@ -1022,6 +1216,15 @@ def predict_ctc_labeled(
         task=config.tokenizer_task,
     )
     decode_fn = getattr(tokenizer, "decode", None)
+    hotwords: tuple[CTCHotword, ...] = ()
+    if config.hotwords_path is not None:
+        hotwords = tuple(
+            load_hotwords(
+                config.hotwords_path,
+                tokenizer=tokenizer,
+                default_weight=config.hotword_weight,
+            )
+        )
     loader = _build_labeled_prediction_loader(config)
 
     predictions: list[CTCLabeledPrediction] = []
@@ -1033,16 +1236,17 @@ def predict_ctc_labeled(
                 mode=config.mode,
                 device=batch.features.device,
             )
-            logits, logit_lengths, _ = model(
+            encoded, encoded_lengths, _ = model.encoder(
                 batch.features,
                 batch.feature_lengths,
                 direction_mask=mask,
             )
+            logits = model.ctc_head(encoded)
             log_probs = logits.detach().float().log_softmax(dim=-1).cpu()
-            if logit_lengths is None:
+            if encoded_lengths is None:
                 lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long)
             else:
-                lengths = logit_lengths.detach().to(dtype=torch.long, device="cpu")
+                lengths = encoded_lengths.detach().to(dtype=torch.long, device="cpu")
 
             target_offset = 0
             for batch_idx, utt_id in enumerate(batch.utt_ids):
@@ -1054,8 +1258,26 @@ def predict_ctc_labeled(
                     token_prune_topk=config.token_prune_topk,
                     length_bonus=config.length_bonus,
                     insertion_bonus=config.insertion_bonus,
+                    hotwords=hotwords,
+                    hotword_prefix_scale=config.hotword_prefix_scale,
                 )
                 best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
+                decode_strategy = "ctc"
+                ctc_score = None
+                decoder_score = None
+                combined_score = None
+                if config.decoder_rescore_topk > 1 and model.decoder is not None and hypotheses:
+                    best, ctc_score, decoder_score = _rescore_ctc_hypotheses_with_decoder(
+                        model=model,
+                        encoded_sample=encoded[batch_idx, :length],
+                        encoded_length=length,
+                        hypotheses=hypotheses,
+                        topk=config.decoder_rescore_topk,
+                        weight=config.decoder_rescore_weight,
+                        length_normalize=config.decoder_rescore_length_normalize,
+                    )
+                    combined_score = float(ctc_score + config.decoder_rescore_weight * decoder_score)
+                    decode_strategy = "ctc_rwkv_rescore"
                 pred_token_ids = [int(token_id) for token_id in best.token_ids]
 
                 target_length = int(batch.target_lengths[batch_idx].item())
@@ -1092,10 +1314,14 @@ def predict_ctc_labeled(
                         ref_token_ids=[int(token_id) for token_id in ref_token_ids],
                         pred_text=pred_text,
                         ref_text=ref_text,
-                        score=float(best.score),
+                        score=float(combined_score if combined_score is not None else best.score),
                         mode=config.mode,
                         alignments=alignments,
                         debug=debug,
+                        decode_strategy=decode_strategy,
+                        ctc_score=ctc_score,
+                        decoder_score=decoder_score,
+                        combined_score=combined_score,
                     )
                 )
                 if limit is not None and len(predictions) >= limit:
@@ -1117,6 +1343,10 @@ def write_labeled_predictions_jsonl(path: str | Path, predictions: list[CTCLabel
                         "pred_text": prediction.pred_text,
                         "ref_text": prediction.ref_text,
                         "score": prediction.score,
+                        "decode_strategy": prediction.decode_strategy,
+                        "ctc_score": prediction.ctc_score,
+                        "decoder_score": prediction.decoder_score,
+                        "combined_score": prediction.combined_score,
                         "mode": prediction.mode,
                         "alignments": [asdict(alignment) for alignment in prediction.alignments],
                         "debug": None if prediction.debug is None else asdict(prediction.debug),
@@ -1140,6 +1370,10 @@ def write_predictions_jsonl(path: str | Path, predictions: list[CTCPrediction]) 
                         "token_ids": prediction.token_ids,
                         "text": prediction.text,
                         "score": prediction.score,
+                        "decode_strategy": prediction.decode_strategy,
+                        "ctc_score": prediction.ctc_score,
+                        "decoder_score": prediction.decoder_score,
+                        "combined_score": prediction.combined_score,
                         "mode": prediction.mode,
                         "alignments": [asdict(alignment) for alignment in prediction.alignments],
                         "debug": None if prediction.debug is None else asdict(prediction.debug),
