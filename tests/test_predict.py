@@ -13,6 +13,7 @@ from rwkvasr.eval import ctc_greedy_decode
 from rwkvasr.modules import RWKVCTCModel, RWKVCTCModelConfig
 from rwkvasr.predict import (
     CTCDecodeDebug,
+    CTCHotword,
     CTCLabeledPrediction,
     PredictionConfig,
     batched_ctc_prefix_beam_search,
@@ -24,6 +25,7 @@ from rwkvasr.predict import (
     write_labeled_predictions_jsonl,
     write_predictions_jsonl,
 )
+from rwkvasr.predict.ctc import load_hotwords
 from rwkvasr.training.checkpoint import export_checkpoint_to_safetensors, save_checkpoint
 
 
@@ -178,6 +180,58 @@ def test_ctc_prefix_beam_search_length_bonus_can_reduce_deletion_bias() -> None:
 
     assert no_bonus[0][0].token_ids == ()
     assert with_bonus[0][0].token_ids == (1,)
+
+
+def test_ctc_prefix_beam_search_hotword_bonus_can_flip_ambiguous_choice() -> None:
+    logits = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.01, 0.51, 0.48],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+    )
+
+    no_hotword = batched_ctc_prefix_beam_search(
+        logits,
+        torch.tensor([1]),
+        blank_id=0,
+        beam_size=2,
+    )
+    with_hotword = batched_ctc_prefix_beam_search(
+        logits,
+        torch.tensor([1]),
+        blank_id=0,
+        beam_size=2,
+        hotwords=(CTCHotword(text="preferred", token_ids=(2,), weight=1.0),),
+    )
+
+    assert no_hotword[0][0].token_ids == (1,)
+    assert with_hotword[0][0].token_ids == (2,)
+
+
+def test_load_hotwords_supports_default_and_per_line_weights(tmp_path: Path) -> None:
+    class _Tokenizer:
+        def encode(self, text: str) -> list[int]:
+            return [ord(ch) for ch in text]
+
+    hotwords_path = tmp_path / "hotwords.txt"
+    hotwords_path.write_text(
+        "# comment\nwizard\n搜狐体育\t6.5\n\n",
+        encoding="utf-8",
+    )
+
+    hotwords = load_hotwords(
+        hotwords_path,
+        tokenizer=_Tokenizer(),
+        default_weight=3.0,
+    )
+
+    assert [(item.text, item.weight) for item in hotwords] == [("wizard", 3.0), ("搜狐体育", 6.5)]
+    assert hotwords[0].token_ids
+    assert hotwords[1].token_ids
 
 
 def test_ctc_forced_align_returns_monotonic_token_spans() -> None:

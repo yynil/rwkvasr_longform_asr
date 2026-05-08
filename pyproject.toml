@@ -36,10 +36,13 @@ rwkvasr-train-ctc-deepspeed = "rwkvasr.cli.train_ctc_deepspeed:main"
 rwkvasr-eval-ctc = "rwkvasr.cli.eval_ctc:main"
 rwkvasr-predict-ctc = "rwkvasr.cli.predict_ctc:main"
 rwkvasr-predict-ctc-labeled = "rwkvasr.cli.predict_ctc_labeled:main"
+rwkvasr-predict-rwkv-decoder-labeled = "rwkvasr.cli.predict_rwkv_decoder_labeled:main"
 rwkvasr-export-safetensors = "rwkvasr.cli.export_checkpoint_safetensors:main"
 rwkvasr-export-ctc-logits = "rwkvasr.cli.export_ctc_logits:main"
 rwkvasr-prepare-flores-sentencepiece = "rwkvasr.cli.prepare_flores_sentencepiece:main"
 rwkvasr-check-rwkv7-cuda = "rwkvasr.cli.check_rwkv7_cuda:main"
+rwkvasr-check-rwkv7-decoder = "rwkvasr.cli.check_rwkv7_decoder:main"
+rwkvasr-watch-checkpoint-sidecar = "rwkvasr.cli.watch_checkpoint_sidecar:main"
 
 [project.optional-dependencies]
 dev = [

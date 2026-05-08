@@ -1,5 +1,6 @@
 from .ctc import (
     CTCDecodeDebug,
+    CTCHotword,
     CTCPrefixBeamHypothesis,
     CTCLabeledPrediction,
     CTCPrediction,
@@ -17,10 +18,16 @@ from .ctc import (
     write_labeled_predictions_jsonl,
     write_predictions_jsonl,
 )
+from .rwkv_decoder import (
+    RWKVDecoderDecodeDebug,
+    predict_rwkv_decoder_labeled,
+    write_rwkv_decoder_labeled_predictions_jsonl,
+)
 
 __all__ = [
     "CTCPrefixBeamHypothesis",
     "CTCDecodeDebug",
+    "CTCHotword",
     "CTCLabeledPrediction",
     "CTCPrediction",
     "CTCTokenAlignment",
@@ -36,4 +43,7 @@ __all__ = [
     "predict_ctc",
     "write_labeled_predictions_jsonl",
     "write_predictions_jsonl",
+    "RWKVDecoderDecodeDebug",
+    "predict_rwkv_decoder_labeled",
+    "write_rwkv_decoder_labeled_predictions_jsonl",
 ]

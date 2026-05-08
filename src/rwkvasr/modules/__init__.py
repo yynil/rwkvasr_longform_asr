@@ -29,6 +29,16 @@ from .rwkv7_bidirectional import (
 )
 from .rwkv_conformer import RWKVConformerBlock, RWKVConformerBlockConfig, RWKVConformerBlockState
 from .rwkv7_time_mixer import RWKV7TimeMixer, RWKV7TimeMixerConfig, RWKV7TimeMixerState
+from .rwkv7_decoder import (
+    RWKV7ChannelMix,
+    RWKV7ChannelMixState,
+    RWKV7DecoderBlock,
+    RWKV7DecoderBlockState,
+    RWKV7DecoderConfig,
+    RWKV7DecoderLM,
+    RWKV7DecoderState,
+    infer_rwkv7_decoder_config_from_checkpoint,
+)
 
 __all__ = [
     "BidirectionalRWKVTimeMixer",
@@ -49,6 +59,14 @@ __all__ = [
     "RWKV7TimeMixer",
     "RWKV7TimeMixerConfig",
     "RWKV7TimeMixerState",
+    "RWKV7ChannelMix",
+    "RWKV7ChannelMixState",
+    "RWKV7DecoderBlock",
+    "RWKV7DecoderBlockState",
+    "RWKV7DecoderConfig",
+    "RWKV7DecoderLM",
+    "RWKV7DecoderState",
+    "infer_rwkv7_decoder_config_from_checkpoint",
     "GlobalCMVN",
     "WenetConv2dSubsampling6",
     "WenetFbankConfig",

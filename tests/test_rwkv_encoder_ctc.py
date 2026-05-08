@@ -137,3 +137,97 @@ def test_conv2d6_frontend_aligns_feature_dtype_with_model_dtype() -> None:
     assert logits.dtype == torch.float64
     assert torch.equal(logit_lengths, torch.tensor([3, 2], dtype=torch.long))
     assert torch.isfinite(loss)
+
+
+def test_joint_ctc_rwkv_decoder_loss_path_uses_extra_blank_class() -> None:
+    torch.manual_seed(25)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=2,
+            vocab_size=32,
+            blank_id=32,
+            head_size=32,
+            conv_kernel_size=5,
+            dropout=0.0,
+            frontend_type="linear",
+            decoder_enabled=True,
+            decoder_n_embd=64,
+            decoder_num_layers=2,
+            decoder_ffn_hidden_size=256,
+            decoder_audio_conditioning="full",
+            decoder_prefix_tokens=8,
+            ctc_loss_weight=0.5,
+            decoder_loss_weight=0.5,
+        )
+    )
+
+    features = torch.randn(2, 12, 80)
+    feature_lengths = torch.tensor([12, 9], dtype=torch.long)
+    targets = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.long)
+    target_lengths = torch.tensor([4, 2], dtype=torch.long)
+    losses = model.joint_losses(features, feature_lengths, targets, target_lengths)
+
+    assert losses["logits"].shape == (2, 12, 33)
+    assert torch.equal(losses["logit_lengths"], feature_lengths)
+    assert torch.isfinite(losses["loss"])
+    assert torch.isfinite(losses["ctc_loss"])
+    assert torch.isfinite(losses["decoder_loss"])
+
+
+def test_rwkv_decoder_template_labels_mask_prompt_and_audio_positions() -> None:
+    torch.manual_seed(26)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=2,
+            vocab_size=32,
+            blank_id=32,
+            head_size=32,
+            conv_kernel_size=5,
+            dropout=0.0,
+            frontend_type="linear",
+            decoder_enabled=True,
+            decoder_n_embd=64,
+            decoder_num_layers=2,
+            decoder_ffn_hidden_size=256,
+            decoder_audio_conditioning="full",
+            decoder_prefix_tokens=3,
+            decoder_prompt_before_audio_token_ids=(10, 11),
+            decoder_prompt_after_audio_token_ids=(12,),
+            decoder_target_suffix_token_ids=(13,),
+            decoder_eos_token_id=0,
+            ctc_loss_weight=0.5,
+            decoder_loss_weight=0.5,
+        )
+    )
+
+    encoded = torch.randn(1, 7, 64)
+    encoded_lengths = torch.tensor([7], dtype=torch.long)
+    context, context_lengths = model._decoder_template_context_embeds(encoded, encoded_lengths)  # noqa: SLF001
+    logits, labels = model._decoder_template_logits_and_labels(  # noqa: SLF001
+        encoded,
+        encoded_lengths,
+        [[7, 8, 13, 0]],
+    )
+
+    context_len = 2 + 7 + 1
+    assert context.shape == (1, context_len, 64)
+    assert torch.equal(context_lengths, torch.tensor([context_len], dtype=torch.long))
+    assert logits.shape[:2] == labels.shape
+    assert torch.equal(labels[0, :context_len], torch.full((context_len,), -100, dtype=torch.long))
+    assert torch.equal(labels[0, context_len : context_len + 4], torch.tensor([7, 8, 13, 0]))
+
+    loss = model.decoder_ar_loss(
+        encoded,
+        encoded_lengths,
+        torch.tensor([7, 8, 0], dtype=torch.long),
+        torch.tensor([3], dtype=torch.long),
+    )
+    assert torch.isfinite(loss)

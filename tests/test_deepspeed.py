@@ -124,6 +124,37 @@ def test_deepspeed_cli_accepts_init_checkpoint_override(tmp_path: Path) -> None:
     assert resolved.init_checkpoint_path == str(init_path)
 
 
+def test_deepspeed_cli_accepts_decoder_text_token_budget(tmp_path: Path) -> None:
+    config_path = tmp_path / "train_ds.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                f"output_dir: {tmp_path / 'out'}",
+                f"manifest_path: {tmp_path / 'manifest.jsonl'}",
+                "device: cpu",
+                "deepspeed:",
+                "  train_micro_batch_size_per_gpu: 8",
+                "  gradient_accumulation_steps: 1",
+                "  zero_optimization:",
+                "    stage: 0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--config-yaml",
+            str(config_path),
+            "--decoder-text-token-budget",
+            "4096",
+        ]
+    )
+    resolved = _resolve_deepspeed_train_config(args)
+
+    assert resolved.decoder_text_token_budget == 4096
+
+
 def test_deepspeed_resolve_max_steps_supports_custom_utt_id_key(tmp_path: Path) -> None:
     index_path = tmp_path / "webdataset_index.json"
     index_path.write_text(

@@ -36,7 +36,13 @@ from rwkvasr.data import (
 from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, DirectionMask, RWKVCTCModel, RWKVCTCModelConfig
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .batch_budget import ctc_batch_token_stats, estimate_token_budget_from_memory, select_ctc_batch_prefix_by_token_budget
+from .batch_budget import (
+    ctc_batch_token_stats,
+    effective_batch_token_budget,
+    effective_padded_text_token_budget,
+    estimate_token_budget_from_memory,
+    select_ctc_batch_prefix_by_token_budget,
+)
 from .ctc_task import RWKVDualModeCTCTrainer
 from .epoch_metrics import save_epoch_metrics, save_step_checkpoint_metrics
 from .optimizer import build_rwkv_param_groups
@@ -46,6 +52,7 @@ from .train_loop import (
     _resolve_bucket_manifest_path,
     _resolve_cmvn_file,
     _resolve_data_source,
+    _resolve_decoder_template_token_ids,
     _resolve_in_memory_length_index_path,
     _resolve_text_tokenizer,
     _resolve_vocab_size,
@@ -62,6 +69,7 @@ class DeepSpeedTrainConfig:
     tokenizer_model_path: str | None = None
     tokenizer_language: str | None = None
     tokenizer_task: str | None = None
+    tokenizer_append_eos: bool = False
     manifest_path: str | None = None
     webdataset_root: str | None = None
     webdataset_index_path: str | None = None
@@ -84,6 +92,7 @@ class DeepSpeedTrainConfig:
     frontend_type: str = "conv2d6"
     cmvn_file: str | None = None
     cmvn_is_json: bool = True
+    blank_id: int = 0
     batch_size: int = 4
     max_steps: int | None = None
     epochs: int | None = None
@@ -96,6 +105,22 @@ class DeepSpeedTrainConfig:
     beta1: float = 0.9
     beta2: float = 0.99
     eps: float = 1e-8
+    decoder_enabled: bool = False
+    decoder_checkpoint_path: str | None = None
+    decoder_num_layers: int | None = None
+    decoder_n_embd: int | None = None
+    decoder_ffn_hidden_size: int | None = None
+    decoder_head_size: int = 64
+    decoder_audio_conditioning: str = "full"
+    decoder_prefix_tokens: int = 32
+    decoder_loss_chunk_size: int = 1024
+    decoder_text_token_budget: int | None = None
+    decoder_prompt_before_audio: str = ""
+    decoder_prompt_after_audio: str = ""
+    decoder_target_suffix: str = ""
+    decoder_eos_token_id: int = 0
+    ctc_loss_weight: float = 1.0
+    decoder_loss_weight: float = 0.0
     direction_variant: str = "drop_both"
     p_start: float = 0.2
     p_max: float = 0.2
@@ -165,12 +190,21 @@ def _is_rank_zero() -> bool:
 
 def _maybe_barrier() -> None:
     if dist.is_available() and dist.is_initialized():
+        if dist.get_world_size() <= 1:
+            return
+        if dist.get_backend() == "gloo" and hasattr(dist, "monitored_barrier"):
+            dist.monitored_barrier()
+            return
         dist.barrier()
 
 
 def _rank_zero_log(message: str) -> None:
     if _is_rank_zero():
         print(f"[rwkvasr] {message}", flush=True)
+
+
+def _all_rank_log(message: str) -> None:
+    print(f"[rwkvasr][rank{_rank()}] {message}", flush=True)
 
 
 def _sample_direction_mask_distributed(
@@ -285,6 +319,7 @@ def _build_webdataset_config(
         length_bucket_frame_budget=length_bucket_frame_budget,
         decoded_batch_prefetch=config.decoded_batch_prefetch,
         max_open_shards_per_worker=config.max_open_shards_per_worker,
+        append_eos=config.tokenizer_append_eos,
     )
 
 
@@ -374,7 +409,11 @@ def _build_train_loader(config: DeepSpeedTrainConfig) -> tuple[DataLoader, Any |
     data_source, data_path = _resolve_data_source(config)
     tokenizer = _resolve_text_tokenizer(config)
     if data_source == "manifest":
-        dataset = ASRManifestDataset(data_path, tokenizer=tokenizer)
+        dataset = ASRManifestDataset(
+            data_path,
+            tokenizer=tokenizer,
+            append_eos=config.tokenizer_append_eos,
+        )
         sampler = None
         if _is_distributed():
             sampler = DistributedSampler(
@@ -444,7 +483,11 @@ def _build_eval_loader(
     data_source, data_path = _resolve_data_source(config)
     eval_batch_size = _resolve_eval_batch_size(config, step_subset=step_subset)
     if data_source == "manifest":
-        dataset = ASRManifestDataset(data_path, tokenizer=_resolve_text_tokenizer(config))
+        dataset = ASRManifestDataset(
+            data_path,
+            tokenizer=_resolve_text_tokenizer(config),
+            append_eos=config.tokenizer_append_eos,
+        )
         sampler = None
         if _is_distributed():
             sampler = DistributedSampler(
@@ -777,10 +820,24 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         backend=config.backend,
         conv_kernel_size=config.conv_kernel_size,
         dropout=config.dropout,
+        blank_id=config.blank_id,
         frontend_type=config.frontend_type,
         cmvn_file=resolved_cmvn_file,
         cmvn_is_json=config.cmvn_is_json,
+        decoder_enabled=config.decoder_enabled,
+        decoder_checkpoint_path=config.decoder_checkpoint_path,
+        decoder_num_layers=config.decoder_num_layers,
+        decoder_n_embd=config.decoder_n_embd,
+        decoder_ffn_hidden_size=config.decoder_ffn_hidden_size,
+        decoder_head_size=config.decoder_head_size,
+        decoder_audio_conditioning=config.decoder_audio_conditioning,
+        decoder_prefix_tokens=config.decoder_prefix_tokens,
+        decoder_loss_chunk_size=config.decoder_loss_chunk_size,
+        **_resolve_decoder_template_token_ids(config),
+        ctc_loss_weight=config.ctc_loss_weight,
+        decoder_loss_weight=config.decoder_loss_weight,
     )
+    decoder_text_tokens_per_sample_extra = int(model_config.decoder_text_tokens_per_sample_extra)
 
     if _is_rank_zero():
         save_yaml(output_dir / "model_config.yaml", model_config)
@@ -937,11 +994,18 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 except StopIteration:
                     break
                 data_time = time.perf_counter() - fetch_start_time
+                use_padded_text_budget = bool(config.decoder_enabled and config.decoder_loss_weight > 0)
+                text_tokens_per_sample_extra = (
+                    decoder_text_tokens_per_sample_extra if use_padded_text_budget else 0
+                )
                 candidate_stats = ctc_batch_token_stats(candidate_batch)
                 budgeted = select_ctc_batch_prefix_by_token_budget(
                     candidate_batch,
                     token_budget=config.batch_token_budget,
                     skip_oversized_samples=config.skip_oversized_samples,
+                    use_padded_text_tokens=use_padded_text_budget,
+                    text_tokens_per_sample_extra=text_tokens_per_sample_extra,
+                    padded_text_token_budget=config.decoder_text_token_budget if use_padded_text_budget else None,
                 )
                 if budgeted is None:
                     if _is_rank_zero():
@@ -949,6 +1013,24 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     continue
                 batch = budgeted.batch
                 batch_stats = ctc_batch_token_stats(batch)
+                candidate_budget_tokens = effective_batch_token_budget(
+                    candidate_stats,
+                    use_padded_text_tokens=use_padded_text_budget,
+                    text_tokens_per_sample_extra=text_tokens_per_sample_extra,
+                )
+                candidate_text_budget_tokens = effective_padded_text_token_budget(
+                    candidate_stats,
+                    text_tokens_per_sample_extra=text_tokens_per_sample_extra,
+                )
+                executed_budget_tokens = effective_batch_token_budget(
+                    batch_stats,
+                    use_padded_text_tokens=use_padded_text_budget,
+                    text_tokens_per_sample_extra=text_tokens_per_sample_extra,
+                )
+                executed_text_budget_tokens = effective_padded_text_token_budget(
+                    batch_stats,
+                    text_tokens_per_sample_extra=text_tokens_per_sample_extra,
+                )
                 skipped_samples = budgeted.skipped_samples
                 dropped_tail_samples = budgeted.dropped_tail_samples
 
@@ -963,14 +1045,28 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 if engine.device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(engine.device)
                 batch = batch.to(engine.device, feature_dtype=feature_dtype)
-                logits, logit_lengths, _ = engine(
-                    batch.features,
-                    batch.feature_lengths,
-                    direction_mask=mask,
-                )
-                if logit_lengths is None:
-                    raise ValueError("CTC training requires feature lengths.")
-                loss = engine.module.ctc_loss(logits, logit_lengths, batch.targets, batch.target_lengths)
+                try:
+                    losses = engine.module.joint_losses(
+                        batch.features,
+                        batch.feature_lengths,
+                        batch.targets,
+                        batch.target_lengths,
+                        direction_mask=mask,
+                    )
+                except torch.OutOfMemoryError:
+                    _all_rank_log(
+                        "OOM during joint_losses "
+                        f"step={step + 1} batch={executed_token_stats.batch_size} "
+                        f"budget={executed_budget_tokens} total={executed_token_stats.total_tokens} "
+                        f"text_budget={executed_text_budget_tokens} "
+                        f"max_audio={executed_token_stats.max_audio_frames} "
+                        f"max_text={executed_token_stats.max_text_tokens} "
+                        f"padded_text={executed_token_stats.padded_text_tokens}"
+                    )
+                    raise
+                loss = losses["loss"]
+                ctc_loss_value = float(losses["ctc_loss"].detach().item())
+                decoder_loss_value = float(losses["decoder_loss"].detach().item())
                 engine.backward(loss)
                 engine.step()
                 step_time = time.perf_counter() - step_start_time
@@ -986,13 +1082,13 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     torch.cuda.synchronize(engine.device)
                     peak_reserved_bytes = int(torch.cuda.max_memory_reserved(engine.device))
                     peak_allocated_bytes = int(torch.cuda.max_memory_allocated(engine.device))
-                    memory_per_token = peak_reserved_bytes / max(executed_token_stats.total_tokens, 1)
+                    memory_per_token = peak_reserved_bytes / max(executed_budget_tokens, 1)
                     ratio_tensor = torch.tensor(memory_per_token, device=engine.device, dtype=torch.float64)
                     if dist.is_available() and dist.is_initialized():
                         dist.all_reduce(ratio_tensor, op=dist.ReduceOp.MAX)
-                    global_peak_reserved_bytes = int(ratio_tensor.item() * max(executed_token_stats.total_tokens, 1))
+                    global_peak_reserved_bytes = int(ratio_tensor.item() * max(executed_budget_tokens, 1))
                     estimated_budget = estimate_token_budget_from_memory(
-                        observed_tokens=executed_token_stats.total_tokens,
+                        observed_tokens=executed_budget_tokens,
                         observed_peak_reserved_bytes=global_peak_reserved_bytes,
                         target_memory_gib=config.target_gpu_memory_gib,
                     )
@@ -1017,9 +1113,13 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     _rank_zero_log(
                         "Batch stats "
                         f"step={step} candidate_batch={candidate_stats.batch_size} "
-                        f"candidate_total={candidate_stats.total_tokens} executed_total={executed_token_stats.total_tokens} "
+                        f"candidate_total={candidate_stats.total_tokens} candidate_budget={candidate_budget_tokens} "
+                        f"candidate_text_budget={candidate_text_budget_tokens} "
+                        f"executed_total={executed_token_stats.total_tokens} executed_budget={executed_budget_tokens} "
+                        f"executed_text_budget={executed_text_budget_tokens} "
                         f"max_audio={executed_token_stats.max_audio_frames} padded_audio={executed_token_stats.padded_audio_tokens} "
-                        f"text={executed_token_stats.text_tokens} "
+                        f"max_text={executed_token_stats.max_text_tokens} text={executed_token_stats.text_tokens} "
+                        f"padded_text={executed_token_stats.padded_text_tokens} "
                         f"peak_reserved={peak_reserved_bytes / (1024**3):.2f}GiB "
                         f"peak_allocated={peak_allocated_bytes / (1024**3):.2f}GiB "
                         f"estimated_budget@{config.target_gpu_memory_gib:.1f}GiB={estimated_budget}"
@@ -1027,11 +1127,17 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     if config.batch_token_budget is not None:
                         _rank_zero_log(
                             f"Token budget active: budget={config.batch_token_budget} "
+                            f"text_budget={config.decoder_text_token_budget} "
                             f"effective_batch={batch_stats.batch_size} dropped_tail={dropped_tail_samples} "
                             f"skipped_samples={skipped_samples}"
                         )
                 if _is_rank_zero() and (step <= 10 or step % config.log_every == 0 or step == resolved_max_steps):
-                    print(f"[deepspeed-train] step={step} loss={loss_value:.4f} device={device}", flush=True)
+                    print(
+                        "[deepspeed-train] "
+                        f"step={step} loss={loss_value:.4f} ctc={ctc_loss_value:.4f} "
+                        f"decoder={decoder_loss_value:.4f} device={device}",
+                        flush=True,
+                    )
                     total_elapsed = time.perf_counter() - train_start_time
                     elapsed_steps = max(step - start_step, 1)
                     rate = elapsed_steps / max(total_elapsed, 1.0e-6)
@@ -1040,6 +1146,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         wandb_run,
                         {
                             "train/loss": loss_value,
+                            "train/ctc_loss": ctc_loss_value,
+                            "train/decoder_loss": decoder_loss_value,
                             "train/epoch": epoch,
                             "train/data_time": data_time,
                             "train/step_time": step_time,
@@ -1048,9 +1156,13 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             "train/eta_hours": eta_hours,
                             "train/effective_batch": batch_stats.batch_size,
                             "train/total_tokens": executed_token_stats.total_tokens,
+                            "train/budget_tokens": executed_budget_tokens,
+                            "train/text_budget_tokens": executed_text_budget_tokens,
                             "train/max_audio_frames": executed_token_stats.max_audio_frames,
                             "train/padded_audio_tokens": executed_token_stats.padded_audio_tokens,
+                            "train/max_text_tokens": executed_token_stats.max_text_tokens,
                             "train/text_tokens": executed_token_stats.text_tokens,
+                            "train/padded_text_tokens": executed_token_stats.padded_text_tokens,
                             "train/peak_reserved_gib": peak_reserved_bytes / (1024**3),
                             "train/peak_allocated_gib": peak_allocated_bytes / (1024**3),
                             "train/estimated_token_budget": estimated_budget,

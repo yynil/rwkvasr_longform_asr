@@ -1,0 +1,33 @@
+# English
+Bertie	5.0
+wizard	4.0
+curtain	3.5
+poverty	4.0
+comparative wealth	4.5
+viper	5.0
+scorpion	5.0
+centipede	5.0
+tarantula	5.0
+naturalist	4.0
+peppered flour	4.0
+fattened sauce	4.0
+
+# Chinese
+雇员	4.0
+薪酬	4.0
+招募	3.5
+顶尖人才	4.0
+搜狐体育	5.0
+郭健文	5.0
+撑杆跳	5.0
+丽萨	5.0
+莱兹奇	5.0
+店主	4.0
+店员	4.0
+辱骂	4.0
+围殴	4.0
+二零一四	5.0
+九二	4.0
+二到二	4.5
+二零一五	5.0
+七二六	4.0

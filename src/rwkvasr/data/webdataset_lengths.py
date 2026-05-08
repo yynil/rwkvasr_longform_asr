@@ -390,6 +390,7 @@ class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
             text_key=self.config.text_key,
             utt_id_key=self.config.utt_id_key,
             token_ids_key=self.config.token_ids_key,
+            append_eos=self.config.append_eos,
         )
 
 
