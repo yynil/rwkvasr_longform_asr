@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-task", default=None)
     parser.add_argument("--tokenizer-append-eos", dest="tokenizer_append_eos", action="store_true", default=None)
     parser.add_argument("--no-tokenizer-append-eos", dest="tokenizer_append_eos", action="store_false")
+    parser.add_argument("--text-normalization", default=None)
     parser.add_argument("--input-dim", default=None, type=int)
     parser.add_argument("--n-embd", default=None, type=int)
     parser.add_argument("--dim-att", default=None, type=int)
@@ -48,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", default=None, type=int)
     parser.add_argument("--decoded-batch-prefetch", default=None, type=int)
     parser.add_argument("--max-open-shards-per-worker", default=None, type=int)
+    parser.add_argument("--bucket-source-interleave", dest="bucket_source_interleave", action="store_true", default=None)
+    parser.add_argument("--no-bucket-source-interleave", dest="bucket_source_interleave", action="store_false")
     parser.add_argument("--lr", default=None, type=float)
     parser.add_argument("--weight-decay", default=None, type=float)
     parser.add_argument("--beta1", default=None, type=float)
@@ -125,6 +128,7 @@ def _resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "tokenizer_language",
         "tokenizer_task",
         "tokenizer_append_eos",
+        "text_normalization",
         "input_dim",
         "n_embd",
         "dim_att",
@@ -145,6 +149,7 @@ def _resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "num_workers",
         "decoded_batch_prefetch",
         "max_open_shards_per_worker",
+        "bucket_source_interleave",
         "lr",
         "weight_decay",
         "beta1",

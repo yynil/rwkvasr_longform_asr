@@ -72,6 +72,7 @@ class TrainConfig:
     tokenizer_language: str | None = None
     tokenizer_task: str | None = None
     tokenizer_append_eos: bool = False
+    text_normalization: str = "none"
     manifest_path: str | None = None
     webdataset_root: str | None = None
     webdataset_index_path: str | None = None
@@ -102,6 +103,7 @@ class TrainConfig:
     num_workers: int = 0
     decoded_batch_prefetch: int = 2
     max_open_shards_per_worker: int = 8
+    bucket_source_interleave: bool = False
     lr: float = 4e-4
     weight_decay: float = 0.1
     beta1: float = 0.9
@@ -249,7 +251,9 @@ def _build_webdataset_config(
         length_bucket_frame_budget=length_bucket_frame_budget,
         decoded_batch_prefetch=config.decoded_batch_prefetch,
         max_open_shards_per_worker=config.max_open_shards_per_worker,
+        bucket_source_interleave=config.bucket_source_interleave,
         append_eos=config.tokenizer_append_eos,
+        text_normalization=config.text_normalization,
     )
 
 

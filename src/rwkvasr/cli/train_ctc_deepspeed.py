@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-task", default=None)
     parser.add_argument("--tokenizer-append-eos", dest="tokenizer_append_eos", action="store_true", default=None)
     parser.add_argument("--no-tokenizer-append-eos", dest="tokenizer_append_eos", action="store_false")
+    parser.add_argument("--text-normalization", default=None)
     parser.add_argument("--blank-id", default=None, type=int)
     parser.add_argument("--batch-size", default=None, type=int)
     parser.add_argument("--backend", default=None)
@@ -54,6 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", default=None, type=int)
     parser.add_argument("--decoded-batch-prefetch", default=None, type=int)
     parser.add_argument("--max-open-shards-per-worker", default=None, type=int)
+    parser.add_argument("--bucket-source-interleave", dest="bucket_source_interleave", action="store_true", default=None)
+    parser.add_argument("--no-bucket-source-interleave", dest="bucket_source_interleave", action="store_false")
     parser.add_argument("--device", default=None)
     parser.add_argument("--init-checkpoint-path", default=None)
     parser.add_argument("--resume-from", default=None)
@@ -106,6 +109,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "tokenizer_language",
         "tokenizer_task",
         "tokenizer_append_eos",
+        "text_normalization",
         "blank_id",
         "batch_size",
         "backend",
@@ -131,6 +135,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "num_workers",
         "decoded_batch_prefetch",
         "max_open_shards_per_worker",
+        "bucket_source_interleave",
         "device",
         "init_checkpoint_path",
         "resume_from",

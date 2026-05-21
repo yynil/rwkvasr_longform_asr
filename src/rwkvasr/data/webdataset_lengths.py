@@ -32,6 +32,9 @@ class WebDatasetLengthEntry:
     audio_member: str
     audio_format: str
     json_member: str
+    num_text_tokens: int | None = None
+    num_text_chars: int | None = None
+    text_bytes: int | None = None
     audio_offset: int | None = None
     audio_size: int | None = None
     json_offset: int | None = None
@@ -254,6 +257,21 @@ def parse_webdataset_length_entry(raw: dict[str, Any]) -> WebDatasetLengthEntry:
         utt_id=str(raw["utt_id"]),
         split=str(raw["split"]),
         num_frames=int(raw["num_frames"]),
+        num_text_tokens=(
+            int(raw["num_text_tokens"])
+            if raw.get("num_text_tokens") is not None
+            else None
+        ),
+        num_text_chars=(
+            int(raw["num_text_chars"])
+            if raw.get("num_text_chars") is not None
+            else None
+        ),
+        text_bytes=(
+            int(raw["text_bytes"])
+            if raw.get("text_bytes") is not None
+            else None
+        ),
         audio_member=str(raw.get("audio_member") or raw["wav_member"]),
         audio_format=str(
             raw.get("audio_format")
@@ -391,6 +409,7 @@ class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
             utt_id_key=self.config.utt_id_key,
             token_ids_key=self.config.token_ids_key,
             append_eos=self.config.append_eos,
+            text_normalization=self.config.text_normalization,
         )
 
 

@@ -14,6 +14,10 @@ struct Config {
     manifest_path: PathBuf,
     bucket_width: u64,
     entries_per_part: u64,
+    text_cost_source: TextCostSource,
+    text_cost_weight: f64,
+    json_size_text_offset: u64,
+    json_size_bytes_per_token: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +25,14 @@ struct LengthEntry {
     shard_name: String,
     split: String,
     num_frames: u64,
+    #[serde(default)]
+    num_text_tokens: Option<u64>,
+    #[serde(default)]
+    num_text_chars: Option<u64>,
+    #[serde(default)]
+    text_bytes: Option<u64>,
+    #[serde(default)]
+    json_size: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -29,8 +41,50 @@ struct BucketManifest {
     root: String,
     source_length_index_path: String,
     bucket_width: u64,
+    bucket_metric: String,
+    text_cost_source: String,
+    text_cost_weight: f64,
+    json_size_text_offset: u64,
+    json_size_bytes_per_token: f64,
     entries_per_part: u64,
     splits: BTreeMap<String, SplitManifest>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextCostSource {
+    None,
+    Auto,
+    NumTextTokens,
+    NumTextChars,
+    TextBytes,
+    JsonSize,
+}
+
+impl TextCostSource {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "auto" => Ok(Self::Auto),
+            "num_text_tokens" => Ok(Self::NumTextTokens),
+            "num_text_chars" => Ok(Self::NumTextChars),
+            "text_bytes" => Ok(Self::TextBytes),
+            "json_size" => Ok(Self::JsonSize),
+            other => Err(format!(
+                "Unsupported --text-cost-source {other:?}; expected none, auto, num_text_tokens, num_text_chars, text_bytes, or json_size."
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Auto => "auto",
+            Self::NumTextTokens => "num_text_tokens",
+            Self::NumTextChars => "num_text_chars",
+            Self::TextBytes => "text_bytes",
+            Self::JsonSize => "json_size",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -92,7 +146,10 @@ impl BucketWriter {
             self.finish_current_part()?;
             self.open_new_part()?;
         }
-        let writer = self.current_writer.as_mut().ok_or_else(|| String::from("missing current writer"))?;
+        let writer = self
+            .current_writer
+            .as_mut()
+            .ok_or_else(|| String::from("missing current writer"))?;
         writer
             .write_all(line.as_bytes())
             .map_err(|err| format!("Failed writing bucket part: {err}"))?;
@@ -119,11 +176,19 @@ impl BucketWriter {
         let relative_path = relative_dir.join(format!("part_{:06}.jsonl", self.part_index));
         let full_path = self.output_dir.join(&relative_path);
         if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("Failed to create bucket part dir {}: {err}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "Failed to create bucket part dir {}: {err}",
+                    parent.display()
+                )
+            })?;
         }
-        let file = File::create(&full_path)
-            .map_err(|err| format!("Failed to create bucket part {}: {err}", full_path.display()))?;
+        let file = File::create(&full_path).map_err(|err| {
+            format!(
+                "Failed to create bucket part {}: {err}",
+                full_path.display()
+            )
+        })?;
         self.current_writer = Some(BufWriter::new(file));
         self.current_rel_path = Some(relative_path.to_string_lossy().to_string());
         self.current_count = 0;
@@ -137,7 +202,9 @@ impl BucketWriter {
         let Some(mut writer) = self.current_writer.take() else {
             return Ok(());
         };
-        writer.flush().map_err(|err| format!("Failed flushing bucket part: {err}"))?;
+        writer
+            .flush()
+            .map_err(|err| format!("Failed flushing bucket part: {err}"))?;
         if let Some(path) = self.current_rel_path.take() {
             self.parts.push(PartInfo {
                 path,
@@ -161,21 +228,31 @@ fn main() {
 fn run() -> Result<(), String> {
     let config = parse_args()?;
     if config.output_dir.exists() {
-        fs::remove_dir_all(&config.output_dir)
-            .map_err(|err| format!("Failed to remove stale bucket dir {}: {err}", config.output_dir.display()))?;
+        fs::remove_dir_all(&config.output_dir).map_err(|err| {
+            format!(
+                "Failed to remove stale bucket dir {}: {err}",
+                config.output_dir.display()
+            )
+        })?;
     }
-    fs::create_dir_all(&config.output_dir)
-        .map_err(|err| format!("Failed to create bucket dir {}: {err}", config.output_dir.display()))?;
+    fs::create_dir_all(&config.output_dir).map_err(|err| {
+        format!(
+            "Failed to create bucket dir {}: {err}",
+            config.output_dir.display()
+        )
+    })?;
     if let Some(parent) = config.manifest_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create manifest dir {}: {err}", parent.display()))?;
     }
 
     let mut writers = BTreeMap::<(String, u64), BucketWriter>::new();
-    let input = BufReader::new(
-        File::open(&config.length_index_path)
-            .map_err(|err| format!("Failed to open {}: {err}", config.length_index_path.display()))?,
-    );
+    let input = BufReader::new(File::open(&config.length_index_path).map_err(|err| {
+        format!(
+            "Failed to open {}: {err}",
+            config.length_index_path.display()
+        )
+    })?);
     let start = Instant::now();
     let mut processed = 0_u64;
 
@@ -184,9 +261,10 @@ fn run() -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
-        let entry: LengthEntry =
-            serde_json::from_str(&line).map_err(|err| format!("Invalid length index JSON: {err}"))?;
-        let bucket_id = entry.num_frames / config.bucket_width;
+        let entry: LengthEntry = serde_json::from_str(&line)
+            .map_err(|err| format!("Invalid length index JSON: {err}"))?;
+        let bucket_cost = combined_bucket_cost(&entry, &config);
+        let bucket_id = bucket_cost / config.bucket_width;
         let key = (entry.split.clone(), bucket_id);
         let writer = writers.entry(key).or_insert_with(|| {
             BucketWriter::new(
@@ -223,15 +301,32 @@ fn run() -> Result<(), String> {
         root: config.shard_root.display().to_string(),
         source_length_index_path: config.length_index_path.display().to_string(),
         bucket_width: config.bucket_width,
+        bucket_metric: if config.text_cost_weight > 0.0
+            && config.text_cost_source != TextCostSource::None
+        {
+            String::from("audio_frames_plus_text_cost")
+        } else {
+            String::from("audio_frames")
+        },
+        text_cost_source: config.text_cost_source.as_str().to_string(),
+        text_cost_weight: config.text_cost_weight,
+        json_size_text_offset: config.json_size_text_offset,
+        json_size_bytes_per_token: config.json_size_bytes_per_token,
         entries_per_part: config.entries_per_part,
         splits,
     };
-    let writer = BufWriter::new(
-        File::create(&config.manifest_path)
-            .map_err(|err| format!("Failed to create manifest {}: {err}", config.manifest_path.display()))?,
-    );
-    serde_json::to_writer_pretty(writer, &manifest)
-        .map_err(|err| format!("Failed writing manifest {}: {err}", config.manifest_path.display()))?;
+    let writer = BufWriter::new(File::create(&config.manifest_path).map_err(|err| {
+        format!(
+            "Failed to create manifest {}: {err}",
+            config.manifest_path.display()
+        )
+    })?);
+    serde_json::to_writer_pretty(writer, &manifest).map_err(|err| {
+        format!(
+            "Failed writing manifest {}: {err}",
+            config.manifest_path.display()
+        )
+    })?;
     println!(
         "build_bucket_index samples={} manifest={}",
         processed,
@@ -247,12 +342,18 @@ fn parse_args() -> Result<Config, String> {
     let mut manifest_path: Option<PathBuf> = None;
     let mut bucket_width = 80_u64;
     let mut entries_per_part = 100_000_u64;
+    let mut text_cost_source = TextCostSource::None;
+    let mut text_cost_weight = 0.0_f64;
+    let mut json_size_text_offset = 256_u64;
+    let mut json_size_bytes_per_token = 4.0_f64;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--shard-root" => shard_root = Some(PathBuf::from(next_value(&mut args, &arg)?)),
-            "--length-index-path" => length_index_path = Some(PathBuf::from(next_value(&mut args, &arg)?)),
+            "--length-index-path" => {
+                length_index_path = Some(PathBuf::from(next_value(&mut args, &arg)?))
+            }
             "--output-dir" => output_dir = Some(PathBuf::from(next_value(&mut args, &arg)?)),
             "--manifest-path" => manifest_path = Some(PathBuf::from(next_value(&mut args, &arg)?)),
             "--bucket-width" => {
@@ -264,6 +365,24 @@ fn parse_args() -> Result<Config, String> {
                 entries_per_part = next_value(&mut args, &arg)?
                     .parse::<u64>()
                     .map_err(|err| format!("Invalid --entries-per-part: {err}"))?;
+            }
+            "--text-cost-source" => {
+                text_cost_source = TextCostSource::parse(&next_value(&mut args, &arg)?)?;
+            }
+            "--text-cost-weight" => {
+                text_cost_weight = next_value(&mut args, &arg)?
+                    .parse::<f64>()
+                    .map_err(|err| format!("Invalid --text-cost-weight: {err}"))?;
+            }
+            "--json-size-text-offset" => {
+                json_size_text_offset = next_value(&mut args, &arg)?
+                    .parse::<u64>()
+                    .map_err(|err| format!("Invalid --json-size-text-offset: {err}"))?;
+            }
+            "--json-size-bytes-per-token" => {
+                json_size_bytes_per_token = next_value(&mut args, &arg)?
+                    .parse::<f64>()
+                    .map_err(|err| format!("Invalid --json-size-bytes-per-token: {err}"))?;
             }
             "--help" | "-h" => {
                 print_help();
@@ -284,6 +403,14 @@ fn parse_args() -> Result<Config, String> {
     if entries_per_part == 0 {
         return Err(String::from("--entries-per-part must be positive."));
     }
+    if text_cost_weight < 0.0 {
+        return Err(String::from("--text-cost-weight must be non-negative."));
+    }
+    if json_size_bytes_per_token <= 0.0 {
+        return Err(String::from(
+            "--json-size-bytes-per-token must be positive.",
+        ));
+    }
 
     Ok(Config {
         shard_root,
@@ -292,6 +419,10 @@ fn parse_args() -> Result<Config, String> {
         manifest_path,
         bucket_width,
         entries_per_part,
+        text_cost_source,
+        text_cost_weight,
+        json_size_text_offset,
+        json_size_bytes_per_token,
     })
 }
 
@@ -307,9 +438,48 @@ fn print_help() {
     println!("  --manifest-path PATH         default: <output-dir>/manifest.json");
     println!("  --bucket-width INT           default: 80");
     println!("  --entries-per-part INT       default: 100000");
+    println!("  --text-cost-source VALUE     none|auto|num_text_tokens|num_text_chars|text_bytes|json_size; default: none");
+    println!("  --text-cost-weight FLOAT     frames per estimated text token; default: 0");
+    println!(
+        "  --json-size-text-offset INT  bytes to subtract when using json_size proxy; default: 256"
+    );
+    println!(
+        "  --json-size-bytes-per-token FLOAT  json bytes per estimated text token; default: 4.0"
+    );
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     args.next()
         .ok_or_else(|| format!("Missing value for {flag}."))
+}
+
+fn combined_bucket_cost(entry: &LengthEntry, config: &Config) -> u64 {
+    if config.text_cost_weight <= 0.0 || config.text_cost_source == TextCostSource::None {
+        return entry.num_frames;
+    }
+    let text_units = text_cost_units(entry, config).unwrap_or(0.0);
+    let text_cost = (config.text_cost_weight * text_units).round().max(0.0) as u64;
+    entry.num_frames.saturating_add(text_cost)
+}
+
+fn text_cost_units(entry: &LengthEntry, config: &Config) -> Option<f64> {
+    match config.text_cost_source {
+        TextCostSource::None => Some(0.0),
+        TextCostSource::Auto => entry
+            .num_text_tokens
+            .map(|value| value as f64)
+            .or_else(|| entry.num_text_chars.map(|value| value as f64))
+            .or_else(|| entry.text_bytes.map(|value| value as f64 / 4.0))
+            .or_else(|| json_size_proxy_units(entry, config)),
+        TextCostSource::NumTextTokens => entry.num_text_tokens.map(|value| value as f64),
+        TextCostSource::NumTextChars => entry.num_text_chars.map(|value| value as f64),
+        TextCostSource::TextBytes => entry.text_bytes.map(|value| value as f64 / 4.0),
+        TextCostSource::JsonSize => json_size_proxy_units(entry, config),
+    }
+}
+
+fn json_size_proxy_units(entry: &LengthEntry, config: &Config) -> Option<f64> {
+    let json_size = entry.json_size?;
+    let text_bytes = json_size.saturating_sub(config.json_size_text_offset);
+    Some(text_bytes as f64 / config.json_size_bytes_per_token)
 }

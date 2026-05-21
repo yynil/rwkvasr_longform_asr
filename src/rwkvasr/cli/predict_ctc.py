@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--webdataset-eval-ratio", default=0.0, type=float)
     parser.add_argument("--webdataset-hash-seed", default=0, type=int)
     parser.add_argument("--webdataset-split-by", default="shard_name")
+    parser.add_argument("--webdataset-utt-id-key", default="sid")
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--config-yaml", default=None)
     parser.add_argument("--batch-size", default=4, type=int)
@@ -38,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-model-path", default=None)
     parser.add_argument("--tokenizer-language", default=None)
     parser.add_argument("--tokenizer-task", default=None)
+    parser.add_argument("--text-normalization", default="none")
     parser.add_argument("--frame-shift-ms", default=10.0, type=float)
     parser.add_argument("--vocab-size", default=None, type=int)
     parser.add_argument("--input-dim", default=80, type=int)
@@ -126,6 +128,7 @@ def main() -> None:
             webdataset_eval_ratio=args.webdataset_eval_ratio,
             webdataset_hash_seed=args.webdataset_hash_seed,
             webdataset_split_by=args.webdataset_split_by,
+            webdataset_utt_id_key=args.webdataset_utt_id_key,
             device=args.device,
             mode=args.mode,
             beam_size=args.beam_size,
@@ -140,6 +143,7 @@ def main() -> None:
             tokenizer_model_path=tokenizer_config["tokenizer_model_path"],
             tokenizer_language=tokenizer_config["tokenizer_language"],
             tokenizer_task=tokenizer_config["tokenizer_task"],
+            text_normalization=args.text_normalization,
             num_workers=args.num_workers,
             frame_shift_ms=args.frame_shift_ms,
         )

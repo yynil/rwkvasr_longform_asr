@@ -19,6 +19,7 @@ from .manifest import (
     build_text_tokenizer,
     maybe_append_eos_token_ids,
 )
+from .text_normalization import normalize_asr_text
 from .webdataset_common import AUDIO_SUFFIXES
 from .webdataset_index import StableHashSplitConfig, resolve_sample_id, sample_in_split, shard_in_split
 
@@ -42,7 +43,9 @@ class WebDatasetConfig:
     length_bucket_frame_budget: int | None = None
     decoded_batch_prefetch: int = 2
     max_open_shards_per_worker: int = 8
+    bucket_source_interleave: bool = False
     append_eos: bool = False
+    text_normalization: str = "none"
 
 
 def decode_webdataset_sample(
@@ -56,6 +59,7 @@ def decode_webdataset_sample(
     utt_id_key: str,
     token_ids_key: str,
     append_eos: bool,
+    text_normalization: str = "none",
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import soundfile as sf
@@ -63,6 +67,13 @@ def decode_webdataset_sample(
     metadata = metadata or json.loads(metadata_bytes.decode("utf-8"))
     token_ids = metadata.get(token_ids_key)
     text = metadata.get(text_key)
+    language = metadata.get("language")
+    if text is not None:
+        text = normalize_asr_text(
+            str(text),
+            language=str(language) if language is not None else None,
+            mode=text_normalization,
+        )
     if token_ids is None:
         if text is None:
             raise ValueError("WebDataset sample needs token_ids or text with a tokenizer.")
@@ -89,7 +100,7 @@ def decode_webdataset_sample(
         "targets": targets,
         "target_length": targets.numel(),
         "text": text,
-        "language": metadata.get("language"),
+        "language": language,
         "metadata": metadata,
     }
 
@@ -202,6 +213,7 @@ class WebDatasetASRIterableDataset(IterableDataset[dict[str, Any]]):
             utt_id_key=self.config.utt_id_key,
             token_ids_key=self.config.token_ids_key,
             append_eos=self.config.append_eos,
+            text_normalization=self.config.text_normalization,
             metadata=metadata,
         )
 

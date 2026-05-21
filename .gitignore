@@ -3,8 +3,12 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.cache/
+node_modules/
 build/
 dist/
+package.json
+package-lock.json
 *.pyc
 *.pyo
 *.pyd

@@ -178,9 +178,9 @@ class _TarShardReader:
 
 
 class _BucketEntryStream:
-    def __init__(self, manifest_path: Path, bucket: WebDatasetBucket):
+    def __init__(self, manifest_path: Path, parts: tuple[WebDatasetBucketPart, ...]):
         self._manifest_path = manifest_path
-        self._bucket = bucket
+        self._parts = parts
         self._part_index = 0
         self._file_pos = 0
         self._handle: TextIO | None = None
@@ -196,9 +196,9 @@ class _BucketEntryStream:
             self._handle = None
 
     def _open_current_part(self) -> TextIO | None:
-        if self._part_index >= len(self._bucket.parts):
+        if self._part_index >= len(self._parts):
             return None
-        part = self._bucket.parts[self._part_index]
+        part = self._parts[self._part_index]
         self._handle = (self._manifest_path.parent / part.path).open("r", encoding="utf-8")
         if self._file_pos:
             self._handle.seek(self._file_pos)
@@ -226,6 +226,63 @@ class _BucketEntryStream:
             # A shuffled bucket schedule may touch many buckets over an epoch. Keeping
             # one JSONL part file open per bucket eventually exhausts per-process fds.
             self.close_idle()
+
+
+def _shard_source_label(shard_name: str | None) -> str:
+    if not shard_name:
+        return "unknown"
+    if shard_name.startswith("GSXL"):
+        return "gigaspeech"
+    if shard_name.startswith("WSL"):
+        return "wenetspeech"
+    return shard_name.split("-", 1)[0].lower() or "unknown"
+
+
+def _part_source_label(part: WebDatasetBucketPart) -> str:
+    first = _shard_source_label(part.first_shard)
+    last = _shard_source_label(part.last_shard)
+    if first == last:
+        return first
+    return "mixed"
+
+
+class _SourceInterleavedBucketEntryStream:
+    def __init__(self, manifest_path: Path, bucket: WebDatasetBucket, *, epoch: int):
+        grouped_parts: "OrderedDict[str, list[WebDatasetBucketPart]]" = OrderedDict()
+        for part in bucket.parts:
+            grouped_parts.setdefault(_part_source_label(part), []).append(part)
+
+        streams: list[tuple[str, _BucketEntryStream]] = [
+            (label, _BucketEntryStream(manifest_path, tuple(parts)))
+            for label, parts in grouped_parts.items()
+            if parts
+        ]
+        if len(streams) > 1:
+            offset = (int(bucket.bucket_id) + int(epoch)) % len(streams)
+            streams = streams[offset:] + streams[:offset]
+        self._streams = streams
+        self._cursor = 0
+
+    def reset(self) -> None:
+        for _, stream in self._streams:
+            stream.reset()
+        self._cursor = 0
+
+    def take(self, num_entries: int) -> list[WebDatasetLengthEntry]:
+        entries: list[WebDatasetLengthEntry] = []
+        while len(entries) < num_entries and self._streams:
+            index = self._cursor % len(self._streams)
+            _, stream = self._streams[index]
+            chunk = stream.take(num_entries - len(entries))
+            if chunk:
+                entries.extend(chunk)
+                self._cursor = (index + 1) % len(self._streams)
+                continue
+            stream.reset()
+            self._streams.pop(index)
+            if self._streams:
+                self._cursor = index % len(self._streams)
+        return entries
 
 
 class _ThreadLocalTarReaderPool:
@@ -325,10 +382,16 @@ class BucketedWebDatasetBatchLoader:
     def _iter_local_entry_batches(self) -> Iterator[list[WebDatasetLengthEntry]]:
         split = self._split_name()
         buckets = {bucket.bucket_id: bucket for bucket in self.manifest.splits.get(split, ())}
-        streams = {
-            bucket_id: _BucketEntryStream(self.manifest.manifest_path, bucket)
-            for bucket_id, bucket in buckets.items()
-        }
+        streams = {}
+        for bucket_id, bucket in buckets.items():
+            if self.config.bucket_source_interleave:
+                streams[bucket_id] = _SourceInterleavedBucketEntryStream(
+                    self.manifest.manifest_path,
+                    bucket,
+                    epoch=self.epoch,
+                )
+            else:
+                streams[bucket_id] = _BucketEntryStream(self.manifest.manifest_path, bucket.parts)
         try:
             for bucket_id in self._build_schedule():
                 bucket = buckets[bucket_id]
@@ -510,6 +573,7 @@ class BucketedWebDatasetBatchLoader:
             utt_id_key=self.config.utt_id_key,
             token_ids_key=self.config.token_ids_key,
             append_eos=self.config.append_eos,
+            text_normalization=self.config.text_normalization,
         )
 
 

@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,10 +28,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", default="bi", choices=["bi", "l2r", "r2l", "alt"])
     parser.add_argument("--beam-size", default=4, type=int)
     parser.add_argument("--token-prune-topk", default=32, type=int)
+    parser.add_argument("--text-normalization", default=None)
     parser.add_argument("--ar-max-new-tokens", default=None, type=int)
     parser.add_argument("--ar-max-new-tokens-factor", default=2.0, type=float)
     parser.add_argument("--limit", default=12, type=int)
     parser.add_argument("--preview-count", default=12, type=int)
+    parser.add_argument(
+        "--source-quota",
+        action="append",
+        default=[],
+        metavar="LABEL:SHARD_GLOB:COUNT",
+        help=(
+            "Evaluate a fixed number of preview samples from one WebDataset source. "
+            "Can be repeated, e.g. gigaspeech:GSXL-*.tar:6 and wenetspeech:WSL-*.tar:6."
+        ),
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--save-debug-lengths", action="store_true", default=True)
     return parser
@@ -127,6 +139,47 @@ def _load_step_metrics(run_dir: Path) -> dict[int, dict[str, Any]]:
     return by_step
 
 
+@dataclass(frozen=True)
+class SourceQuota:
+    label: str
+    shard_pattern: str
+    limit: int
+
+
+def _safe_label(value: str) -> str:
+    label = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value.strip())
+    return label.strip("._-") or "source"
+
+
+def _parse_source_quotas(raw_values: list[str]) -> list[SourceQuota]:
+    quotas: list[SourceQuota] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        parts = raw_value.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError(
+                "--source-quota must use LABEL:SHARD_GLOB:COUNT, "
+                f"got {raw_value!r}"
+            )
+        label, shard_pattern, count_raw = (part.strip() for part in parts)
+        if not label:
+            raise ValueError(f"--source-quota label must not be empty: {raw_value!r}")
+        if not shard_pattern:
+            raise ValueError(f"--source-quota shard glob must not be empty: {raw_value!r}")
+        try:
+            limit = int(count_raw)
+        except ValueError as exc:
+            raise ValueError(f"--source-quota COUNT must be an integer: {raw_value!r}") from exc
+        if limit < 1:
+            raise ValueError(f"--source-quota COUNT must be >= 1: {raw_value!r}")
+        safe = _safe_label(label)
+        if safe in seen:
+            raise ValueError(f"Duplicate --source-quota label after sanitizing: {label!r}")
+        seen.add(safe)
+        quotas.append(SourceQuota(label=safe, shard_pattern=shard_pattern, limit=limit))
+    return quotas
+
+
 def _build_predict_command(
     *,
     module_name: str,
@@ -136,7 +189,12 @@ def _build_predict_command(
     config_yaml_override: Path | None,
     train_config: dict[str, Any],
     args: argparse.Namespace,
+    limit: int | None = None,
+    preview_count: int | None = None,
+    webdataset_shard_pattern: str | None = None,
 ) -> list[str]:
+    resolved_limit = args.limit if limit is None else int(limit)
+    resolved_preview_count = args.preview_count if preview_count is None else int(preview_count)
     command = [
         sys.executable,
         "-m",
@@ -148,9 +206,9 @@ def _build_predict_command(
         "--preview-path",
         str(preview_path),
         "--preview-count",
-        str(args.preview_count),
+        str(resolved_preview_count),
         "--limit",
-        str(args.limit),
+        str(resolved_limit),
         "--device",
         args.device,
         "--batch-size",
@@ -182,6 +240,10 @@ def _build_predict_command(
             command.extend(["--max-new-tokens", str(args.ar_max_new_tokens)])
     else:
         raise ValueError(f"Unsupported prediction module: {module_name}")
+    text_normalization = args.text_normalization
+    if text_normalization is None:
+        text_normalization = str(train_config.get("text_normalization", "none"))
+    command.extend(["--text-normalization", text_normalization])
     if config_yaml_override is not None:
         command.extend(["--config-yaml", str(config_yaml_override)])
     if module_name == "rwkvasr.cli.predict_ctc_labeled" and args.save_debug_lengths:
@@ -198,12 +260,16 @@ def _build_predict_command(
                 str(webdataset_root),
                 "--webdataset-split",
                 "eval",
+                "--webdataset-shard-pattern",
+                webdataset_shard_pattern or str(train_config.get("webdataset_shard_pattern", "*.tar")),
                 "--webdataset-eval-ratio",
                 str(train_config.get("webdataset_eval_ratio", 0.0)),
                 "--webdataset-hash-seed",
                 str(train_config.get("webdataset_hash_seed", 0)),
                 "--webdataset-split-by",
                 str(train_config.get("webdataset_split_by", "shard_name")),
+                "--webdataset-utt-id-key",
+                str(train_config.get("webdataset_utt_id_key", "sid")),
             ]
         )
     else:
@@ -809,6 +875,102 @@ def _backfill_comments(
     return changed
 
 
+def _write_jsonl_records(path: Path, records: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _format_debug_preview_line(record: dict[str, Any], *, module_name: str) -> str | None:
+    debug = record.get("debug")
+    if not isinstance(debug, dict):
+        return None
+    if module_name == "rwkvasr.cli.predict_ctc_labeled":
+        return (
+            "  DEBUG: "
+            f"feat={int(debug.get('feature_length', 0))} "
+            f"logit={int(debug.get('logit_length', 0))} "
+            f"pred_tok={int(debug.get('pred_token_count', 0))} "
+            f"ref_tok={int(debug.get('ref_token_count', 0))} "
+            f"blank_top1={float(debug.get('blank_top1_ratio', 0.0)):.3f} "
+            f"avg_blank={float(debug.get('avg_blank_prob', 0.0)):.3f}"
+        )
+    if module_name == "rwkvasr.cli.predict_rwkv_decoder_labeled":
+        return (
+            "  DEBUG: "
+            f"feat={int(debug.get('feature_length', 0))} "
+            f"enc={int(debug.get('encoded_length', 0))} "
+            f"pred_tok={int(debug.get('pred_token_count', 0))} "
+            f"ref_tok={int(debug.get('ref_token_count', 0))} "
+            f"eos={1 if bool(debug.get('eos_emitted', False)) else 0} "
+            f"avg_logprob={float(debug.get('avg_logprob', 0.0)):.4f}"
+        )
+    return None
+
+
+def _write_combined_preview(
+    path: Path,
+    records: list[dict[str, Any]],
+    *,
+    preview_count: int,
+    module_name: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for index, record in enumerate(records[: max(0, int(preview_count))], start=1):
+        source_label = record.get("sidecar_source")
+        source_suffix = f" source={source_label}" if source_label else ""
+        lines.append(f"[{index}] utt_id={record.get('utt_id', '')}{source_suffix}")
+        lines.append(f"  REF : {record.get('ref_text') or ''}")
+        lines.append(f"  PRED: {record.get('pred_text') or ''}")
+        score = record.get("score")
+        try:
+            lines.append(f"  SCORE: {float(score):.4f}")
+        except (TypeError, ValueError):
+            lines.append("  SCORE: n/a")
+        strategy = record.get("decode_strategy")
+        if strategy and strategy != "ctc":
+            lines.append(f"  STRATEGY: {strategy}")
+        debug_line = _format_debug_preview_line(record, module_name=module_name)
+        if debug_line is not None:
+            lines.append(debug_line)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _run_prediction_command(
+    *,
+    command: list[str],
+    cwd: Path,
+    checkpoint_path: Path,
+    meta_path: Path,
+    meta: dict[str, Any],
+) -> None:
+    started_at = time.time()
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    duration_sec = time.time() - started_at
+    meta.update(
+        {
+            "returncode": int(completed.returncode),
+            "duration_sec": float(duration_sec),
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+    )
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"Prediction preview failed for {checkpoint_path.name}; see {meta_path}"
+        )
+
+
 def _run_prediction_preview(
     *,
     module_name: str,
@@ -829,6 +991,94 @@ def _run_prediction_preview(
         checkpoint_stem=stem,
         device=args.device,
     )
+    cwd = run_dir.parent.parent if (run_dir.parent.parent / "src").exists() else run_dir.parent
+    source_quotas = _parse_source_quotas(args.source_quota)
+    if source_quotas and not train_config.get("webdataset_root"):
+        raise ValueError("--source-quota is only supported for WebDataset-backed sidecar evaluation.")
+
+    meta = {
+        "checkpoint_path": str(checkpoint_path),
+        "output_jsonl": str(output_jsonl),
+        "preview_path": str(preview_path),
+        "module_name": module_name,
+        "config_yaml_override": None if config_yaml_override is None else str(config_yaml_override),
+    }
+    meta_path = sidecar_dir / f"{stem_with_suffix}.meta.json"
+
+    if source_quotas:
+        _log(
+            f"Evaluating {checkpoint_path.name} -> {preview_path.name} "
+            f"with source quotas "
+            + ", ".join(f"{quota.label}:{quota.shard_pattern}:{quota.limit}" for quota in source_quotas)
+        )
+        all_records: list[dict[str, Any]] = []
+        source_meta: list[dict[str, Any]] = []
+        started_at = time.time()
+        for quota in source_quotas:
+            source_stem = f"{stem_with_suffix}.{quota.label}"
+            source_jsonl = sidecar_dir / f"{source_stem}.jsonl"
+            source_preview = sidecar_dir / f"{source_stem}.preview.txt"
+            command = _build_predict_command(
+                module_name=module_name,
+                checkpoint_path=checkpoint_path,
+                output_jsonl=source_jsonl,
+                preview_path=source_preview,
+                config_yaml_override=config_yaml_override,
+                train_config=train_config,
+                args=args,
+                limit=quota.limit,
+                preview_count=quota.limit,
+                webdataset_shard_pattern=quota.shard_pattern,
+            )
+            source_meta_path = sidecar_dir / f"{source_stem}.meta.json"
+            source_record = {
+                "label": quota.label,
+                "shard_pattern": quota.shard_pattern,
+                "limit": quota.limit,
+                "output_jsonl": str(source_jsonl),
+                "preview_path": str(source_preview),
+            }
+            _run_prediction_command(
+                command=command,
+                cwd=cwd,
+                checkpoint_path=checkpoint_path,
+                meta_path=source_meta_path,
+                meta={
+                    **meta,
+                    **source_record,
+                    "output_jsonl": str(source_jsonl),
+                    "preview_path": str(source_preview),
+                },
+            )
+            records = _load_prediction_jsonl(source_jsonl)
+            for record in records:
+                record["sidecar_source"] = quota.label
+            all_records.extend(records)
+            source_record["num_predictions"] = len(records)
+            source_meta.append(source_record)
+
+        _write_jsonl_records(output_jsonl, all_records)
+        _write_combined_preview(
+            preview_path,
+            all_records,
+            preview_count=args.preview_count,
+            module_name=module_name,
+        )
+        meta.update(
+            {
+                "returncode": 0,
+                "duration_sec": float(time.time() - started_at),
+                "stdout": "",
+                "stderr": "",
+                "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                "source_quotas": [quota.__dict__ for quota in source_quotas],
+                "source_outputs": source_meta,
+                "num_predictions": len(all_records),
+            }
+        )
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return meta
+
     command = _build_predict_command(
         module_name=module_name,
         checkpoint_path=checkpoint_path,
@@ -839,33 +1089,13 @@ def _run_prediction_preview(
         args=args,
     )
     _log(f"Evaluating {checkpoint_path.name} -> {preview_path.name}")
-    started_at = time.time()
-    completed = subprocess.run(
-        command,
-        cwd=run_dir.parent.parent if (run_dir.parent.parent / "src").exists() else run_dir.parent,
-        check=False,
-        capture_output=True,
-        text=True,
+    _run_prediction_command(
+        command=command,
+        cwd=cwd,
+        checkpoint_path=checkpoint_path,
+        meta_path=meta_path,
+        meta=meta,
     )
-    duration_sec = time.time() - started_at
-    meta = {
-        "checkpoint_path": str(checkpoint_path),
-        "output_jsonl": str(output_jsonl),
-        "preview_path": str(preview_path),
-        "module_name": module_name,
-        "config_yaml_override": None if config_yaml_override is None else str(config_yaml_override),
-        "returncode": int(completed.returncode),
-        "duration_sec": float(duration_sec),
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-    }
-    meta_path = sidecar_dir / f"{stem_with_suffix}.meta.json"
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"Prediction preview failed for {checkpoint_path.name}; see {meta_path}"
-        )
     return meta
 
 
@@ -914,6 +1144,12 @@ def main() -> None:
     if not run_dir.exists():
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
+    train_config_path = run_dir / "train_config.yaml"
+    while not train_config_path.exists():
+        if args.once:
+            raise FileNotFoundError(f"train_config.yaml not found under {run_dir}")
+        _log(f"Waiting for train_config.yaml under {run_dir}")
+        time.sleep(min(30.0, max(1.0, float(args.poll_seconds))))
     train_config = _load_train_config(run_dir)
     sidecar_dir, state_path, tmux_tail_path = _sidecar_paths(run_dir, args.output_subdir)
     state = _load_state(state_path)

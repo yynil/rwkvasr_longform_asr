@@ -19,9 +19,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-path", default=None)
     parser.add_argument("--webdataset-root", default=None)
     parser.add_argument("--webdataset-split", default="all")
+    parser.add_argument("--webdataset-shard-pattern", default="*.tar")
     parser.add_argument("--webdataset-eval-ratio", default=0.0, type=float)
     parser.add_argument("--webdataset-hash-seed", default=0, type=int)
     parser.add_argument("--webdataset-split-by", default="shard_name")
+    parser.add_argument("--webdataset-utt-id-key", default="sid")
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--config-yaml", default=None)
     parser.add_argument("--batch-size", default=1, type=int)
@@ -36,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-model-path", default=None)
     parser.add_argument("--tokenizer-language", default=None)
     parser.add_argument("--tokenizer-task", default=None)
+    parser.add_argument("--text-normalization", default="none")
     parser.add_argument("--frame-shift-ms", default=10.0, type=float)
     parser.add_argument("--max-new-tokens", default=None, type=int)
     parser.add_argument("--max-new-tokens-factor", default=2.0, type=float)
@@ -151,15 +154,18 @@ def main() -> None:
             manifest_path=args.manifest_path,
             webdataset_root=args.webdataset_root,
             webdataset_split=args.webdataset_split,
+            webdataset_shard_pattern=args.webdataset_shard_pattern,
             webdataset_eval_ratio=args.webdataset_eval_ratio,
             webdataset_hash_seed=args.webdataset_hash_seed,
             webdataset_split_by=args.webdataset_split_by,
+            webdataset_utt_id_key=args.webdataset_utt_id_key,
             device=args.device,
             mode=args.mode,
             tokenizer_type=str(tokenizer_config["tokenizer_type"]),
             tokenizer_model_path=tokenizer_config["tokenizer_model_path"],
             tokenizer_language=tokenizer_config["tokenizer_language"],
             tokenizer_task=tokenizer_config["tokenizer_task"],
+            text_normalization=args.text_normalization,
             num_workers=args.num_workers,
             frame_shift_ms=args.frame_shift_ms,
         ),

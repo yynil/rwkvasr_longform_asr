@@ -19,7 +19,7 @@ EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    bi_baseline|bi_baseline_spm4k|bi_baseline_spm8k|dirdrop_both|emilia_zh_bi_baseline|emilia_zh_dirdrop_both|emilia_en_zh_bi_baseline|emilia_en_zh_bi_baseline_whisper|emilia_en_zh_bi_baseline_qwen3|emilia_en_zh_dirdrop_both|emilia_en_zh_bi_baseline_spm8k|emilia_en_zh_dirdrop_both_spm8k|emilia_en_zh_joint_rwkv7g1)
+    bi_baseline|bi_baseline_spm4k|bi_baseline_spm8k|dirdrop_both|emilia_zh_bi_baseline|emilia_zh_dirdrop_both|emilia_en_zh_bi_baseline|emilia_en_zh_bi_baseline_whisper|emilia_en_zh_bi_baseline_qwen3|emilia_en_zh_dirdrop_both|emilia_en_zh_bi_baseline_spm8k|emilia_en_zh_dirdrop_both_spm8k|emilia_en_zh_joint_rwkv7g1|gigaspeech_wenetspeech_joint_rwkv7g1|gigaspeech_wenetspeech_joint_rwkv7g1_interleave_from_step28000)
       MODE="$1"
       shift
       ;;
@@ -86,6 +86,12 @@ if [[ -z "${CONFIG_YAML}" ]]; then
       ;;
     emilia_en_zh_joint_rwkv7g1)
       CONFIG_YAML="${REPO_ROOT}/configs/emilia_en_zh_joint_rwkv7g1_ctc_ar_4x4090_deepspeed.yaml"
+      ;;
+    gigaspeech_wenetspeech_joint_rwkv7g1)
+      CONFIG_YAML="${REPO_ROOT}/configs/gigaspeech_wenetspeech_joint_rwkv7g1_ctc_ar_4x4090_deepspeed.yaml"
+      ;;
+    gigaspeech_wenetspeech_joint_rwkv7g1_interleave_from_step28000)
+      CONFIG_YAML="${REPO_ROOT}/configs/gigaspeech_wenetspeech_joint_rwkv7g1_ctc_ar_interleave_from_step28000_4x4090_deepspeed.yaml"
       ;;
     *)
       echo "Unsupported mode: ${MODE}" >&2

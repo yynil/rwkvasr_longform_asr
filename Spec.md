@@ -98,6 +98,11 @@ Important implementation constraints extracted from upstream:
 - kernel-aware path for RWKV-7 when shapes and dtypes are compatible
 - fallback pure PyTorch path for correctness and unit tests
 - on CUDA, runtime activations should stay in `bf16` outside numerically sensitive reduction paths
+- WebDataset length bucketing for joint CTC+AR training should use a single combined cost, not audio-only frames:
+  - `combined_cost = audio_frames + text_cost_weight * estimated_text_tokens`
+  - exact text token counts are used when present in the length index
+  - otherwise the bucket builder may use text character/byte counts or a bounded `json_size` proxy
+  - this intentionally stays one-dimensional to avoid complex per-rank max-audio/max-text balancing while reducing obvious AR decoder stragglers
 
 ### Research
 - Establish the dual-mode single-checkpoint path first.
@@ -574,14 +579,91 @@ WebDataset support:
     - training / eval configs
     must all set `webdataset_utt_id_key: id`
   - it is invalid to let training fall back to the project default `sid` once an index was built with `id`
-- WebDataset length-index schema should no longer assume `.wav` audio:
-  - audio entries must be generic `audio_member`
-  - current minimum supported audio formats are:
-    - `wav`
-    - `mp3`
-    - `flac`
-  - old indexes that only store `wav_member` should remain readable for backward compatibility
-- on the target `4 x RTX 4090` setup, default DeepSpeed ZeRO-2 configs should not offload optimizer state to CPU unless explicitly requested for an ablation; current model sizes and observed bf16 activation footprints leave enough GPU headroom, and CPU offload reduces utilization
+- ASR corpus ingestion policy for non-WebDataset sources:
+  - new corpora should be normalized into the same WebDataset contract instead of adding dataset-specific training loaders
+  - the default large-corpus converter must be a Rust tool under `tools/`; Python conversion is fallback-only for small debugging jobs
+  - converter progress must be visible before the first output shard is complete:
+    - log total input shards before work starts
+    - use an `indicatif` progress bar in the Rust converter for total input-shard progress, elapsed time, ETA, converted / skipped sample counts, and current worker state
+    - do not print one line per worker event in interactive runs; reserve lines for command start, final summary, and exceptional warnings
+    - update converted / skipped sample counts periodically while a large input shard is still in progress
+  - conversion should process input shards concurrently with bounded workers, and then write deterministic output tar shards in a single ordered writer path
+  - conversion may use an NVMe staging root for completed tar parts:
+    - `--staging-root` writes tar parts to fast local scratch first, then publishes each completed part to the final WebDataset root
+    - `--staging-max-bytes` is a safety guard for scratch usage, with scripts defaulting to a 100 GiB limit when staging is enabled
+    - staged files must be fully finished before being copied / renamed into the final HDD output root, so resume never sees half-written final tar files
+    - even without a separate staging root, active tar writes must use `.part` files and publish to final `.tar` only after `tar::Builder::finish()` succeeds
+  - conversion must be resumable at input-shard granularity:
+    - successful input shards write `_conversion_state/{prefix}-{input_index}.json` done markers after all output tar parts are finished
+    - `--resume` skips marker-validated shards and deletes stale partial parts before retrying unfinished shards
+    - `--adopt-existing` may recover pre-marker tar output only when expected tar part count matches the input shard's expected sample count and the final tar part contains the expected number of `.json` entries
+    - adoption should avoid scanning all previously written tar payloads; for sequential per-input writers, validating part count plus the final part is sufficient to detect normal interrupted-shard cases
+    - corrupt adopted output must not abort the whole conversion; the converter should warn, remove that input shard's old tar parts / marker, and rebuild that input shard
+    - preprocessing scripts default to `RESUME=1`; `OVERWRITE=1` requires `RESUME=0` to avoid deleting expensive partial conversions by accident
+    - preprocessing scripts should skip already completed downstream artifacts by default, including `webdataset_index.json`, `webdataset_lengths.jsonl` plus summary, bucket manifests, and CMVN; use `OVERWRITE=1` when those derived artifacts must be rebuilt
+  - default conversion thread count should be conservative on rotational disks:
+    - `4` workers is the safe default for `/media/usbhd`-style HDD storage
+    - use higher `CONVERT_THREADS` only when input and output are on SSD/NVMe or separate physical disks
+    - running multiple converters concurrently on the same HDD is expected to reduce throughput due to seek contention
+  - canonical sample layout remains:
+    - `{sample_key}.{wav|flac|mp3}`
+    - `{sample_key}.json`
+  - canonical metadata keys are:
+    - `id`
+    - `text`
+    - `language`
+    - `duration`
+    - `sample_rate`
+    - `source`
+    - optional source-specific provenance such as `source_shard`, `source_id`, and `source_audio_path`
+  - generated roots must then run the existing preprocessing chain:
+    - `inspect_webdataset --utt-id-key id --split-by shard_name`
+    - Rust `rwkvasr-tools` length index
+    - Rust `build_bucket_index`
+    - `compute_cmvn`
+  - mixed roots built from already-normalized corpora should not rescan tar payloads when source artifacts already exist:
+    - refresh symlinks into the mixed root
+    - merge source `webdataset_index.json` files by summing shard and split counts
+    - concatenate source `webdataset_lengths.jsonl` files and merge their summaries
+    - rebuild only the mixed bucket manifest from the merged length index
+    - this keeps GigaSpeech + WenetSpeech mixing fast enough to run after both source corpora finish preprocessing
+  - if true mixed CMVN is intentionally skipped for launch speed, training config must point at an explicit identity/no-op CMVN file instead of silently triggering full-dataset CMVN at train startup
+  - default split policy for converted large corpora is shard-name hashing so eval can skip most shard files during normal training/evaluation
+  - conversion code should tolerate partially downloaded corpora by skipping incomplete / unpaired input shards when `--skip-missing` is set and reporting exact counts
+  - GigaSpeech XL parquet ingestion:
+    - read HuggingFace-style parquet shards with Rust `parquet/arrow`
+    - accept embedded `audio` dictionaries containing `bytes` and/or `path`
+    - infer text from common ASR text columns such as `text`, `sentence`, `normalized_text`, or `transcription`
+    - normalize GigaSpeech text before tokenization for ASR runtime compatibility:
+      - default training and prediction loaders should use `text_normalization = runtime`
+      - runtime normalization should happen after reading sample metadata and before tokenizer encoding so existing WebDataset audio tar shards do not need to be rewritten
+      - offline conversion may still write normalized text for archival datasets, but it is not required for training
+      - English transcripts should be ASCII-lowercased instead of keeping GigaSpeech all-caps
+      - GigaSpeech markup punctuation such as `<COMMA>`, `<PERIOD>`, and `<QUESTIONMARK>` should be converted to real punctuation
+      - non-speech / annotation markup such as `<SIL>`, `<NOISE>`, and `<MUSIC>` should be removed from CTC/AR targets because emitting markup tokens is not useful for the current ASR product target
+      - for runtime-loader normalization, keep source metadata untouched and expose normalized `text` only inside the decoded sample / eval reference path
+      - for optional offline-normalized archival conversion, store the original transcript as `source_text` and record `text_normalization` in metadata
+      - length indexes and bucket manifests may remain audio-dominant; if text-token-cost bucketing is used for AR-heavy training, rebuild only the bucket manifest / length text-cost metadata, not the audio tar shards
+    - preserve original audio bytes when possible rather than transcoding
+    - preserve the input parquet split and shard name in metadata; training scripts should default to `train-*.parquet` and keep official test shards for separate benchmark conversion
+  - WenetSpeech ingestion:
+    - current downloaded layout is Lhotse-style paired `cuts_*.jsonl.gz` and `cuts_*.tar.gz`
+    - each JSONL line is a `MonoCut` with supervision text and recording source path; the paired tar already contains cut-level `.wav` audio
+    - conversion should stream one cut shard at a time, pair metadata with tar members by cut id / basename, and write normal WebDataset tar shards
+    - do not use Lhotse at training time; it is only an input metadata format for conversion
+	- WebDataset length-index schema should no longer assume `.wav` audio:
+	  - audio entries must be generic `audio_member`
+	  - current minimum supported audio formats are:
+	    - `wav`
+	    - `mp3`
+	    - `flac`
+	  - old indexes that only store `wav_member` should remain readable for backward compatibility
+	- for mixed roots whose existing bucket manifest was built from concatenated source indexes, do not require expensive bucket rebuilds just to fix early-epoch source order:
+	  - training loader must support runtime source interleaving inside each bucket
+	  - source groups are inferred from bucket part `first_shard` / `last_shard` prefixes, e.g. `GSXL` and `WSL`
+	  - each repeated visit to a bucket should rotate across source groups / source offsets before returning to the same group
+	  - rank partitioning must still happen after taking the same global batch on every rank, so all ranks keep synchronized collective shapes
+	- on the target `4 x RTX 4090` setup, default DeepSpeed ZeRO-2 configs should not offload optimizer state to CPU unless explicitly requested for an ablation; current model sizes and observed bf16 activation footprints leave enough GPU headroom, and CPU offload reduces utilization
 - for 4090 training configs, prefer:
   - larger `max_local_batch` upper bounds
   - offline length-bucket frame budgets as the primary limiter
@@ -625,6 +707,7 @@ WebDataset support:
     - when CPU preview is used for a run trained with `backend: cuda`, force prediction to a temporary `backend: native` config override instead of trying to load fused CUDA kernels on CPU
     - write preview text, JSONL predictions, watcher state, and a checkpoint-level comment file under the same run directory
     - optionally capture the current `tmux` training pane tail into the watcher output for lightweight progress inspection
+    - for mixed-corpus runs, sidecar preview sampling must support per-source quotas, e.g. GigaSpeech and WenetSpeech each contribute a fixed number of examples; implement this by filtering shard globs such as `GSXL-*.tar` and `WSL-*.tar` instead of sequentially scanning the full mixed eval set
     - sidecar comments should combine:
       - sampled step-eval loss trend from `step_checkpoint_metrics.yaml`
       - preview-level blank / length-collapse signals from labeled prediction debug output

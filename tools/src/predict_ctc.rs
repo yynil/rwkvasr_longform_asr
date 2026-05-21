@@ -41,12 +41,18 @@ pub fn load_logits_and_lengths(
 ) -> Result<(Vec<Vec<Vec<f32>>>, Vec<usize>), String> {
     let tensors = candle_core::safetensors::load(tensors_path, &Device::Cpu)
         .map_err(|err| format!("Failed to load {}: {err}", tensors_path.display()))?;
-    let logits = tensors
-        .get(logits_key)
-        .ok_or_else(|| format!("Missing tensor {logits_key:?} in {}.", tensors_path.display()))?;
-    let lengths = tensors
-        .get(lengths_key)
-        .ok_or_else(|| format!("Missing tensor {lengths_key:?} in {}.", tensors_path.display()))?;
+    let logits = tensors.get(logits_key).ok_or_else(|| {
+        format!(
+            "Missing tensor {logits_key:?} in {}.",
+            tensors_path.display()
+        )
+    })?;
+    let lengths = tensors.get(lengths_key).ok_or_else(|| {
+        format!(
+            "Missing tensor {lengths_key:?} in {}.",
+            tensors_path.display()
+        )
+    })?;
 
     let logits = logits
         .to_dtype(DType::F32)
@@ -83,14 +89,16 @@ pub fn load_utt_ids(path: &Path) -> Result<Vec<String>, String> {
             continue;
         }
         if trimmed.starts_with('{') {
-            let value: serde_json::Value =
-                serde_json::from_str(trimmed).map_err(|err| format!("Invalid JSONL utt id line: {err}"))?;
+            let value: serde_json::Value = serde_json::from_str(trimmed)
+                .map_err(|err| format!("Invalid JSONL utt id line: {err}"))?;
             let utt_id = value
                 .get("utt_id")
                 .or_else(|| value.get("id"))
                 .or_else(|| value.get("audio_id"))
                 .and_then(|value| value.as_str())
-                .ok_or_else(|| String::from("JSONL utt id line must contain utt_id, id, or audio_id."))?;
+                .ok_or_else(|| {
+                    String::from("JSONL utt id line must contain utt_id, id, or audio_id.")
+                })?;
             utt_ids.push(utt_id.to_string());
             continue;
         }
@@ -132,9 +140,9 @@ pub fn predict_from_logits(
         }
         let log_probs = log_softmax_sequence(&sequence[..length]);
         let hypotheses = prefix_beam_search(&log_probs, blank_id, beam_size, token_prune_topk)?;
-        let best = hypotheses
-            .first()
-            .ok_or_else(|| format!("No beam-search hypothesis generated for batch index {batch_idx}."))?;
+        let best = hypotheses.first().ok_or_else(|| {
+            format!("No beam-search hypothesis generated for batch index {batch_idx}.")
+        })?;
         let spans = ctc_forced_align(&log_probs, &best.token_ids, blank_id)?;
         let alignments = build_token_alignments(
             &best.token_ids,
@@ -153,11 +161,18 @@ pub fn predict_from_logits(
     Ok(predictions)
 }
 
-pub fn write_predictions_jsonl(path: &Path, predictions: &[PredictionRecord]) -> Result<(), String> {
+pub fn write_predictions_jsonl(
+    path: &Path,
+    predictions: &[PredictionRecord],
+) -> Result<(), String> {
     let mut output = String::new();
     for prediction in predictions {
-        let line = serde_json::to_string(prediction)
-            .map_err(|err| format!("Failed to serialize prediction for {}: {err}", prediction.utt_id))?;
+        let line = serde_json::to_string(prediction).map_err(|err| {
+            format!(
+                "Failed to serialize prediction for {}: {err}",
+                prediction.utt_id
+            )
+        })?;
         output.push_str(&line);
         output.push('\n');
     }
@@ -183,17 +198,23 @@ pub fn prefix_beam_search(
     }
     let vocab_size = log_probs[0].len();
     if vocab_size == 0 {
-        return Err(String::from("logits vocabulary dimension must be positive."));
+        return Err(String::from(
+            "logits vocabulary dimension must be positive.",
+        ));
     }
     let blank_index = blank_id as usize;
     if blank_index >= vocab_size {
-        return Err(format!("blank_id {blank_id} is out of range for vocab size {vocab_size}."));
+        return Err(format!(
+            "blank_id {blank_id} is out of range for vocab size {vocab_size}."
+        ));
     }
 
     let mut beams = vec![(Vec::<u32>::new(), 0.0_f32, LOG_ZERO)];
     for frame in log_probs {
         if frame.len() != vocab_size {
-            return Err(String::from("All frames must have the same vocabulary size."));
+            return Err(String::from(
+                "All frames must have the same vocabulary size.",
+            ));
         }
         let candidates = frame_candidates(frame, blank_index, token_prune_topk);
         let mut next_beams: Vec<(Vec<u32>, f32, f32)> = Vec::new();
@@ -227,7 +248,9 @@ pub fn prefix_beam_search(
         next_beams.sort_by(|left, right| {
             let left_score = log_addexp(left.1, left.2);
             let right_score = log_addexp(right.1, right.2);
-            right_score.partial_cmp(&left_score).unwrap_or(Ordering::Equal)
+            right_score
+                .partial_cmp(&left_score)
+                .unwrap_or(Ordering::Equal)
         });
         next_beams.truncate(beam_size);
         beams = next_beams;
@@ -235,12 +258,14 @@ pub fn prefix_beam_search(
 
     Ok(beams
         .into_iter()
-        .map(|(token_ids, blank_score, non_blank_score)| PrefixBeamHypothesis {
-            score: log_addexp(blank_score, non_blank_score),
-            token_ids,
-            blank_score,
-            non_blank_score,
-        })
+        .map(
+            |(token_ids, blank_score, non_blank_score)| PrefixBeamHypothesis {
+                score: log_addexp(blank_score, non_blank_score),
+                token_ids,
+                blank_score,
+                non_blank_score,
+            },
+        )
         .collect())
 }
 
@@ -258,7 +283,9 @@ pub fn ctc_forced_align(
     let vocab_size = log_probs[0].len();
     let blank_index = blank_id as usize;
     if blank_index >= vocab_size {
-        return Err(format!("blank_id {blank_id} is out of range for vocab size {vocab_size}."));
+        return Err(format!(
+            "blank_id {blank_id} is out of range for vocab size {vocab_size}."
+        ));
     }
 
     let mut extended = Vec::with_capacity(token_ids.len() * 2 + 1);
@@ -306,11 +333,15 @@ pub fn ctc_forced_align(
     }
 
     let mut final_state = num_states - 1;
-    if num_states > 1 && scores[time_steps - 1][num_states - 2] > scores[time_steps - 1][num_states - 1] {
+    if num_states > 1
+        && scores[time_steps - 1][num_states - 2] > scores[time_steps - 1][num_states - 1]
+    {
         final_state = num_states - 2;
     }
     if scores[time_steps - 1][final_state] == LOG_ZERO {
-        return Err(String::from("Unable to compute a valid CTC alignment path."));
+        return Err(String::from(
+            "Unable to compute a valid CTC alignment path.",
+        ));
     }
 
     let mut path_states = vec![final_state; time_steps];
@@ -330,10 +361,18 @@ pub fn ctc_forced_align(
         let positions = path_states
             .iter()
             .enumerate()
-            .filter_map(|(time_idx, state)| if *state == state_index { Some(time_idx) } else { None })
+            .filter_map(|(time_idx, state)| {
+                if *state == state_index {
+                    Some(time_idx)
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>();
         if positions.is_empty() {
-            return Err(format!("Token at index {token_index} received no alignment span."));
+            return Err(format!(
+                "Token at index {token_index} received no alignment span."
+            ));
         }
         spans.push((positions[0], *positions.last().unwrap()));
     }
@@ -387,12 +426,19 @@ fn log_softmax(values: &[f32]) -> Vec<f32> {
         .iter()
         .copied()
         .fold(f32::NEG_INFINITY, |acc, value| acc.max(value));
-    let sum_exp = values.iter().map(|value| (*value - max_value).exp()).sum::<f32>();
+    let sum_exp = values
+        .iter()
+        .map(|value| (*value - max_value).exp())
+        .sum::<f32>();
     let log_sum_exp = max_value + sum_exp.ln();
     values.iter().map(|value| *value - log_sum_exp).collect()
 }
 
-fn frame_candidates(frame: &[f32], blank_index: usize, token_prune_topk: Option<usize>) -> Vec<(usize, f32)> {
+fn frame_candidates(
+    frame: &[f32],
+    blank_index: usize,
+    token_prune_topk: Option<usize>,
+) -> Vec<(usize, f32)> {
     match token_prune_topk {
         Some(topk) if topk > 0 && topk < frame.len() => {
             let mut indexed = frame
@@ -439,11 +485,14 @@ fn log_addexp(a: f32, b: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ctc_forced_align, prefix_beam_search, predict_from_logits};
+    use super::{ctc_forced_align, predict_from_logits, prefix_beam_search};
 
     #[test]
     fn prefix_beam_search_can_beat_greedy_when_paths_merge() {
-        let log_probs = vec![vec![0.6_f32.ln(), 0.4_f32.ln()], vec![0.6_f32.ln(), 0.4_f32.ln()]];
+        let log_probs = vec![
+            vec![0.6_f32.ln(), 0.4_f32.ln()],
+            vec![0.6_f32.ln(), 0.4_f32.ln()],
+        ];
         let beam1 = prefix_beam_search(&log_probs, 0, 1, None).unwrap();
         let beam2 = prefix_beam_search(&log_probs, 0, 2, None).unwrap();
 
@@ -459,13 +508,20 @@ mod tests {
             vec![vec![1.0, 5.0], vec![1.0, 5.0], vec![1.0, 5.0]],
         ];
         let lengths = vec![3, 3];
-        let predictions = predict_from_logits(&utt_ids, &logits, &lengths, 0, 2, None, 1, 0, 10.0).unwrap();
+        let predictions =
+            predict_from_logits(&utt_ids, &logits, &lengths, 0, 2, None, 1, 0, 10.0).unwrap();
 
         assert_eq!(predictions.len(), 2);
         assert_eq!(predictions[0].utt_id, "utt-0");
         assert!(!predictions[0].token_ids.is_empty());
-        assert!(predictions[0].token_ids.iter().all(|token_id| *token_id == 1));
-        assert_eq!(predictions[0].alignments.len(), predictions[0].token_ids.len());
+        assert!(predictions[0]
+            .token_ids
+            .iter()
+            .all(|token_id| *token_id == 1));
+        assert_eq!(
+            predictions[0].alignments.len(),
+            predictions[0].token_ids.len()
+        );
     }
 
     #[test]

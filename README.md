@@ -56,30 +56,41 @@ The RWKV decoder path uses the RWKV tokenizer and EOS convention required by RWK
 
 ```mermaid
 flowchart TD
-    A[Raw EN/ZH Emilia WebDataset] --> B[Rust/Python inspection]
-    B --> C[Length index and bucket manifest]
-    B --> D[Global CMVN stats]
-    C --> E[Bucketed WebDataset loader]
-    D --> E
-    E --> F[Decoded batch prefetch]
-    F --> G[4x4090 DeepSpeed ZeRO-2 bf16]
-    G --> H[Step checkpoints]
-    H --> I[Sidecar sampled evaluation]
-    H --> J[Best checkpoint retention]
+    A1[GigaSpeech XL parquet] --> B[Rust corpus conversion]
+    A2[WenetSpeech data] --> B
+    B --> C[WebDataset shards]
+    C --> D[Length index and bucket manifests]
+    D --> E[Runtime source-interleaved bucket loader]
+    E --> F[Online wav decode + fbank]
+    F --> G[Decoded batch prefetch]
+    G --> H[4x4090 DeepSpeed ZeRO-2 bf16]
+    H --> I[Step checkpoints]
+    I --> J[Balanced GigaSpeech/WenetSpeech sidecar eval]
+    I --> K[Best checkpoint retention]
 ```
 
-Training is optimized for `4 x RTX 4090`, `DeepSpeed ZeRO-2`, `bf16`, and CUDA fused RWKV kernels. Large Emilia indexes are split into length buckets so each rank sees similar acoustic lengths and avoids excessive padding. Decoded batch prefetch is used to keep the GPU path fed after online wav to fbank decoding.
+Training is optimized for `4 x RTX 4090`, `DeepSpeed ZeRO-2`, `bf16`, and CUDA fused RWKV kernels. Large indexes are converted and inspected with Rust tools, then loaded with bucketed WebDataset sampling so each rank sees reasonably similar `audio + text` budgets and avoids excessive padding. Decoded batch prefetch is used to keep the GPU path fed after online wav to fbank decoding.
+
+The current mixed corpus uses `GigaSpeech XL` for English and `WenetSpeech L` for Chinese. The mixed WebDataset is represented by symlinked shards plus local indexes, so raw converted data is not duplicated. Because the original bucket manifest is ordered by dataset prefix, training uses runtime source interleaving: bucket parts are grouped by shard prefix such as `GSXL-*` and `WSL-*`, then alternated during sampling. This avoids the earlier failure mode where the first tens of thousands of steps were effectively all English.
 
 Main entrypoint:
 
 ```bash
-./scripts/train_paper_rwkv_asr.sh emilia_en_zh_joint_rwkv7g1
+./scripts/train_paper_rwkv_asr.sh gigaspeech_wenetspeech_joint_rwkv7g1_interleave_from_step28000
 ```
 
 Current joint config:
 
 ```bash
-configs/emilia_en_zh_joint_rwkv7g1_ctc_ar_4x4090_deepspeed.yaml
+configs/gigaspeech_wenetspeech_joint_rwkv7g1_ctc_ar_interleave_from_step28000_4x4090_deepspeed.yaml
+```
+
+Useful data preparation commands:
+
+```bash
+OVERWRITE=1 COMPUTE_CMVN=0 ./scripts/prepare_gigaspeech_xl.sh
+OVERWRITE=1 COMPUTE_CMVN=0 ./scripts/prepare_wenetspeech_l.sh
+./scripts/prepare_gigaspeech_wenetspeech_mix.sh
 ```
 
 ## Prediction Flow
@@ -106,19 +117,63 @@ Sidecar evaluation can monitor newly written checkpoints:
 
 Do not commit or publish checkpoints, run logs, W&B caches, or decoded outputs. The following numbers are only a dated project note from local runs.
 
-Current joint run observed on `2026-05-08`:
+Current GigaSpeech XL + WenetSpeech L mixed data snapshot observed on `2026-05-21`:
 
 ```text
-run_dir: runs/emilia_en_zh_joint_rwkv7g1_ctc_ar_fullaudio_template_eos0_4x4090_20260504_094402_safe
-training: epoch 1, about 64k / 701k steps observed
-recent train loss: about 0.92
-sampled eval best observed:
-  step-58000 eval_loss = 1.7894
-  step-56000 eval_loss = 1.8100
-  step-63000 eval_loss = 1.8401
+mixed_root: /media/usbhd/training_data/asr/mix/gigaspeech_xl_wenetspeech_l_webdataset
+num_shards: 4,731
+num_samples: 22,904,403
+train_samples: 22,695,193
+eval_samples: 209,210
+gigaspeech:
+  shards: 1,806
+  samples: 8,282,988
+  train_samples: 8,188,778
+  eval_samples: 94,210
+wenetspeech:
+  shards: 2,925
+  samples: 14,621,415
+  train_samples: 14,506,415
+  eval_samples: 115,000
+length_index_summary:
+  min_frames: 26
+  max_frames: 9,644
+  audio_suffixes: flac, mp3, wav
 ```
 
-Latest sampled sidecar comparison still shows CTC ahead of AR on short previews. AR EOS behavior is stable, but AR transcript quality needs more training before it can be treated as a reliable ASR decoder. The expected milestone is at least one full Emilia EN/ZH epoch before judging AR alignment.
+Current joint training snapshot observed on `2026-05-21`:
+
+```text
+run_dir: runs/gigaspeech_wenetspeech_joint_rwkv7g1_ctc_ar_source_interleave_from_step28000_4x4090
+init_checkpoint: runs/gigaspeech_wenetspeech_joint_rwkv7g1_ctc_ar_drop_markup_text_20260519_231959/step-28000.pt
+training: epoch 1, about 34k / 278k steps observed
+latest observed train loss: about 1.65
+latest observed step eval:
+  step-34000 eval_loss = 1.1269
+best observed step eval:
+  step-29000 eval_loss = 1.0697
+  step-31000 eval_loss = 1.0800
+  step-16000 eval_loss = 1.0839
+```
+
+Latest sampled sidecar comparison observed on `2026-05-21`:
+
+```text
+latest_sidecar_checkpoint: step-31000.pt
+balanced_preview: 6 GigaSpeech + 6 WenetSpeech utterances
+overall:
+  ctc_token_error: 0.4104
+  rwkv_decoder_ar_token_error: 0.4328
+gigaspeech:
+  ctc_token_error: 0.4234
+  rwkv_decoder_ar_token_error: 0.5541
+wenetspeech:
+  ctc_token_error: 0.6194
+  rwkv_decoder_ar_token_error: 0.6472
+ar_eos_emitted_ratio: 1.0000
+```
+
+CTC is still the more stable decoding path overall. AR generation now reliably emits EOS and sometimes corrects CTC errors, especially on short English or Chinese phrases, but it still introduces language-model rewrites and hallucinations. Chinese quality has improved after runtime source interleaving, but long Chinese utterances remain the main weakness.
 
 Earlier CTC-only Emilia and VoxBox experiments confirmed the prototype can train and decode, but also showed that small or short-utterance-heavy data is insufficient for robust long-form ASR quality.
 
@@ -128,7 +183,9 @@ Earlier CTC-only Emilia and VoxBox experiments confirmed the prototype can train
 - CTC model, CTC prefix beam search, and token timestamp alignment.
 - WeNet-style fbank, CMVN, and `conv2d6` frontend.
 - WebDataset loading, length indexing, shard split, and bucketed sampling.
+- Runtime source-interleaved bucket sampling for mixed corpora without rebuilding large bucket manifests.
 - Rust-assisted preprocessing tools for large shard indexes.
+- Rust-assisted GigaSpeech parquet and WenetSpeech conversion to WebDataset.
 - DeepSpeed ZeRO-2 bf16 training with step checkpoints and sampled eval.
 - RWKV-7 G1 decoder initialization and joint CTC + AR loss path.
 - Sidecar checkpoint evaluation for CTC and RWKV decoder predictions.
@@ -137,7 +194,7 @@ Earlier CTC-only Emilia and VoxBox experiments confirmed the prototype can train
 
 ## In Progress
 
-- Full-epoch Emilia EN/ZH joint CTC-AR training.
+- Full-epoch GigaSpeech XL + WenetSpeech L joint CTC-AR training.
 - Better AR generation diagnostics after the decoder has seen enough paired audio/text.
 - Stable benchmark reports for CER/WER on AISHELL and short English public audio.
 - Rust inference parity for the full model, including custom RWKV fused behavior.

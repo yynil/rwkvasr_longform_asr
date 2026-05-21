@@ -23,7 +23,9 @@ impl SplitBy {
         match value {
             "sample_id" => Ok(Self::SampleId),
             "shard_name" => Ok(Self::ShardName),
-            other => Err(format!("Unsupported --split-by {other:?}; expected sample_id or shard_name.")),
+            other => Err(format!(
+                "Unsupported --split-by {other:?}; expected sample_id or shard_name."
+            )),
         }
     }
 
@@ -59,6 +61,8 @@ struct PartialEntry {
     json_size: Option<u64>,
     utt_id: Option<String>,
     num_frames: Option<u64>,
+    text_bytes: Option<u64>,
+    num_text_chars: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -82,6 +86,8 @@ enum WorkerMessage {
 struct MetadataInfo {
     utt_id: String,
     num_frames: u64,
+    text_bytes: u64,
+    num_text_chars: u64,
 }
 
 struct TarHeader {
@@ -139,8 +145,12 @@ fn run() -> Result<(), String> {
                 .unwrap_or("webdataset_lengths.jsonl")
         ));
     if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir)
-            .map_err(|err| format!("Failed to clean stale temp dir {}: {err}", temp_dir.display()))?;
+        fs::remove_dir_all(&temp_dir).map_err(|err| {
+            format!(
+                "Failed to clean stale temp dir {}: {err}",
+                temp_dir.display()
+            )
+        })?;
     }
     fs::create_dir_all(&temp_dir)
         .map_err(|err| format!("Failed to create temp dir {}: {err}", temp_dir.display()))?;
@@ -164,21 +174,19 @@ fn run() -> Result<(), String> {
         let shards = Arc::clone(&shared_shards);
         let temp_dir = temp_dir.clone();
         let config = config.clone();
-        handles.push(thread::spawn(move || {
-            loop {
-                let shard_index = next_index.fetch_add(1, Ordering::Relaxed);
-                if shard_index >= shards.len() {
-                    break;
-                }
-                let shard_path = &shards[shard_index];
-                let result = inspect_shard(shard_index, shard_path, &temp_dir, &config);
-                let message = match result {
-                    Ok(summary) => WorkerMessage::Done(summary),
-                    Err(err) => WorkerMessage::Err(err),
-                };
-                if tx.send(message).is_err() {
-                    break;
-                }
+        handles.push(thread::spawn(move || loop {
+            let shard_index = next_index.fetch_add(1, Ordering::Relaxed);
+            if shard_index >= shards.len() {
+                break;
+            }
+            let shard_path = &shards[shard_index];
+            let result = inspect_shard(shard_index, shard_path, &temp_dir, &config);
+            let message = match result {
+                Ok(summary) => WorkerMessage::Done(summary),
+                Err(err) => WorkerMessage::Err(err),
+            };
+            if tx.send(message).is_err() {
+                break;
             }
         }));
     }
@@ -193,7 +201,10 @@ fn run() -> Result<(), String> {
     let mut frame_buckets = BTreeMap::<u64, u64>::new();
 
     for completed in 0..shared_shards.len() {
-        match rx.recv().map_err(|err| format!("Worker channel failed: {err}"))? {
+        match rx
+            .recv()
+            .map_err(|err| format!("Worker channel failed: {err}"))?
+        {
             WorkerMessage::Done(result) => {
                 num_samples += result.num_samples;
                 train_samples += result.train_samples;
@@ -238,7 +249,11 @@ fn run() -> Result<(), String> {
         num_samples,
         train_samples,
         eval_samples,
-        if min_frames == u64::MAX { 0 } else { min_frames },
+        if min_frames == u64::MAX {
+            0
+        } else {
+            min_frames
+        },
         max_frames,
         &frame_buckets,
     )?;
@@ -261,12 +276,16 @@ fn parse_args() -> Result<Config, String> {
     let mut utt_id_key = String::from("sid");
     let mut split_by = SplitBy::ShardName;
     let mut shard_pattern = String::from("*.tar");
-    let mut threads = thread::available_parallelism().map(|value| value.get()).unwrap_or(4);
+    let mut threads = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4);
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--webdataset-root" => webdataset_root = Some(PathBuf::from(next_value(&mut args, &arg)?)),
+            "--webdataset-root" => {
+                webdataset_root = Some(PathBuf::from(next_value(&mut args, &arg)?))
+            }
             "--output-path" => output_path = Some(PathBuf::from(next_value(&mut args, &arg)?)),
             "--summary-path" => summary_path = Some(PathBuf::from(next_value(&mut args, &arg)?)),
             "--eval-ratio" => {
@@ -310,7 +329,8 @@ fn parse_args() -> Result<Config, String> {
         ));
     }
 
-    let webdataset_root = webdataset_root.ok_or_else(|| String::from("--webdataset-root is required."))?;
+    let webdataset_root =
+        webdataset_root.ok_or_else(|| String::from("--webdataset-root is required."))?;
     let output_path = output_path.unwrap_or_else(|| default_length_index_path(&webdataset_root));
     let summary_path = summary_path.unwrap_or_else(|| default_length_summary_path(&output_path));
 
@@ -398,7 +418,8 @@ fn inspect_shard(
         .map_err(|err| format!("Failed to create temp part {}: {err}", part_path.display()))?;
     let mut part_writer = BufWriter::new(part_file);
     let mut reader = BufReader::new(
-        File::open(shard_path).map_err(|err| format!("Failed to open {}: {err}", shard_path.display()))?,
+        File::open(shard_path)
+            .map_err(|err| format!("Failed to open {}: {err}", shard_path.display()))?,
     );
     let mut pending = HashMap::<String, PartialEntry>::new();
     let mut header = [0_u8; TAR_BLOCK_SIZE];
@@ -421,21 +442,33 @@ fn inspect_shard(
         };
 
         if !tar_header.is_regular_file {
-            skip_entry(&mut reader, tar_header.file_size)
-                .map_err(|err| format!("Failed to skip {} member {}: {err}", shard_name, tar_header.member_name))?;
+            skip_entry(&mut reader, tar_header.file_size).map_err(|err| {
+                format!(
+                    "Failed to skip {} member {}: {err}",
+                    shard_name, tar_header.member_name
+                )
+            })?;
             continue;
         }
 
         let Some((sample_key, suffix)) = split_member_name(&tar_header.member_name) else {
-            skip_entry(&mut reader, tar_header.file_size)
-                .map_err(|err| format!("Failed to skip {} member {}: {err}", shard_name, tar_header.member_name))?;
+            skip_entry(&mut reader, tar_header.file_size).map_err(|err| {
+                format!(
+                    "Failed to skip {} member {}: {err}",
+                    shard_name, tar_header.member_name
+                )
+            })?;
             continue;
         };
 
         match suffix.as_str() {
             audio_suffix if is_supported_audio_suffix(audio_suffix) => {
-                skip_entry(&mut reader, tar_header.file_size)
-                    .map_err(|err| format!("Failed to skip audio payload {}:{}: {err}", shard_name, tar_header.member_name))?;
+                skip_entry(&mut reader, tar_header.file_size).map_err(|err| {
+                    format!(
+                        "Failed to skip audio payload {}:{}: {err}",
+                        shard_name, tar_header.member_name
+                    )
+                })?;
                 let entry = pending.entry(sample_key.clone()).or_default();
                 entry.audio_member = Some(tar_header.member_name);
                 entry.audio_format = Some(audio_suffix.to_string());
@@ -443,31 +476,42 @@ fn inspect_shard(
                 entry.audio_size = Some(tar_header.file_size);
             }
             "json" => {
-                let payload = read_entry_bytes(&mut reader, tar_header.file_size).map_err(|err| {
-                    format!(
-                        "Failed to read json payload {}:{}: {err}",
-                        shard_name, tar_header.member_name
-                    )
-                })?;
+                let payload =
+                    read_entry_bytes(&mut reader, tar_header.file_size).map_err(|err| {
+                        format!(
+                            "Failed to read json payload {}:{}: {err}",
+                            shard_name, tar_header.member_name
+                        )
+                    })?;
                 let json_text = String::from_utf8(payload).map_err(|err| {
                     format!(
                         "Metadata is not valid UTF-8 for {}:{}: {err}",
                         shard_name, tar_header.member_name
                     )
                 })?;
-                let metadata = parse_metadata(&json_text, &sample_key, &config.utt_id_key).map_err(|err| {
-                    format!("Failed to parse metadata {}:{}: {err}", shard_name, tar_header.member_name)
-                })?;
+                let metadata = parse_metadata(&json_text, &sample_key, &config.utt_id_key)
+                    .map_err(|err| {
+                        format!(
+                            "Failed to parse metadata {}:{}: {err}",
+                            shard_name, tar_header.member_name
+                        )
+                    })?;
                 let entry = pending.entry(sample_key.clone()).or_default();
                 entry.json_member = Some(tar_header.member_name);
                 entry.json_offset = Some(tar_header.payload_offset);
                 entry.json_size = Some(tar_header.file_size);
                 entry.utt_id = Some(metadata.utt_id);
                 entry.num_frames = Some(metadata.num_frames);
+                entry.text_bytes = Some(metadata.text_bytes);
+                entry.num_text_chars = Some(metadata.num_text_chars);
             }
             _ => {
-                skip_entry(&mut reader, tar_header.file_size)
-                    .map_err(|err| format!("Failed to skip {} member {}: {err}", shard_name, tar_header.member_name))?;
+                skip_entry(&mut reader, tar_header.file_size).map_err(|err| {
+                    format!(
+                        "Failed to skip {} member {}: {err}",
+                        shard_name, tar_header.member_name
+                    )
+                })?;
             }
         }
 
@@ -483,15 +527,20 @@ fn inspect_shard(
                     && entry.json_size.is_some()
                     && entry.utt_id.is_some()
                     && entry.num_frames.is_some()
+                    && entry.text_bytes.is_some()
+                    && entry.num_text_chars.is_some()
             })
             .unwrap_or(false);
         if !should_emit {
             continue;
         }
 
-        let complete = pending
-            .remove(&sample_key)
-            .ok_or_else(|| format!("Missing pending sample state for {}:{}.", shard_name, sample_key))?;
+        let complete = pending.remove(&sample_key).ok_or_else(|| {
+            format!(
+                "Missing pending sample state for {}:{}.",
+                shard_name, sample_key
+            )
+        })?;
         let utt_id = complete
             .utt_id
             .ok_or_else(|| format!("Missing utt_id for {}:{}.", shard_name, sample_key))?;
@@ -523,6 +572,18 @@ fn inspect_shard(
         let json_size = complete
             .json_size
             .ok_or_else(|| format!("Missing json size for {}:{}.", shard_name, sample_key))?;
+        let text_bytes = complete.text_bytes.ok_or_else(|| {
+            format!(
+                "Missing text byte length for {}:{}.",
+                shard_name, sample_key
+            )
+        })?;
+        let num_text_chars = complete.num_text_chars.ok_or_else(|| {
+            format!(
+                "Missing text char length for {}:{}.",
+                shard_name, sample_key
+            )
+        })?;
         write_index_line(
             &mut part_writer,
             &shard_name,
@@ -537,6 +598,8 @@ fn inspect_shard(
             audio_size,
             json_offset,
             json_size,
+            text_bytes,
+            num_text_chars,
         )
         .map_err(|err| format!("Failed writing shard part {}: {err}", part_path.display()))?;
 
@@ -561,7 +624,11 @@ fn inspect_shard(
         num_samples,
         train_samples,
         eval_samples,
-        min_frames: if min_frames == u64::MAX { 0 } else { min_frames },
+        min_frames: if min_frames == u64::MAX {
+            0
+        } else {
+            min_frames
+        },
         max_frames,
         frame_buckets,
     })
@@ -572,10 +639,10 @@ fn merge_part_files(output_path: &Path, parts: &[ShardResult]) -> Result<(), Str
         .map_err(|err| format!("Failed to create {}: {err}", output_path.display()))?;
     let mut writer = BufWriter::new(output_file);
     for result in parts {
-        let mut input = BufReader::new(
-            File::open(&result.part_path)
-                .map_err(|err| format!("Failed to open part {}: {err}", result.part_path.display()))?,
-        );
+        let mut input =
+            BufReader::new(File::open(&result.part_path).map_err(|err| {
+                format!("Failed to open part {}: {err}", result.part_path.display())
+            })?);
         io::copy(&mut input, &mut writer)
             .map_err(|err| format!("Failed to merge part {}: {err}", result.part_path.display()))?;
     }
@@ -616,31 +683,66 @@ fn write_summary(
     writeln!(writer, "  \"num_samples\": {num_samples},").map_err(io_error)?;
     writeln!(writer, "  \"min_frames\": {min_frames},").map_err(io_error)?;
     writeln!(writer, "  \"max_frames\": {max_frames},").map_err(io_error)?;
-    writeln!(writer, "  \"audio_suffixes\": [\"wav\", \"mp3\", \"flac\"],").map_err(io_error)?;
+    writeln!(
+        writer,
+        "  \"audio_suffixes\": [\"wav\", \"mp3\", \"flac\"],"
+    )
+    .map_err(io_error)?;
     writeln!(writer, "  \"split\": {{").map_err(io_error)?;
     writeln!(writer, "    \"type\": \"stable_hash\",").map_err(io_error)?;
-    writeln!(writer, "    \"split_by\": {},", json_string(config.split_by.as_str())).map_err(io_error)?;
+    writeln!(
+        writer,
+        "    \"split_by\": {},",
+        json_string(config.split_by.as_str())
+    )
+    .map_err(io_error)?;
     writeln!(writer, "    \"train_name\": \"train\",").map_err(io_error)?;
     writeln!(writer, "    \"eval_name\": \"eval\",").map_err(io_error)?;
-    writeln!(writer, "    \"eval_ratio\": {},", format_float(config.eval_ratio)).map_err(io_error)?;
+    writeln!(
+        writer,
+        "    \"eval_ratio\": {},",
+        format_float(config.eval_ratio)
+    )
+    .map_err(io_error)?;
     writeln!(writer, "    \"hash_seed\": {},", config.hash_seed).map_err(io_error)?;
-    writeln!(writer, "    \"utt_id_key\": {}", json_string(&config.utt_id_key)).map_err(io_error)?;
+    writeln!(
+        writer,
+        "    \"utt_id_key\": {}",
+        json_string(&config.utt_id_key)
+    )
+    .map_err(io_error)?;
     writeln!(writer, "  }},").map_err(io_error)?;
     writeln!(writer, "  \"splits\": {{").map_err(io_error)?;
-    writeln!(writer, "    \"train\": {{ \"num_samples\": {train_samples} }},").map_err(io_error)?;
-    writeln!(writer, "    \"eval\": {{ \"num_samples\": {eval_samples} }}").map_err(io_error)?;
+    writeln!(
+        writer,
+        "    \"train\": {{ \"num_samples\": {train_samples} }},"
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "    \"eval\": {{ \"num_samples\": {eval_samples} }}"
+    )
+    .map_err(io_error)?;
     writeln!(writer, "  }},").map_err(io_error)?;
     writeln!(writer, "  \"frame_buckets\": {{").map_err(io_error)?;
     let mut iter = frame_buckets.iter().peekable();
     while let Some((bucket, count)) = iter.next() {
         let suffix = if iter.peek().is_some() { "," } else { "" };
-        writeln!(writer, "    {}: {count}{suffix}", json_string(&bucket.to_string())).map_err(io_error)?;
+        writeln!(
+            writer,
+            "    {}: {count}{suffix}",
+            json_string(&bucket.to_string())
+        )
+        .map_err(io_error)?;
     }
     writeln!(writer, "  }}").map_err(io_error)?;
     writeln!(writer, "}}").map_err(io_error)?;
-    writer
-        .flush()
-        .map_err(|err| format!("Failed to flush summary {}: {err}", config.summary_path.display()))?;
+    writer.flush().map_err(|err| {
+        format!(
+            "Failed to flush summary {}: {err}",
+            config.summary_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -648,7 +750,10 @@ fn io_error(err: io::Error) -> String {
     err.to_string()
 }
 
-fn read_tar_header(reader: &mut BufReader<File>, block: &mut [u8; TAR_BLOCK_SIZE]) -> io::Result<Option<TarHeader>> {
+fn read_tar_header(
+    reader: &mut BufReader<File>,
+    block: &mut [u8; TAR_BLOCK_SIZE],
+) -> io::Result<Option<TarHeader>> {
     let mut read = 0;
     while read < TAR_BLOCK_SIZE {
         let count = reader.read(&mut block[read..])?;
@@ -688,7 +793,10 @@ fn read_tar_header(reader: &mut BufReader<File>, block: &mut [u8; TAR_BLOCK_SIZE
 }
 
 fn parse_tar_string(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|value| *value == 0).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(bytes.len());
     let trimmed = bytes[..end]
         .iter()
         .copied()
@@ -748,7 +856,13 @@ fn padded_tar_size(file_size: u64) -> u64 {
 fn parse_metadata(json: &str, sample_key: &str, utt_id_key: &str) -> Result<MetadataInfo, String> {
     let utt_id = extract_json_string(json, utt_id_key).unwrap_or_else(|| sample_key.to_string());
     let num_frames = infer_num_frames(json)?;
-    Ok(MetadataInfo { utt_id, num_frames })
+    let text = extract_json_string(json, "text").unwrap_or_default();
+    Ok(MetadataInfo {
+        utt_id,
+        num_frames,
+        text_bytes: text.len() as u64,
+        num_text_chars: text.chars().count() as u64,
+    })
 }
 
 fn infer_num_frames(json: &str) -> Result<u64, String> {
@@ -779,7 +893,8 @@ fn infer_num_frames(json: &str) -> Result<u64, String> {
         None
     };
 
-    let duration_sec = duration_sec.ok_or_else(|| String::from("Unable to infer num_frames from metadata."))?;
+    let duration_sec =
+        duration_sec.ok_or_else(|| String::from("Unable to infer num_frames from metadata."))?;
     if duration_sec <= 0.0 {
         return Err(String::from("Duration is non-positive."));
     }
@@ -892,15 +1007,19 @@ fn write_index_line(
     audio_size: u64,
     json_offset: u64,
     json_size: u64,
+    text_bytes: u64,
+    num_text_chars: u64,
 ) -> io::Result<()> {
     writeln!(
         writer,
-        "{{\"shard_name\":{},\"key\":{},\"utt_id\":{},\"split\":{},\"num_frames\":{},\"audio_member\":{},\"audio_format\":{},\"json_member\":{},\"audio_offset\":{},\"audio_size\":{},\"json_offset\":{},\"json_size\":{}}}",
+        "{{\"shard_name\":{},\"key\":{},\"utt_id\":{},\"split\":{},\"num_frames\":{},\"num_text_chars\":{},\"text_bytes\":{},\"audio_member\":{},\"audio_format\":{},\"json_member\":{},\"audio_offset\":{},\"audio_size\":{},\"json_offset\":{},\"json_size\":{}}}",
         json_string(shard_name),
         json_string(key),
         json_string(utt_id),
         json_string(split),
         num_frames,
+        num_text_chars,
+        text_bytes,
         json_string(audio_member),
         json_string(audio_format),
         json_string(json_member),
@@ -1033,7 +1152,10 @@ mod tests {
     #[test]
     fn sha1_matches_known_vector() {
         let digest = sha1_digest(b"abc");
-        assert_eq!(hex_string(&digest), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            hex_string(&digest),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
     }
 
     #[test]
@@ -1059,22 +1181,13 @@ mod tests {
         write_tar(
             &shard_path,
             &[
-                (
-                    "abc.wav",
-                    b"RIFF....WAVE".to_vec(),
-                ),
+                ("abc.wav", b"RIFF....WAVE".to_vec()),
                 (
                     "abc.json",
                     br#"{"sid":"utt-abc","begin_time":0.0,"end_time":2.34}"#.to_vec(),
                 ),
-                (
-                    "def.wav",
-                    b"RIFF....WAVE".to_vec(),
-                ),
-                (
-                    "def.json",
-                    br#"{"sid":"utt-def","duration":1.25}"#.to_vec(),
-                ),
+                ("def.wav", b"RIFF....WAVE".to_vec()),
+                ("def.json", br#"{"sid":"utt-def","duration":1.25}"#.to_vec()),
             ],
         )
         .expect("write tar");
@@ -1097,7 +1210,17 @@ mod tests {
         fs::create_dir_all(&temp_dir).expect("temp dir");
         let shard = inspect_shard(0, &shard_path, &temp_dir, &config).expect("inspect");
         merge_part_files(&output_path, &[shard]).expect("merge");
-        write_summary(&config, 1, 2, 2, 0, 125, 234, &BTreeMap::from([(1, 1), (2, 1)])).expect("summary");
+        write_summary(
+            &config,
+            1,
+            2,
+            2,
+            0,
+            125,
+            234,
+            &BTreeMap::from([(1, 1), (2, 1)]),
+        )
+        .expect("summary");
 
         let index_text = fs::read_to_string(output_path).expect("read index");
         assert!(index_text.contains("\"utt_id\":\"utt-abc\""));

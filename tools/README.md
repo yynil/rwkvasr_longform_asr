@@ -5,7 +5,58 @@ Offline dataset preprocessing and deployment-oriented Rust utilities live here.
 Current tools:
 - `rwkvasr-tools` binary: multithreaded Rust WebDataset length indexer that scans tar metadata without decoding audio
 - `build_bucket_index` binary: Rust external-memory bucket manifest builder over a large `webdataset_lengths.jsonl`
+- `convert_asr_corpus` binary: Rust multi-threaded converter from GigaSpeech parquet or WenetSpeech Lhotse cuts into canonical WebDataset tar shards
 - `predict_ctc` binary: Rust + Candle CTC prefix-beam predictor over exported `safetensors logits + lengths`
+- `rwkvasr-convert-asr-corpus` Python CLI: small fallback/debug converter only; large corpora should use the Rust binary through the scripts below
+
+New ASR corpus preprocessing:
+
+```bash
+# GigaSpeech XL HuggingFace parquet train shards -> WebDataset + length buckets.
+# Scripts resume by default. Use RESUME=0 OVERWRITE=1 only for a clean rebuild.
+./scripts/prepare_gigaspeech_xl.sh \
+  /media/usbhd/training_data/asr/speechcolab/gigaspeech/parquet-data/xl \
+  /media/usbhd/training_data/asr/speechcolab/gigaspeech/webdataset_xl_train_runtime
+
+# GigaSpeech defaults to TEXT_NORMALIZATION=runtime:
+# - lowercases English
+# - maps <COMMA>/<PERIOD>/<QUESTIONMARK> to real punctuation
+# - preserves non-speech tags such as <NOISE>/<MUSIC>/<SIL>
+# - stores the original transcript in source_text when it changes
+
+# WenetSpeech Lhotse cuts_L shards -> WebDataset + length buckets.
+./scripts/prepare_wenetspeech_l.sh \
+  /media/usbhd/training_data/asr/wenet-e2e/wenetspeech/data \
+  /media/usbhd/training_data/asr/wenet-e2e/wenetspeech/webdataset_l_train
+
+# Optional mixed EN+ZH training root from the two converted roots.
+./scripts/prepare_gigaspeech_wenetspeech_mix.sh \
+  /media/usbhd/training_data/asr/speechcolab/gigaspeech/webdataset_xl_train_runtime \
+  /media/usbhd/training_data/asr/wenet-e2e/wenetspeech/webdataset_l_train \
+  /media/usbhd/training_data/asr/mix/gigaspeech_xl_runtime_wenetspeech_l_webdataset
+```
+
+The conversion roots use `id` as `webdataset_utt_id_key`, and the scripts build:
+- `webdataset_index.json`
+- `webdataset_lengths.jsonl`
+- `webdataset_buckets/manifest.json`
+- `global_cmvn.json` unless `COMPUTE_CMVN=0`
+
+The default scripts call the Rust converter first, then reuse the existing Python index/CMVN CLIs plus Rust length/bucket tools. WenetSpeech conversion does not need Lhotse at runtime; it reads the existing `cuts_*.jsonl.gz` metadata and paired `cuts_*.tar.gz` cut-level wav archives.
+
+For joint `CTC + RWKV AR` training, the bucket builder should not use audio length alone. The scripts default to combined-cost bucketing:
+
+```text
+bucket_cost = audio_frames + BUCKET_TEXT_COST_WEIGHT * estimated_text_tokens
+```
+
+`estimated_text_tokens` is read from the length index when available, otherwise it falls back to text char/byte counts or a bounded `json_size` proxy. Set `BUCKET_TEXT_COST_WEIGHT=0` to restore audio-only bucketing.
+
+Conversion progress is displayed by the Rust converter with an `indicatif` progress bar showing shard progress, elapsed time, ETA, total samples, skipped samples, and the latest worker state.
+
+Set `STAGING_ROOT=/path/on/nvme STAGING_MAX_GB=100` to write each completed tar part to NVMe first and then publish it to the final HDD WebDataset root. This keeps final tar files complete-only and bounded by the staging limit.
+
+Conversion resume is input-shard based. `RESUME=1` is the script default and passes `--resume --adopt-existing`, so completed shards are skipped by marker and older pre-marker tar output is adopted only when output part count plus the final part sample count match the source shard. `OVERWRITE=1` is rejected unless `RESUME=0` is also set.
 
 Recommended prediction/export workflow:
 
@@ -69,6 +120,8 @@ cargo run --release --manifest-path tools/Cargo.toml --bin build_bucket_index --
   --output-dir /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_buckets \
   --manifest-path /media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_buckets/manifest.json \
   --bucket-width 80 \
+  --text-cost-source auto \
+  --text-cost-weight 4 \
   --entries-per-part 100000
 ```
 

@@ -43,8 +43,12 @@ rwkvasr-prepare-flores-sentencepiece = "rwkvasr.cli.prepare_flores_sentencepiece
 rwkvasr-check-rwkv7-cuda = "rwkvasr.cli.check_rwkv7_cuda:main"
 rwkvasr-check-rwkv7-decoder = "rwkvasr.cli.check_rwkv7_decoder:main"
 rwkvasr-watch-checkpoint-sidecar = "rwkvasr.cli.watch_checkpoint_sidecar:main"
+rwkvasr-convert-asr-corpus = "rwkvasr.cli.convert_asr_corpus_to_webdataset:main"
 
 [project.optional-dependencies]
+preprocess = [
+  "pyarrow>=18.0",
+]
 dev = [
   "pytest>=8.3",
   "pytest-cov>=6.0",

@@ -74,7 +74,7 @@ def predict_rwkv_decoder_labeled(
     )
     decode_fn = getattr(tokenizer, "decode", None)
     eos_token_id = _resolve_eos_token_id(tokenizer)
-    loader = _build_labeled_prediction_loader(config)
+    loader = _build_labeled_prediction_loader(config, tokenizer=tokenizer)
 
     predictions: list[CTCLabeledPrediction] = []
     debug_rows: list[RWKVDecoderDecodeDebug] = []

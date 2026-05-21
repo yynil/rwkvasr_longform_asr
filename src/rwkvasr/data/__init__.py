@@ -24,6 +24,7 @@ from .manifest import (
     WenetFbankFeatureExtractor,
 )
 from .webdataset import WebDatasetASRIterableDataset, WebDatasetConfig, build_webdataset_dataloader
+from .text_normalization import normalize_asr_text
 from .webdataset_bucketed import (
     BucketedWebDatasetBatchLoader,
     WebDatasetBucket,
@@ -110,6 +111,7 @@ __all__ = [
     "load_webdataset_bucket_manifest",
     "load_webdataset_length_entries",
     "maybe_append_eos_token_ids",
+    "normalize_asr_text",
     "resolve_sample_id",
     "resolve_webdataset_bucket_manifest_path",
     "resolve_webdataset_length_index_path",

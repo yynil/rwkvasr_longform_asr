@@ -121,9 +121,11 @@ class PredictionConfig:
     manifest_path: str | None = None
     webdataset_root: str | None = None
     webdataset_split: str = "all"
+    webdataset_shard_pattern: str = "*.tar"
     webdataset_eval_ratio: float = 0.0
     webdataset_hash_seed: int = 0
     webdataset_split_by: str = "shard_name"
+    webdataset_utt_id_key: str = "sid"
     device: str = "cpu"
     mode: str = "bi"
     beam_size: int = 8
@@ -132,6 +134,7 @@ class PredictionConfig:
     tokenizer_model_path: str | None = None
     tokenizer_language: str | None = None
     tokenizer_task: str | None = None
+    text_normalization: str = "none"
     num_workers: int = 0
     frame_shift_ms: float = 10.0
     length_bonus: float = 0.0
@@ -529,11 +532,14 @@ def _build_prediction_loader(config: PredictionConfig) -> DataLoader:
     dataset = PredictionWebDataset(
         str(config.webdataset_root),
         config=WebDatasetConfig(
+            shard_pattern=config.webdataset_shard_pattern,
             shuffle_shards=False,
             split=config.webdataset_split,
             eval_ratio=config.webdataset_eval_ratio,
             hash_seed=config.webdataset_hash_seed,
             split_by=config.webdataset_split_by,
+            utt_id_key=config.webdataset_utt_id_key,
+            text_normalization=config.text_normalization,
         ),
     )
     return DataLoader(
@@ -544,7 +550,7 @@ def _build_prediction_loader(config: PredictionConfig) -> DataLoader:
     )
 
 
-def _build_labeled_prediction_loader(config: PredictionConfig) -> DataLoader:
+def _build_labeled_prediction_loader(config: PredictionConfig, *, tokenizer: Any | None = None) -> DataLoader:
     has_manifest = config.manifest_path is not None
     has_webdataset = config.webdataset_root is not None
     if has_manifest == has_webdataset:
@@ -562,13 +568,17 @@ def _build_labeled_prediction_loader(config: PredictionConfig) -> DataLoader:
 
     dataset = WebDatasetASRIterableDataset(
         str(config.webdataset_root),
+        tokenizer=tokenizer,
         config=WebDatasetConfig(
+            shard_pattern=config.webdataset_shard_pattern,
             shuffle_shards=False,
             split=config.webdataset_split,
             eval_ratio=config.webdataset_eval_ratio,
             hash_seed=config.webdataset_hash_seed,
             split_by=config.webdataset_split_by,
+            utt_id_key=config.webdataset_utt_id_key,
             partition_by_rank=False,
+            text_normalization=config.text_normalization,
         ),
     )
     return DataLoader(
@@ -1225,7 +1235,7 @@ def predict_ctc_labeled(
                 default_weight=config.hotword_weight,
             )
         )
-    loader = _build_labeled_prediction_loader(config)
+    loader = _build_labeled_prediction_loader(config, tokenizer=tokenizer)
 
     predictions: list[CTCLabeledPrediction] = []
     with torch.no_grad():
