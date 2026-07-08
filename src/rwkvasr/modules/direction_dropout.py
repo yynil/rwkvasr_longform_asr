@@ -6,7 +6,7 @@ from typing import Literal
 import torch
 from torch import Tensor
 
-DirectionDropoutVariant = Literal["drop_r2l_only", "drop_both"]
+DirectionDropoutVariant = Literal["none", "drop_r2l_only", "drop_both"]
 InferenceMode = Literal["bi", "l2r", "r2l", "alt"]
 
 
@@ -47,9 +47,9 @@ class DirectionMask:
 @dataclass(frozen=True)
 class DirectionDropoutConfig:
     num_layers: int
-    variant: DirectionDropoutVariant = "drop_both"
-    p_start: float = 0.2
-    p_max: float = 0.2
+    variant: DirectionDropoutVariant = "none"
+    p_start: float = 0.0
+    p_max: float = 0.0
     warmup_steps: int = 0
     ramp_steps: int = 0
 
@@ -130,6 +130,8 @@ class DirectionDropoutScheduler:
         p_drop = self.probability_at(step)
         forward = torch.ones(self.config.num_layers, dtype=torch.bool, device=device)
         backward = torch.ones(self.config.num_layers, dtype=torch.bool, device=device)
+        if self.config.variant == "none" or p_drop <= 0.0:
+            return DirectionMask(forward=forward, backward=backward)
         drop = torch.rand(self.config.num_layers, generator=generator, device=device) < p_drop
 
         if self.config.variant == "drop_r2l_only":

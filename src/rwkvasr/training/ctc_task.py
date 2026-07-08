@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -19,6 +20,12 @@ class CTCBatch:
     feature_lengths: Tensor
     targets: Tensor
     target_lengths: Tensor
+    utt_ids: list[str] | None = None
+    decoder_targets: Tensor | None = None
+    decoder_target_lengths: Tensor | None = None
+    decoder_prompt_before_audio: Tensor | None = None
+    decoder_prompt_before_audio_lengths: Tensor | None = None
+    ctc_teacher_audio_rows: list[dict[str, Any] | None] | None = None
 
     def to(
         self,
@@ -34,6 +41,26 @@ class CTCBatch:
             feature_lengths=self.feature_lengths.to(device),
             targets=self.targets.to(device),
             target_lengths=self.target_lengths.to(device),
+            utt_ids=self.utt_ids,
+            decoder_targets=(
+                self.decoder_targets.to(device) if self.decoder_targets is not None else None
+            ),
+            decoder_target_lengths=(
+                self.decoder_target_lengths.to(device)
+                if self.decoder_target_lengths is not None
+                else None
+            ),
+            decoder_prompt_before_audio=(
+                self.decoder_prompt_before_audio.to(device)
+                if self.decoder_prompt_before_audio is not None
+                else None
+            ),
+            decoder_prompt_before_audio_lengths=(
+                self.decoder_prompt_before_audio_lengths.to(device)
+                if self.decoder_prompt_before_audio_lengths is not None
+                else None
+            ),
+            ctc_teacher_audio_rows=self.ctc_teacher_audio_rows,
         )
 
 
@@ -90,6 +117,10 @@ class RWKVDualModeCTCTrainer:
             batch.feature_lengths,
             batch.targets,
             batch.target_lengths,
+            decoder_targets=batch.decoder_targets,
+            decoder_target_lengths=batch.decoder_target_lengths,
+            decoder_prompt_before_audio=batch.decoder_prompt_before_audio,
+            decoder_prompt_before_audio_lengths=batch.decoder_prompt_before_audio_lengths,
             direction_mask=mask,
         )
         return losses["loss"], mask
@@ -123,6 +154,10 @@ class RWKVDualModeCTCTrainer:
             batch.feature_lengths,
             batch.targets,
             batch.target_lengths,
+            decoder_targets=batch.decoder_targets,
+            decoder_target_lengths=batch.decoder_target_lengths,
+            decoder_prompt_before_audio=batch.decoder_prompt_before_audio,
+            decoder_prompt_before_audio_lengths=batch.decoder_prompt_before_audio_lengths,
             direction_mask=mask,
         )
         return losses["loss"]

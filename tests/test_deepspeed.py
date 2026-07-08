@@ -13,7 +13,9 @@ from rwkvasr.training.deepspeed_loop import (
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
     _prune_deepspeed_step_checkpoint_artifacts,
+    _resolve_ctc_teacher_online_device,
     _resolve_max_steps as resolve_deepspeed_max_steps,
+    _save_export_checkpoints,
     _sample_direction_mask_distributed,
     _step_checkpoint_record_is_retained,
     train_ctc_model_deepspeed,
@@ -40,6 +42,13 @@ def _write_manifest(tmp_path: Path, num_examples: int = 3, base_frames: int = 48
                 + "\n"
             )
     return manifest_path
+
+
+def test_online_ctc_teacher_device_uses_cuda_zero_for_single_process_debug() -> None:
+    assert _resolve_ctc_teacher_online_device(None, torch.device("cuda"), local_rank=-1) == "cuda:0"
+    assert _resolve_ctc_teacher_online_device(None, torch.device("cuda", 2), local_rank=2) == "cuda:2"
+    assert _resolve_ctc_teacher_online_device("cuda:1", torch.device("cuda"), local_rank=-1) == "cuda:1"
+    assert _resolve_ctc_teacher_online_device(None, torch.device("cpu"), local_rank=-1) == "cpu"
 
 
 def test_deepspeed_cli_config_can_be_loaded_from_yaml_and_overridden(tmp_path: Path) -> None:
@@ -336,6 +345,31 @@ def test_normalize_deepspeed_config_does_not_force_cpu_offload() -> None:
     assert "offload_optimizer" not in normalized["zero_optimization"]
 
 
+def test_normalize_deepspeed_config_respects_explicit_bf16_false() -> None:
+    config = DeepSpeedTrainConfig(
+        output_dir="out",
+        manifest_path="manifest.jsonl",
+        batch_size=4,
+        max_steps=1,
+        device="cuda",
+        deepspeed={
+            "train_micro_batch_size_per_gpu": 4,
+            "gradient_accumulation_steps": 1,
+            "zero_optimization": {
+                "stage": 1,
+            },
+            "bf16": {
+                "enabled": False,
+            },
+        },
+    )
+
+    normalized = _normalize_deepspeed_config(config)
+
+    assert normalized["bf16"] == {"enabled": False}
+    assert normalized["fp16"] == {"enabled": False}
+
+
 def test_build_deepspeed_optimizer_uses_adamw_when_offload_disabled() -> None:
     model = RWKVCTCModel(
         RWKVCTCModelConfig(
@@ -501,3 +535,46 @@ def test_step_checkpoint_record_is_retained_matches_by_file_or_dir() -> None:
         record={"checkpoint_path": "/tmp/step-3.pt"},
         top_records=top_records,
     )
+
+
+def test_save_export_checkpoints_can_skip_deepspeed_shards(tmp_path: Path) -> None:
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=1,
+            vocab_size=8,
+            head_size=32,
+            conv_kernel_size=5,
+            dropout=0.0,
+            frontend_type="linear",
+        )
+    )
+
+    class FakeEngine:
+        module = model
+
+        def save_checkpoint(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            raise AssertionError("DeepSpeed sharded checkpoint should be skipped")
+
+    saved = _save_export_checkpoints(
+        engine=FakeEngine(),
+        output_dir=tmp_path,
+        tag="step-1",
+        export_name="step-1.pt",
+        step=1,
+        zero_stage=1,
+        extra_state={"epoch": 1, "epoch_batch_offset": 0},
+        save_deepspeed_sharded=False,
+    )
+
+    assert saved["checkpoint_path"] == str(tmp_path / "step-1.pt")
+    assert saved["deepspeed_checkpoint_dir"] is None
+    assert (tmp_path / "step-1.pt").exists()
+    assert not (tmp_path / "ds_checkpoints").exists()
+    latest = load_yaml(tmp_path / "latest_checkpoint.yaml")
+    assert latest["checkpoint_type"] == "export"
+    assert latest["checkpoint_path"] == str(tmp_path / "step-1.pt")
+    assert "deepspeed_checkpoint_dir" not in latest

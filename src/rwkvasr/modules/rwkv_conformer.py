@@ -138,6 +138,7 @@ class RWKVConformerBlock(nn.Module):
         v_first: BidirectionalVFirstState | None = None,
         state: RWKVConformerBlockState | None = None,
         layer_mask: LayerDirectionMask | None = None,
+        lengths: Tensor | None = None,
     ) -> tuple[Tensor, BidirectionalVFirstState, RWKVConformerBlockState]:
         x = x + 0.5 * self.ffn1(self.ffn1_norm(x))
 
@@ -147,6 +148,7 @@ class RWKVConformerBlock(nn.Module):
             v_first=v_first,
             state=time_state,
             layer_mask=layer_mask,
+            lengths=lengths,
         )
         x = x + time_out
 

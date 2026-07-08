@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import io
+import fnmatch
 import json
 import math
 import os
 import random
+import sys
 import tarfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 
-from rwkvasr.data import ASRManifestDataset, WenetFbankFeatureExtractor, WebDatasetASRIterableDataset, WebDatasetConfig, build_text_tokenizer
+from rwkvasr.data import (
+    ASRManifestDataset,
+    LengthIndexedWebDatasetDataset,
+    WebDatasetASRIterableDataset,
+    WebDatasetConfig,
+    build_audio_feature_extractor,
+    build_text_tokenizer,
+    load_webdataset_length_entries,
+)
+from rwkvasr.data.manifest import load_audio_waveform
 from rwkvasr.data.webdataset_common import AUDIO_SUFFIXES
 from rwkvasr.data.webdataset_index import StableHashSplitConfig, resolve_sample_id, sample_in_split, shard_in_split
 from rwkvasr.modules import RWKVCTCModel, RWKVCTCModelConfig, build_inference_direction_mask
@@ -120,6 +132,7 @@ class PredictionConfig:
     model_config: RWKVCTCModelConfig
     manifest_path: str | None = None
     webdataset_root: str | None = None
+    webdataset_length_index_path: str | None = None
     webdataset_split: str = "all"
     webdataset_shard_pattern: str = "*.tar"
     webdataset_eval_ratio: float = 0.0
@@ -139,6 +152,7 @@ class PredictionConfig:
     frame_shift_ms: float = 10.0
     length_bonus: float = 0.0
     insertion_bonus: float = 0.0
+    blank_logit_bias: float = 0.0
     save_debug_lengths: bool = False
     hotwords_path: str | None = None
     hotword_weight: float = 3.0
@@ -146,6 +160,23 @@ class PredictionConfig:
     decoder_rescore_topk: int = 0
     decoder_rescore_weight: float = 0.5
     decoder_rescore_length_normalize: bool = True
+    decoder_prompt_before_audio: str = ""
+    decoder_prompt_before_audio_use_language: bool = False
+    decoder_ctc_draft_cache_path: str | None = None
+    decoder_ctc_draft_prompt_template: str = ""
+    decoder_ctc_draft_text_key: str = "pred_text"
+    decoder_ctc_draft_missing_policy: str = "empty"
+    decoder_ctc_draft_dropout_prob: float = 0.0
+    decoder_ctc_draft_language_mismatch_dropout_prob: float = 0.0
+    decoder_ctc_draft_dropout_seed: int = 0
+    decoder_target_prefix: str = ""
+    decoder_target_prefix_use_language: bool = False
+    decoder_language_confirmation_en: str = "This is English text."
+    decoder_language_confirmation_zh: str = "这是中文文字。"
+    decoder_prompt_language_label_noise_prob: float = 0.0
+    decoder_prompt_language_label_noise_seed: int = 0
+    skip_decode_errors: bool = False
+    progress_interval: int = 0
 
 
 @dataclass(frozen=True)
@@ -156,6 +187,50 @@ class ExportedLogitsPart:
     num_samples: int
     max_time: int
     vocab_size: int
+
+
+def _resolve_prediction_total(loader: DataLoader, *, limit: int | None) -> int | None:
+    dataset = getattr(loader, "dataset", None)
+    try:
+        total = len(dataset)  # type: ignore[arg-type]
+    except (TypeError, AttributeError):
+        total = None
+    if total is not None and limit is not None:
+        total = min(int(total), int(limit))
+    return int(total) if total is not None else None
+
+
+def _maybe_report_prediction_progress(
+    *,
+    kind: str,
+    count: int,
+    total: int | None,
+    started_at: float,
+    last_reported: int,
+    interval: int,
+    final: bool = False,
+) -> int:
+    interval = int(interval)
+    if interval <= 0:
+        return last_reported
+    should_report = final or count == 0 or count - last_reported >= interval
+    if total is not None and count >= total:
+        should_report = True
+    if not should_report:
+        return last_reported
+    elapsed = max(1e-6, time.monotonic() - started_at)
+    rate = float(count) / elapsed
+    total_text = str(total) if total is not None else "?"
+    percent_text = ""
+    if total:
+        percent_text = f" {100.0 * float(count) / float(total):.1f}%"
+    print(
+        f"[rwkvasr-predict] kind={kind} samples={count}/{total_text}{percent_text} "
+        f"elapsed={elapsed:.1f}s rate={rate:.2f}/s",
+        file=sys.stderr,
+        flush=True,
+    )
+    return count
 
 
 @dataclass(frozen=True)
@@ -204,6 +279,18 @@ def _build_decode_debug(
     )
 
 
+def _ctc_greedy_collapse(frame_log_probs: Tensor, *, blank_id: int) -> tuple[list[int], float]:
+    best_log_probs, best_ids = frame_log_probs.max(dim=-1)
+    collapsed: list[int] = []
+    previous: int | None = None
+    for token_id in best_ids.tolist():
+        token_id = int(token_id)
+        if token_id != int(blank_id) and token_id != previous:
+            collapsed.append(token_id)
+        previous = token_id
+    return collapsed, float(best_log_probs.sum().item())
+
+
 @dataclass
 class PredictionBatch:
     features: Tensor
@@ -234,6 +321,8 @@ class LabeledPredictionBatch:
     target_lengths: Tensor
     utt_ids: list[str]
     texts: list[str | None]
+    decoder_prompt_before_audio: Tensor | None = None
+    decoder_prompt_before_audio_lengths: Tensor | None = None
 
     def to(
         self,
@@ -251,6 +340,16 @@ class LabeledPredictionBatch:
             target_lengths=self.target_lengths.to(device),
             utt_ids=self.utt_ids,
             texts=self.texts,
+            decoder_prompt_before_audio=(
+                self.decoder_prompt_before_audio.to(device)
+                if self.decoder_prompt_before_audio is not None
+                else None
+            ),
+            decoder_prompt_before_audio_lengths=(
+                self.decoder_prompt_before_audio_lengths.to(device)
+                if self.decoder_prompt_before_audio_lengths is not None
+                else None
+            ),
         )
 
 
@@ -289,15 +388,30 @@ class LabeledPredictionCollator:
         feat_dim = samples[0]["features"].size(-1)
         max_frames = max(int(sample["feature_length"]) for sample in samples)
         total_targets = sum(int(sample["target_length"]) for sample in samples)
+        has_decoder_prompt_before_audio = any("decoder_prompt_before_audio" in sample for sample in samples)
+        total_decoder_prompt_before_audio = (
+            sum(int(sample.get("decoder_prompt_before_audio_length", 0)) for sample in samples)
+            if has_decoder_prompt_before_audio
+            else 0
+        )
 
         features = torch.zeros(batch_size, max_frames, feat_dim, dtype=samples[0]["features"].dtype)
         feature_lengths = torch.zeros(batch_size, dtype=torch.long)
         targets = torch.zeros(total_targets, dtype=torch.long)
         target_lengths = torch.zeros(batch_size, dtype=torch.long)
+        decoder_prompt_before_audio = (
+            torch.zeros(total_decoder_prompt_before_audio, dtype=torch.long)
+            if has_decoder_prompt_before_audio
+            else None
+        )
+        decoder_prompt_before_audio_lengths = (
+            torch.zeros(batch_size, dtype=torch.long) if has_decoder_prompt_before_audio else None
+        )
         utt_ids: list[str] = []
         texts: list[str | None] = []
 
         target_offset = 0
+        decoder_prompt_offset = 0
         for idx, sample in enumerate(samples):
             feat = sample["features"]
             feature_len = int(sample["feature_length"])
@@ -312,6 +426,18 @@ class LabeledPredictionCollator:
 
             utt_ids.append(str(sample["utt_id"]))
             texts.append(sample.get("text"))
+            if (
+                decoder_prompt_before_audio is not None
+                and decoder_prompt_before_audio_lengths is not None
+                and "decoder_prompt_before_audio" in sample
+            ):
+                decoder_prompt = sample["decoder_prompt_before_audio"]
+                decoder_prompt_len = int(sample.get("decoder_prompt_before_audio_length", 0))
+                decoder_prompt_before_audio[
+                    decoder_prompt_offset : decoder_prompt_offset + decoder_prompt_len
+                ] = decoder_prompt
+                decoder_prompt_before_audio_lengths[idx] = decoder_prompt_len
+                decoder_prompt_offset += decoder_prompt_len
 
         return LabeledPredictionBatch(
             features=features,
@@ -320,6 +446,8 @@ class LabeledPredictionCollator:
             target_lengths=target_lengths,
             utt_ids=utt_ids,
             texts=texts,
+            decoder_prompt_before_audio=decoder_prompt_before_audio,
+            decoder_prompt_before_audio_lengths=decoder_prompt_before_audio_lengths,
         )
 
 
@@ -328,11 +456,11 @@ class PredictionManifestDataset(Dataset[dict[str, Any]]):
         self,
         manifest_path: str | Path,
         *,
-        feature_extractor: WenetFbankFeatureExtractor | None = None,
+        feature_extractor: Any | None = None,
     ):
         self.manifest_path = Path(manifest_path)
         self.root = self.manifest_path.parent
-        self.feature_extractor = feature_extractor or WenetFbankFeatureExtractor()
+        self.feature_extractor = feature_extractor or build_audio_feature_extractor("wenet_fbank", input_dim=80)
         self.entries = self._load_entries()
 
     def _load_entries(self) -> list[dict[str, Any]]:
@@ -371,12 +499,11 @@ class PredictionManifestDataset(Dataset[dict[str, Any]]):
         audio_filepath = entry.get("audio_filepath")
         if audio_filepath is None:
             raise ValueError("Prediction manifest entry must contain feature_path or audio_filepath.")
-        import torchaudio
 
         resolved = Path(audio_filepath)
         if not resolved.is_absolute():
             resolved = self.root / resolved
-        waveform, sample_rate = torchaudio.load(resolved)
+        waveform, sample_rate = load_audio_waveform(resolved)
         return self.feature_extractor(waveform, sample_rate).float()
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -394,7 +521,7 @@ def decode_prediction_webdataset_sample(
     key: str,
     audio_bytes: bytes,
     metadata_bytes: bytes,
-    feature_extractor: WenetFbankFeatureExtractor,
+    feature_extractor: Any,
     utt_id_key: str,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -418,12 +545,12 @@ class PredictionWebDataset(IterableDataset[dict[str, Any]]):
         self,
         shard_root: str | Path,
         *,
-        feature_extractor: WenetFbankFeatureExtractor | None = None,
+        feature_extractor: Any | None = None,
         config: WebDatasetConfig | None = None,
     ):
         super().__init__()
         self.shard_root = Path(shard_root)
-        self.feature_extractor = feature_extractor or WenetFbankFeatureExtractor()
+        self.feature_extractor = feature_extractor or build_audio_feature_extractor("wenet_fbank", input_dim=80)
         self.config = config or WebDatasetConfig()
         self.epoch = 0
         self.shards = self._resolve_shards()
@@ -519,8 +646,12 @@ def _build_prediction_loader(config: PredictionConfig) -> DataLoader:
     if has_manifest == has_webdataset:
         raise ValueError("Exactly one of manifest_path or webdataset_root must be provided for prediction.")
 
+    feature_extractor = build_audio_feature_extractor(
+        config.model_config.feature_extractor_type,
+        input_dim=int(config.model_config.input_dim),
+    )
     if has_manifest:
-        dataset = PredictionManifestDataset(str(config.manifest_path))
+        dataset = PredictionManifestDataset(str(config.manifest_path), feature_extractor=feature_extractor)
         return DataLoader(
             dataset,
             batch_size=config.batch_size,
@@ -531,6 +662,7 @@ def _build_prediction_loader(config: PredictionConfig) -> DataLoader:
 
     dataset = PredictionWebDataset(
         str(config.webdataset_root),
+        feature_extractor=feature_extractor,
         config=WebDatasetConfig(
             shard_pattern=config.webdataset_shard_pattern,
             shuffle_shards=False,
@@ -556,8 +688,94 @@ def _build_labeled_prediction_loader(config: PredictionConfig, *, tokenizer: Any
     if has_manifest == has_webdataset:
         raise ValueError("Exactly one of manifest_path or webdataset_root must be provided for prediction.")
 
+    feature_extractor = build_audio_feature_extractor(
+        config.model_config.feature_extractor_type,
+        input_dim=int(config.model_config.input_dim),
+    )
+    has_dynamic_decoder_prompt = bool(
+        config.decoder_prompt_before_audio_use_language or config.decoder_ctc_draft_prompt_template
+    )
     if has_manifest:
-        dataset = ASRManifestDataset(str(config.manifest_path))
+        dataset = ASRManifestDataset(
+            str(config.manifest_path),
+            tokenizer=tokenizer,
+            decoder_tokenizer=tokenizer if has_dynamic_decoder_prompt else None,
+            feature_extractor=feature_extractor,
+            text_normalization=config.text_normalization,
+            decoder_text_normalization=config.text_normalization,
+            decoder_prompt_before_audio=config.decoder_prompt_before_audio,
+            decoder_prompt_before_audio_use_language=config.decoder_prompt_before_audio_use_language,
+            decoder_ctc_draft_cache_path=config.decoder_ctc_draft_cache_path,
+            decoder_ctc_draft_prompt_template=config.decoder_ctc_draft_prompt_template,
+            decoder_ctc_draft_text_key=config.decoder_ctc_draft_text_key,
+            decoder_ctc_draft_missing_policy=config.decoder_ctc_draft_missing_policy,
+            decoder_ctc_draft_dropout_prob=config.decoder_ctc_draft_dropout_prob,
+            decoder_ctc_draft_language_mismatch_dropout_prob=(
+                config.decoder_ctc_draft_language_mismatch_dropout_prob
+            ),
+            decoder_ctc_draft_dropout_seed=config.decoder_ctc_draft_dropout_seed,
+            decoder_target_prefix=config.decoder_target_prefix,
+            decoder_target_prefix_use_language=config.decoder_target_prefix_use_language,
+            decoder_language_confirmation_en=config.decoder_language_confirmation_en,
+            decoder_language_confirmation_zh=config.decoder_language_confirmation_zh,
+            decoder_prompt_language_label_noise_prob=config.decoder_prompt_language_label_noise_prob,
+            decoder_prompt_language_label_noise_seed=config.decoder_prompt_language_label_noise_seed,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            collate_fn=LabeledPredictionCollator(),
+        )
+
+    if config.webdataset_length_index_path is not None:
+        entries = load_webdataset_length_entries(
+            config.webdataset_length_index_path,
+            split=config.webdataset_split,
+        )
+        if config.webdataset_shard_pattern and config.webdataset_shard_pattern != "*.tar":
+            entries = [
+                entry
+                for entry in entries
+                if fnmatch.fnmatch(entry.shard_name, config.webdataset_shard_pattern)
+            ]
+        dataset = LengthIndexedWebDatasetDataset(
+            str(config.webdataset_root),
+            entries,
+            tokenizer=tokenizer,
+            decoder_tokenizer=tokenizer if has_dynamic_decoder_prompt else None,
+            feature_extractor=feature_extractor,
+            config=WebDatasetConfig(
+                shuffle_shards=False,
+                split=config.webdataset_split,
+                eval_ratio=config.webdataset_eval_ratio,
+                hash_seed=config.webdataset_hash_seed,
+                split_by=config.webdataset_split_by,
+                utt_id_key=config.webdataset_utt_id_key,
+                partition_by_rank=False,
+                text_normalization=config.text_normalization,
+                decoder_text_normalization=config.text_normalization,
+                decoder_prompt_before_audio=config.decoder_prompt_before_audio,
+                decoder_prompt_before_audio_use_language=config.decoder_prompt_before_audio_use_language,
+                decoder_ctc_draft_cache_path=config.decoder_ctc_draft_cache_path,
+                decoder_ctc_draft_prompt_template=config.decoder_ctc_draft_prompt_template,
+                decoder_ctc_draft_text_key=config.decoder_ctc_draft_text_key,
+                decoder_ctc_draft_missing_policy=config.decoder_ctc_draft_missing_policy,
+                decoder_ctc_draft_dropout_prob=config.decoder_ctc_draft_dropout_prob,
+                decoder_ctc_draft_language_mismatch_dropout_prob=(
+                    config.decoder_ctc_draft_language_mismatch_dropout_prob
+                ),
+                decoder_ctc_draft_dropout_seed=config.decoder_ctc_draft_dropout_seed,
+                decoder_target_prefix=config.decoder_target_prefix,
+                decoder_target_prefix_use_language=config.decoder_target_prefix_use_language,
+                decoder_language_confirmation_en=config.decoder_language_confirmation_en,
+                decoder_language_confirmation_zh=config.decoder_language_confirmation_zh,
+                decoder_prompt_language_label_noise_prob=config.decoder_prompt_language_label_noise_prob,
+                decoder_prompt_language_label_noise_seed=config.decoder_prompt_language_label_noise_seed,
+                skip_decode_errors=config.skip_decode_errors,
+            ),
+        )
         return DataLoader(
             dataset,
             batch_size=config.batch_size,
@@ -569,6 +787,8 @@ def _build_labeled_prediction_loader(config: PredictionConfig, *, tokenizer: Any
     dataset = WebDatasetASRIterableDataset(
         str(config.webdataset_root),
         tokenizer=tokenizer,
+        decoder_tokenizer=tokenizer if has_dynamic_decoder_prompt else None,
+        feature_extractor=feature_extractor,
         config=WebDatasetConfig(
             shard_pattern=config.webdataset_shard_pattern,
             shuffle_shards=False,
@@ -579,8 +799,27 @@ def _build_labeled_prediction_loader(config: PredictionConfig, *, tokenizer: Any
             utt_id_key=config.webdataset_utt_id_key,
             partition_by_rank=False,
             text_normalization=config.text_normalization,
-        ),
-    )
+            decoder_text_normalization=config.text_normalization,
+            decoder_prompt_before_audio=config.decoder_prompt_before_audio,
+            decoder_prompt_before_audio_use_language=config.decoder_prompt_before_audio_use_language,
+            decoder_ctc_draft_cache_path=config.decoder_ctc_draft_cache_path,
+            decoder_ctc_draft_prompt_template=config.decoder_ctc_draft_prompt_template,
+            decoder_ctc_draft_text_key=config.decoder_ctc_draft_text_key,
+            decoder_ctc_draft_missing_policy=config.decoder_ctc_draft_missing_policy,
+            decoder_ctc_draft_dropout_prob=config.decoder_ctc_draft_dropout_prob,
+            decoder_ctc_draft_language_mismatch_dropout_prob=(
+                config.decoder_ctc_draft_language_mismatch_dropout_prob
+            ),
+            decoder_ctc_draft_dropout_seed=config.decoder_ctc_draft_dropout_seed,
+            decoder_target_prefix=config.decoder_target_prefix,
+            decoder_target_prefix_use_language=config.decoder_target_prefix_use_language,
+            decoder_language_confirmation_en=config.decoder_language_confirmation_en,
+            decoder_language_confirmation_zh=config.decoder_language_confirmation_zh,
+                decoder_prompt_language_label_noise_prob=config.decoder_prompt_language_label_noise_prob,
+                decoder_prompt_language_label_noise_seed=config.decoder_prompt_language_label_noise_seed,
+                skip_decode_errors=config.skip_decode_errors,
+            ),
+        )
     return DataLoader(
         dataset,
         batch_size=config.batch_size,
@@ -594,13 +833,14 @@ def _load_prediction_model(
     *,
     device: torch.device,
 ) -> tuple[RWKVCTCModel, torch.dtype | None]:
-    feature_dtype = torch.bfloat16 if device.type == "cuda" else None
+    frontend_type = str(config.model_config.frontend_type or "")
+    feature_dtype = torch.bfloat16 if device.type == "cuda" and frontend_type != "funasr_nano_encoder" else None
     model = RWKVCTCModel(config.model_config)
+    load_checkpoint(config.checkpoint_path, model=model, map_location="cpu")
     if feature_dtype is not None:
         model = model.to(device=device, dtype=feature_dtype)
     else:
         model = model.to(device)
-    load_checkpoint(config.checkpoint_path, model=model, map_location=device.type)
     model.eval()
     return model, feature_dtype
 
@@ -803,6 +1043,21 @@ def ctc_prefix_beam_search(
     ]
 
 
+def _ctc_decode_log_probs(
+    logits: Tensor,
+    *,
+    blank_id: int,
+    blank_logit_bias: float = 0.0,
+) -> Tensor:
+    decode_logits = logits.detach().float()
+    if blank_logit_bias != 0.0:
+        if blank_id < 0 or blank_id >= decode_logits.size(-1):
+            raise ValueError(f"blank_id={blank_id} is outside logits vocab size {decode_logits.size(-1)}")
+        decode_logits = decode_logits.clone()
+        decode_logits[..., blank_id] += float(blank_logit_bias)
+    return decode_logits.log_softmax(dim=-1)
+
+
 def batched_ctc_prefix_beam_search(
     logits: Tensor,
     lengths: Tensor | None,
@@ -812,13 +1067,18 @@ def batched_ctc_prefix_beam_search(
     token_prune_topk: int | None = None,
     length_bonus: float = 0.0,
     insertion_bonus: float = 0.0,
+    blank_logit_bias: float = 0.0,
     hotwords: tuple[CTCHotword, ...] = (),
     hotword_prefix_scale: float = 0.3,
 ) -> list[list[CTCPrefixBeamHypothesis]]:
     if logits.dim() != 3:
         raise ValueError(f"Expected [B, T, V] logits, got shape {tuple(logits.shape)}")
 
-    log_probs = logits.detach().float().log_softmax(dim=-1).cpu()
+    log_probs = _ctc_decode_log_probs(
+        logits,
+        blank_id=blank_id,
+        blank_logit_bias=blank_logit_bias,
+    ).cpu()
     if lengths is None:
         lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long)
     else:
@@ -851,6 +1111,8 @@ def _rescore_ctc_hypotheses_with_decoder(
     topk: int,
     weight: float,
     length_normalize: bool,
+    decoder_prompt_before_audio: Tensor | None = None,
+    decoder_prompt_before_audio_lengths: Tensor | None = None,
 ) -> tuple[CTCPrefixBeamHypothesis, float | None, float | None]:
     if topk <= 1 or model.decoder is None:
         best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
@@ -863,6 +1125,8 @@ def _rescore_ctc_hypotheses_with_decoder(
         encoded_lengths,
         token_sequences,
         normalize_by_length=bool(length_normalize),
+        decoder_prompt_before_audio=decoder_prompt_before_audio,
+        decoder_prompt_before_audio_lengths=decoder_prompt_before_audio_lengths,
     ).detach().to(dtype=torch.float32, device="cpu")
 
     ranked: list[tuple[float, CTCPrefixBeamHypothesis, float, float]] = []
@@ -956,6 +1220,10 @@ def _frontend_frame_span(
 ) -> tuple[int, int]:
     if frontend_type == "conv2d6":
         return 6 * start_encoder_t, 6 * end_encoder_t + 10
+    if frontend_type in {"sensevoice_rwkv", "funasr_nano_encoder"}:
+        return 6 * start_encoder_t, 6 * end_encoder_t + 5
+    if frontend_type in {"aut_rwkv", "qwen3_transformer"}:
+        return 8 * start_encoder_t, 8 * end_encoder_t + 7
     if frontend_type == "linear":
         return start_encoder_t, end_encoder_t
     raise ValueError(f"Unsupported frontend_type for timestamp projection: {frontend_type}")
@@ -964,6 +1232,10 @@ def _frontend_frame_span(
 def _frontend_alignment_config(frontend_type: str) -> tuple[int, int]:
     if frontend_type == "conv2d6":
         return 6, 10
+    if frontend_type in {"sensevoice_rwkv", "funasr_nano_encoder"}:
+        return 6, 5
+    if frontend_type in {"aut_rwkv", "qwen3_transformer"}:
+        return 8, 7
     if frontend_type == "linear":
         return 1, 0
     raise ValueError(f"Unsupported frontend_type for timestamp projection: {frontend_type}")
@@ -1035,27 +1307,60 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
                 batch.feature_lengths,
                 direction_mask=mask,
             )
-            logits = model.ctc_head(encoded)
-            log_probs = logits.detach().float().log_softmax(dim=-1).cpu()
-            if encoded_lengths is None:
+            logits, logit_lengths = model.ctc_logits_from_encoded(encoded, encoded_lengths)
+            log_probs = _ctc_decode_log_probs(
+                logits,
+                blank_id=model.config.blank_id,
+                blank_logit_bias=config.blank_logit_bias,
+            ).cpu()
+            if logit_lengths is None:
                 lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long)
             else:
-                lengths = encoded_lengths.detach().to(dtype=torch.long, device="cpu")
+                lengths = logit_lengths.detach().to(dtype=torch.long, device="cpu")
 
+            decoder_prompt_offset = 0
             for batch_idx, utt_id in enumerate(batch.utt_ids):
                 length = int(lengths[batch_idx].item())
-                hypotheses = ctc_prefix_beam_search(
-                    log_probs[batch_idx, :length],
-                    blank_id=model.config.blank_id,
-                    beam_size=config.beam_size,
-                    token_prune_topk=config.token_prune_topk,
-                    length_bonus=config.length_bonus,
-                    insertion_bonus=config.insertion_bonus,
-                    hotwords=hotwords,
-                    hotword_prefix_scale=config.hotword_prefix_scale,
+                frame_log_probs = log_probs[batch_idx, :length]
+                sample_decoder_prompt_before_audio = None
+                sample_decoder_prompt_before_audio_lengths = None
+                decoder_prompt_before_audio = getattr(batch, "decoder_prompt_before_audio", None)
+                decoder_prompt_before_audio_lengths = getattr(batch, "decoder_prompt_before_audio_lengths", None)
+                if decoder_prompt_before_audio is not None and decoder_prompt_before_audio_lengths is not None:
+                    prompt_len = int(decoder_prompt_before_audio_lengths[batch_idx].item())
+                    sample_decoder_prompt_before_audio = decoder_prompt_before_audio[
+                        decoder_prompt_offset : decoder_prompt_offset + prompt_len
+                    ]
+                    sample_decoder_prompt_before_audio_lengths = decoder_prompt_before_audio_lengths[
+                        batch_idx : batch_idx + 1
+                    ]
+                    decoder_prompt_offset += prompt_len
+                use_greedy = (
+                    int(config.beam_size) <= 1
+                    and not hotwords
+                    and int(config.decoder_rescore_topk) <= 1
                 )
-                best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
-                decode_strategy = "ctc"
+                if use_greedy:
+                    token_ids, greedy_score = _ctc_greedy_collapse(
+                        frame_log_probs,
+                        blank_id=model.config.blank_id,
+                    )
+                    best = CTCPrefixBeamHypothesis(tuple(token_ids), greedy_score, greedy_score, _LOG_ZERO)
+                    hypotheses: list[CTCPrefixBeamHypothesis] = [best]
+                    decode_strategy = "ctc_greedy"
+                else:
+                    hypotheses = ctc_prefix_beam_search(
+                        frame_log_probs,
+                        blank_id=model.config.blank_id,
+                        beam_size=config.beam_size,
+                        token_prune_topk=config.token_prune_topk,
+                        length_bonus=config.length_bonus,
+                        insertion_bonus=config.insertion_bonus,
+                        hotwords=hotwords,
+                        hotword_prefix_scale=config.hotword_prefix_scale,
+                    )
+                    best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
+                    decode_strategy = "ctc"
                 ctc_score = None
                 decoder_score = None
                 combined_score = None
@@ -1068,6 +1373,8 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
                         topk=config.decoder_rescore_topk,
                         weight=config.decoder_rescore_weight,
                         length_normalize=config.decoder_rescore_length_normalize,
+                        decoder_prompt_before_audio=sample_decoder_prompt_before_audio,
+                        decoder_prompt_before_audio_lengths=sample_decoder_prompt_before_audio_lengths,
                     )
                     combined_score = float(ctc_score + config.decoder_rescore_weight * decoder_score)
                     decode_strategy = "ctc_rwkv_rescore"
@@ -1076,7 +1383,7 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
                 debug = None
                 if config.save_debug_lengths:
                     debug = _build_decode_debug(
-                        log_probs[batch_idx, :length],
+                        frame_log_probs,
                         blank_id=model.config.blank_id,
                         feature_length=int(batch.feature_lengths[batch_idx].item()),
                         logit_length=length,
@@ -1084,7 +1391,7 @@ def predict_ctc(config: PredictionConfig) -> list[CTCPrediction]:
                         ref_token_count=None,
                     )
                 alignments = build_token_alignments(
-                    log_probs[batch_idx, :length],
+                    frame_log_probs,
                     token_ids,
                     blank_id=model.config.blank_id,
                     frontend_type=model.config.frontend_type,
@@ -1213,6 +1520,8 @@ def predict_ctc_labeled(
     config: PredictionConfig,
     *,
     limit: int | None = None,
+    on_prediction: Callable[[CTCLabeledPrediction], None] | None = None,
+    collect_predictions: bool = True,
 ) -> list[CTCLabeledPrediction]:
     if limit is not None and limit < 1:
         raise ValueError("limit must be >= 1 when provided.")
@@ -1238,6 +1547,10 @@ def predict_ctc_labeled(
     loader = _build_labeled_prediction_loader(config, tokenizer=tokenizer)
 
     predictions: list[CTCLabeledPrediction] = []
+    prediction_count = 0
+    progress_total = _resolve_prediction_total(loader, limit=limit)
+    progress_started_at = time.monotonic()
+    progress_last_reported = 0
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device, feature_dtype=feature_dtype)
@@ -1251,28 +1564,63 @@ def predict_ctc_labeled(
                 batch.feature_lengths,
                 direction_mask=mask,
             )
-            logits = model.ctc_head(encoded)
-            log_probs = logits.detach().float().log_softmax(dim=-1).cpu()
-            if encoded_lengths is None:
+            logits, logit_lengths = model.ctc_logits_from_encoded(encoded, encoded_lengths)
+            log_probs = _ctc_decode_log_probs(
+                logits,
+                blank_id=model.config.blank_id,
+                blank_logit_bias=config.blank_logit_bias,
+            ).cpu()
+            if logit_lengths is None:
                 lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long)
             else:
-                lengths = encoded_lengths.detach().to(dtype=torch.long, device="cpu")
+                lengths = logit_lengths.detach().to(dtype=torch.long, device="cpu")
 
             target_offset = 0
+            decoder_prompt_offset = 0
             for batch_idx, utt_id in enumerate(batch.utt_ids):
                 length = int(lengths[batch_idx].item())
-                hypotheses = ctc_prefix_beam_search(
-                    log_probs[batch_idx, :length],
-                    blank_id=model.config.blank_id,
-                    beam_size=config.beam_size,
-                    token_prune_topk=config.token_prune_topk,
-                    length_bonus=config.length_bonus,
-                    insertion_bonus=config.insertion_bonus,
-                    hotwords=hotwords,
-                    hotword_prefix_scale=config.hotword_prefix_scale,
+                frame_log_probs = log_probs[batch_idx, :length]
+                sample_decoder_prompt_before_audio = None
+                sample_decoder_prompt_before_audio_lengths = None
+                if (
+                    batch.decoder_prompt_before_audio is not None
+                    and batch.decoder_prompt_before_audio_lengths is not None
+                ):
+                    prompt_len = int(batch.decoder_prompt_before_audio_lengths[batch_idx].item())
+                    sample_decoder_prompt_before_audio = batch.decoder_prompt_before_audio[
+                        decoder_prompt_offset : decoder_prompt_offset + prompt_len
+                    ]
+                    sample_decoder_prompt_before_audio_lengths = batch.decoder_prompt_before_audio_lengths[
+                        batch_idx : batch_idx + 1
+                    ]
+                    decoder_prompt_offset += prompt_len
+                use_greedy = (
+                    int(config.beam_size) <= 1
+                    and not hotwords
+                    and int(config.decoder_rescore_topk) <= 1
                 )
-                best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
-                decode_strategy = "ctc"
+                if use_greedy:
+                    pred_token_ids, greedy_score = _ctc_greedy_collapse(
+                        frame_log_probs,
+                        blank_id=model.config.blank_id,
+                    )
+                    best = CTCPrefixBeamHypothesis(tuple(pred_token_ids), greedy_score, greedy_score, _LOG_ZERO)
+                    hypotheses: list[CTCPrefixBeamHypothesis] = [best]
+                    decode_strategy = "ctc_greedy"
+                else:
+                    hypotheses = ctc_prefix_beam_search(
+                        frame_log_probs,
+                        blank_id=model.config.blank_id,
+                        beam_size=config.beam_size,
+                        token_prune_topk=config.token_prune_topk,
+                        length_bonus=config.length_bonus,
+                        insertion_bonus=config.insertion_bonus,
+                        hotwords=hotwords,
+                        hotword_prefix_scale=config.hotword_prefix_scale,
+                    )
+                    best = hypotheses[0] if hypotheses else CTCPrefixBeamHypothesis((), 0.0, 0.0, _LOG_ZERO)
+                    pred_token_ids = [int(token_id) for token_id in best.token_ids]
+                    decode_strategy = "ctc"
                 ctc_score = None
                 decoder_score = None
                 combined_score = None
@@ -1285,6 +1633,8 @@ def predict_ctc_labeled(
                         topk=config.decoder_rescore_topk,
                         weight=config.decoder_rescore_weight,
                         length_normalize=config.decoder_rescore_length_normalize,
+                        decoder_prompt_before_audio=sample_decoder_prompt_before_audio,
+                        decoder_prompt_before_audio_lengths=sample_decoder_prompt_before_audio_lengths,
                     )
                     combined_score = float(ctc_score + config.decoder_rescore_weight * decoder_score)
                     decode_strategy = "ctc_rwkv_rescore"
@@ -1302,7 +1652,7 @@ def predict_ctc_labeled(
                 debug = None
                 if config.save_debug_lengths:
                     debug = _build_decode_debug(
-                        log_probs[batch_idx, :length],
+                        frame_log_probs,
                         blank_id=model.config.blank_id,
                         feature_length=int(batch.feature_lengths[batch_idx].item()),
                         logit_length=length,
@@ -1310,33 +1660,80 @@ def predict_ctc_labeled(
                         ref_token_count=target_length,
                     )
                 alignments = build_token_alignments(
-                    log_probs[batch_idx, :length],
+                    frame_log_probs,
                     pred_token_ids,
                     blank_id=model.config.blank_id,
                     frontend_type=model.config.frontend_type,
                     frame_shift_ms=config.frame_shift_ms,
                     decode_fn=decode_fn,
                 )
-                predictions.append(
-                    CTCLabeledPrediction(
-                        utt_id=str(utt_id),
-                        pred_token_ids=pred_token_ids,
-                        ref_token_ids=[int(token_id) for token_id in ref_token_ids],
-                        pred_text=pred_text,
-                        ref_text=ref_text,
-                        score=float(combined_score if combined_score is not None else best.score),
-                        mode=config.mode,
-                        alignments=alignments,
-                        debug=debug,
-                        decode_strategy=decode_strategy,
-                        ctc_score=ctc_score,
-                        decoder_score=decoder_score,
-                        combined_score=combined_score,
-                    )
+                prediction = CTCLabeledPrediction(
+                    utt_id=str(utt_id),
+                    pred_token_ids=pred_token_ids,
+                    ref_token_ids=[int(token_id) for token_id in ref_token_ids],
+                    pred_text=pred_text,
+                    ref_text=ref_text,
+                    score=float(combined_score if combined_score is not None else best.score),
+                    mode=config.mode,
+                    alignments=alignments,
+                    debug=debug,
+                    decode_strategy=decode_strategy,
+                    ctc_score=ctc_score,
+                    decoder_score=decoder_score,
+                    combined_score=combined_score,
                 )
-                if limit is not None and len(predictions) >= limit:
+                if collect_predictions:
+                    predictions.append(prediction)
+                if on_prediction is not None:
+                    on_prediction(prediction)
+                prediction_count += 1
+                progress_last_reported = _maybe_report_prediction_progress(
+                    kind="ctc",
+                    count=prediction_count,
+                    total=progress_total,
+                    started_at=progress_started_at,
+                    last_reported=progress_last_reported,
+                    interval=config.progress_interval,
+                )
+                if limit is not None and prediction_count >= limit:
+                    _maybe_report_prediction_progress(
+                        kind="ctc",
+                        count=prediction_count,
+                        total=progress_total,
+                        started_at=progress_started_at,
+                        last_reported=progress_last_reported,
+                        interval=config.progress_interval,
+                        final=True,
+                    )
                     return predictions
+    _maybe_report_prediction_progress(
+        kind="ctc",
+        count=prediction_count,
+        total=progress_total,
+        started_at=progress_started_at,
+        last_reported=progress_last_reported,
+        interval=config.progress_interval,
+        final=True,
+    )
     return predictions
+
+
+def labeled_prediction_to_json_dict(prediction: CTCLabeledPrediction) -> dict[str, Any]:
+    return {
+        "utt_id": prediction.utt_id,
+        "pred_token_ids": prediction.pred_token_ids,
+        "ref_token_ids": prediction.ref_token_ids,
+        "pred_text": prediction.pred_text,
+        "ref_text": prediction.ref_text,
+        "score": prediction.score,
+        "decode_strategy": prediction.decode_strategy,
+        "ctc_score": prediction.ctc_score,
+        "decoder_score": prediction.decoder_score,
+        "combined_score": prediction.combined_score,
+        "mode": prediction.mode,
+        "alignments": [asdict(alignment) for alignment in prediction.alignments],
+        "debug": None if prediction.debug is None else asdict(prediction.debug),
+    }
 
 
 def write_labeled_predictions_jsonl(path: str | Path, predictions: list[CTCLabeledPrediction]) -> Path:
@@ -1345,24 +1742,7 @@ def write_labeled_predictions_jsonl(path: str | Path, predictions: list[CTCLabel
     with output_path.open("w", encoding="utf-8") as handle:
         for prediction in predictions:
             handle.write(
-                json.dumps(
-                    {
-                        "utt_id": prediction.utt_id,
-                        "pred_token_ids": prediction.pred_token_ids,
-                        "ref_token_ids": prediction.ref_token_ids,
-                        "pred_text": prediction.pred_text,
-                        "ref_text": prediction.ref_text,
-                        "score": prediction.score,
-                        "decode_strategy": prediction.decode_strategy,
-                        "ctc_score": prediction.ctc_score,
-                        "decoder_score": prediction.decoder_score,
-                        "combined_score": prediction.combined_score,
-                        "mode": prediction.mode,
-                        "alignments": [asdict(alignment) for alignment in prediction.alignments],
-                        "debug": None if prediction.debug is None else asdict(prediction.debug),
-                    },
-                    ensure_ascii=False,
-                )
+                json.dumps(labeled_prediction_to_json_dict(prediction), ensure_ascii=False)
                 + "\n"
             )
     return output_path

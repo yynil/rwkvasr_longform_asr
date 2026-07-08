@@ -13,6 +13,8 @@ from typing import Any, Iterable
 
 import soundfile as sf
 
+from rwkvasr.data.text_normalization import normalize_asr_text
+
 SUPPORTED_AUDIO_SUFFIXES = {"wav", "mp3", "flac"}
 TEXT_KEYS = ("text", "sentence", "normalized_text", "transcription", "transcript")
 ID_KEYS = ("id", "sid", "utt_id", "utterance_id", "segment_id", "key")
@@ -88,47 +90,9 @@ def _normalise_language(value: object | None, default: str) -> str:
 
 
 def _normalise_text_for_runtime(text: str, language: str, mode: str) -> str:
-    if mode == "none":
-        return text
-    if mode != "runtime":
+    if mode not in {"none", "runtime", "ctc"}:
         raise ValueError(f"Unsupported text normalization mode: {mode}")
-
-    replacements = {
-        "COMMA": ",",
-        "PERIOD": ".",
-        "FULLSTOP": ".",
-        "DOT": ".",
-        "QUESTION": "?",
-        "QUESTIONMARK": "?",
-        "EXCLAMATION": "!",
-        "EXCLAMATIONMARK": "!",
-        "EXCLAMATIONPOINT": "!",
-        "COLON": ":",
-        "SEMICOLON": ";",
-        "DASH": "-",
-        "HYPHEN": "-",
-        "APOSTROPHE": "'",
-    }
-
-    def replace_tag(match: re.Match[str]) -> str:
-        tag = re.sub(r"[\s_-]+", "", match.group(1)).upper()
-        return replacements.get(tag, " ")
-
-    normalized = re.sub(r"<([^<>]+)>", replace_tag, text)
-    if language == "en" or language.startswith(("en-", "en_")):
-        pieces: list[str] = []
-        cursor = 0
-        for match in re.finditer(r"<[^<>]+>", normalized):
-            pieces.append(normalized[cursor : match.start()].lower())
-            pieces.append(match.group(0))
-            cursor = match.end()
-        pieces.append(normalized[cursor:].lower())
-        normalized = "".join(pieces)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    normalized = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", normalized)
-    normalized = re.sub(r"\s+([,.?!:;])", r"\1", normalized)
-    normalized = re.sub(r"([,.?!:;])(?=\S)", r"\1 ", normalized)
-    return normalized.strip()
+    return normalize_asr_text(text, language=language, mode=mode)
 
 
 def _tarinfo(name: str, payload: bytes) -> tarfile.TarInfo:
@@ -587,7 +551,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-input-shards", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=10000)
-    parser.add_argument("--text-normalization", choices=("none", "runtime"), default="none")
+    parser.add_argument("--text-normalization", choices=("none", "runtime", "ctc"), default="none")
     parser.add_argument("--skip-missing", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
 

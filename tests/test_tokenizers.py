@@ -1,3 +1,4 @@
+import base64
 import json
 import sys
 import types
@@ -10,6 +11,7 @@ from rwkvasr.data import (
     QwenTokenizer,
     RWKVTokenizer,
     WhisperMultilingualTokenizer,
+    SenseVoiceTiktokenTokenizer,
     build_text_tokenizer,
     maybe_append_eos_token_ids,
 )
@@ -32,6 +34,15 @@ class _FakeWhisperProcessor:
 
     def decode(self, token_ids: list[int]) -> str:
         return f"decoded:{','.join(str(token_id) for token_id in token_ids)}"
+
+
+class _EchoCharTokenizer:
+    def encode(self, text: str) -> list[int]:
+        return [ord(ch) for ch in text]
+
+    @property
+    def eos_token_id(self) -> int | None:
+        return None
 
 
 def _install_fake_whisper(monkeypatch) -> None:
@@ -113,6 +124,96 @@ def test_manifest_dataset_defaults_to_whisper_tokenizer_for_text(monkeypatch, tm
     assert dataset.entries[0].token_ids == [101, 102, 103]
 
 
+def test_manifest_dataset_ctc_normalization_reencodes_text_token_ids(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "utt_id": "utt-0",
+                    "language": "en",
+                    "text": "Yorke's house, wasn't quiet!",
+                    "token_ids": [999],
+                    "feature_path": "feat.pt",
+                }
+            )
+            + "\n"
+        )
+
+    dataset = ASRManifestDataset(
+        manifest_path,
+        tokenizer=_EchoCharTokenizer(),
+        text_normalization="ctc",
+    )
+
+    assert dataset.entries[0].text == "yorkes house wasnt quiet"
+    assert dataset.entries[0].token_ids == [ord(ch) for ch in "yorkes house wasnt quiet"]
+
+
+def test_manifest_dataset_decoder_target_preserves_runtime_punctuation(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "utt_id": "utt-0",
+                    "language": "en",
+                    "text": "Yorke's house, wasn't quiet!",
+                    "feature_path": "feat.pt",
+                }
+            )
+            + "\n"
+        )
+
+    dataset = ASRManifestDataset(
+        manifest_path,
+        tokenizer=_EchoCharTokenizer(),
+        decoder_tokenizer=_EchoCharTokenizer(),
+        text_normalization="ctc",
+        decoder_text_normalization="runtime",
+    )
+
+    assert dataset.entries[0].text == "yorkes house wasnt quiet"
+    assert dataset.entries[0].token_ids == [ord(ch) for ch in "yorkes house wasnt quiet"]
+    assert dataset.entries[0].decoder_token_ids == [
+        ord(ch) for ch in "yorke's house, wasn't quiet!"
+    ]
+
+
+def test_manifest_dataset_decoder_target_language_confirmation_can_correct_metadata(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "utt_id": "utt-0",
+                    "language": "en",
+                    "text": "你好，世界！",
+                    "feature_path": "feat.pt",
+                }
+            )
+            + "\n"
+        )
+
+    dataset = ASRManifestDataset(
+        manifest_path,
+        tokenizer=_EchoCharTokenizer(),
+        decoder_tokenizer=_EchoCharTokenizer(),
+        text_normalization="ctc",
+        decoder_text_normalization="runtime",
+        decoder_prompt_before_audio="User: The language label says this audio is {language_name}.\n",
+        decoder_prompt_before_audio_use_language=True,
+        decoder_target_prefix="{language_confirmation} ",
+        decoder_target_prefix_use_language=True,
+    )
+
+    prompt = "".join(chr(token_id) for token_id in dataset.entries[0].decoder_prompt_before_audio_token_ids or [])
+    target = "".join(chr(token_id) for token_id in dataset.entries[0].decoder_token_ids or [])
+
+    assert "English" in prompt
+    assert target == "这是中文文字。 你好，世界！"
+
+
 def test_qwen_tokenizer_uses_tokenizer_json(monkeypatch) -> None:
     _install_fake_qwen(monkeypatch)
 
@@ -130,6 +231,59 @@ def test_build_text_tokenizer_creates_qwen_tokenizer(monkeypatch) -> None:
 
     assert isinstance(tokenizer, QwenTokenizer)
     assert tokenizer.vocab_size == 151643
+
+
+def _write_byte_tiktoken_vocab(vocab_path: Path) -> None:
+    with vocab_path.open("w", encoding="utf-8") as handle:
+        for idx in range(256):
+            token = base64.b64encode(bytes([idx])).decode("ascii")
+            handle.write(f"{token} {idx}\n")
+
+
+def test_sensevoice_tiktoken_tokenizer_uses_fun_asr_special_layout(tmp_path: Path) -> None:
+    pytest.importorskip("tiktoken")
+    vocab_path = tmp_path / "multilingual.tiktoken"
+    _write_byte_tiktoken_vocab(vocab_path)
+
+    tokenizer = SenseVoiceTiktokenTokenizer(str(vocab_path))
+    token_ids = tokenizer.encode("Hello 你好")
+
+    assert tokenizer.vocab_size == 1935
+    assert tokenizer.eos_token_id is None
+    assert token_ids
+    assert all(0 <= int(token_id) < tokenizer.vocab_size for token_id in token_ids)
+    assert tokenizer.decode(token_ids) == "Hello 你好"
+
+
+def test_sensevoice_tiktoken_ctc_suppresses_non_pronunciation_units(tmp_path: Path) -> None:
+    pytest.importorskip("tiktoken")
+    vocab_path = tmp_path / "multilingual.tiktoken"
+    _write_byte_tiktoken_vocab(vocab_path)
+
+    tokenizer = SenseVoiceTiktokenTokenizer(str(vocab_path))
+    special_tokens = tokenizer.processor._special_tokens
+    nospeech_id = int(special_tokens["<|nospeech|>"])
+    timestamp_id = int(special_tokens["<|0.00|>"])
+    text_id = tokenizer.encode("a")[0]
+
+    suppressed = set(tokenizer.ctc_suppressed_token_ids(blank_id=timestamp_id))
+
+    assert nospeech_id in suppressed
+    assert timestamp_id not in suppressed
+    assert ord(" ") in suppressed
+    assert 255 in suppressed
+    assert text_id not in suppressed
+
+
+def test_build_text_tokenizer_creates_sensevoice_tiktoken(tmp_path: Path) -> None:
+    pytest.importorskip("tiktoken")
+    vocab_path = tmp_path / "multilingual.tiktoken"
+    _write_byte_tiktoken_vocab(vocab_path)
+
+    tokenizer = build_text_tokenizer("sensevoice_tiktoken", model_path=str(vocab_path))
+
+    assert isinstance(tokenizer, SenseVoiceTiktokenTokenizer)
+    assert tokenizer.vocab_size == 1935
 
 
 def test_real_whisper_multilingual_tokenizer_encodes_text_when_dependency_is_available() -> None:

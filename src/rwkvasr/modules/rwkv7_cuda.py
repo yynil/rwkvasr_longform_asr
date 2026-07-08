@@ -17,6 +17,10 @@ def _kernel_source_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "kernels" / "rwkv7_wind_backstepping"
 
 
+def _clampw_v3_source_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "kernels" / "rwkv7_clampw_v3"
+
+
 def _select_matching_cuda_home() -> None:
     torch_cuda_version = torch.version.cuda
     if not torch_cuda_version:
@@ -54,6 +58,33 @@ def _load_wind_backstepping() -> object:
         extra_cuda_cflags=flags,
     )
     return torch.ops.rwkvasr_wind_backstepping
+
+
+@lru_cache(maxsize=1)
+def _load_clampw_v3() -> object:
+    _select_matching_cuda_home()
+    source_dir = _clampw_v3_source_dir()
+    flags = [
+        "-res-usage",
+        f"-D_N_={_SUPPORTED_HEAD_SIZE}",
+        f"-D_CHUNK_LEN_={_SUPPORTED_CHUNK_LEN}",
+        "--use_fast_math",
+        "-O3",
+        "-Xptxas",
+        "-O3",
+        "--extra-device-vectorization",
+    ]
+    cpp_extension.load(
+        name=f"rwkvasr_rwkv7_clampw_v3_h{_SUPPORTED_HEAD_SIZE}_c{_SUPPORTED_CHUNK_LEN}",
+        sources=[
+            str(source_dir / "rwkv7_clampw_v3_for_h100_alt.cu"),
+            str(source_dir / "rwkv7_clampw_v3.cpp"),
+        ],
+        is_python_module=False,
+        verbose=os.environ.get("RWKVASR_VERBOSE_KERNEL_BUILD", "0") == "1",
+        extra_cuda_cflags=flags,
+    )
+    return torch.ops.rwkvasr_rwkv7_clampw_v3
 
 
 def is_fused_wkv7_supported(
@@ -120,6 +151,40 @@ class _WindBackstepping(torch.autograd.Function):
         return dw, dq, dk, dv, dz, da
 
 
+class _ClampWV3(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, r: Tensor, w: Tensor, k: Tensor, v: Tensor, a: Tensor, b: Tensor) -> Tensor:
+        ops = _load_clampw_v3()
+        bsz, tsz, n_head, head_size = r.shape
+        if tsz % _SUPPORTED_CHUNK_LEN != 0:
+            raise ValueError("clampw_v3 RWKV-7 inputs must already be padded to chunk_len")
+        if head_size != _SUPPORTED_HEAD_SIZE:
+            raise ValueError(f"clampw_v3 RWKV-7 requires head_size={_SUPPORTED_HEAD_SIZE}")
+        y = torch.empty_like(v)
+        s = torch.empty(
+            bsz,
+            n_head,
+            tsz // _SUPPORTED_CHUNK_LEN,
+            head_size,
+            head_size,
+            dtype=torch.float32,
+            device=w.device,
+        )
+        sa = torch.empty(bsz, tsz, n_head, head_size, dtype=torch.float32, device=w.device)
+        ops.forward(r, w, k, v, a, b, y, s, sa)
+        ctx.save_for_backward(r, w, k, v, a, b, s, sa)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        ops = _load_clampw_v3()
+        r, w, k, v, a, b, s, sa = ctx.saved_tensors
+        dy = dy.contiguous()
+        dr, dw, dk, dv, da, db = [torch.empty_like(x) for x in (r, w, k, v, a, b)]
+        ops.backward(r, w, k, v, a, b, dy, s, sa, dr, dw, dk, dv, da, db)
+        return dr, dw, dk, dv, da, db
+
+
 def fused_wkv7(
     q: Tensor,
     w: Tensor,
@@ -155,6 +220,47 @@ def fused_wkv7(
         pad = tensor_pad
         padded.append(padded_tensor.contiguous())
     y = _WindBackstepping.apply(padded[1], padded[0], padded[2], padded[3], padded[4], padded[5])
+    if pad:
+        y = y[:, :-pad]
+    return y.contiguous().view(bsz, tsz, hidden)
+
+
+def fused_wkv7_clampw(
+    q: Tensor,
+    raw_w: Tensor,
+    k: Tensor,
+    v: Tensor,
+    a: Tensor,
+    b: Tensor,
+    *,
+    head_size: int,
+    chunk_len: int,
+) -> Tensor:
+    supported, reason = is_fused_wkv7_supported(
+        head_size=head_size,
+        chunk_len=chunk_len,
+        tensors=(q, raw_w, k, v, a, b),
+    )
+    if not supported:
+        raise RuntimeError(f"clampw_v3 RWKV-7 backend is unavailable: {reason}")
+    bsz, tsz, hidden = q.shape
+    n_head = hidden // head_size
+    if hidden % head_size != 0:
+        raise ValueError("hidden size must be divisible by head_size")
+
+    q4, w4, k4, v4, a4, b4 = [
+        x.view(bsz, tsz, n_head, head_size).contiguous()
+        for x in (q, raw_w, k, v, a, b)
+    ]
+    padded: list[Tensor] = []
+    pad = 0
+    for tensor in (q4, w4, k4, v4, a4, b4):
+        padded_tensor, tensor_pad = _pad_time_to_chunk(tensor, chunk_len=chunk_len)
+        if padded and tensor_pad != pad:
+            raise RuntimeError("inconsistent chunk padding across clampw_v3 RWKV-7 inputs")
+        pad = tensor_pad
+        padded.append(padded_tensor.contiguous())
+    y = _ClampWV3.apply(*padded)
     if pad:
         y = y[:, :-pad]
     return y.contiguous().view(bsz, tsz, hidden)

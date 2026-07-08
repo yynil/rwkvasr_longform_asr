@@ -11,7 +11,12 @@ from typing import Any, BinaryIO, Iterable
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .manifest import FeatureCollator, TokenizerLike, WenetFbankFeatureExtractor
-from .webdataset import WebDatasetConfig, decode_webdataset_sample
+from .webdataset import (
+    WebDatasetConfig,
+    decode_webdataset_sample,
+    log_webdataset_decode_skip,
+    preload_decoder_ctc_draft_cache,
+)
 from .webdataset_common import AUDIO_SUFFIXES
 from .webdataset_index import StableHashSplitConfig, assign_split, resolve_sample_id
 
@@ -39,6 +44,7 @@ class WebDatasetLengthEntry:
     audio_size: int | None = None
     json_offset: int | None = None
     json_size: int | None = None
+    raw: dict[str, Any] | None = None
 
     @property
     def wav_member(self) -> str:
@@ -47,6 +53,16 @@ class WebDatasetLengthEntry:
 
 def _member_audio_format(member_name: str) -> str:
     return Path(member_name).suffix.lower().lstrip(".")
+
+
+def _shard_source_label(shard_name: str | None) -> str:
+    if not shard_name:
+        return "unknown"
+    if shard_name.startswith("GSXL"):
+        return "gigaspeech"
+    if shard_name.startswith("WSL"):
+        return "wenetspeech"
+    return shard_name.split("-", 1)[0].lower() or "unknown"
 
 
 def resolve_webdataset_length_index_path(shard_root: str | Path, index_path: str | Path | None = None) -> Path:
@@ -298,6 +314,7 @@ def parse_webdataset_length_entry(raw: dict[str, Any]) -> WebDatasetLengthEntry:
             if raw.get("json_size") is not None
             else None
         ),
+        raw=dict(raw),
     )
 
 
@@ -357,14 +374,17 @@ class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
         entries: list[WebDatasetLengthEntry],
         *,
         tokenizer: TokenizerLike | None = None,
+        decoder_tokenizer: TokenizerLike | None = None,
         feature_extractor: WenetFbankFeatureExtractor | None = None,
         config: WebDatasetConfig | None = None,
     ):
         self.shard_root = Path(shard_root)
         self.entries = entries
         self.tokenizer = tokenizer
+        self.decoder_tokenizer = decoder_tokenizer
         self.feature_extractor = feature_extractor or WenetFbankFeatureExtractor()
         self.config = config or WebDatasetConfig()
+        preload_decoder_ctc_draft_cache(self.config)
         self._reader_cache: dict[str, _TarShardReader] = {}
 
     def __getstate__(self) -> dict[str, Any]:
@@ -386,8 +406,7 @@ class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
             self._reader_cache[shard_name] = reader
         return reader
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        entry = self.entries[index]
+    def _decode_entry(self, entry: WebDatasetLengthEntry) -> dict[str, Any]:
         reader = self._reader(entry.shard_name)
         audio_bytes = reader.read_member(
             entry.audio_member,
@@ -404,13 +423,54 @@ class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
             audio_bytes=audio_bytes,
             metadata_bytes=metadata_bytes,
             tokenizer=self.tokenizer,
+            decoder_tokenizer=self.decoder_tokenizer,
             feature_extractor=self.feature_extractor,
             text_key=self.config.text_key,
             utt_id_key=self.config.utt_id_key,
             token_ids_key=self.config.token_ids_key,
             append_eos=self.config.append_eos,
+            decoder_append_eos=self.config.decoder_append_eos,
             text_normalization=self.config.text_normalization,
+            decoder_text_normalization=self.config.decoder_text_normalization,
+            decoder_prompt_before_audio=self.config.decoder_prompt_before_audio,
+            decoder_prompt_before_audio_use_language=self.config.decoder_prompt_before_audio_use_language,
+            decoder_ctc_draft_cache_path=self.config.decoder_ctc_draft_cache_path,
+            decoder_ctc_draft_prompt_template=self.config.decoder_ctc_draft_prompt_template,
+            decoder_ctc_draft_text_key=self.config.decoder_ctc_draft_text_key,
+            decoder_ctc_draft_missing_policy=self.config.decoder_ctc_draft_missing_policy,
+            decoder_ctc_draft_dropout_prob=self.config.decoder_ctc_draft_dropout_prob,
+            decoder_ctc_draft_language_mismatch_dropout_prob=(
+                self.config.decoder_ctc_draft_language_mismatch_dropout_prob
+            ),
+            decoder_ctc_draft_dropout_seed=self.config.decoder_ctc_draft_dropout_seed,
+            ctc_label_override_cache_path=self.config.ctc_label_override_cache_path,
+            ctc_label_override_text_key=self.config.ctc_label_override_text_key,
+            decoder_target_prefix=self.config.decoder_target_prefix,
+            decoder_target_prefix_use_language=self.config.decoder_target_prefix_use_language,
+            decoder_language_confirmation_en=self.config.decoder_language_confirmation_en,
+            decoder_language_confirmation_zh=self.config.decoder_language_confirmation_zh,
+            decoder_prompt_language_label_noise_prob=self.config.decoder_prompt_language_label_noise_prob,
+            decoder_prompt_language_label_noise_seed=self.config.decoder_prompt_language_label_noise_seed,
         )
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        if not self.config.skip_decode_errors:
+            return self._decode_entry(self.entries[index])
+        last_exc: Exception | None = None
+        for offset in range(len(self.entries)):
+            entry = self.entries[(index + offset) % len(self.entries)]
+            try:
+                return self._decode_entry(entry)
+            except Exception as exc:
+                last_exc = exc
+                log_webdataset_decode_skip(
+                    key=entry.key,
+                    shard_name=entry.shard_name,
+                    audio_member=entry.audio_member,
+                    json_member=entry.json_member,
+                    exc=exc,
+                )
+        raise RuntimeError("All length-index WebDataset samples failed to decode.") from last_exc
 
 
 class LengthBucketedBatchSampler(Sampler[list[int]]):
@@ -418,6 +478,8 @@ class LengthBucketedBatchSampler(Sampler[list[int]]):
         self,
         lengths: list[int],
         *,
+        source_labels: list[str] | None = None,
+        source_interleave: bool = False,
         batch_size: int,
         rank: int = 0,
         world_size: int = 1,
@@ -431,6 +493,10 @@ class LengthBucketedBatchSampler(Sampler[list[int]]):
         if world_size <= 0:
             raise ValueError("world_size must be positive")
         self.lengths = list(lengths)
+        self.source_labels = list(source_labels) if source_labels is not None else None
+        if self.source_labels is not None and len(self.source_labels) != len(self.lengths):
+            raise ValueError("source_labels must have the same length as lengths")
+        self.source_interleave = bool(source_interleave and self.source_labels is not None)
         self.batch_size = int(batch_size)
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -450,6 +516,42 @@ class LengthBucketedBatchSampler(Sampler[list[int]]):
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
+    def _source_interleave_sorted_indices(self, indices: list[int], rng: random.Random) -> list[int]:
+        if not self.source_interleave or self.source_labels is None:
+            return indices
+        window_size = max(self._max_global_batch_size() * 32, 256)
+        interleaved: list[int] = []
+        for offset in range(0, len(indices), window_size):
+            window = indices[offset : offset + window_size]
+            grouped: dict[str, list[int]] = {}
+            for index in window:
+                grouped.setdefault(self.source_labels[index], []).append(index)
+            labels = sorted(grouped)
+            if self.shuffle and len(labels) > 1:
+                shift = rng.randrange(len(labels))
+                labels = labels[shift:] + labels[:shift]
+            cursors = {label: 0 for label in labels}
+            totals = {label: len(grouped[label]) for label in labels}
+            order = {label: index for index, label in enumerate(labels)}
+            remaining = len(window)
+            while remaining > 0 and labels:
+                label = min(
+                    labels,
+                    key=lambda candidate: (
+                        (cursors[candidate] + 0.5) / totals[candidate],
+                        order[candidate],
+                    ),
+                )
+                source_indices = grouped[label]
+                source_cursor = cursors[label]
+                if source_cursor >= len(source_indices):
+                    labels.remove(label)
+                    continue
+                interleaved.append(source_indices[source_cursor])
+                cursors[label] = source_cursor + 1
+                remaining -= 1
+        return interleaved
+
     def _build_global_batches(self, *, epoch: int) -> list[list[int]]:
         indices = list(range(len(self.lengths)))
         rng = random.Random(self.seed + epoch)
@@ -460,6 +562,7 @@ class LengthBucketedBatchSampler(Sampler[list[int]]):
             if remainder:
                 indices = indices[:-remainder]
         indices.sort(key=lambda idx: self.lengths[idx])
+        indices = self._source_interleave_sorted_indices(indices, rng)
         max_global_batch = self._max_global_batch_size()
         global_batches: list[list[int]] = []
         offset = 0
@@ -508,6 +611,61 @@ class LengthBucketedBatchSampler(Sampler[list[int]]):
         return len(self._build_global_batches(epoch=0))
 
 
+class _StaticBatchSampler(Sampler[list[int]]):
+    def __init__(self, batches: Iterable[list[int]]):
+        self.batches = [list(batch) for batch in batches]
+
+    def __iter__(self) -> Iterable[list[int]]:
+        yield from self.batches
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+
+class LengthBucketedDataLoader:
+    def __init__(
+        self,
+        dataset: LengthIndexedWebDatasetDataset,
+        *,
+        batch_sampler: LengthBucketedBatchSampler,
+        num_workers: int,
+        collate_fn: FeatureCollator,
+    ):
+        self.dataset = dataset
+        self.batch_sampler = batch_sampler
+        self.num_workers = int(num_workers)
+        self.collate_fn = collate_fn
+
+    def _build_loader(self, batch_sampler: Sampler[list[int]]) -> DataLoader:
+        return DataLoader(
+            self.dataset,
+            batch_sampler=batch_sampler,
+            num_workers=self.num_workers,
+            collate_fn=self.collate_fn,
+        )
+
+    def __iter__(self) -> Iterable[Any]:
+        yield from self._build_loader(self.batch_sampler)
+
+    def __len__(self) -> int:
+        return len(self.batch_sampler)
+
+    def iter_from_batch_offset(
+        self,
+        batch_offset: int,
+        *,
+        progress_interval: int = 0,
+        progress_callback: Any | None = None,
+    ) -> tuple[Iterable[Any], int]:
+        batches = list(self.batch_sampler)
+        skipped = min(max(0, int(batch_offset)), len(batches))
+        if progress_callback is not None and progress_interval > 0:
+            for value in range(progress_interval, skipped + 1, progress_interval):
+                progress_callback(value)
+        remaining_sampler = _StaticBatchSampler(batches[skipped:])
+        return self._build_loader(remaining_sampler), skipped
+
+
 def _select_dynamic_global_batch_size(
     lengths: list[int],
     sorted_indices: list[int],
@@ -532,7 +690,7 @@ def _select_dynamic_global_batch_size(
     candidate = step
     while candidate <= max_global_batch:
         local_batch_size = candidate if world_size == 1 else candidate // world_size
-        max_frames = lengths[sorted_indices[start + candidate - 1]]
+        max_frames = max(lengths[index] for index in sorted_indices[start : start + candidate])
         if local_batch_size * max_frames <= frame_budget:
             best = candidate
             candidate += step
@@ -574,24 +732,32 @@ def build_length_bucketed_webdataset_dataloader(
     *,
     length_index_path: str | Path,
     tokenizer: TokenizerLike | None = None,
+    decoder_tokenizer: TokenizerLike | None = None,
     feature_extractor: WenetFbankFeatureExtractor | None = None,
     config: WebDatasetConfig | None = None,
     batch_size: int = 4,
     num_workers: int = 0,
     rank: int = 0,
     world_size: int = 1,
-) -> tuple[DataLoader, LengthBucketedBatchSampler]:
+) -> tuple[LengthBucketedDataLoader, LengthBucketedBatchSampler]:
     config = config or WebDatasetConfig()
     entries = load_webdataset_length_entries(length_index_path, split=config.split)
     dataset = LengthIndexedWebDatasetDataset(
         shard_root,
         entries,
         tokenizer=tokenizer,
+        decoder_tokenizer=decoder_tokenizer,
         feature_extractor=feature_extractor,
         config=config,
     )
     sampler = LengthBucketedBatchSampler(
         [entry.num_frames for entry in entries],
+        source_labels=(
+            [_shard_source_label(entry.shard_name) for entry in entries]
+            if config.bucket_source_interleave
+            else None
+        ),
+        source_interleave=config.bucket_source_interleave,
         batch_size=batch_size,
         rank=rank,
         world_size=world_size,
@@ -600,7 +766,7 @@ def build_length_bucketed_webdataset_dataloader(
         drop_last=config.length_bucket_drop_last,
         frame_budget=config.length_bucket_frame_budget,
     )
-    loader = DataLoader(
+    loader = LengthBucketedDataLoader(
         dataset,
         batch_sampler=sampler,
         num_workers=num_workers,

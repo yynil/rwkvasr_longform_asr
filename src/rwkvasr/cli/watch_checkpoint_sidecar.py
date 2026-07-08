@@ -7,10 +7,19 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from rwkvasr.config import load_yaml, save_yaml
+from rwkvasr.eval import (
+    compare_prediction_text_sets,
+    compute_text_error_stats,
+    edit_distance,
+    normalize_asr_text_for_metrics,
+    tokenize_for_cer,
+    tokenize_for_wer,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,9 +37,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", default="bi", choices=["bi", "l2r", "r2l", "alt"])
     parser.add_argument("--beam-size", default=4, type=int)
     parser.add_argument("--token-prune-topk", default=32, type=int)
-    parser.add_argument("--text-normalization", default=None)
+    parser.add_argument("--text-normalization", default="runtime")
+    parser.add_argument(
+        "--metric-normalization",
+        default="ctc",
+        help=(
+            "Text normalization used only for WER/CER scoring. Keep this separate from "
+            "--text-normalization so prediction previews can stay readable while metrics "
+            "use ASR-content normalization."
+        ),
+    )
     parser.add_argument("--ar-max-new-tokens", default=None, type=int)
     parser.add_argument("--ar-max-new-tokens-factor", default=2.0, type=float)
+    parser.add_argument("--ar-do-sample", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ar-temperature", default=0.8, type=float)
+    parser.add_argument("--ar-top-k", default=5, type=int)
+    parser.add_argument("--ar-top-p", default=0.8, type=float)
+    parser.add_argument("--ar-seed", default=20260615, type=int)
+    parser.add_argument("--ar-ctc-draft-fallback-max-cer", default=None, type=float)
+    parser.add_argument("--ar-ctc-draft-fallback-min-length-ratio", default=0.75, type=float)
+    parser.add_argument("--ar-ctc-draft-fallback-max-length-ratio", default=1.25, type=float)
+    parser.add_argument(
+        "--ar-ctc-draft-fallback-reject-repetition",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--ar-ctc-draft-fallback-metric-normalization", default="ctc")
     parser.add_argument("--limit", default=12, type=int)
     parser.add_argument("--preview-count", default=12, type=int)
     parser.add_argument(
@@ -41,6 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Evaluate a fixed number of preview samples from one WebDataset source. "
             "Can be repeated, e.g. gigaspeech:GSXL-*.tar:6 and wenetspeech:WSL-*.tar:6."
+        ),
+    )
+    parser.add_argument(
+        "--webdataset-split",
+        default="eval",
+        choices=("train", "eval", "all"),
+        help=(
+            "WebDataset split used for sidecar preview sampling. Use train for sampled "
+            "train-only sidecar datasets; keep eval for validation-style previews."
         ),
     )
     parser.add_argument("--once", action="store_true")
@@ -192,6 +233,7 @@ def _build_predict_command(
     limit: int | None = None,
     preview_count: int | None = None,
     webdataset_shard_pattern: str | None = None,
+    decoder_ctc_draft_cache_path: Path | None = None,
 ) -> list[str]:
     resolved_limit = args.limit if limit is None else int(limit)
     resolved_preview_count = args.preview_count if preview_count is None else int(preview_count)
@@ -225,6 +267,12 @@ def _build_predict_command(
                 str(args.beam_size),
                 "--token-prune-topk",
                 str(args.token_prune_topk),
+                "--decoder-ctc-draft-cache-path",
+                "",
+                "--decoder-ctc-draft-prompt-template",
+                "",
+                "--decoder-ctc-draft-missing-policy",
+                "empty",
             ]
         )
     elif module_name == "rwkvasr.cli.predict_rwkv_decoder_labeled":
@@ -234,15 +282,41 @@ def _build_predict_command(
                 str(args.num_workers),
                 "--max-new-tokens-factor",
                 str(args.ar_max_new_tokens_factor),
+                *(["--do-sample"] if args.ar_do_sample else []),
+                "--temperature",
+                str(args.ar_temperature),
+                "--top-k",
+                str(args.ar_top_k),
+                "--top-p",
+                str(args.ar_top_p),
+                "--seed",
+                str(args.ar_seed),
             ]
         )
         if args.ar_max_new_tokens is not None:
             command.extend(["--max-new-tokens", str(args.ar_max_new_tokens)])
+        if decoder_ctc_draft_cache_path is not None:
+            command.extend(["--decoder-ctc-draft-cache-path", str(decoder_ctc_draft_cache_path)])
+        if args.ar_ctc_draft_fallback_max_cer is not None:
+            command.extend(
+                [
+                    "--ctc-draft-fallback-max-cer",
+                    str(args.ar_ctc_draft_fallback_max_cer),
+                    "--ctc-draft-fallback-min-length-ratio",
+                    str(args.ar_ctc_draft_fallback_min_length_ratio),
+                    "--ctc-draft-fallback-max-length-ratio",
+                    str(args.ar_ctc_draft_fallback_max_length_ratio),
+                    "--ctc-draft-fallback-metric-normalization",
+                    str(args.ar_ctc_draft_fallback_metric_normalization),
+                ]
+            )
+            if args.ar_ctc_draft_fallback_reject_repetition:
+                command.append("--ctc-draft-fallback-reject-repetition")
+            else:
+                command.append("--no-ctc-draft-fallback-reject-repetition")
     else:
         raise ValueError(f"Unsupported prediction module: {module_name}")
-    text_normalization = args.text_normalization
-    if text_normalization is None:
-        text_normalization = str(train_config.get("text_normalization", "none"))
+    text_normalization = str(args.text_normalization or train_config.get("text_normalization", "runtime"))
     command.extend(["--text-normalization", text_normalization])
     if config_yaml_override is not None:
         command.extend(["--config-yaml", str(config_yaml_override)])
@@ -254,12 +328,13 @@ def _build_predict_command(
     if manifest_path:
         command.extend(["--manifest-path", str(manifest_path)])
     elif webdataset_root:
+        webdataset_split = str(args.webdataset_split)
         command.extend(
             [
                 "--webdataset-root",
                 str(webdataset_root),
                 "--webdataset-split",
-                "eval",
+                webdataset_split,
                 "--webdataset-shard-pattern",
                 webdataset_shard_pattern or str(train_config.get("webdataset_shard_pattern", "*.tar")),
                 "--webdataset-eval-ratio",
@@ -272,9 +347,40 @@ def _build_predict_command(
                 str(train_config.get("webdataset_utt_id_key", "sid")),
             ]
         )
+        webdataset_length_index_path = train_config.get("webdataset_length_index_path")
+        if webdataset_length_index_path and (
+            webdataset_split == "all"
+            or _length_index_contains_split(str(webdataset_length_index_path), webdataset_split)
+        ):
+            command.extend(["--webdataset-length-index-path", str(webdataset_length_index_path)])
+        elif webdataset_length_index_path:
+            _log(
+                "Ignoring train_config webdataset_length_index_path for sidecar "
+                f"{webdataset_split} preview because it has no {webdataset_split} split rows: "
+                f"{webdataset_length_index_path}"
+            )
     else:
         raise ValueError("train_config must contain manifest_path or webdataset_root")
     return command
+
+
+@lru_cache(maxsize=32)
+def _length_index_contains_split(length_index_path: str, split: str) -> bool:
+    path = Path(length_index_path)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(raw.get("split")) == split:
+                    return True
+    except FileNotFoundError:
+        return False
+    return False
 
 
 def _maybe_write_backend_override(
@@ -384,6 +490,12 @@ def _format_optional_float(value: float | None, digits: int = 4) -> str:
     return f"{value:.{digits}f}"
 
 
+def _format_optional_percent(value: float | None, digits: int = 2) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value * 100.0:.{digits}f}%"
+
+
 def _load_prediction_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -397,123 +509,31 @@ def _load_prediction_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _edit_distance(source: list[int], target: list[int]) -> int:
-    if not source:
-        return len(target)
-    if not target:
-        return len(source)
-    prev = list(range(len(target) + 1))
-    for source_idx, source_token in enumerate(source, start=1):
-        current = [source_idx]
-        for target_idx, target_token in enumerate(target, start=1):
-            cost = 0 if source_token == target_token else 1
-            current.append(
-                min(
-                    prev[target_idx] + 1,
-                    current[target_idx - 1] + 1,
-                    prev[target_idx - 1] + cost,
-                )
-            )
-        prev = current
-    return prev[-1]
-
-
-def _compute_token_error_stats(path: Path) -> dict[str, Any]:
-    records = _load_prediction_jsonl(path)
-    if not records:
-        return {}
-    total_ref = 0
-    total_err = 0
-    per_sample: dict[str, float] = {}
-    for record in records:
-        pred = [int(token) for token in record.get("pred_token_ids", [])]
-        ref = [int(token) for token in record.get("ref_token_ids", [])]
-        err = _edit_distance(pred, ref)
-        denom = max(1, len(ref))
-        total_ref += denom
-        total_err += err
-        per_sample[str(record.get("utt_id", ""))] = float(err) / float(denom)
-    return {
-        "sample_count": len(records),
-        "avg_token_error": float(total_err) / float(max(1, total_ref)),
-        "per_sample_token_error": per_sample,
-    }
-
-
-def _compute_prediction_length_stats(path: Path) -> dict[str, Any]:
-    records = _load_prediction_jsonl(path)
-    if not records:
-        return {}
-    ratios: list[float] = []
-    collapsed = 0
-    for record in records:
-        pred = [int(token) for token in record.get("pred_token_ids", [])]
-        ref = [int(token) for token in record.get("ref_token_ids", [])]
-        ref_len = max(1, len(ref))
-        ratio = float(len(pred)) / float(ref_len)
-        ratios.append(ratio)
-        if ratio <= 0.3:
-            collapsed += 1
-    return {
-        "sample_count": len(records),
-        "pred_ref_ratio_mean": sum(ratios) / len(ratios) if ratios else None,
-        "collapsed_ratio": float(collapsed) / float(len(records)),
-    }
-
-
 def _compare_prediction_sets(
     baseline_jsonl: Path,
     candidate_jsonl: Path,
     *,
     baseline_label: str,
     candidate_label: str,
+    metric_normalization: str = "ctc",
 ) -> dict[str, Any]:
-    baseline = _compute_token_error_stats(baseline_jsonl)
-    candidate = _compute_token_error_stats(candidate_jsonl)
-    if not baseline or not candidate:
+    return compare_prediction_text_sets(
+        baseline_jsonl,
+        candidate_jsonl,
+        baseline_label=baseline_label,
+        candidate_label=candidate_label,
+        normalization=metric_normalization,
+    )
+
+
+def _jsonl_text_error_stats(
+    jsonl_path: Path | None,
+    *,
+    normalization: str = "ctc",
+) -> dict[str, Any]:
+    if jsonl_path is None or not jsonl_path.exists():
         return {}
-    baseline_per_sample = baseline.get("per_sample_token_error", {})
-    candidate_per_sample = candidate.get("per_sample_token_error", {})
-    improved = 0
-    worsened = 0
-    unchanged = 0
-    changed_prediction = 0
-    shared_utts = sorted(set(baseline_per_sample) & set(candidate_per_sample))
-    baseline_records = {str(record.get("utt_id", "")): record for record in _load_prediction_jsonl(baseline_jsonl)}
-    candidate_records = {str(record.get("utt_id", "")): record for record in _load_prediction_jsonl(candidate_jsonl)}
-    for utt_id in shared_utts:
-        base_err = float(baseline_per_sample[utt_id])
-        candidate_err = float(candidate_per_sample[utt_id])
-        if candidate_err < base_err - 1e-9:
-            improved += 1
-        elif candidate_err > base_err + 1e-9:
-            worsened += 1
-        else:
-            unchanged += 1
-        if baseline_records.get(utt_id, {}).get("pred_token_ids") != candidate_records.get(utt_id, {}).get("pred_token_ids"):
-            changed_prediction += 1
-    baseline_avg = baseline.get("avg_token_error")
-    candidate_avg = candidate.get("avg_token_error")
-    verdict = "comparison unavailable"
-    if isinstance(baseline_avg, float) and isinstance(candidate_avg, float):
-        if candidate_avg < baseline_avg - 0.01:
-            verdict = f"{candidate_label} improved preview token error vs {baseline_label}"
-        elif candidate_avg > baseline_avg + 0.01:
-            verdict = f"{baseline_label} remained better than {candidate_label} on preview token error"
-        else:
-            verdict = f"{baseline_label} and {candidate_label} were roughly neutral on preview token error"
-    return {
-        "baseline_avg_token_error": baseline_avg,
-        "candidate_avg_token_error": candidate_avg,
-        "shared_sample_count": len(shared_utts),
-        "changed_prediction_count": changed_prediction,
-        "improved_count": improved,
-        "worsened_count": worsened,
-        "unchanged_count": unchanged,
-        "verdict": verdict,
-        "baseline_label": baseline_label,
-        "candidate_label": candidate_label,
-    }
+    return compute_text_error_stats(jsonl_path, normalization=normalization)
 
 
 def _short_text(value: Any, *, limit: int = 160) -> str:
@@ -524,46 +544,107 @@ def _short_text(value: Any, *, limit: int = 160) -> str:
     return text[: limit - 1] + "…"
 
 
-def _record_token_error(record: dict[str, Any]) -> float | None:
-    pred = record.get("pred_token_ids")
-    ref = record.get("ref_token_ids")
-    if not isinstance(pred, list) or not isinstance(ref, list):
-        return None
-    pred_ids = [int(token) for token in pred]
-    ref_ids = [int(token) for token in ref]
-    return float(_edit_distance(pred_ids, ref_ids)) / float(max(1, len(ref_ids)))
+def _record_text_error(
+    record: dict[str, Any],
+    *,
+    normalization: str = "runtime",
+    language: str | None = None,
+) -> tuple[float | None, float | None]:
+    pred = record.get("pred_text")
+    ref = record.get("ref_text")
+    if not isinstance(pred, str) and not isinstance(ref, str):
+        return None, None
+    pred_norm = normalize_asr_text_for_metrics(pred if isinstance(pred, str) else "", language=language, normalization=normalization)
+    ref_norm = normalize_asr_text_for_metrics(ref if isinstance(ref, str) else "", language=language, normalization=normalization)
+    pred_wer_tokens = tokenize_for_wer(pred_norm)
+    ref_wer_tokens = tokenize_for_wer(ref_norm)
+    pred_cer_tokens = tokenize_for_cer(pred_norm)
+    ref_cer_tokens = tokenize_for_cer(ref_norm)
+    wer = float(edit_distance(pred_wer_tokens, ref_wer_tokens)) / float(max(1, len(ref_wer_tokens)))
+    cer = float(edit_distance(pred_cer_tokens, ref_cer_tokens)) / float(max(1, len(ref_cer_tokens)))
+    return wer, cer
 
 
-def _record_length_ratio(record: dict[str, Any]) -> float | None:
-    pred = record.get("pred_token_ids")
-    ref = record.get("ref_token_ids")
-    if not isinstance(pred, list) or not isinstance(ref, list):
+def _record_length_ratio(
+    record: dict[str, Any],
+    *,
+    normalization: str = "ctc",
+    language: str | None = None,
+) -> float | None:
+    pred = record.get("pred_text")
+    ref = record.get("ref_text")
+    if not isinstance(pred, str) and not isinstance(ref, str):
         return None
-    return float(len(pred)) / float(max(1, len(ref)))
+    pred_norm = normalize_asr_text_for_metrics(
+        pred if isinstance(pred, str) else "",
+        language=language,
+        normalization=normalization,
+    )
+    ref_norm = normalize_asr_text_for_metrics(
+        ref if isinstance(ref, str) else "",
+        language=language,
+        normalization=normalization,
+    )
+    pred_tokens = tokenize_for_wer(pred_norm)
+    ref_tokens = tokenize_for_wer(ref_norm)
+    return float(len(pred_tokens)) / float(max(1, len(ref_tokens)))
+
+
+def _jsonl_content_length_stats(
+    jsonl_path: Path | None,
+    *,
+    normalization: str = "ctc",
+) -> dict[str, Any]:
+    if jsonl_path is None or not jsonl_path.exists():
+        return {}
+    ratios: list[float] = []
+    collapsed = 0
+    records = _load_prediction_jsonl(jsonl_path)
+    for record in records:
+        ratio = _record_length_ratio(record, normalization=normalization)
+        if ratio is None:
+            continue
+        ratios.append(ratio)
+        if ratio <= 0.3:
+            collapsed += 1
+    if not records or not ratios:
+        return {}
+    return {
+        "sample_count": len(records),
+        "pred_ref_ratio_mean": sum(ratios) / len(ratios),
+        "collapsed_ratio": collapsed / len(ratios),
+    }
 
 
 def _build_sample_comment(
     *,
-    ctc_error: float | None,
-    ar_error: float | None,
+    ctc_wer: float | None,
+    ar_wer: float | None,
+    ctc_cer: float | None,
+    ar_cer: float | None,
     ctc_ratio: float | None,
     ar_ratio: float | None,
     ar_record: dict[str, Any],
 ) -> str:
     parts: list[str] = []
-    if ctc_error is not None and ar_error is not None:
-        if ctc_error + 1e-9 < ar_error:
-            parts.append("CTC closer on token edit distance")
-        elif ar_error + 1e-9 < ctc_error:
-            parts.append("AR closer on token edit distance")
+    if ctc_wer is not None and ar_wer is not None:
+        if ctc_wer + 1e-9 < ar_wer:
+            parts.append("CTC closer on ASR-content normalized WER")
+        elif ar_wer + 1e-9 < ctc_wer:
+            parts.append("AR closer on ASR-content normalized WER")
         else:
-            parts.append("CTC and AR tie on token edit distance")
-    elif ctc_error is not None:
-        parts.append("only CTC token error available")
-    elif ar_error is not None:
-        parts.append("only AR token error available")
+            parts.append("CTC and AR tie on ASR-content normalized WER/CER")
+    elif ctc_wer is not None:
+        parts.append("only CTC WER/CER available")
+    elif ar_wer is not None:
+        parts.append("only AR WER/CER available")
     else:
-        parts.append("token error unavailable")
+        parts.append("WER/CER unavailable")
+    if ctc_cer is not None and ar_cer is not None:
+        if ctc_cer + 1e-9 < ar_cer:
+            parts.append("CTC also wins on CER")
+        elif ar_cer + 1e-9 < ctc_cer:
+            parts.append("AR also wins on CER")
 
     if ctc_ratio is not None and ctc_ratio <= 0.5:
         parts.append("CTC is short")
@@ -584,6 +665,7 @@ def _build_prediction_examples(
     ctc_jsonl: Path | None,
     ar_jsonl: Path | None,
     *,
+    metric_normalization: str = "ctc",
     limit: int = 5,
 ) -> list[dict[str, Any]]:
     if ctc_jsonl is None or ar_jsonl is None or not ctc_jsonl.exists() or not ar_jsonl.exists():
@@ -596,23 +678,39 @@ def _build_prediction_examples(
         ar_record = ar_records.get(utt_id)
         if ar_record is None:
             continue
-        ctc_error = _record_token_error(ctc_record)
-        ar_error = _record_token_error(ar_record)
-        ctc_ratio = _record_length_ratio(ctc_record)
-        ar_ratio = _record_length_ratio(ar_record)
+        ctc_error = _record_text_error(
+            ctc_record,
+            normalization=metric_normalization,
+        )
+        ar_error = _record_text_error(
+            ar_record,
+            normalization=metric_normalization,
+        )
+        ctc_ratio = _record_length_ratio(
+            ctc_record,
+            normalization=metric_normalization,
+        )
+        ar_ratio = _record_length_ratio(
+            ar_record,
+            normalization=metric_normalization,
+        )
         examples.append(
             {
                 "utt_id": utt_id,
                 "ref_text": ctc_record.get("ref_text") or ar_record.get("ref_text") or "",
                 "ctc_pred_text": ctc_record.get("pred_text") or "",
                 "ar_pred_text": ar_record.get("pred_text") or "",
-                "ctc_token_error": ctc_error,
-                "ar_token_error": ar_error,
+                "ctc_wer": ctc_error[0],
+                "ar_wer": ar_error[0],
+                "ctc_cer": ctc_error[1],
+                "ar_cer": ar_error[1],
                 "ctc_pred_ref_ratio": ctc_ratio,
                 "ar_pred_ref_ratio": ar_ratio,
                 "comment": _build_sample_comment(
-                    ctc_error=ctc_error,
-                    ar_error=ar_error,
+                    ctc_wer=ctc_error[0],
+                    ar_wer=ar_error[0],
+                    ctc_cer=ctc_error[1],
+                    ar_cer=ar_error[1],
                     ctc_ratio=ctc_ratio,
                     ar_ratio=ar_ratio,
                     ar_record=ar_record,
@@ -631,6 +729,8 @@ def _build_comment(
     metrics_by_step: dict[int, dict[str, Any]],
     ctc_preview_stats: dict[str, Any],
     ar_preview_stats: dict[str, Any],
+    ctc_error_stats: dict[str, Any] | None = None,
+    ar_error_stats: dict[str, Any] | None = None,
     compare_stats: dict[str, Any] | None = None,
     examples: list[dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -681,6 +781,14 @@ def _build_comment(
     ar_pred_ref_ratio = ar_preview_stats.get("pred_ref_ratio_mean")
     ar_collapsed_ratio = float(ar_preview_stats.get("collapsed_ratio", 0.0))
     ar_eos_ratio = ar_preview_stats.get("eos_emitted_ratio")
+    ctc_error_stats = ctc_error_stats or {}
+    ar_error_stats = ar_error_stats or {}
+    ctc_avg_wer = ctc_error_stats.get("avg_wer")
+    ctc_avg_cer = ctc_error_stats.get("avg_cer")
+    ar_avg_wer = ar_error_stats.get("avg_wer")
+    ar_avg_cer = ar_error_stats.get("avg_cer")
+    ctc_sample_count = int(ctc_error_stats.get("sample_count", 0) or 0)
+    ar_sample_count = int(ar_error_stats.get("sample_count", 0) or 0)
     if ar_pred_ref_ratio is None:
         ar_preview_status = "preview unavailable"
     elif ar_collapsed_ratio >= 0.5 or ar_pred_ref_ratio <= 0.35:
@@ -706,7 +814,9 @@ def _build_comment(
         else:
             eval_status = "first sampled eval point available"
 
-    if eval_loss is None:
+    if eval_loss is None and ctc_avg_wer is not None and ctc_avg_cer is not None:
+        overall_status = "preview-metrics"
+    elif eval_loss is None:
         overall_status = "comment-only"
     elif best_eval_loss is not None and abs(eval_loss - best_eval_loss) <= 1e-8 and (
         blank_top1 is None or blank_top1 <= 0.9
@@ -732,11 +842,17 @@ def _build_comment(
         f"- Previous eval loss: {_format_optional_float(prev_eval_loss)}",
         f"- Best eval loss so far: {_format_optional_float(best_eval_loss)}"
         + ("" if best_step is None else f" at step {best_step}"),
+        f"- CTC normalized WER/CER: {_format_optional_percent(ctc_avg_wer)} / "
+        f"{_format_optional_percent(ctc_avg_cer)}"
+        + ("" if ctc_sample_count <= 0 else f" over {ctc_sample_count} samples"),
+        f"- AR normalized WER/CER: {_format_optional_percent(ar_avg_wer)} / "
+        f"{_format_optional_percent(ar_avg_cer)}"
+        + ("" if ar_sample_count <= 0 else f" over {ar_sample_count} samples"),
         f"- Mean blank_top1: {_format_optional_float(blank_top1)}",
         f"- Mean avg_blank: {_format_optional_float(ctc_preview_stats.get('avg_blank_mean'))}",
-        f"- CTC mean pred/ref token ratio: {_format_optional_float(ctc_pred_ref_ratio)}",
+        f"- CTC mean ASR-content pred/ref ratio: {_format_optional_float(ctc_pred_ref_ratio)}",
         f"- CTC collapsed preview ratio: {_format_optional_float(ctc_collapsed_ratio)}",
-        f"- AR mean pred/ref token ratio: {_format_optional_float(ar_pred_ref_ratio)}",
+        f"- AR mean ASR-content pred/ref ratio: {_format_optional_float(ar_pred_ref_ratio)}",
         f"- AR EOS-emitted ratio: {_format_optional_float(ar_eos_ratio)}",
         f"- AR mean avg_logprob: {_format_optional_float(ar_preview_stats.get('avg_logprob_mean'))}",
         f"- AR collapsed preview ratio: {_format_optional_float(ar_collapsed_ratio)}",
@@ -747,8 +863,13 @@ def _build_comment(
                 "",
                 "## CTC vs RWKV Decoder",
                 f"- Verdict: {compare_stats.get('verdict', 'n/a')}",
-                f"- {compare_stats.get('baseline_label', 'baseline')} avg token error: {_format_optional_float(compare_stats.get('baseline_avg_token_error'))}",
-                f"- {compare_stats.get('candidate_label', 'candidate')} avg token error: {_format_optional_float(compare_stats.get('candidate_avg_token_error'))}",
+                "- Metric note: WER/CER strip punctuation, symbols, case, project-generated AR language-confirmation prefixes, and normalize Arabic numerals before scoring.",
+                f"- {compare_stats.get('baseline_label', 'baseline')} avg WER/CER: "
+                f"{_format_optional_float(compare_stats.get('baseline_avg_wer'))} / "
+                f"{_format_optional_float(compare_stats.get('baseline_avg_cer'))}",
+                f"- {compare_stats.get('candidate_label', 'candidate')} avg WER/CER: "
+                f"{_format_optional_float(compare_stats.get('candidate_avg_wer'))} / "
+                f"{_format_optional_float(compare_stats.get('candidate_avg_cer'))}",
                 f"- Changed predictions: {int(compare_stats.get('changed_prediction_count', 0))}/{int(compare_stats.get('shared_sample_count', 0))}",
                 f"- Improved / worsened / unchanged: {int(compare_stats.get('improved_count', 0))}/{int(compare_stats.get('worsened_count', 0))}/{int(compare_stats.get('unchanged_count', 0))}",
             ]
@@ -756,8 +877,10 @@ def _build_comment(
     if examples:
         lines.extend(["", "## Text Examples"])
         for index, example in enumerate(examples, start=1):
-            ctc_error = example.get("ctc_token_error")
-            ar_error = example.get("ar_token_error")
+            ctc_wer = example.get("ctc_wer")
+            ar_wer = example.get("ar_wer")
+            ctc_cer = example.get("ctc_cer")
+            ar_cer = example.get("ar_cer")
             ctc_ratio = example.get("ctc_pred_ref_ratio")
             ar_ratio = example.get("ar_pred_ref_ratio")
             lines.extend(
@@ -767,8 +890,9 @@ def _build_comment(
                     f"- REF: {_short_text(example.get('ref_text'))}",
                     f"- CTC: {_short_text(example.get('ctc_pred_text'))}",
                     f"- AR: {_short_text(example.get('ar_pred_text'))}",
-                    f"- Token error CTC / AR: {_format_optional_float(ctc_error)} / {_format_optional_float(ar_error)}",
-                    f"- Pred/ref length CTC / AR: {_format_optional_float(ctc_ratio)} / {_format_optional_float(ar_ratio)}",
+                    f"- WER CTC / AR: {_format_optional_float(ctc_wer)} / {_format_optional_float(ar_wer)}",
+                    f"- CER CTC / AR: {_format_optional_float(ctc_cer)} / {_format_optional_float(ar_cer)}",
+                    f"- ASR-content pred/ref length CTC / AR: {_format_optional_float(ctc_ratio)} / {_format_optional_float(ar_ratio)}",
                     f"- Comment: {example.get('comment', '')}",
                 ]
             )
@@ -783,6 +907,8 @@ def _build_comment(
         "best_step_so_far": best_step,
         "ctc_preview_stats": ctc_preview_stats,
         "ar_preview_stats": ar_preview_stats,
+        "ctc_error_stats": ctc_error_stats,
+        "ar_error_stats": ar_error_stats,
         "branch_compare": compare_stats or {},
         "examples": examples or [],
     }
@@ -793,21 +919,48 @@ def _write_comment_for_checkpoint(
     *,
     checkpoint_name: str,
     ctc_preview_path: Path,
-    ar_preview_path: Path,
+    ar_preview_path: Path | None,
     sidecar_dir: Path,
     metrics_by_step: dict[int, dict[str, Any]],
+    text_normalization: str = "runtime",
     compare_stats: dict[str, Any] | None = None,
     ctc_output_jsonl: Path | None = None,
     ar_output_jsonl: Path | None = None,
+    metric_normalization: str = "ctc",
     example_count: int = 5,
 ) -> dict[str, Any]:
     step = _parse_step_number(checkpoint_name)
     comment_path = sidecar_dir / f"{Path(checkpoint_name).stem}.comment.md"
     ctc_preview_stats = _parse_preview_debug_stats(ctc_preview_path)
-    ar_preview_stats = _parse_ar_preview_debug_stats(ar_preview_path)
+    ar_preview_stats = (
+        _parse_ar_preview_debug_stats(ar_preview_path)
+        if ar_preview_path is not None and ar_preview_path.exists()
+        else {}
+    )
+    ctc_content_length_stats = _jsonl_content_length_stats(
+        ctc_output_jsonl,
+        normalization=metric_normalization,
+    )
+    if ctc_content_length_stats:
+        ctc_preview_stats.update(ctc_content_length_stats)
+    ar_content_length_stats = _jsonl_content_length_stats(
+        ar_output_jsonl,
+        normalization=metric_normalization,
+    )
+    if ar_content_length_stats:
+        ar_preview_stats.update(ar_content_length_stats)
+    ctc_error_stats = _jsonl_text_error_stats(
+        ctc_output_jsonl,
+        normalization=metric_normalization,
+    )
+    ar_error_stats = _jsonl_text_error_stats(
+        ar_output_jsonl,
+        normalization=metric_normalization,
+    )
     examples = _build_prediction_examples(
         ctc_output_jsonl,
         ar_output_jsonl,
+        metric_normalization=metric_normalization,
         limit=example_count,
     )
     comment_text, summary = _build_comment(
@@ -816,6 +969,8 @@ def _write_comment_for_checkpoint(
         metrics_by_step=metrics_by_step,
         ctc_preview_stats=ctc_preview_stats,
         ar_preview_stats=ar_preview_stats,
+        ctc_error_stats=ctc_error_stats,
+        ar_error_stats=ar_error_stats,
         compare_stats=compare_stats,
         examples=examples,
     )
@@ -829,6 +984,8 @@ def _backfill_comments(
     state: dict[str, Any],
     sidecar_dir: Path,
     metrics_by_step: dict[int, dict[str, Any]],
+    text_normalization: str = "runtime",
+    metric_normalization: str = "ctc",
 ) -> bool:
     changed = False
     evaluated = state.get("evaluated", {})
@@ -839,11 +996,13 @@ def _backfill_comments(
             continue
         ctc_preview_path_raw = record.get("ctc_preview_path") or record.get("preview_path")
         ar_preview_path_raw = record.get("ar_preview_path")
-        if not isinstance(ctc_preview_path_raw, str) or not isinstance(ar_preview_path_raw, str):
+        if not isinstance(ctc_preview_path_raw, str):
             continue
         ctc_preview_path = Path(ctc_preview_path_raw)
-        ar_preview_path = Path(ar_preview_path_raw)
-        if not ctc_preview_path.exists() or not ar_preview_path.exists():
+        ar_preview_path = Path(ar_preview_path_raw) if isinstance(ar_preview_path_raw, str) else None
+        if not ctc_preview_path.exists() or (
+            ar_preview_path is not None and not ar_preview_path.exists()
+        ):
             continue
         compare_stats = {}
         ctc_output_jsonl_raw = record.get("ctc_output_jsonl") or record.get("output_jsonl")
@@ -857,6 +1016,7 @@ def _backfill_comments(
                     ar_output_jsonl_path,
                     baseline_label="ctc",
                     candidate_label="rwkv_decoder_ar",
+                    metric_normalization=metric_normalization,
                 )
         summary = _write_comment_for_checkpoint(
             checkpoint_name=checkpoint_name,
@@ -864,6 +1024,8 @@ def _backfill_comments(
             ar_preview_path=ar_preview_path,
             sidecar_dir=sidecar_dir,
             metrics_by_step=metrics_by_step,
+            text_normalization=text_normalization,
+            metric_normalization=metric_normalization,
             compare_stats=compare_stats,
             ctc_output_jsonl=Path(ctc_output_jsonl_raw)
             if isinstance(ctc_output_jsonl_raw, str)
@@ -980,6 +1142,7 @@ def _run_prediction_preview(
     train_config: dict[str, Any],
     args: argparse.Namespace,
     stem_suffix: str = "",
+    decoder_ctc_draft_cache_path: Path | None = None,
 ) -> dict[str, Any]:
     stem = checkpoint_path.stem
     stem_with_suffix = f"{stem}{stem_suffix}"
@@ -991,7 +1154,11 @@ def _run_prediction_preview(
         checkpoint_stem=stem,
         device=args.device,
     )
-    cwd = run_dir.parent.parent if (run_dir.parent.parent / "src").exists() else run_dir.parent
+    current_cwd = Path.cwd()
+    if (current_cwd / "src").exists():
+        cwd = current_cwd
+    else:
+        cwd = run_dir.parent.parent if (run_dir.parent.parent / "src").exists() else run_dir.parent
     source_quotas = _parse_source_quotas(args.source_quota)
     if source_quotas and not train_config.get("webdataset_root"):
         raise ValueError("--source-quota is only supported for WebDataset-backed sidecar evaluation.")
@@ -1002,6 +1169,9 @@ def _run_prediction_preview(
         "preview_path": str(preview_path),
         "module_name": module_name,
         "config_yaml_override": None if config_yaml_override is None else str(config_yaml_override),
+        "decoder_ctc_draft_cache_path": (
+            None if decoder_ctc_draft_cache_path is None else str(decoder_ctc_draft_cache_path)
+        ),
     }
     meta_path = sidecar_dir / f"{stem_with_suffix}.meta.json"
 
@@ -1029,6 +1199,7 @@ def _run_prediction_preview(
                 limit=quota.limit,
                 preview_count=quota.limit,
                 webdataset_shard_pattern=quota.shard_pattern,
+                decoder_ctc_draft_cache_path=decoder_ctc_draft_cache_path,
             )
             source_meta_path = sidecar_dir / f"{source_stem}.meta.json"
             source_record = {
@@ -1087,6 +1258,7 @@ def _run_prediction_preview(
         config_yaml_override=config_yaml_override,
         train_config=train_config,
         args=args,
+        decoder_ctc_draft_cache_path=decoder_ctc_draft_cache_path,
     )
     _log(f"Evaluating {checkpoint_path.name} -> {preview_path.name}")
     _run_prediction_command(
@@ -1106,6 +1278,8 @@ def _evaluate_checkpoint(
     sidecar_dir: Path,
     train_config: dict[str, Any],
     args: argparse.Namespace,
+    text_normalization: str,
+    metric_normalization: str,
 ) -> dict[str, Any]:
     ctc_meta = _run_prediction_preview(
         checkpoint_path=checkpoint_path,
@@ -1116,6 +1290,12 @@ def _evaluate_checkpoint(
         module_name="rwkvasr.cli.predict_ctc_labeled",
         stem_suffix=".ctc",
     )
+    if not bool(train_config.get("decoder_enabled", False)):
+        return {
+            "ctc": ctc_meta,
+            "ar": None,
+            "compare_stats": {},
+        }
     ar_meta = _run_prediction_preview(
         checkpoint_path=checkpoint_path,
         run_dir=run_dir,
@@ -1124,12 +1304,14 @@ def _evaluate_checkpoint(
         args=args,
         module_name="rwkvasr.cli.predict_rwkv_decoder_labeled",
         stem_suffix=".ar",
+        decoder_ctc_draft_cache_path=Path(ctc_meta["output_jsonl"]),
     )
     compare_stats = _compare_prediction_sets(
         Path(ctc_meta["output_jsonl"]),
         Path(ar_meta["output_jsonl"]),
         baseline_label="ctc",
         candidate_label="rwkv_decoder_ar",
+        metric_normalization=metric_normalization,
     )
     return {
         "ctc": ctc_meta,
@@ -1151,16 +1333,32 @@ def main() -> None:
         _log(f"Waiting for train_config.yaml under {run_dir}")
         time.sleep(min(30.0, max(1.0, float(args.poll_seconds))))
     train_config = _load_train_config(run_dir)
+    text_normalization = str(args.text_normalization or train_config.get("text_normalization", "runtime"))
+    metric_normalization = str(args.metric_normalization or "ctc")
     sidecar_dir, state_path, tmux_tail_path = _sidecar_paths(run_dir, args.output_subdir)
     state = _load_state(state_path)
+    state["text_normalization"] = text_normalization
+    state["metric_normalization"] = metric_normalization
     metrics_by_step = _load_step_metrics(run_dir)
-    if _backfill_comments(state=state, sidecar_dir=sidecar_dir, metrics_by_step=metrics_by_step):
+    if _backfill_comments(
+        state=state,
+        sidecar_dir=sidecar_dir,
+        metrics_by_step=metrics_by_step,
+        text_normalization=text_normalization,
+        metric_normalization=metric_normalization,
+    ):
         save_yaml(state_path, state)
 
     while True:
         _capture_tmux_tail(args.tmux_target, tmux_tail_path)
         metrics_by_step = _load_step_metrics(run_dir)
-        if _backfill_comments(state=state, sidecar_dir=sidecar_dir, metrics_by_step=metrics_by_step):
+        if _backfill_comments(
+            state=state,
+            sidecar_dir=sidecar_dir,
+            metrics_by_step=metrics_by_step,
+            text_normalization=text_normalization,
+            metric_normalization=metric_normalization,
+        ):
             save_yaml(state_path, state)
         checkpoints = _list_step_checkpoints(run_dir)
         new_work = False
@@ -1179,28 +1377,40 @@ def main() -> None:
                 sidecar_dir=sidecar_dir,
                 train_config=train_config,
                 args=args,
+                text_normalization=text_normalization,
+                metric_normalization=metric_normalization,
             )
             ctc_meta = meta["ctc"]
             ar_meta = meta["ar"]
             compare_stats = meta.get("compare_stats", {})
-            state["evaluated"][key] = {
+            state_record = {
                 "ctc_preview_path": ctc_meta["preview_path"],
                 "ctc_output_jsonl": ctc_meta["output_jsonl"],
-                "ar_preview_path": ar_meta["preview_path"],
-                "ar_output_jsonl": ar_meta["output_jsonl"],
                 "evaluated_at": ctc_meta["evaluated_at"],
                 "ctc_duration_sec": ctc_meta["duration_sec"],
-                "ar_duration_sec": ar_meta["duration_sec"],
+                "metric_normalization": metric_normalization,
+                "text_normalization": text_normalization,
             }
+            if isinstance(ar_meta, dict):
+                state_record.update(
+                    {
+                        "ar_preview_path": ar_meta["preview_path"],
+                        "ar_output_jsonl": ar_meta["output_jsonl"],
+                        "ar_duration_sec": ar_meta["duration_sec"],
+                    }
+                )
+            state["evaluated"][key] = state_record
             summary = _write_comment_for_checkpoint(
                 checkpoint_name=key,
                 ctc_preview_path=Path(ctc_meta["preview_path"]),
-                ar_preview_path=Path(ar_meta["preview_path"]),
+                ar_preview_path=Path(ar_meta["preview_path"]) if isinstance(ar_meta, dict) else None,
                 sidecar_dir=sidecar_dir,
                 metrics_by_step=metrics_by_step,
+                text_normalization=text_normalization,
+                metric_normalization=metric_normalization,
                 compare_stats=compare_stats,
                 ctc_output_jsonl=Path(ctc_meta["output_jsonl"]),
-                ar_output_jsonl=Path(ar_meta["output_jsonl"]),
+                ar_output_jsonl=Path(ar_meta["output_jsonl"]) if isinstance(ar_meta, dict) else None,
             )
             state["evaluated"][key].update(summary)
             save_yaml(state_path, state)

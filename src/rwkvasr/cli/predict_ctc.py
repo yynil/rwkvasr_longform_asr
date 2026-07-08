@@ -30,6 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-prune-topk", default=None, type=int)
     parser.add_argument("--length-bonus", default=0.0, type=float)
     parser.add_argument("--insertion-bonus", default=0.0, type=float)
+    parser.add_argument(
+        "--blank-logit-bias",
+        default=0.0,
+        type=float,
+        help="Add this value to the CTC blank logit before decode log_softmax; negative values penalize blank.",
+    )
     parser.add_argument("--hotwords-path", default=None)
     parser.add_argument("--hotword-weight", default=3.0, type=float)
     parser.add_argument("--hotword-prefix-scale", default=0.3, type=float)
@@ -41,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-task", default=None)
     parser.add_argument("--text-normalization", default="none")
     parser.add_argument("--frame-shift-ms", default=10.0, type=float)
+    parser.add_argument("--feature-extractor-type", default="wenet_fbank")
     parser.add_argument("--vocab-size", default=None, type=int)
     parser.add_argument("--input-dim", default=80, type=int)
     parser.add_argument("--n-embd", default=512, type=int)
@@ -70,6 +77,7 @@ def _resolve_model_config(args: argparse.Namespace) -> RWKVCTCModelConfig:
     if args.vocab_size is None:
         raise ValueError("Either --config-yaml or --vocab-size plus model shape arguments must be provided.")
     return RWKVCTCModelConfig(
+        feature_extractor_type=args.feature_extractor_type,
         input_dim=args.input_dim,
         n_embd=args.n_embd,
         dim_att=args.dim_att,
@@ -135,6 +143,7 @@ def main() -> None:
             token_prune_topk=args.token_prune_topk,
             length_bonus=args.length_bonus,
             insertion_bonus=args.insertion_bonus,
+            blank_logit_bias=args.blank_logit_bias,
             hotwords_path=args.hotwords_path,
             hotword_weight=args.hotword_weight,
             hotword_prefix_scale=args.hotword_prefix_scale,

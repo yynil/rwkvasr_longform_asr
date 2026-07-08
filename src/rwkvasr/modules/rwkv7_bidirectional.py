@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor, nn
 
 from .direction_dropout import LayerDirectionMask
@@ -22,6 +23,25 @@ class BidirectionalTimeMixerState:
 
 def reverse_time(x: Tensor) -> Tensor:
     return x.flip(dims=(1,))
+
+
+def reverse_time_by_lengths(x: Tensor, lengths: Tensor | None) -> Tensor:
+    if lengths is None:
+        return reverse_time(x)
+    if x.ndim < 2:
+        raise ValueError("reverse_time_by_lengths expects a time dimension at dim=1.")
+    batch_size = int(x.size(0))
+    time_size = int(x.size(1))
+    if int(lengths.numel()) != batch_size:
+        raise ValueError("lengths must contain one value per batch item.")
+    lengths = lengths.to(device=x.device, dtype=torch.long).clamp_min(0).clamp_max(time_size)
+    positions = torch.arange(time_size, device=x.device, dtype=torch.long).unsqueeze(0)
+    valid = positions < lengths.unsqueeze(1)
+    gather_index = torch.where(valid, lengths.unsqueeze(1) - 1 - positions, torch.zeros_like(positions))
+    gather_index = gather_index.view(batch_size, time_size, *([1] * (x.ndim - 2))).expand_as(x)
+    reversed_x = x.gather(dim=1, index=gather_index)
+    valid = valid.view(batch_size, time_size, *([1] * (x.ndim - 2)))
+    return reversed_x.masked_fill(~valid, 0)
 
 
 class BidirectionalRWKVTimeMixer(nn.Module):
@@ -58,6 +78,7 @@ class BidirectionalRWKVTimeMixer(nn.Module):
         v_first: BidirectionalVFirstState | None = None,
         state: BidirectionalTimeMixerState | None = None,
         layer_mask: LayerDirectionMask | None = None,
+        lengths: Tensor | None = None,
     ) -> tuple[Tensor, BidirectionalVFirstState, BidirectionalTimeMixerState]:
         mask = layer_mask or LayerDirectionMask()
         outputs: list[Tensor] = []
@@ -83,15 +104,17 @@ class BidirectionalRWKVTimeMixer(nn.Module):
             outputs.append(out_forward)
 
         if mask.use_backward:
-            x_rev = reverse_time(x)
-            backward_v_first_rev = None if backward_v_first is None else reverse_time(backward_v_first)
+            x_rev = reverse_time_by_lengths(x, lengths)
+            backward_v_first_rev = (
+                None if backward_v_first is None else reverse_time_by_lengths(backward_v_first, lengths)
+            )
             out_backward_rev, next_backward_v_first_rev, next_backward_state = self.backward_mixer(
                 x_rev,
                 v_first=backward_v_first_rev,
                 state=backward_state,
             )
-            out_backward = reverse_time(out_backward_rev)
-            next_backward_v_first = reverse_time(next_backward_v_first_rev)
+            out_backward = reverse_time_by_lengths(out_backward_rev, lengths)
+            next_backward_v_first = reverse_time_by_lengths(next_backward_v_first_rev, lengths)
             outputs.append(out_backward)
 
         if len(outputs) == 1:
