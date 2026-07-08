@@ -101,6 +101,31 @@ def _write_mp3_named_shard(tmp_path: Path, shard_name: str, samples: list[tuple[
     return shard_path
 
 
+def _write_shard_with_corrupt_audio(tmp_path: Path, shard_name: str) -> Path:
+    shard_path = tmp_path / shard_name
+    with tarfile.open(shard_path, "w") as archive:
+        bad_audio = b"not a supported audio file"
+        bad_audio_info = tarfile.TarInfo(name="bad.wav")
+        bad_audio_info.size = len(bad_audio)
+        archive.addfile(bad_audio_info, io.BytesIO(bad_audio))
+
+        bad_json = _write_json_bytes("坏音频", "sid-bad")
+        bad_json_info = tarfile.TarInfo(name="bad.json")
+        bad_json_info.size = len(bad_json)
+        archive.addfile(bad_json_info, io.BytesIO(bad_json))
+
+        good_audio = _make_wav_bytes(16000)
+        good_audio_info = tarfile.TarInfo(name="good.wav")
+        good_audio_info.size = len(good_audio)
+        archive.addfile(good_audio_info, io.BytesIO(good_audio))
+
+        good_json = _write_json_bytes("正常音频", "sid-good")
+        good_json_info = tarfile.TarInfo(name="good.json")
+        good_json_info.size = len(good_json)
+        archive.addfile(good_json_info, io.BytesIO(good_json))
+    return shard_path
+
+
 def _build_root(tmp_path: Path) -> Path:
     _write_shard(
         tmp_path,
@@ -218,6 +243,43 @@ def test_webdataset_iterable_decodes_audio_and_tokenizes_text(tmp_path: Path) ->
     assert [sample["target_length"] for sample in samples] == [4, 4, 4]
 
 
+def test_webdataset_ctc_label_override_changes_only_ctc_targets(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    override_cache = tmp_path / "teacher_labels.jsonl"
+    override_cache.write_text(
+        json.dumps(
+            {
+                "utt_id": "sid-1",
+                "teacher_text_tn": "修正",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset = WebDatasetASRIterableDataset(
+        root,
+        tokenizer=DummyTokenizer(),
+        decoder_tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            ctc_label_override_cache_path=str(override_cache),
+            ctc_label_override_text_key="teacher_text_tn",
+        ),
+    )
+
+    samples = list(dataset)
+
+    assert [sample["utt_id"] for sample in samples] == ["sid-1", "sid-2", "sid-3"]
+    assert samples[0]["text"] == "修正"
+    assert samples[0]["target_length"] == 2
+    assert samples[0]["decoder_target_length"] == 4
+    assert samples[0]["metadata"]["_ctc_label_override_text"] == "修正"
+    assert samples[1]["text"] == "双向语音"
+    assert samples[1]["target_length"] == 4
+    assert "_ctc_label_override_text" not in samples[1]["metadata"]
+
+
 def test_webdataset_dataloader_batches_like_manifest_pipeline(tmp_path: Path) -> None:
     root = _build_root(tmp_path)
     loader = build_webdataset_dataloader(
@@ -234,6 +296,22 @@ def test_webdataset_dataloader_batches_like_manifest_pipeline(tmp_path: Path) ->
     assert batch.feature_lengths.shape == (2,)
     assert batch.target_lengths.tolist() == [4, 4]
     assert batch.utt_ids == ["sid-1", "sid-2"]
+
+
+def test_webdataset_iterable_skips_corrupt_audio_when_configured(tmp_path: Path, capsys) -> None:
+    _write_shard_with_corrupt_audio(tmp_path, "shard_00000000.tar")
+    dataset = WebDatasetASRIterableDataset(
+        tmp_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(shuffle_shards=False, skip_decode_errors=True),
+    )
+
+    samples = list(dataset)
+
+    assert [sample["utt_id"] for sample in samples] == ["sid-good"]
+    err = capsys.readouterr().err
+    assert "skipped corrupt sample" in err
+    assert "key=bad" in err
 
 
 def test_webdataset_rank_partition_uses_disjoint_shards(tmp_path: Path, monkeypatch) -> None:
@@ -497,6 +575,48 @@ def test_length_bucketed_batch_sampler_dynamically_adjusts_batch_size_by_length(
     assert batch_max_lengths == [120, 130, 500, 520, 540, 560]
 
 
+def test_length_bucketed_batch_sampler_source_interleaves_within_length_window() -> None:
+    lengths = [100] * 8
+    source_labels = ["gigaspeech"] * 4 + ["wenetspeech"] * 4
+
+    batches = list(
+        LengthBucketedBatchSampler(
+            lengths,
+            source_labels=source_labels,
+            source_interleave=True,
+            batch_size=4,
+            rank=0,
+            world_size=1,
+            seed=0,
+            shuffle=False,
+        )
+    )
+
+    assert batches == [[0, 4, 1, 5], [2, 6, 3, 7]]
+    assert all({source_labels[idx] for idx in batch} == {"gigaspeech", "wenetspeech"} for batch in batches)
+
+
+def test_length_bucketed_batch_sampler_source_interleave_spreads_minority_source() -> None:
+    lengths = [100] * 8
+    source_labels = ["gigaspeech"] * 2 + ["wenetspeech"] * 6
+
+    batches = list(
+        LengthBucketedBatchSampler(
+            lengths,
+            source_labels=source_labels,
+            source_interleave=True,
+            batch_size=4,
+            rank=0,
+            world_size=1,
+            seed=0,
+            shuffle=False,
+        )
+    )
+
+    assert all("gigaspeech" in {source_labels[idx] for idx in batch} for batch in batches)
+    assert all("wenetspeech" in {source_labels[idx] for idx in batch} for batch in batches)
+
+
 def test_estimate_length_bucketed_steps_matches_dynamic_batches() -> None:
     lengths = [100, 110, 120, 130, 500, 520, 540, 560]
     steps = estimate_length_bucketed_steps(
@@ -576,6 +696,12 @@ def test_length_bucketed_webdataset_dataloader_reads_similar_length_batches(tmp_
     assert batch.features.size(0) == 2
     assert max(batch.feature_lengths.tolist()) - min(batch.feature_lengths.tolist()) <= 20
     assert [candidate.features.size(0) for candidate in batches] == [2, 1, 1]
+
+    resumed_iter, skipped = loader.iter_from_batch_offset(1)
+    resumed_batches = list(resumed_iter)
+
+    assert skipped == 1
+    assert [candidate.features.size(0) for candidate in resumed_batches] == [1, 1]
 
 
 def test_bucket_manifest_step_estimation_and_loading(tmp_path: Path) -> None:
@@ -730,6 +856,158 @@ def test_bucketed_webdataset_loader_splits_same_bucket_across_ranks(tmp_path: Pa
     assert batch1.utt_ids == ["sid-2"]
 
 
+def test_bucketed_webdataset_loader_skips_corrupt_audio_when_configured(tmp_path: Path, capsys) -> None:
+    root = tmp_path / "bucket_loader_skip_root"
+    root.mkdir()
+    _write_shard_with_corrupt_audio(root, "shard_00000000.tar")
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[
+            (
+                "train/bucket_0000/part_000000.jsonl",
+                [
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": "bad",
+                        "utt_id": "sid-bad",
+                        "split": "train",
+                        "num_frames": 40,
+                        "audio_member": "bad.wav",
+                        "audio_format": "wav",
+                        "json_member": "bad.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": "good",
+                        "utt_id": "sid-good",
+                        "split": "train",
+                        "num_frames": 50,
+                        "audio_member": "good.wav",
+                        "audio_format": "wav",
+                        "json_member": "good.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                ],
+            ),
+        ],
+    )
+    loader = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            split="train",
+            skip_decode_errors=True,
+        ),
+        batch_size=2,
+        num_workers=2,
+        rank=0,
+        world_size=1,
+    )
+
+    batch = next(iter(loader))
+
+    assert batch.utt_ids == ["sid-good"]
+    err = capsys.readouterr().err
+    assert "skipped corrupt sample" in err
+    assert "key=bad" in err
+
+
+def test_bucketed_webdataset_loader_fast_forwards_without_decoding_skipped_batches(tmp_path: Path) -> None:
+    root = tmp_path / "bucket_loader_resume_root"
+    root.mkdir()
+    root = _build_root(root)
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[
+            (
+                "train/bucket_0000/part_000000.jsonl",
+                [
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": "0000000001",
+                        "utt_id": "sid-1",
+                        "split": "train",
+                        "num_frames": 40,
+                        "audio_member": "0000000001.wav",
+                        "audio_format": "wav",
+                        "json_member": "0000000001.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": "0000000002",
+                        "utt_id": "sid-2",
+                        "split": "train",
+                        "num_frames": 50,
+                        "audio_member": "0000000002.wav",
+                        "audio_format": "wav",
+                        "json_member": "0000000002.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                ],
+            ),
+            (
+                "train/bucket_0001/part_000000.jsonl",
+                [
+                    {
+                        "shard_name": "shard_00000001.tar",
+                        "key": "0000000003",
+                        "utt_id": "sid-3",
+                        "split": "train",
+                        "num_frames": 120,
+                        "audio_member": "0000000003.wav",
+                        "audio_format": "wav",
+                        "json_member": "0000000003.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    },
+                ],
+            ),
+        ],
+    )
+    loader = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(shuffle_shards=False, split="train"),
+        batch_size=1,
+        num_workers=1,
+        rank=0,
+        world_size=1,
+    )
+    progress = []
+
+    resumed_iter, skipped = loader.iter_from_batch_offset(
+        2,
+        progress_interval=1,
+        progress_callback=progress.append,
+    )
+    batch = next(iter(resumed_iter))
+
+    assert skipped == 2
+    assert progress == [1, 2]
+    assert batch.utt_ids == ["sid-3"]
+
+
 def test_bucket_entry_stream_closes_part_handle_between_takes(tmp_path: Path) -> None:
     bucket_root = tmp_path / "webdataset_buckets"
     bucket_root.mkdir()
@@ -760,17 +1038,12 @@ def test_bucket_entry_stream_closes_part_handle_between_takes(tmp_path: Path) ->
     manifest_path.write_text("{}", encoding="utf-8")
     stream = _BucketEntryStream(
         manifest_path,
-        WebDatasetBucket(
-            split="train",
-            bucket_id=0,
-            num_samples=3,
-            parts=(
-                WebDatasetBucketPart(
-                    path=part_path.name,
-                    num_samples=3,
-                    first_shard="shard_00000000.tar",
-                    last_shard="shard_00000000.tar",
-                ),
+        (
+            WebDatasetBucketPart(
+                path=part_path.name,
+                num_samples=3,
+                first_shard="shard_00000000.tar",
+                last_shard="shard_00000000.tar",
             ),
         ),
     )

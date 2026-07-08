@@ -11,6 +11,7 @@ from rwkvasr.modules import (
     build_inference_direction_mask,
     build_last_n_bidirectional_mask,
     reverse_time,
+    reverse_time_by_lengths,
 )
 from rwkvasr.modules.rwkv7_cuda import fused_wkv7
 from rwkvasr.modules.rwkv7_time_mixer import _native_wkv7, pad_to_chunk_length
@@ -116,6 +117,41 @@ def test_bidirectional_merge_matches_branch_outputs() -> None:
     assert torch.allclose(v_first.backward, vf_b)
 
 
+def test_reverse_time_by_lengths_keeps_padding_after_valid_frames() -> None:
+    x = torch.tensor(
+        [
+            [[1.0], [2.0], [3.0], [99.0], [99.0]],
+            [[4.0], [5.0], [99.0], [99.0], [99.0]],
+        ]
+    )
+    lengths = torch.tensor([3, 2])
+
+    y = reverse_time_by_lengths(x, lengths)
+
+    expected = torch.tensor(
+        [
+            [[3.0], [2.0], [1.0], [0.0], [0.0]],
+            [[5.0], [4.0], [0.0], [0.0], [0.0]],
+        ]
+    )
+    assert torch.equal(y, expected)
+
+
+def test_bidirectional_mixer_valid_frames_are_batch_padding_invariant() -> None:
+    torch.manual_seed(12)
+    module = BidirectionalRWKVTimeMixer(_build_config(layer_id=0))
+    module.eval()
+    sample = torch.randn(1, 4, 128)
+    companion = torch.randn(1, 7, 128)
+    padded_sample = torch.cat([sample, torch.full((1, 3, 128), 100.0)], dim=1)
+    batch = torch.cat([padded_sample, companion], dim=0)
+
+    y_single, _, _ = module(sample, lengths=torch.tensor([4]))
+    y_batch, _, _ = module(batch, lengths=torch.tensor([4, 7]))
+
+    assert torch.allclose(y_batch[0, :4], y_single[0], atol=1e-5, rtol=1e-5)
+
+
 def test_bidirectional_l2r_mask_matches_forward_branch() -> None:
     torch.manual_seed(4)
     module = BidirectionalRWKVTimeMixer(_build_config(layer_id=1))
@@ -156,6 +192,53 @@ def test_direction_dropout_scheduler_probability_ramps() -> None:
     assert scheduler.probability_at(20) == 0.1
     assert scheduler.probability_at(30) == 0.2
     assert scheduler.probability_at(100) == 0.2
+
+
+def test_direction_dropout_zero_probability_is_full_bidirectional() -> None:
+    scheduler = DirectionDropoutScheduler(
+        DirectionDropoutConfig(
+            num_layers=8,
+            variant="drop_both",
+            p_start=0.0,
+            p_max=0.0,
+            warmup_steps=0,
+            ramp_steps=0,
+        )
+    )
+    generator = torch.Generator().manual_seed(123)
+    mask = scheduler.sample_mask(0, generator=generator)
+
+    assert torch.all(mask.forward)
+    assert torch.all(mask.backward)
+
+
+def test_direction_dropout_default_is_disabled() -> None:
+    scheduler = DirectionDropoutScheduler(DirectionDropoutConfig(num_layers=8))
+    mask = scheduler.sample_mask(0, generator=torch.Generator().manual_seed(123))
+
+    assert scheduler.config.variant == "none"
+    assert scheduler.config.p_start == 0.0
+    assert scheduler.config.p_max == 0.0
+    assert torch.all(mask.forward)
+    assert torch.all(mask.backward)
+
+
+def test_direction_dropout_none_variant_is_full_bidirectional_even_with_probability() -> None:
+    scheduler = DirectionDropoutScheduler(
+        DirectionDropoutConfig(
+            num_layers=8,
+            variant="none",
+            p_start=1.0,
+            p_max=1.0,
+            warmup_steps=0,
+            ramp_steps=0,
+        )
+    )
+    generator = torch.Generator().manual_seed(123)
+    mask = scheduler.sample_mask(0, generator=generator)
+
+    assert torch.all(mask.forward)
+    assert torch.all(mask.backward)
 
 
 def test_direction_dropout_drop_r2l_only_keeps_forward() -> None:

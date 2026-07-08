@@ -1,11 +1,22 @@
 import torch
+import torch.nn.functional as F
 
 from rwkvasr.modules import (
     RWKVCTCModel,
     RWKVCTCModelConfig,
     RWKVConformerEncoder,
     RWKVConformerEncoderConfig,
+    aut_conv2d8_out_lengths,
     build_inference_direction_mask,
+)
+from rwkvasr.training.deepspeed_loop import (
+    _ctc_teacher_hidden_loss,
+    _ctc_teacher_nonblank_hard_loss,
+    _ctc_teacher_nonblank_window_loss,
+    _ctc_teacher_nonblank_window_topk_loss,
+    _ctc_teacher_sequence_presence_loss,
+    _ctc_teacher_sequence_window_loss,
+    _project_ctc_teacher_full_log_probs,
 )
 
 
@@ -90,6 +101,664 @@ def test_ctc_model_forward_and_loss() -> None:
     assert torch.isfinite(loss)
 
 
+def test_nano_style_ctc_decoder_path_forward_and_loss() -> None:
+    torch.manual_seed(2201)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=8,
+            n_embd=16,
+            dim_att=16,
+            dim_ff=32,
+            num_layers=2,
+            vocab_size=10,
+            blank_id=10,
+            head_size=8,
+            conv_kernel_size=3,
+            dropout=0.0,
+            frontend_type="linear",
+            ctc_decoder_type="funasr_nano_transformer",
+            ctc_decoder_dim=16,
+            ctc_decoder_ffn_dim=32,
+            ctc_decoder_num_layers=2,
+            ctc_decoder_attention_heads=4,
+        )
+    )
+    features = torch.randn(2, 7, 8)
+    feature_lengths = torch.tensor([7, 5], dtype=torch.long)
+    logits, logit_lengths, _ = model(features, feature_lengths)
+    targets = torch.tensor([1, 2, 3], dtype=torch.long)
+    target_lengths = torch.tensor([2, 1], dtype=torch.long)
+    loss = model.ctc_loss(logits, logit_lengths, targets, target_lengths)
+
+    assert model.ctc_decoder is not None
+    assert model.ctc_head.in_features == 16
+    assert logits.shape == (2, 7, 11)
+    assert torch.equal(logit_lengths, feature_lengths)
+    assert torch.isfinite(loss)
+
+
+def test_ctc_bridge_residual_mlp_is_identity_initialized() -> None:
+    torch.manual_seed(22011)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=8,
+            n_embd=16,
+            dim_att=16,
+            dim_ff=32,
+            num_layers=2,
+            vocab_size=10,
+            blank_id=10,
+            head_size=8,
+            conv_kernel_size=3,
+            dropout=0.0,
+            frontend_type="linear",
+            ctc_bridge_type="residual_mlp",
+            ctc_bridge_hidden_dim=32,
+            ctc_bridge_dropout=0.0,
+            ctc_loss_weight=0.0,
+        )
+    )
+    encoded = torch.randn(2, 7, 16)
+    lengths = torch.tensor([7, 5], dtype=torch.long)
+
+    ctc_encoded, ctc_lengths = model.ctc_encoder_features_from_encoded(encoded, lengths)
+
+    assert torch.allclose(ctc_encoded, encoded)
+    assert torch.equal(ctc_lengths, lengths)
+    assert any(parameter.requires_grad for parameter in model.ctc_bridge.parameters())
+
+    features = torch.randn(2, 7, 8)
+    targets = torch.empty(0, dtype=torch.long)
+    target_lengths = torch.tensor([0, 0], dtype=torch.long)
+    losses = model.joint_losses(features, lengths, targets, target_lengths)
+
+    assert losses["encoded"].shape == (2, 7, 16)
+    assert losses["ctc_encoded"].shape == (2, 7, 16)
+    assert torch.equal(losses["ctc_encoded_lengths"], lengths)
+
+
+def test_ctc_bridge_context_residual_mlp_is_identity_initialized_and_masks_padding() -> None:
+    torch.manual_seed(22012)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=8,
+            n_embd=16,
+            dim_att=16,
+            dim_ff=32,
+            num_layers=2,
+            vocab_size=10,
+            blank_id=10,
+            head_size=8,
+            conv_kernel_size=3,
+            dropout=0.0,
+            frontend_type="linear",
+            ctc_bridge_type="context_residual_mlp",
+            ctc_bridge_hidden_dim=32,
+            ctc_bridge_dropout=0.0,
+            ctc_loss_weight=0.0,
+        )
+    )
+    encoded = torch.randn(2, 7, 16)
+    lengths = torch.tensor([7, 4], dtype=torch.long)
+
+    ctc_encoded, ctc_lengths = model.ctc_encoder_features_from_encoded(encoded, lengths)
+
+    assert torch.allclose(ctc_encoded, encoded)
+    assert torch.equal(ctc_lengths, lengths)
+    assert any(parameter.requires_grad for parameter in model.ctc_bridge.parameters())
+
+    with torch.no_grad():
+        model.ctc_bridge.temporal.weight.fill_(0.1)
+        model.ctc_bridge.temporal.bias.fill_(0.2)
+    changed, _ = model.ctc_encoder_features_from_encoded(encoded, lengths)
+
+    assert not torch.allclose(changed[0, : lengths[0]], encoded[0, : lengths[0]])
+    assert not torch.allclose(changed[1, : lengths[1]], encoded[1, : lengths[1]])
+    assert torch.allclose(changed[1, lengths[1] :], encoded[1, lengths[1] :])
+
+
+def test_ctc_bridge_nano_encoder_tail_forward_and_loads_tp_tail_weights() -> None:
+    torch.manual_seed(22013)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=8,
+            n_embd=16,
+            dim_att=16,
+            dim_ff=32,
+            num_layers=2,
+            vocab_size=10,
+            blank_id=10,
+            head_size=8,
+            conv_kernel_size=3,
+            dropout=0.0,
+            frontend_type="linear",
+            ctc_bridge_type="nano_encoder_tail2",
+            ctc_bridge_hidden_dim=64,
+            ctc_bridge_dropout=0.0,
+            ctc_loss_weight=0.0,
+        )
+    )
+    encoded = torch.randn(2, 7, 16)
+    lengths = torch.tensor([7, 5], dtype=torch.long)
+
+    ctc_encoded, ctc_lengths = model.ctc_encoder_features_from_encoded(encoded, lengths)
+
+    assert ctc_encoded.shape == encoded.shape
+    assert torch.equal(ctc_lengths, lengths)
+
+    bridge = model.ctc_bridge
+    source = {}
+    for block_index, block in enumerate(bridge.blocks):
+        source_index = bridge.source_block_offset + block_index
+        for key, value in block.state_dict().items():
+            source[f"audio_encoder.tp_encoders.{source_index}.{key}"] = torch.randn_like(value)
+    for key, value in bridge.final_norm.state_dict().items():
+        source[f"audio_encoder.tp_norm.{key}"] = torch.randn_like(value)
+
+    report = bridge.load_funasr_nano_bridge_state_dict(source)
+
+    expected = sum(len(block.state_dict()) for block in bridge.blocks) + len(bridge.final_norm.state_dict())
+    assert len(report["loaded"]) == expected
+    assert report["skipped"] == []
+    assert torch.equal(
+        bridge.blocks[0].norm1.weight,
+        source[f"audio_encoder.tp_encoders.{bridge.source_block_offset}.norm1.weight"],
+    )
+    assert torch.equal(bridge.final_norm.bias, source["audio_encoder.tp_norm.bias"])
+
+
+def test_funasr_nano_ctc_init_remaps_teacher_blank(tmp_path) -> None:
+    torch.manual_seed(2202)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=8,
+            n_embd=16,
+            dim_att=16,
+            dim_ff=32,
+            num_layers=2,
+            vocab_size=21,
+            blank_id=21,
+            head_size=8,
+            conv_kernel_size=3,
+            dropout=0.0,
+            frontend_type="linear",
+            ctc_decoder_type="funasr_nano_transformer",
+            ctc_decoder_dim=16,
+            ctc_decoder_ffn_dim=32,
+            ctc_decoder_num_layers=1,
+            ctc_decoder_attention_heads=4,
+        )
+    )
+    assert model.ctc_decoder is not None
+    state = {
+        f"ctc_decoder.{key}": torch.randn_like(value)
+        for key, value in model.ctc_decoder.state_dict().items()
+    }
+    teacher_weight = torch.randn(21, 16)
+    teacher_bias = torch.arange(21, dtype=torch.float32)
+    state["ctc.ctc_lo.weight"] = teacher_weight
+    state["ctc.ctc_lo.bias"] = teacher_bias
+    checkpoint_path = tmp_path / "nano_ctc.pt"
+    torch.save({"state_dict": state}, checkpoint_path)
+
+    report = model.load_funasr_nano_ctc_checkpoint(
+        str(checkpoint_path),
+        teacher_blank_id=20,
+        project_ignored_token_ids=(20,),
+    )
+
+    assert report["ctc_decoder_loaded"] == len(model.ctc_decoder.state_dict())
+    assert report["ctc_head_loaded_rows"] == 21
+    assert torch.allclose(model.ctc_head.weight[0], teacher_weight[0])
+    assert torch.allclose(model.ctc_head.weight[21], teacher_weight[20])
+    assert torch.equal(model.ctc_head.bias[21], teacher_bias[20])
+    assert torch.equal(model.ctc_head.weight[20], torch.zeros_like(model.ctc_head.weight[20]))
+    assert model.ctc_head.bias[20].item() < -9999
+
+
+def test_funasr_nano_ctc_init_applies_blank_bias_delta_after_remap(tmp_path) -> None:
+    torch.manual_seed(2203)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=8,
+            n_embd=16,
+            dim_att=16,
+            dim_ff=32,
+            num_layers=2,
+            vocab_size=21,
+            blank_id=21,
+            head_size=8,
+            conv_kernel_size=3,
+            dropout=0.0,
+            frontend_type="linear",
+            ctc_decoder_type="funasr_nano_transformer",
+            ctc_decoder_dim=16,
+            ctc_decoder_ffn_dim=32,
+            ctc_decoder_num_layers=1,
+            ctc_decoder_attention_heads=4,
+        )
+    )
+    assert model.ctc_decoder is not None
+    state = {
+        f"ctc_decoder.{key}": torch.randn_like(value)
+        for key, value in model.ctc_decoder.state_dict().items()
+    }
+    teacher_weight = torch.randn(21, 16)
+    teacher_bias = torch.arange(21, dtype=torch.float32)
+    state["ctc.ctc_lo.weight"] = teacher_weight
+    state["ctc.ctc_lo.bias"] = teacher_bias
+    checkpoint_path = tmp_path / "nano_ctc.pt"
+    torch.save({"state_dict": state}, checkpoint_path)
+
+    report = model.load_funasr_nano_ctc_checkpoint(
+        str(checkpoint_path),
+        teacher_blank_id=20,
+        project_ignored_token_ids=(20,),
+        blank_bias_delta=-3.0,
+    )
+
+    assert report["ctc_head_blank_bias_delta"] == -3.0
+    assert torch.equal(model.ctc_head.bias[21], teacher_bias[20] - 3.0)
+    assert model.ctc_head.bias[20].item() < -9999
+
+
+def test_project_ctc_teacher_full_log_probs_remaps_teacher_blank() -> None:
+    raw = torch.full((2, 5), float("-inf"))
+    raw[:, 0] = torch.log(torch.tensor([0.1, 0.2]))
+    raw[:, 2] = torch.log(torch.tensor([0.2, 0.1]))
+    raw[:, 4] = torch.log(torch.tensor([0.7, 0.7]))
+
+    projected = _project_ctc_teacher_full_log_probs(
+        raw,
+        vocab_size=6,
+        blank_id=5,
+        teacher_blank_id=4,
+        project_blank_id=5,
+        ignored_token_ids=(4,),
+    )
+
+    assert projected.shape == (2, 6)
+    assert torch.allclose(projected[:, 0], raw[:, 0])
+    assert torch.allclose(projected[:, 2], raw[:, 2])
+    assert torch.isneginf(projected[:, 4]).all()
+    assert torch.allclose(projected[:, 5], raw[:, 4])
+
+
+def test_project_ctc_teacher_full_log_probs_keeps_preprojected_blank() -> None:
+    raw = torch.full((2, 6), float("-inf"))
+    raw[:, 0] = torch.log(torch.tensor([0.1, 0.2]))
+    raw[:, 5] = torch.log(torch.tensor([0.9, 0.8]))
+
+    projected = _project_ctc_teacher_full_log_probs(
+        raw,
+        vocab_size=6,
+        blank_id=5,
+        teacher_blank_id=4,
+        project_blank_id=5,
+        ignored_token_ids=(4,),
+    )
+
+    assert projected.shape == (2, 6)
+    assert torch.isneginf(projected[:, 4]).all()
+    assert torch.allclose(projected[:, 5], raw[:, 5])
+
+
+def test_ctc_suppressed_token_ids_mask_logits_but_not_blank() -> None:
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=1,
+            head_size=4,
+            vocab_size=8,
+            blank_id=7,
+            ctc_suppressed_token_ids=(3, 7, 99),
+        )
+    )
+    logits = torch.zeros(2, 3, 8)
+
+    masked = model.apply_ctc_logit_mask(logits)
+
+    assert masked[..., 3].max().item() < -999.0
+    assert torch.equal(masked[..., 7], logits[..., 7])
+    assert torch.equal(masked[..., 0], logits[..., 0])
+
+
+def test_ctc_teacher_nonblank_hard_loss_selects_teacher_emission_frames() -> None:
+    student_logits = torch.zeros(1, 4, 6)
+    student_logits[0, 1, 5] = 3.0
+    student_logits[0, 1, 2] = 1.0
+    teacher_ids = torch.tensor(
+        [
+            [5, 1],
+            [2, 5],
+            [5, 3],
+            [4, 5],
+        ],
+        dtype=torch.long,
+    )
+    teacher_log_probs = torch.log(
+        torch.tensor(
+            [
+                [0.90, 0.10],
+                [0.80, 0.20],
+                [0.95, 0.05],
+                [0.85, 0.15],
+            ],
+            dtype=torch.float32,
+        )
+    )
+    records = {
+        "utt-1": {
+            "topk_token_ids": teacher_ids,
+            "topk_log_probs": teacher_log_probs,
+            "project_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+
+    hard_loss, margin_loss, matched, missing = _ctc_teacher_nonblank_hard_loss(
+        student_logits,
+        torch.tensor([4]),
+        ["utt-1"],
+        records,
+        blank_id=5,
+        time_map="nearest",
+        frame_filter_min_nonblank_prob=0.5,
+        missing_policy="error",
+        margin=0.5,
+    )
+
+    expected_hard = F.cross_entropy(student_logits[0, 1].unsqueeze(0), torch.tensor([2]))
+    assert matched == 1
+    assert missing == 0
+    assert torch.allclose(hard_loss, expected_hard)
+    assert torch.allclose(margin_loss, torch.tensor(2.5))
+
+
+def test_ctc_teacher_nonblank_window_loss_allows_local_emission_shift() -> None:
+    student_logits = torch.zeros(1, 5, 6)
+    student_logits[0, 2, 5] = 4.0
+    student_logits[0, 3, 2] = 5.0
+    teacher_ids = torch.tensor(
+        [
+            [5, 1],
+            [5, 1],
+            [2, 5],
+            [5, 3],
+            [5, 3],
+        ],
+        dtype=torch.long,
+    )
+    teacher_log_probs = torch.log(
+        torch.tensor(
+            [
+                [0.95, 0.05],
+                [0.90, 0.10],
+                [0.80, 0.20],
+                [0.96, 0.04],
+                [0.96, 0.04],
+            ],
+            dtype=torch.float32,
+        )
+    )
+    records = {
+        "utt-1": {
+            "topk_token_ids": teacher_ids,
+            "topk_log_probs": teacher_log_probs,
+            "project_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+
+    token_loss, margin_loss, matched, missing, events = _ctc_teacher_nonblank_window_loss(
+        student_logits,
+        torch.tensor([5]),
+        ["utt-1"],
+        records,
+        blank_id=5,
+        time_map="nearest",
+        frame_filter_min_nonblank_prob=0.5,
+        missing_policy="error",
+        margin=0.5,
+        window_radius=1,
+        temperature=0.0,
+    )
+
+    expected_token = F.cross_entropy(student_logits[0, 3].unsqueeze(0), torch.tensor([2]))
+    assert matched == 1
+    assert missing == 0
+    assert events == 1
+    assert torch.allclose(token_loss, expected_token)
+    assert torch.allclose(margin_loss, torch.tensor(0.0))
+
+
+def test_ctc_teacher_nonblank_window_topk_loss_uses_local_nonblank_distribution() -> None:
+    student_logits = torch.zeros(1, 5, 7)
+    student_logits[0, 2, 6] = 4.0
+    student_logits[0, 3, 2] = 4.0
+    student_logits[0, 3, 3] = 3.0
+    teacher_ids = torch.tensor(
+        [
+            [6, 1, 2],
+            [6, 1, 2],
+            [2, 3, 6],
+            [6, 3, 2],
+            [6, 3, 2],
+        ],
+        dtype=torch.long,
+    )
+    teacher_log_probs = torch.log(
+        torch.tensor(
+            [
+                [0.95, 0.03, 0.02],
+                [0.90, 0.08, 0.02],
+                [0.60, 0.30, 0.10],
+                [0.96, 0.03, 0.01],
+                [0.96, 0.03, 0.01],
+            ],
+            dtype=torch.float32,
+        )
+    )
+    records = {
+        "utt-1": {
+            "topk_token_ids": teacher_ids,
+            "topk_log_probs": teacher_log_probs,
+            "project_blank_id": 6,
+            "project_ignored_token_ids": [5],
+        }
+    }
+
+    loss, matched, missing, events = _ctc_teacher_nonblank_window_topk_loss(
+        student_logits,
+        torch.tensor([5]),
+        ["utt-1"],
+        records,
+        blank_id=6,
+        time_map="nearest",
+        frame_filter_min_nonblank_prob=0.5,
+        missing_policy="error",
+        window_radius=1,
+        temperature=0.0,
+    )
+
+    log_probs = F.log_softmax(student_logits[0, 3].float(), dim=-1)
+    teacher_probs = torch.tensor([0.60, 0.30]) / 0.90
+    expected = -(teacher_probs * log_probs[torch.tensor([2, 3])]).sum()
+    assert matched == 1
+    assert missing == 0
+    assert events == 1
+    assert torch.allclose(loss, expected)
+
+
+def test_ctc_teacher_sequence_presence_loss_rewards_tokens_anywhere() -> None:
+    student_logits = torch.full((1, 4, 7), -4.0)
+    student_logits[0, :, 6] = 2.0
+    student_logits[0, 1, 2] = 6.0
+    student_logits[0, 3, 3] = 5.0
+    records = {
+        "utt-1": {
+            "argmax_token_ids": [2, 3, 6, 5],
+        }
+    }
+
+    loss, matched, missing, token_count = _ctc_teacher_sequence_presence_loss(
+        student_logits,
+        torch.tensor([4]),
+        ["utt-1"],
+        records,
+        blank_id=6,
+        ignored_token_ids=(5,),
+        missing_policy="error",
+    )
+
+    frame_probs = torch.softmax(student_logits[0].float(), dim=-1)
+    targets = torch.tensor([2, 3])
+    token_probs = frame_probs.index_select(dim=-1, index=targets).clamp(max=1.0 - 1.0e-6)
+    expected = -torch.log((-torch.expm1(torch.log1p(-token_probs).sum(dim=0))).clamp_min(1.0e-8)).mean()
+    assert matched == 1
+    assert missing == 0
+    assert token_count == 2
+    assert torch.allclose(loss, expected)
+
+
+def test_ctc_teacher_sequence_window_loss_maps_tokens_to_ordered_windows() -> None:
+    student_logits = torch.full((1, 5, 7), -4.0)
+    student_logits[0, :, 6] = 2.0
+    student_logits[0, 1, 2] = 6.0
+    student_logits[0, 3, 3] = 5.0
+    student_logits[0, 4, 2] = 9.0
+    records = {
+        "utt-1": {
+            "argmax_token_ids": [2, 3, 6, 5],
+        }
+    }
+
+    loss, matched, missing, events = _ctc_teacher_sequence_window_loss(
+        student_logits,
+        torch.tensor([5]),
+        ["utt-1"],
+        records,
+        blank_id=6,
+        ignored_token_ids=(5,),
+        missing_policy="error",
+        radius=1,
+        temperature=0.0,
+    )
+
+    log_probs = F.log_softmax(student_logits[0].float(), dim=-1)
+    expected_first = -log_probs[1, 2]
+    expected_second = -log_probs[3, 3]
+    expected = (expected_first + expected_second) / 2.0
+    assert matched == 1
+    assert missing == 0
+    assert events == 2
+    assert torch.allclose(loss, expected)
+
+
+def test_ctc_teacher_hidden_loss_matches_equal_encoder_states() -> None:
+    student = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+    records = {
+        "utt0": {
+            "encoder_out": student[0].clone(),
+        }
+    }
+
+    loss, matched, missing = _ctc_teacher_hidden_loss(
+        student,
+        torch.tensor([3], dtype=torch.long),
+        ("utt0",),
+        records,
+        teacher_field="encoder_out",
+        time_map="nearest",
+        missing_policy="error",
+    )
+
+    assert matched == 1
+    assert missing == 0
+    assert torch.equal(loss, torch.zeros_like(loss))
+
+
+def test_ctc_teacher_hidden_loss_can_filter_to_teacher_nonblank_frames() -> None:
+    teacher = torch.tensor([[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]])
+    student = teacher.clone()
+    student[0, 0] = torch.tensor([100.0, -100.0])
+    records = {
+        "utt0": {
+            "encoder_out": teacher[0].clone(),
+            "project_blank_id": 9,
+            "project_ignored_token_ids": [8],
+            "topk_token_ids": torch.tensor(
+                [
+                    [9, 1],
+                    [2, 9],
+                    [9, 3],
+                    [8, 9],
+                ],
+                dtype=torch.long,
+            ),
+            "topk_log_probs": torch.log(
+                torch.tensor(
+                    [
+                        [0.9, 0.1],
+                        [0.8, 0.2],
+                        [0.9, 0.1],
+                        [0.8, 0.2],
+                    ],
+                    dtype=torch.float32,
+                )
+            ),
+        }
+    }
+
+    all_loss, _, _ = _ctc_teacher_hidden_loss(
+        student,
+        torch.tensor([4], dtype=torch.long),
+        ("utt0",),
+        records,
+        teacher_field="encoder_out",
+        time_map="nearest",
+        missing_policy="error",
+        blank_id=9,
+    )
+    filtered_loss, matched, missing = _ctc_teacher_hidden_loss(
+        student,
+        torch.tensor([4], dtype=torch.long),
+        ("utt0",),
+        records,
+        teacher_field="encoder_out",
+        time_map="nearest",
+        missing_policy="error",
+        blank_id=9,
+        frame_filter="nonblank",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.5,
+    )
+
+    assert matched == 1
+    assert missing == 0
+    assert all_loss > 0
+    assert torch.equal(filtered_loss, torch.zeros_like(filtered_loss))
+
+
+def test_decoder_sampling_top_p_keeps_threshold_crossing_token() -> None:
+    logits = torch.log(torch.tensor([[0.4, 0.3, 0.2, 0.1]], dtype=torch.float32))
+
+    filtered = RWKVCTCModel._filter_decoder_sampling_logits(logits, top_p=0.5)
+
+    assert torch.equal(torch.isfinite(filtered), torch.tensor([[True, True, False, False]]))
+
+
+def test_decoder_sampling_top_k_still_limits_nucleus_candidates() -> None:
+    logits = torch.log(torch.tensor([[0.34, 0.33, 0.20, 0.13]], dtype=torch.float32))
+
+    filtered = RWKVCTCModel._filter_decoder_sampling_logits(logits, top_k=2, top_p=0.95)
+
+    assert torch.equal(torch.isfinite(filtered), torch.tensor([[True, True, False, False]]))
+
+
 def test_ctc_model_backward_with_gradient_checkpointing() -> None:
     torch.manual_seed(23)
     model = _ctc_model()
@@ -137,6 +806,505 @@ def test_conv2d6_frontend_aligns_feature_dtype_with_model_dtype() -> None:
     assert logits.dtype == torch.float64
     assert torch.equal(logit_lengths, torch.tensor([3, 2], dtype=torch.long))
     assert torch.isfinite(loss)
+
+
+def test_aut_rwkv_encoder_forward_shape_and_lengths() -> None:
+    torch.manual_seed(241)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=16,
+            n_embd=64,
+            encoder_output_dim=80,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=2,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="aut_rwkv",
+            aut_downsample_hidden_size=8,
+            aut_max_source_positions=16,
+        )
+    )
+
+    features = torch.randn(2, 32, 16)
+    feature_lengths = torch.tensor([32, 29], dtype=torch.long)
+    logits, logit_lengths, _ = model(features, feature_lengths)
+
+    assert logits.shape == (2, 4, 16)
+    assert torch.equal(logit_lengths, aut_conv2d8_out_lengths(feature_lengths))
+    assert model.ctc_head.in_features == 80
+
+
+def test_aut_rwkv_joint_decoder_uses_encoder_output_projection_dim() -> None:
+    torch.manual_seed(242)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=16,
+            n_embd=64,
+            encoder_output_dim=80,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=2,
+            vocab_size=32,
+            blank_id=32,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="aut_rwkv",
+            aut_downsample_hidden_size=8,
+            aut_max_source_positions=16,
+            decoder_enabled=True,
+            decoder_n_embd=64,
+            decoder_num_layers=2,
+            decoder_ffn_hidden_size=256,
+            decoder_audio_conditioning="full",
+            ctc_loss_weight=0.5,
+            decoder_loss_weight=0.5,
+        )
+    )
+
+    features = torch.randn(2, 40, 16)
+    feature_lengths = torch.tensor([40, 36], dtype=torch.long)
+    targets = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+    target_lengths = torch.tensor([2, 2], dtype=torch.long)
+    losses = model.joint_losses(features, feature_lengths, targets, target_lengths)
+
+    assert losses["logits"].shape[-1] == 33
+    assert model.decoder_prefix_proj is not None
+    assert model.decoder_prefix_proj.weight.shape == (64, 80)
+    assert torch.isfinite(losses["loss"])
+
+
+def test_aut_rwkv_loads_qwen3_non_attention_matching_keys() -> None:
+    torch.manual_seed(243)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=16,
+            n_embd=64,
+            encoder_output_dim=80,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=2,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="aut_rwkv",
+            aut_downsample_hidden_size=8,
+            aut_max_source_positions=16,
+        )
+    )
+    encoder = model.encoder.aut_encoder
+    source = {
+        "thinker.audio_tower.conv2d1.weight": torch.full_like(encoder.conv2d1.weight, 0.25),
+        "thinker.audio_tower.layers.0.fc1.weight": torch.full_like(encoder.layers[0].fc1.weight, 0.5),
+        "thinker.audio_tower.layers.0.time_mixer.forward_mixer.w0": torch.zeros_like(
+            encoder.layers[0].time_mixer.forward_mixer.w0
+        ),
+    }
+    report = encoder.load_qwen3_asr_non_attention_state_dict(source)
+
+    assert "conv2d1.weight" in report["loaded"]
+    assert "layers.0.fc1.weight" in report["loaded"]
+    assert "layers.0.time_mixer.forward_mixer.w0" in report["skipped"]
+    assert torch.equal(encoder.conv2d1.weight, torch.full_like(encoder.conv2d1.weight, 0.25))
+    assert torch.equal(encoder.layers[0].fc1.weight, torch.full_like(encoder.layers[0].fc1.weight, 0.5))
+
+
+def test_qwen3_transformer_encoder_forward_shape_and_lengths() -> None:
+    torch.manual_seed(246)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=16,
+            n_embd=64,
+            encoder_output_dim=80,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=2,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="qwen3_transformer",
+            aut_downsample_hidden_size=8,
+            aut_max_source_positions=16,
+        )
+    )
+
+    features = torch.randn(2, 32, 16)
+    feature_lengths = torch.tensor([32, 29], dtype=torch.long)
+    logits, logit_lengths, _ = model(features, feature_lengths)
+
+    assert logits.shape == (2, 4, 16)
+    assert torch.equal(logit_lengths, aut_conv2d8_out_lengths(feature_lengths))
+    assert model.ctc_head.in_features == 80
+
+
+def test_qwen3_transformer_loads_attention_matching_keys() -> None:
+    torch.manual_seed(247)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=16,
+            n_embd=64,
+            encoder_output_dim=80,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=2,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="qwen3_transformer",
+            aut_downsample_hidden_size=8,
+            aut_max_source_positions=16,
+        )
+    )
+    encoder = model.encoder.qwen3_transformer_encoder
+    source = {
+        "thinker.audio_tower.conv2d1.weight": torch.full_like(encoder.conv2d1.weight, 0.25),
+        "thinker.audio_tower.layers.0.fc1.weight": torch.full_like(encoder.layers[0].fc1.weight, 0.5),
+        "thinker.audio_tower.layers.0.self_attn.q_proj.weight": torch.full_like(
+            encoder.layers[0].self_attn.q_proj.weight,
+            0.75,
+        ),
+        "thinker.audio_tower.layers.0.self_attn.out_proj.bias": torch.full_like(
+            encoder.layers[0].self_attn.out_proj.bias,
+            1.25,
+        ),
+    }
+    report = encoder.load_qwen3_asr_state_dict(source)
+
+    assert "conv2d1.weight" in report["loaded"]
+    assert "layers.0.fc1.weight" in report["loaded"]
+    assert "layers.0.self_attn.q_proj.weight" in report["loaded"]
+    assert "layers.0.self_attn.out_proj.bias" in report["loaded"]
+    assert torch.equal(encoder.conv2d1.weight, torch.full_like(encoder.conv2d1.weight, 0.25))
+    assert torch.equal(encoder.layers[0].fc1.weight, torch.full_like(encoder.layers[0].fc1.weight, 0.5))
+    assert torch.equal(
+        encoder.layers[0].self_attn.q_proj.weight,
+        torch.full_like(encoder.layers[0].self_attn.q_proj.weight, 0.75),
+    )
+
+
+def test_sensevoice_rwkv_encoder_forward_shape_and_lengths() -> None:
+    torch.manual_seed(244)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=560,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+
+    features = torch.randn(2, 7, 560)
+    feature_lengths = torch.tensor([7, 5], dtype=torch.long)
+    logits, logit_lengths, state = model(features, feature_lengths)
+
+    assert logits.shape == (2, 7, 16)
+    assert torch.equal(logit_lengths, feature_lengths)
+    assert len(state.block_states) == 3
+    assert model.ctc_head.in_features == 64
+
+
+def test_sensevoice_rwkv_loads_non_attention_matching_keys() -> None:
+    torch.manual_seed(245)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=560,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    encoder = model.encoder.sensevoice_encoder
+    source = {
+        "audio_encoder.encoders0.0.norm1.weight": torch.full_like(encoder.layers[0].norm1.weight, 0.25),
+        "audio_encoder.encoders0.0.feed_forward.w_1.weight": torch.full_like(
+            encoder.layers[0].feed_forward.w_1.weight,
+            0.5,
+        ),
+        "audio_encoder.encoders.0.norm2.bias": torch.full_like(encoder.layers[1].norm2.bias, 0.75),
+        "audio_encoder.tp_encoders.0.feed_forward.w_2.bias": torch.full_like(
+            encoder.layers[2].feed_forward.w_2.bias,
+            1.25,
+        ),
+        "audio_encoder.after_norm.weight": torch.full_like(encoder.after_norm.weight, 1.5),
+        "audio_encoder.tp_norm.bias": torch.full_like(encoder.tp_norm.bias, 2.0),
+        "audio_encoder.encoders0.0.self_attn.linear_q_k_v.weight": torch.zeros(192, 560),
+    }
+
+    report = encoder.load_sensevoice_non_attention_state_dict(source)
+
+    assert "layers.0.norm1.weight" in report["loaded"]
+    assert "layers.0.feed_forward.w_1.weight" in report["loaded"]
+    assert "layers.1.norm2.bias" in report["loaded"]
+    assert "layers.2.feed_forward.w_2.bias" in report["loaded"]
+    assert "after_norm.weight" in report["loaded"]
+    assert "tp_norm.bias" in report["loaded"]
+    assert "layers.0.time_mixer.forward_mixer.w0" in report["skipped"]
+    assert torch.equal(encoder.layers[0].norm1.weight, torch.full_like(encoder.layers[0].norm1.weight, 0.25))
+    assert torch.equal(
+        encoder.layers[0].feed_forward.w_1.weight,
+        torch.full_like(encoder.layers[0].feed_forward.w_1.weight, 0.5),
+    )
+    assert torch.equal(encoder.layers[1].norm2.bias, torch.full_like(encoder.layers[1].norm2.bias, 0.75))
+    assert torch.equal(
+        encoder.layers[2].feed_forward.w_2.bias,
+        torch.full_like(encoder.layers[2].feed_forward.w_2.bias, 1.25),
+    )
+
+
+def test_sensevoice_conformer_conv_encoder_forward_shape_and_lengths() -> None:
+    torch.manual_seed(246)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=560,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            conv_kernel_size=5,
+            dropout=0.0,
+            frontend_type="sensevoice_conformer_conv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+
+    features = torch.randn(2, 7, 560)
+    feature_lengths = torch.tensor([7, 5], dtype=torch.long)
+    logits, logit_lengths, state = model(features, feature_lengths)
+
+    assert logits.shape == (2, 7, 16)
+    assert torch.equal(logit_lengths, feature_lengths)
+    assert len(state.block_states) == 3
+    assert model.ctc_head.in_features == 64
+    assert hasattr(model.encoder, "sensevoice_conformer_encoder")
+    assert not any("self_attn" in name or "time_mixer" in name for name, _ in model.encoder.named_modules())
+
+
+def test_sensevoice_conformer_conv_loads_non_attention_matching_keys() -> None:
+    torch.manual_seed(247)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=560,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            conv_kernel_size=5,
+            dropout=0.0,
+            frontend_type="sensevoice_conformer_conv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    encoder = model.encoder.sensevoice_conformer_encoder
+    conv_before = encoder.layers[0].conv.depthwise.weight.detach().clone()
+    source = {
+        "audio_encoder.encoders0.0.norm1.weight": torch.full_like(encoder.layers[0].norm1.weight, 0.25),
+        "audio_encoder.encoders0.0.feed_forward.w_1.weight": torch.full_like(
+            encoder.layers[0].feed_forward.w_1.weight,
+            0.5,
+        ),
+        "audio_encoder.encoders.0.norm2.bias": torch.full_like(encoder.layers[1].norm2.bias, 0.75),
+        "audio_encoder.tp_encoders.0.feed_forward.w_2.bias": torch.full_like(
+            encoder.layers[2].feed_forward.w_2.bias,
+            1.25,
+        ),
+        "audio_encoder.after_norm.weight": torch.full_like(encoder.after_norm.weight, 1.5),
+        "audio_encoder.tp_norm.bias": torch.full_like(encoder.tp_norm.bias, 2.0),
+        "audio_encoder.encoders0.0.self_attn.linear_q_k_v.weight": torch.zeros(192, 560),
+    }
+
+    report = encoder.load_sensevoice_non_attention_state_dict(source)
+
+    assert "layers.0.norm1.weight" in report["loaded"]
+    assert "layers.0.feed_forward.w_1.weight" in report["loaded"]
+    assert "layers.1.norm2.bias" in report["loaded"]
+    assert "layers.2.feed_forward.w_2.bias" in report["loaded"]
+    assert "after_norm.weight" in report["loaded"]
+    assert "tp_norm.bias" in report["loaded"]
+    assert "layers.0.conv.depthwise.weight" in report["skipped"]
+    assert torch.equal(encoder.layers[0].norm1.weight, torch.full_like(encoder.layers[0].norm1.weight, 0.25))
+    assert torch.equal(
+        encoder.layers[0].feed_forward.w_1.weight,
+        torch.full_like(encoder.layers[0].feed_forward.w_1.weight, 0.5),
+    )
+    assert torch.equal(encoder.layers[1].norm2.bias, torch.full_like(encoder.layers[1].norm2.bias, 0.75))
+    assert torch.equal(
+        encoder.layers[2].feed_forward.w_2.bias,
+        torch.full_like(encoder.layers[2].feed_forward.w_2.bias, 1.25),
+    )
+    assert torch.equal(encoder.layers[0].conv.depthwise.weight, conv_before)
+
+
+def test_funasr_nano_encoder_forward_shape_and_lengths() -> None:
+    torch.manual_seed(248)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=16,
+            n_embd=32,
+            encoder_output_dim=32,
+            dim_att=32,
+            dim_ff=64,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="funasr_nano_encoder",
+            sensevoice_tp_blocks=1,
+        )
+    )
+
+    features = torch.randn(2, 7, 16)
+    feature_lengths = torch.tensor([7, 5], dtype=torch.long)
+    logits, logit_lengths, state = model(features, feature_lengths)
+
+    assert logits.shape == (2, 7, 16)
+    assert torch.equal(logit_lengths, feature_lengths)
+    assert len(state.block_states) == 3
+    assert model.ctc_head.in_features == 32
+
+
+def test_funasr_nano_encoder_and_ctc_init_loads_matching_keys(tmp_path) -> None:
+    torch.manual_seed(249)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=16,
+            n_embd=32,
+            encoder_output_dim=32,
+            dim_att=32,
+            dim_ff=64,
+            num_layers=3,
+            vocab_size=21,
+            blank_id=21,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="funasr_nano_encoder",
+            sensevoice_tp_blocks=1,
+            ctc_decoder_type="funasr_nano_transformer",
+            ctc_decoder_dim=16,
+            ctc_decoder_ffn_dim=32,
+            ctc_decoder_num_layers=1,
+            ctc_decoder_attention_heads=4,
+        )
+    )
+    assert model.ctc_decoder is not None
+    encoder = model.encoder.funasr_nano_encoder
+    state = {
+        f"audio_encoder.{key}": torch.randn_like(value)
+        for key, value in encoder.audio_encoder.state_dict().items()
+    }
+    state.update(
+        {
+            f"ctc_decoder.{key}": torch.randn_like(value)
+            for key, value in model.ctc_decoder.state_dict().items()
+        }
+    )
+    teacher_weight = torch.randn(21, model.ctc_head.in_features)
+    teacher_bias = torch.randn(21)
+    state["ctc.ctc_lo.weight"] = teacher_weight
+    state["ctc.ctc_lo.bias"] = teacher_bias
+    checkpoint_path = tmp_path / "nano_full_ctc.pt"
+    torch.save(state, checkpoint_path)
+
+    report = model.load_funasr_nano_ctc_checkpoint(
+        str(checkpoint_path),
+        load_encoder=True,
+        teacher_blank_id=20,
+        project_ignored_token_ids=(20,),
+    )
+
+    assert report["encoder_loaded"] == len(encoder.audio_encoder.state_dict())
+    assert report["ctc_decoder_loaded"] == len(model.ctc_decoder.state_dict())
+    assert report["ctc_head_loaded_rows"] == 21
+    assert torch.equal(
+        encoder.audio_encoder.encoders0[0].norm1.weight,
+        state["audio_encoder.encoders0.0.norm1.weight"],
+    )
+    assert torch.equal(model.ctc_head.weight[21], teacher_weight[20])
+
+
+def test_funasr_nano_encoder_init_can_skip_attention_weights(tmp_path) -> None:
+    torch.manual_seed(250)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=16,
+            n_embd=32,
+            encoder_output_dim=32,
+            dim_att=32,
+            dim_ff=64,
+            num_layers=3,
+            vocab_size=21,
+            blank_id=21,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="funasr_nano_encoder",
+            sensevoice_tp_blocks=1,
+            ctc_decoder_type="funasr_nano_transformer",
+            ctc_decoder_dim=16,
+            ctc_decoder_ffn_dim=32,
+            ctc_decoder_num_layers=1,
+            ctc_decoder_attention_heads=4,
+        )
+    )
+    assert model.ctc_decoder is not None
+    encoder = model.encoder.funasr_nano_encoder
+    attention_before = encoder.audio_encoder.encoders0[0].self_attn.linear_q_k_v.weight.detach().clone()
+    state = {
+        f"audio_encoder.{key}": torch.randn_like(value)
+        for key, value in encoder.audio_encoder.state_dict().items()
+    }
+    state.update(
+        {
+            f"ctc_decoder.{key}": torch.randn_like(value)
+            for key, value in model.ctc_decoder.state_dict().items()
+        }
+    )
+    teacher_weight = torch.randn(21, model.ctc_head.in_features)
+    teacher_bias = torch.randn(21)
+    state["ctc.ctc_lo.weight"] = teacher_weight
+    state["ctc.ctc_lo.bias"] = teacher_bias
+    checkpoint_path = tmp_path / "nano_partial_encoder_ctc.pt"
+    torch.save(state, checkpoint_path)
+
+    report = model.load_funasr_nano_ctc_checkpoint(
+        str(checkpoint_path),
+        load_encoder=True,
+        load_encoder_attention=False,
+        teacher_blank_id=20,
+        project_ignored_token_ids=(20,),
+    )
+
+    assert report["encoder_attention_skipped"] > 0
+    assert report["encoder_loaded"] + report["encoder_attention_skipped"] == len(encoder.audio_encoder.state_dict())
+    assert torch.equal(
+        encoder.audio_encoder.encoders0[0].norm1.weight,
+        state["audio_encoder.encoders0.0.norm1.weight"],
+    )
+    assert torch.equal(
+        encoder.audio_encoder.encoders0[0].feed_forward.w_1.weight,
+        state["audio_encoder.encoders0.0.feed_forward.w_1.weight"],
+    )
+    assert torch.equal(encoder.audio_encoder.encoders0[0].self_attn.linear_q_k_v.weight, attention_before)
+    assert torch.equal(model.ctc_head.weight[21], teacher_weight[20])
 
 
 def test_joint_ctc_rwkv_decoder_loss_path_uses_extra_blank_class() -> None:

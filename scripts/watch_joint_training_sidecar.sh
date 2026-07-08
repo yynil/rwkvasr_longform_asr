@@ -20,9 +20,21 @@ LIMIT="${LIMIT:-12}"
 PREVIEW_COUNT="${PREVIEW_COUNT:-12}"
 BEAM_SIZE="${BEAM_SIZE:-4}"
 TOKEN_PRUNE_TOPK="${TOKEN_PRUNE_TOPK:-32}"
-TEXT_NORMALIZATION="${TEXT_NORMALIZATION:-}"
+TEXT_NORMALIZATION="${TEXT_NORMALIZATION:-runtime}"
+METRIC_NORMALIZATION="${METRIC_NORMALIZATION:-ctc}"
+SIDECAR_WEBDATASET_SPLIT="${SIDECAR_WEBDATASET_SPLIT:-eval}"
 AR_MAX_NEW_TOKENS="${AR_MAX_NEW_TOKENS:-}"
 AR_MAX_NEW_TOKENS_FACTOR="${AR_MAX_NEW_TOKENS_FACTOR:-0.5}"
+AR_DO_SAMPLE="${AR_DO_SAMPLE:-1}"
+AR_TEMPERATURE="${AR_TEMPERATURE:-0.8}"
+AR_TOP_K="${AR_TOP_K:-5}"
+AR_TOP_P="${AR_TOP_P:-0.8}"
+AR_SEED="${AR_SEED:-20260615}"
+AR_CTC_DRAFT_FALLBACK_MAX_CER="${AR_CTC_DRAFT_FALLBACK_MAX_CER:-}"
+AR_CTC_DRAFT_FALLBACK_MIN_LENGTH_RATIO="${AR_CTC_DRAFT_FALLBACK_MIN_LENGTH_RATIO:-0.75}"
+AR_CTC_DRAFT_FALLBACK_MAX_LENGTH_RATIO="${AR_CTC_DRAFT_FALLBACK_MAX_LENGTH_RATIO:-1.25}"
+AR_CTC_DRAFT_FALLBACK_REJECT_REPETITION="${AR_CTC_DRAFT_FALLBACK_REJECT_REPETITION:-1}"
+AR_CTC_DRAFT_FALLBACK_METRIC_NORMALIZATION="${AR_CTC_DRAFT_FALLBACK_METRIC_NORMALIZATION:-ctc}"
 SOURCE_QUOTAS="${SOURCE_QUOTAS:-}"
 
 if [[ -z "${SOURCE_QUOTAS}" && "${RUN_DIR}" == *gigaspeech_wenetspeech* ]]; then
@@ -38,8 +50,41 @@ EXTRA_ARGS=()
 if [[ -n "${AR_MAX_NEW_TOKENS}" ]]; then
   EXTRA_ARGS+=(--ar-max-new-tokens "${AR_MAX_NEW_TOKENS}")
 fi
+if [[ "${AR_DO_SAMPLE}" == "0" || "${AR_DO_SAMPLE}" == "false" || "${AR_DO_SAMPLE}" == "False" ]]; then
+  EXTRA_ARGS+=(--no-ar-do-sample)
+else
+  EXTRA_ARGS+=(--ar-do-sample)
+fi
+if [[ -n "${AR_TEMPERATURE}" ]]; then
+  EXTRA_ARGS+=(--ar-temperature "${AR_TEMPERATURE}")
+fi
+if [[ -n "${AR_TOP_K}" ]]; then
+  EXTRA_ARGS+=(--ar-top-k "${AR_TOP_K}")
+fi
+if [[ -n "${AR_TOP_P}" ]]; then
+  EXTRA_ARGS+=(--ar-top-p "${AR_TOP_P}")
+fi
+if [[ -n "${AR_SEED}" ]]; then
+  EXTRA_ARGS+=(--ar-seed "${AR_SEED}")
+fi
+if [[ -n "${AR_CTC_DRAFT_FALLBACK_MAX_CER}" ]]; then
+  EXTRA_ARGS+=(
+    --ar-ctc-draft-fallback-max-cer "${AR_CTC_DRAFT_FALLBACK_MAX_CER}"
+    --ar-ctc-draft-fallback-min-length-ratio "${AR_CTC_DRAFT_FALLBACK_MIN_LENGTH_RATIO}"
+    --ar-ctc-draft-fallback-max-length-ratio "${AR_CTC_DRAFT_FALLBACK_MAX_LENGTH_RATIO}"
+    --ar-ctc-draft-fallback-metric-normalization "${AR_CTC_DRAFT_FALLBACK_METRIC_NORMALIZATION}"
+  )
+  if [[ "${AR_CTC_DRAFT_FALLBACK_REJECT_REPETITION}" == "0" || "${AR_CTC_DRAFT_FALLBACK_REJECT_REPETITION}" == "false" || "${AR_CTC_DRAFT_FALLBACK_REJECT_REPETITION}" == "False" ]]; then
+    EXTRA_ARGS+=(--no-ar-ctc-draft-fallback-reject-repetition)
+  else
+    EXTRA_ARGS+=(--ar-ctc-draft-fallback-reject-repetition)
+  fi
+fi
 if [[ -n "${TEXT_NORMALIZATION}" ]]; then
   EXTRA_ARGS+=(--text-normalization "${TEXT_NORMALIZATION}")
+fi
+if [[ -n "${METRIC_NORMALIZATION}" ]]; then
+  EXTRA_ARGS+=(--metric-normalization "${METRIC_NORMALIZATION}")
 fi
 if [[ -n "${SOURCE_QUOTAS}" ]]; then
   IFS=',' read -r -a SOURCE_QUOTA_ARRAY <<< "${SOURCE_QUOTAS}"
@@ -59,6 +104,7 @@ exec "${PYTHON_BIN}" -m rwkvasr.cli.watch_checkpoint_sidecar \
   --batch-size "${BATCH_SIZE}" \
   --beam-size "${BEAM_SIZE}" \
   --token-prune-topk "${TOKEN_PRUNE_TOPK}" \
+  --webdataset-split "${SIDECAR_WEBDATASET_SPLIT}" \
   --ar-max-new-tokens-factor "${AR_MAX_NEW_TOKENS_FACTOR}" \
   --limit "${LIMIT}" \
   --preview-count "${PREVIEW_COUNT}" \

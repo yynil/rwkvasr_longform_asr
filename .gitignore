@@ -25,6 +25,12 @@ wandb/
 runs/
 outputs/
 checkpoints/
+artifacts/
+configs/generated/
+assets/fun-asr-nano-2512/
+assets/omnilingual-asr-ctc/
+assets/qwen3-asr-0.6b/
+assets/rwkv7/
 tools/target/
 assets/tokenizers/flores200/flores200_dev_devtest_multilingual.txt
 tmp/

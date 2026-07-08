@@ -7,6 +7,8 @@ from pathlib import Path
 
 import torch
 
+from rwkvasr.training import checkpoint
+import rwkvasr.training.train_loop as train_loop
 from rwkvasr.cli.train_ctc import _resolve_train_config, build_parser
 from rwkvasr.config import load_yaml
 from rwkvasr.data import (
@@ -14,10 +16,12 @@ from rwkvasr.data import (
     FeatureCollator,
     StableHashSplitConfig,
     accumulate_webdataset_global_cmvn_stats,
+    build_audio_feature_extractor,
     inspect_webdataset_lengths,
     compute_manifest_global_cmvn,
     inspect_webdataset,
 )
+from rwkvasr.data.manifest import maybe_dropout_ctc_draft_text
 from rwkvasr.modules import load_wenet_cmvn
 from rwkvasr.training.checkpoint import load_checkpoint, save_checkpoint
 from rwkvasr.training.train_loop import TrainConfig, train_ctc_model
@@ -54,6 +58,16 @@ def _make_wav_bytes(num_frames: int = 16000) -> bytes:
         handle.setframerate(16000)
         handle.writeframes(waveform.numpy().tobytes())
     return buffer.getvalue()
+
+
+def test_funasr_wav_frontend_feature_extractor_emits_lfr_features() -> None:
+    extractor = build_audio_feature_extractor("funasr_wav_frontend", input_dim=560)
+    waveform = torch.zeros(16000, dtype=torch.float32)
+    features = extractor(waveform, 16000)
+
+    assert features.dim() == 2
+    assert features.shape[1] == 560
+    assert features.shape[0] > 0
 
 
 def _write_webdataset_root(tmp_path: Path, num_examples: int = 2, *, utt_id_key: str = "sid") -> Path:
@@ -128,6 +142,127 @@ def test_manifest_dataset_and_collator(tmp_path: Path) -> None:
     assert batch.utt_ids == ["utt-0", "utt-1"]
 
 
+def test_manifest_decoder_prompt_can_use_ctc_draft_cache(tmp_path: Path) -> None:
+    class RecordingTokenizer:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def encode(self, text: str) -> list[int]:
+            self.texts.append(text)
+            return list(range(1, len(text) + 1))
+
+    features = torch.randn(12, 80)
+    feature_path = tmp_path / "feat.pt"
+    torch.save(features, feature_path)
+    manifest = tmp_path / "manifest_with_text.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "utt_id": "utt-0",
+                "feature_path": feature_path.name,
+                "text": "hello target",
+                "language": "en",
+                "token_ids": [1, 2, 3],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    draft_cache = tmp_path / "ctc_draft.jsonl"
+    draft_cache.write_text(
+        json.dumps({"utt_id": "utt-0", "pred_text": "hello draft"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    decoder_tokenizer = RecordingTokenizer()
+
+    ASRManifestDataset(
+        manifest,
+        decoder_tokenizer=decoder_tokenizer,
+        decoder_prompt_before_audio="Language: {language_name}",
+        decoder_prompt_before_audio_use_language=True,
+        decoder_ctc_draft_cache_path=str(draft_cache),
+        decoder_ctc_draft_prompt_template="Draft: {ctc_draft}",
+    )
+
+    assert any("Language:" in text and "Draft: hello draft" in text for text in decoder_tokenizer.texts)
+
+
+def test_manifest_decoder_prompt_can_drop_wrong_language_or_mixed_script_ctc_draft(
+    tmp_path: Path,
+) -> None:
+    class RecordingTokenizer:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def encode(self, text: str) -> list[int]:
+            self.texts.append(text)
+            return list(range(1, len(text) + 1))
+
+    features = torch.randn(12, 80)
+    feature_path = tmp_path / "feat.pt"
+    torch.save(features, feature_path)
+    manifest = tmp_path / "manifest_with_text.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "utt_id": "utt-0",
+                "feature_path": feature_path.name,
+                "text": "hello target",
+                "language": "en",
+                "token_ids": [1, 2, 3],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    draft_cache = tmp_path / "ctc_draft.jsonl"
+    draft_cache.write_text(
+        json.dumps({"utt_id": "utt-0", "pred_text": "不让 the心 time"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    decoder_tokenizer = RecordingTokenizer()
+
+    ASRManifestDataset(
+        manifest,
+        decoder_tokenizer=decoder_tokenizer,
+        decoder_prompt_before_audio="Language: {language_name}",
+        decoder_prompt_before_audio_use_language=True,
+        decoder_ctc_draft_cache_path=str(draft_cache),
+        decoder_ctc_draft_prompt_template="Draft: {ctc_draft}",
+        decoder_ctc_draft_language_mismatch_dropout_prob=1.0,
+    )
+
+    assert any("Language:" in text and "Draft:" in text for text in decoder_tokenizer.texts)
+    assert not any("不让" in text or "心" in text for text in decoder_tokenizer.texts)
+
+
+def test_ctc_draft_language_mismatch_keeps_chinese_mixed_script_draft() -> None:
+    assert (
+        maybe_dropout_ctc_draft_text(
+            "你好 world",
+            sample_id="zh-mixed",
+            reference_text="你好世界",
+            reference_language="zh",
+            dropout_prob=0.0,
+            language_mismatch_dropout_prob=1.0,
+            seed=20260615,
+        )
+        == "你好 world"
+    )
+    assert (
+        maybe_dropout_ctc_draft_text(
+            "hello world",
+            sample_id="zh-latin-only",
+            reference_text="你好世界",
+            reference_language="zh",
+            dropout_prob=0.0,
+            language_mismatch_dropout_prob=1.0,
+            seed=20260615,
+        )
+        == ""
+    )
+
+
 def test_checkpoint_roundtrip(tmp_path: Path) -> None:
     model = RWKVCTCModel(
         RWKVCTCModelConfig(
@@ -151,6 +286,43 @@ def test_checkpoint_roundtrip(tmp_path: Path) -> None:
     assert restored["extra"]["tag"] == "x"
 
 
+def test_train_ctc_model_writes_latest_checkpoint_pointer(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path, num_examples=4, base_frames=16)
+    out_dir = tmp_path / "out_latest"
+
+    result = train_ctc_model(
+        TrainConfig(
+            manifest_path=str(manifest),
+            output_dir=str(out_dir),
+            vocab_size=8,
+            tokenizer_type="synthetic",
+            input_dim=80,
+            n_embd=128,
+            dim_att=128,
+            dim_ff=256,
+            num_layers=2,
+            head_size=32,
+            conv_kernel_size=5,
+            dropout=0.0,
+            batch_size=2,
+            max_steps=2,
+            save_every=1,
+            device="cpu",
+            p_start=0.0,
+            p_max=0.0,
+        )
+    )
+
+    assert result["steps"] == 2
+    latest_state = checkpoint.load_latest_checkpoint_state(out_dir)
+    assert latest_state["checkpoint_type"] == "pytorch"
+    assert latest_state["step"] == 2
+    assert latest_state["epoch"] == 1
+    assert latest_state["epoch_batch_offset"] == 0
+    assert Path(latest_state["checkpoint_path"]).name.endswith(".pt")
+    assert Path(latest_state["checkpoint_path"]).exists()
+
+
 def test_train_ctc_model_smoke(tmp_path: Path) -> None:
     manifest = _write_manifest(tmp_path, num_examples=4, base_frames=48)
     out_dir = tmp_path / "out"
@@ -160,6 +332,7 @@ def test_train_ctc_model_smoke(tmp_path: Path) -> None:
             manifest_path=str(manifest),
             output_dir=str(out_dir),
             vocab_size=8,
+            tokenizer_type="synthetic",
             input_dim=80,
             n_embd=128,
             dim_att=128,
@@ -241,6 +414,7 @@ def test_train_ctc_model_supports_webdataset_root(tmp_path: Path) -> None:
         TrainConfig(
             output_dir=str(out_dir),
             vocab_size=8,
+            tokenizer_type="synthetic",
             webdataset_root=str(webdataset_root),
             input_dim=80,
             n_embd=128,
@@ -282,6 +456,7 @@ def test_train_max_steps_supports_webdataset_index_with_custom_utt_id_key(tmp_pa
         TrainConfig(
             output_dir=str(tmp_path / "out"),
             vocab_size=8,
+            tokenizer_type="synthetic",
             webdataset_root=str(webdataset_root),
             webdataset_index_path=str(index_path),
             webdataset_split="train",
@@ -308,6 +483,7 @@ def test_train_ctc_model_supports_length_bucketed_webdataset_root(tmp_path: Path
         TrainConfig(
             output_dir=str(out_dir),
             vocab_size=8,
+            tokenizer_type="synthetic",
             webdataset_root=str(webdataset_root),
             webdataset_length_index_path=str(length_index_path),
             input_dim=80,
@@ -353,6 +529,7 @@ def test_train_ctc_model_records_epoch_metrics_and_supports_resume(tmp_path: Pat
         TrainConfig(
             output_dir=str(out_dir),
             vocab_size=8,
+            tokenizer_type="synthetic",
             webdataset_root=str(webdataset_root),
             webdataset_index_path=str(index_path),
             webdataset_length_index_path=str(length_index_path),
@@ -391,6 +568,7 @@ def test_train_ctc_model_records_epoch_metrics_and_supports_resume(tmp_path: Pat
         TrainConfig(
             output_dir=str(out_dir),
             vocab_size=8,
+            tokenizer_type="synthetic",
             webdataset_root=str(webdataset_root),
             webdataset_index_path=str(index_path),
             webdataset_length_index_path=str(length_index_path),
@@ -423,6 +601,96 @@ def test_train_ctc_model_records_epoch_metrics_and_supports_resume(tmp_path: Pat
     assert len(resumed_metrics["epochs"]) == 2
 
 
+def test_train_ctc_model_supports_latest_resume_with_batch_offset_skip(tmp_path: Path, monkeypatch) -> None:
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=128,
+            dim_att=128,
+            dim_ff=256,
+            num_layers=2,
+            vocab_size=8,
+            head_size=32,
+            conv_kernel_size=5,
+            dropout=0.0,
+        )
+    )
+    optimizer = build_rwkv_optimizer(model, RWKVOptimizerConfig(lr=1e-3, weight_decay=0.1))
+    out_dir = tmp_path / "out_resume_latest"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = _write_manifest(tmp_path, num_examples=6, base_frames=16)
+
+    latest_ckpt = out_dir / "step-3.pt"
+    save_checkpoint(
+        latest_ckpt,
+        model=model,
+        optimizer=optimizer,
+        step=3,
+        extra={
+            "epoch": 1,
+            "epoch_batch_offset": 2,
+            "history": [],
+            "step_checkpoint_history": [],
+            "best_step_checkpoints": [],
+            "best_epoch": 0,
+            "best_eval_loss": float("inf"),
+            "best_train_loss": float("inf"),
+        },
+    )
+    checkpoint.write_latest_checkpoint_state(
+        out_dir,
+        {
+            "checkpoint_type": "pytorch",
+            "checkpoint_path": str(latest_ckpt),
+            "step": 3,
+            "epoch": 1,
+            "epoch_batch_offset": 2,
+        },
+    )
+
+    calls = {"count": 0, "counts": []}
+    original_skip_batches = train_loop._skip_batches
+
+    def _tracked_skip(loader_iter, count: int, **kwargs) -> int:
+        calls["count"] += 1
+        calls["counts"].append(count)
+        return original_skip_batches(loader_iter, count, **kwargs)
+
+    monkeypatch.setattr(train_loop, "_skip_batches", _tracked_skip)
+
+    result = train_ctc_model(
+        TrainConfig(
+            manifest_path=str(manifest),
+            output_dir=str(out_dir),
+            vocab_size=8,
+            tokenizer_type="synthetic",
+            input_dim=80,
+            n_embd=128,
+            dim_att=128,
+            dim_ff=256,
+            num_layers=2,
+            head_size=32,
+            conv_kernel_size=5,
+            dropout=0.0,
+            batch_size=2,
+            max_steps=5,
+            save_every=1,
+            num_workers=0,
+            device="cpu",
+            resume_from="latest",
+            p_start=0.0,
+            p_max=0.0,
+        )
+    )
+
+    assert result["steps"] == 5
+    assert calls["count"] == 1
+    assert calls["counts"] == [2]
+    latest_state = checkpoint.load_latest_checkpoint_state(out_dir)
+    assert latest_state["step"] == 5
+    assert latest_state["epoch_batch_offset"] >= 0
+
+
 def test_train_ctc_model_keeps_top_k_step_checkpoints(tmp_path: Path) -> None:
     manifest = _write_manifest(tmp_path, num_examples=6, base_frames=40)
     out_dir = tmp_path / "out_step_topk"
@@ -432,6 +700,7 @@ def test_train_ctc_model_keeps_top_k_step_checkpoints(tmp_path: Path) -> None:
             output_dir=str(out_dir),
             manifest_path=str(manifest),
             vocab_size=8,
+            tokenizer_type="synthetic",
             input_dim=80,
             n_embd=128,
             dim_att=128,
@@ -476,6 +745,7 @@ def test_train_ctc_model_resolves_epochs_from_webdataset_index(tmp_path: Path) -
         TrainConfig(
             output_dir=str(out_dir),
             vocab_size=8,
+            tokenizer_type="synthetic",
             webdataset_root=str(webdataset_root),
             webdataset_index_path=str(index_path),
             webdataset_split="train",

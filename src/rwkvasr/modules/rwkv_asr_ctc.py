@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +9,10 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .direction_dropout import DirectionMask, LayerDirectionMask
+from .aurwkv_encoder import AuRWKVEncoder, AuRWKVEncoderConfig
+from .funasr_nano_encoder import FunASRNanoEncoder, FunASRNanoEncoderConfig
+from .funasr_nano_ctc_decoder import NanoCTCTransformerDecoder, NanoCTCTransformerDecoderConfig
+from .qwen3_transformer_encoder import Qwen3TransformerEncoder, Qwen3TransformerEncoderConfig
 from .rwkv7_bidirectional import BidirectionalVFirstState
 from .rwkv7_decoder import (
     RWKV7DecoderConfig,
@@ -18,6 +23,11 @@ from .rwkv_conformer import (
     RWKVConformerBlock,
     RWKVConformerBlockConfig,
     RWKVConformerBlockState,
+)
+from .sensevoice_rwkv_encoder import (
+    SenseVoiceConformerConvEncoder,
+    SenseVoiceRWKVEncoder,
+    SenseVoiceRWKVEncoderConfig,
 )
 from .wenet_frontend import GlobalCMVN, WenetConv2dSubsampling6, load_wenet_cmvn
 
@@ -34,8 +44,87 @@ class RWKVConformerEncoderConfig:
     conv_kernel_size: int = 31
     dropout: float = 0.1
     frontend_type: str = "conv2d6"
+    output_dim: int | None = None
+    aut_downsample_hidden_size: int = 480
+    aut_activation_function: str = "gelu"
+    aut_activation_dropout: float = 0.0
+    aut_max_source_positions: int = 1500
+    aut_scale_embedding: bool = False
+    aut_conv_chunksize: int = 500
+    sensevoice_tp_blocks: int = 20
     cmvn_file: str | None = None
     cmvn_is_json: bool = True
+
+    @property
+    def encoder_output_dim(self) -> int:
+        return int(self.n_embd if self.output_dim is None else self.output_dim)
+
+    def to_aurwkv_config(self) -> AuRWKVEncoderConfig:
+        return AuRWKVEncoderConfig(
+            input_dim=self.input_dim,
+            n_embd=self.n_embd,
+            output_dim=self.encoder_output_dim,
+            dim_att=self.dim_att,
+            dim_ff=self.dim_ff,
+            num_layers=self.num_layers,
+            head_size=self.head_size,
+            backend=self.backend,
+            dropout=self.dropout,
+            activation_dropout=self.aut_activation_dropout,
+            activation_function=self.aut_activation_function,
+            max_source_positions=self.aut_max_source_positions,
+            downsample_hidden_size=self.aut_downsample_hidden_size,
+            scale_embedding=self.aut_scale_embedding,
+            conv_chunksize=self.aut_conv_chunksize,
+            cmvn_file=self.cmvn_file,
+            cmvn_is_json=self.cmvn_is_json,
+        )
+
+    def to_qwen3_transformer_config(self) -> Qwen3TransformerEncoderConfig:
+        return Qwen3TransformerEncoderConfig(
+            input_dim=self.input_dim,
+            n_embd=self.n_embd,
+            output_dim=self.encoder_output_dim,
+            dim_att=self.dim_att,
+            dim_ff=self.dim_ff,
+            num_layers=self.num_layers,
+            head_size=self.head_size,
+            dropout=self.dropout,
+            activation_dropout=self.aut_activation_dropout,
+            activation_function=self.aut_activation_function,
+            max_source_positions=self.aut_max_source_positions,
+            downsample_hidden_size=self.aut_downsample_hidden_size,
+            scale_embedding=self.aut_scale_embedding,
+            conv_chunksize=self.aut_conv_chunksize,
+            cmvn_file=self.cmvn_file,
+            cmvn_is_json=self.cmvn_is_json,
+        )
+
+    def to_sensevoice_rwkv_config(self) -> SenseVoiceRWKVEncoderConfig:
+        return SenseVoiceRWKVEncoderConfig(
+            input_dim=self.input_dim,
+            n_embd=self.n_embd,
+            output_dim=self.encoder_output_dim,
+            dim_att=self.dim_att,
+            dim_ff=self.dim_ff,
+            num_layers=self.num_layers,
+            tp_blocks=self.sensevoice_tp_blocks,
+            head_size=self.head_size,
+            backend=self.backend,
+            conv_kernel_size=self.conv_kernel_size,
+            dropout=self.dropout,
+        )
+
+    def to_funasr_nano_encoder_config(self) -> FunASRNanoEncoderConfig:
+        return FunASRNanoEncoderConfig(
+            input_dim=self.input_dim,
+            n_embd=self.n_embd,
+            output_dim=self.encoder_output_dim,
+            dim_ff=self.dim_ff,
+            num_layers=self.num_layers,
+            tp_blocks=self.sensevoice_tp_blocks,
+            dropout=self.dropout,
+        )
 
 
 @dataclass
@@ -51,12 +140,21 @@ class RWKVCTCModelConfig:
     dim_ff: int
     num_layers: int
     vocab_size: int
+    feature_extractor_type: str = "wenet_fbank"
     head_size: int = 64
     backend: str = "native"
     conv_kernel_size: int = 31
     dropout: float = 0.1
     blank_id: int = 0
     frontend_type: str = "conv2d6"
+    encoder_output_dim: int | None = None
+    aut_downsample_hidden_size: int = 480
+    aut_activation_function: str = "gelu"
+    aut_activation_dropout: float = 0.0
+    aut_max_source_positions: int = 1500
+    aut_scale_embedding: bool = False
+    aut_conv_chunksize: int = 500
+    sensevoice_tp_blocks: int = 20
     cmvn_file: str | None = None
     cmvn_is_json: bool = True
     decoder_enabled: bool = False
@@ -64,6 +162,7 @@ class RWKVCTCModelConfig:
     decoder_num_layers: int | None = None
     decoder_n_embd: int | None = None
     decoder_ffn_hidden_size: int | None = None
+    decoder_vocab_size: int | None = None
     decoder_head_size: int = 64
     decoder_audio_conditioning: str = "full"
     decoder_prefix_tokens: int = 32
@@ -74,6 +173,18 @@ class RWKVCTCModelConfig:
     decoder_eos_token_id: int = 0
     ctc_loss_weight: float = 1.0
     decoder_loss_weight: float = 0.0
+    ctc_decoder_type: str = "none"
+    ctc_decoder_downsample_rate: int = 1
+    ctc_decoder_dim: int | None = None
+    ctc_decoder_ffn_dim: int = 2048
+    ctc_decoder_num_layers: int = 5
+    ctc_decoder_attention_heads: int = 8
+    ctc_decoder_dropout: float = 0.0
+    ctc_decoder_attention_dropout: float = 0.0
+    ctc_bridge_type: str = "none"
+    ctc_bridge_hidden_dim: int | None = None
+    ctc_bridge_dropout: float = 0.0
+    ctc_suppressed_token_ids: tuple[int, ...] | list[int] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -90,6 +201,11 @@ class RWKVCTCModelConfig:
             self,
             "decoder_target_suffix_token_ids",
             tuple(int(token_id) for token_id in self.decoder_target_suffix_token_ids),
+        )
+        object.__setattr__(
+            self,
+            "ctc_suppressed_token_ids",
+            tuple(sorted({int(token_id) for token_id in self.ctc_suppressed_token_ids})),
         )
 
     @property
@@ -110,6 +226,10 @@ class RWKVCTCModelConfig:
     def ctc_vocab_size(self) -> int:
         return max(int(self.vocab_size), int(self.blank_id) + 1)
 
+    @property
+    def resolved_encoder_output_dim(self) -> int:
+        return int(self.n_embd if self.encoder_output_dim is None else self.encoder_output_dim)
+
     def to_encoder_config(self) -> RWKVConformerEncoderConfig:
         return RWKVConformerEncoderConfig(
             input_dim=self.input_dim,
@@ -122,6 +242,14 @@ class RWKVCTCModelConfig:
             conv_kernel_size=self.conv_kernel_size,
             dropout=self.dropout,
             frontend_type=self.frontend_type,
+            output_dim=self.encoder_output_dim,
+            aut_downsample_hidden_size=self.aut_downsample_hidden_size,
+            aut_activation_function=self.aut_activation_function,
+            aut_activation_dropout=self.aut_activation_dropout,
+            aut_max_source_positions=self.aut_max_source_positions,
+            aut_scale_embedding=self.aut_scale_embedding,
+            aut_conv_chunksize=self.aut_conv_chunksize,
+            sensevoice_tp_blocks=self.sensevoice_tp_blocks,
             cmvn_file=self.cmvn_file,
             cmvn_is_json=self.cmvn_is_json,
         )
@@ -133,7 +261,7 @@ class RWKVConformerEncoder(nn.Module):
         self.config = config
         self.gradient_checkpointing = False
         self.global_cmvn: nn.Module | None = None
-        if config.cmvn_file is not None:
+        if config.frontend_type != "aut_rwkv" and config.cmvn_file is not None:
             mean, istd = load_wenet_cmvn(config.cmvn_file, is_json=config.cmvn_is_json)
             self.global_cmvn = GlobalCMVN(mean, istd)
         elif config.frontend_type == "conv2d6":
@@ -142,6 +270,36 @@ class RWKVConformerEncoder(nn.Module):
                 torch.zeros(config.input_dim, dtype=torch.float32),
                 torch.ones(config.input_dim, dtype=torch.float32),
             )
+
+        if config.frontend_type == "aut_rwkv":
+            self.aut_encoder = AuRWKVEncoder(config.to_aurwkv_config())
+            self.frontend = self.aut_encoder
+            self.blocks = self.aut_encoder.layers
+            return
+
+        if config.frontend_type == "qwen3_transformer":
+            self.qwen3_transformer_encoder = Qwen3TransformerEncoder(config.to_qwen3_transformer_config())
+            self.frontend = self.qwen3_transformer_encoder
+            self.blocks = self.qwen3_transformer_encoder.layers
+            return
+
+        if config.frontend_type == "sensevoice_rwkv":
+            self.sensevoice_encoder = SenseVoiceRWKVEncoder(config.to_sensevoice_rwkv_config())
+            self.frontend = self.sensevoice_encoder
+            self.blocks = self.sensevoice_encoder.layers
+            return
+
+        if config.frontend_type == "sensevoice_conformer_conv":
+            self.sensevoice_conformer_encoder = SenseVoiceConformerConvEncoder(config.to_sensevoice_rwkv_config())
+            self.frontend = self.sensevoice_conformer_encoder
+            self.blocks = self.sensevoice_conformer_encoder.layers
+            return
+
+        if config.frontend_type == "funasr_nano_encoder":
+            self.funasr_nano_encoder = FunASRNanoEncoder(config.to_funasr_nano_encoder_config())
+            self.frontend = self.funasr_nano_encoder
+            self.blocks = self.funasr_nano_encoder.layers
+            return
 
         if config.frontend_type == "linear":
             self.frontend = (
@@ -174,6 +332,16 @@ class RWKVConformerEncoder(nn.Module):
 
     def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
         self.gradient_checkpointing = bool(enabled)
+        if self.config.frontend_type == "aut_rwkv":
+            self.aut_encoder.enable_gradient_checkpointing(enabled)
+        if self.config.frontend_type == "qwen3_transformer":
+            self.qwen3_transformer_encoder.enable_gradient_checkpointing(enabled)
+        if self.config.frontend_type == "sensevoice_rwkv":
+            self.sensevoice_encoder.enable_gradient_checkpointing(enabled)
+        if self.config.frontend_type == "sensevoice_conformer_conv":
+            self.sensevoice_conformer_encoder.enable_gradient_checkpointing(enabled)
+        if self.config.frontend_type == "funasr_nano_encoder":
+            self.funasr_nano_encoder.enable_gradient_checkpointing(enabled)
 
     @staticmethod
     def _pack_optional_tensor(tensor: Tensor | None, *, reference: Tensor) -> Tensor:
@@ -211,6 +379,7 @@ class RWKVConformerEncoder(nn.Module):
         *,
         v_first: BidirectionalVFirstState | None,
         layer_mask: LayerDirectionMask,
+        lengths: Tensor | None,
     ) -> tuple[Tensor, BidirectionalVFirstState]:
         forward_v_first = self._pack_optional_tensor(
             None if v_first is None else v_first.forward,
@@ -233,6 +402,7 @@ class RWKVConformerEncoder(nn.Module):
                 v_first=current_v_first,
                 state=None,
                 layer_mask=layer_mask,
+                lengths=lengths,
             )
             return (
                 next_x,
@@ -260,6 +430,42 @@ class RWKVConformerEncoder(nn.Module):
         direction_mask: DirectionMask | None = None,
         state: RWKVConformerEncoderState | None = None,
     ) -> tuple[Tensor, Tensor | None, RWKVConformerEncoderState]:
+        if self.config.frontend_type == "aut_rwkv":
+            return self.aut_encoder(
+                x,
+                lengths,
+                direction_mask=direction_mask,
+                state=state,
+            )
+        if self.config.frontend_type == "qwen3_transformer":
+            return self.qwen3_transformer_encoder(
+                x,
+                lengths,
+                direction_mask=direction_mask,
+                state=state,
+            )
+        if self.config.frontend_type == "sensevoice_rwkv":
+            return self.sensevoice_encoder(
+                x,
+                lengths,
+                direction_mask=direction_mask,
+                state=state,
+            )
+        if self.config.frontend_type == "sensevoice_conformer_conv":
+            return self.sensevoice_conformer_encoder(
+                x,
+                lengths,
+                direction_mask=direction_mask,
+                state=state,
+            )
+        if self.config.frontend_type == "funasr_nano_encoder":
+            return self.funasr_nano_encoder(
+                x,
+                lengths,
+                direction_mask=direction_mask,
+                state=state,
+            )
+
         if self.global_cmvn is not None:
             x = self.global_cmvn(x.float())
         compute_dtype = self._encoder_compute_dtype()
@@ -290,6 +496,7 @@ class RWKVConformerEncoder(nn.Module):
                     x,
                     v_first=v_first,
                     layer_mask=layer_mask,
+                    lengths=lengths,
                 )
                 next_states.append(None)
             else:
@@ -298,10 +505,213 @@ class RWKVConformerEncoder(nn.Module):
                     v_first=v_first,
                     state=block_states[layer_idx],
                     layer_mask=layer_mask,
+                    lengths=lengths,
                 )
                 next_states.append(next_block_state)
 
         return x, lengths, RWKVConformerEncoderState(block_states=next_states)
+
+
+class CTCEncoderBridge(nn.Module):
+    """Optional CTC-path adapter between the ASR encoder and CTC decoder/head."""
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        bridge_type: str = "none",
+        hidden_dim: int | None = None,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.bridge_type = str(bridge_type or "none").lower()
+        self.kind = "identity"
+        if self.bridge_type in {"", "none", "identity"}:
+            self.kind = "identity"
+            self.net = nn.Identity()
+            return
+        if self.bridge_type == "linear":
+            self.kind = "linear"
+            self.net = nn.Linear(self.dim, self.dim)
+            self.reset_parameters()
+            return
+        if self.bridge_type in {"mlp", "residual_mlp"}:
+            self.kind = "residual_mlp"
+            hidden_dim = int(hidden_dim or self.dim * 4)
+            if hidden_dim <= 0:
+                raise ValueError("ctc_bridge_hidden_dim must be positive.")
+            self.norm = nn.LayerNorm(self.dim)
+            self.up = nn.Linear(self.dim, hidden_dim)
+            self.down = nn.Linear(hidden_dim, self.dim)
+            self.dropout = nn.Dropout(float(dropout))
+            self.activation = nn.GELU()
+            self.reset_parameters()
+            return
+        if self.bridge_type in {"context_residual_mlp", "temporal_residual_mlp", "conv_residual_mlp"}:
+            self.kind = "context_residual_mlp"
+            hidden_dim = int(hidden_dim or self.dim * 4)
+            if hidden_dim <= 0:
+                raise ValueError("ctc_bridge_hidden_dim must be positive.")
+            self.temporal_norm = nn.LayerNorm(self.dim)
+            self.temporal = nn.Conv1d(
+                self.dim,
+                self.dim,
+                kernel_size=5,
+                padding=2,
+                groups=self.dim,
+            )
+            self.ffn_norm = nn.LayerNorm(self.dim)
+            self.up = nn.Linear(self.dim, hidden_dim)
+            self.down = nn.Linear(hidden_dim, self.dim)
+            self.dropout = nn.Dropout(float(dropout))
+            self.activation = nn.GELU()
+            self.reset_parameters()
+            return
+        if self.bridge_type.startswith("nano_encoder_tail") or self.bridge_type.startswith("nano_tp_tail"):
+            self.kind = "nano_encoder_tail"
+            if self.dim <= 0:
+                raise ValueError("nano encoder tail bridge requires a positive dim.")
+            tail_layers = self._parse_nano_tail_layers(self.bridge_type, default=5)
+            if tail_layers <= 0 or tail_layers > 20:
+                raise ValueError("nano_encoder_tailN requires 1 <= N <= 20.")
+            if self.dim % 4 != 0:
+                raise ValueError("nano encoder tail bridge requires dim divisible by 4 attention heads.")
+            self.tail_layers = int(tail_layers)
+            try:
+                from funasr.models.sense_voice.model import SenseVoiceEncoderSmall
+            except ImportError as exc:  # pragma: no cover - dependency is present in the project env.
+                raise ImportError("funasr is required for ctc_bridge_type='nano_encoder_tailN'.") from exc
+            assistant = SenseVoiceEncoderSmall(
+                input_size=self.dim,
+                output_size=self.dim,
+                attention_heads=4,
+                linear_units=int(hidden_dim or self.dim * 4),
+                num_blocks=1,
+                tp_blocks=self.tail_layers,
+                dropout_rate=float(dropout),
+                attention_dropout_rate=float(dropout),
+                kernel_size=11,
+            )
+            self.blocks = nn.ModuleList(list(assistant.tp_encoders))
+            self.final_norm = assistant.tp_norm
+            self.source_block_offset = 20 - self.tail_layers
+            return
+        raise ValueError(f"Unsupported ctc_bridge_type: {bridge_type}")
+
+    @staticmethod
+    def _parse_nano_tail_layers(bridge_type: str, *, default: int) -> int:
+        match = re.search(r"(?:tail|tail_)(\d+)$", str(bridge_type))
+        if match is None:
+            return int(default)
+        return int(match.group(1))
+
+    def reset_parameters(self) -> None:
+        if getattr(self, "kind", "") == "linear":
+            linear = self.net
+            if not isinstance(linear, nn.Linear):
+                raise TypeError("linear bridge expected nn.Linear")
+            nn.init.eye_(linear.weight)
+            nn.init.zeros_(linear.bias)
+            return
+        if getattr(self, "kind", "") == "residual_mlp":
+            nn.init.zeros_(self.down.weight)
+            nn.init.zeros_(self.down.bias)
+            return
+        if getattr(self, "kind", "") == "context_residual_mlp":
+            nn.init.zeros_(self.temporal.weight)
+            nn.init.zeros_(self.temporal.bias)
+            nn.init.zeros_(self.down.weight)
+            nn.init.zeros_(self.down.bias)
+
+    @staticmethod
+    def _length_mask(x: Tensor, lengths: Tensor | None) -> Tensor | None:
+        if lengths is None:
+            return None
+        steps = torch.arange(int(x.size(1)), device=x.device)
+        return (steps.unsqueeze(0) < lengths.to(device=x.device).unsqueeze(1)).unsqueeze(-1)
+
+    def forward(self, x: Tensor, lengths: Tensor | None = None) -> Tensor:
+        if self.kind == "identity":
+            return x
+        if self.kind == "linear":
+            return self.net(x)
+        if self.kind == "context_residual_mlp":
+            mask = self._length_mask(x, lengths)
+            residual = x
+            y = self.temporal_norm(x)
+            if mask is not None:
+                y = y * mask.to(dtype=y.dtype)
+            y = self.temporal(y.transpose(1, 2)).transpose(1, 2)
+            if mask is not None:
+                y = y * mask.to(dtype=y.dtype)
+            x = residual + y
+            y = self.ffn_norm(x)
+            y = self.up(y)
+            y = self.activation(y)
+            y = self.dropout(y)
+            y = self.down(y)
+            x = x + y
+            if mask is not None:
+                x = torch.where(mask, x, residual)
+            return x
+        if self.kind == "nano_encoder_tail":
+            mask = None
+            if lengths is not None:
+                steps = torch.arange(int(x.size(1)), device=x.device)
+                mask = steps.unsqueeze(0) < lengths.to(device=x.device, dtype=torch.long).unsqueeze(1)
+                mask = mask[:, None, :]
+            for block in self.blocks:
+                block_out = block(x, mask)
+                if not isinstance(block_out, tuple) or len(block_out) < 2:
+                    raise RuntimeError("FunASR Nano encoder tail block returned an unexpected payload.")
+                x = block_out[0]
+                mask = block_out[1]
+            x = self.final_norm(x)
+            return x
+        residual = x
+        x = self.norm(x)
+        x = self.up(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        return residual + self.down(x)
+
+    def load_funasr_nano_bridge_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, list[str]]:
+        if self.kind != "nano_encoder_tail":
+            return {"loaded": [], "skipped": []}
+        loaded: list[str] = []
+        skipped: list[str] = []
+        source_roots = ("", "audio_encoder.", "model.audio_encoder.")
+        for block_index, block in enumerate(self.blocks):
+            source_index = int(self.source_block_offset) + int(block_index)
+            own_state = block.state_dict()
+            for own_key, own_value in own_state.items():
+                source_value = None
+                for root in source_roots:
+                    candidate = f"{root}tp_encoders.{source_index}.{own_key}"
+                    if candidate in state_dict:
+                        source_value = state_dict[candidate]
+                        break
+                target_name = f"blocks.{block_index}.{own_key}"
+                if source_value is None or tuple(source_value.shape) != tuple(own_value.shape):
+                    skipped.append(target_name)
+                    continue
+                own_value.copy_(source_value.to(dtype=own_value.dtype))
+                loaded.append(target_name)
+        for own_key, own_value in self.final_norm.state_dict().items():
+            source_value = None
+            for root in source_roots:
+                candidate = f"{root}tp_norm.{own_key}"
+                if candidate in state_dict:
+                    source_value = state_dict[candidate]
+                    break
+            target_name = f"final_norm.{own_key}"
+            if source_value is None or tuple(source_value.shape) != tuple(own_value.shape):
+                skipped.append(target_name)
+                continue
+            own_value.copy_(source_value.to(dtype=own_value.dtype))
+            loaded.append(target_name)
+        return {"loaded": sorted(set(loaded)), "skipped": sorted(set(skipped))}
 
 
 class RWKVCTCModel(nn.Module):
@@ -309,7 +719,44 @@ class RWKVCTCModel(nn.Module):
         super().__init__()
         self.config = config
         self.encoder = RWKVConformerEncoder(config.to_encoder_config())
-        self.ctc_head = nn.Linear(config.n_embd, config.ctc_vocab_size)
+        encoder_output_dim = int(config.resolved_encoder_output_dim)
+        self.ctc_bridge = CTCEncoderBridge(
+            encoder_output_dim,
+            bridge_type=config.ctc_bridge_type,
+            hidden_dim=config.ctc_bridge_hidden_dim,
+            dropout=config.ctc_bridge_dropout,
+        )
+        self.ctc_decoder: NanoCTCTransformerDecoder | None = None
+        ctc_head_input_dim = encoder_output_dim
+        ctc_decoder_type = str(config.ctc_decoder_type or "none").lower()
+        if ctc_decoder_type not in {"", "none"}:
+            if ctc_decoder_type not in {"funasr_nano_transformer", "nano_transformer"}:
+                raise ValueError(f"Unsupported ctc_decoder_type: {config.ctc_decoder_type}")
+            ctc_decoder_dim = int(config.ctc_decoder_dim or encoder_output_dim)
+            self.ctc_decoder = NanoCTCTransformerDecoder(
+                NanoCTCTransformerDecoderConfig(
+                    downsample_rate=int(config.ctc_decoder_downsample_rate),
+                    encoder_dim=encoder_output_dim,
+                    hidden_dim=ctc_decoder_dim,
+                    ffn_dim=int(config.ctc_decoder_ffn_dim),
+                    num_layers=int(config.ctc_decoder_num_layers),
+                    attention_heads=int(config.ctc_decoder_attention_heads),
+                    dropout_rate=float(config.ctc_decoder_dropout),
+                    attention_dropout_rate=float(config.ctc_decoder_attention_dropout),
+                )
+            )
+            ctc_head_input_dim = ctc_decoder_dim
+        self.ctc_head = nn.Linear(ctc_head_input_dim, config.ctc_vocab_size)
+        suppressed_token_ids = [
+            int(token_id)
+            for token_id in config.ctc_suppressed_token_ids
+            if 0 <= int(token_id) < int(config.ctc_vocab_size) and int(token_id) != int(config.blank_id)
+        ]
+        self.register_buffer(
+            "ctc_suppressed_token_ids",
+            torch.tensor(sorted(set(suppressed_token_ids)), dtype=torch.long),
+            persistent=False,
+        )
         self.decoder: RWKV7DecoderLM | None = None
         self.decoder_prefix_proj: nn.Module | None = None
         self.decoder_bos: nn.Parameter | None = None
@@ -317,18 +764,13 @@ class RWKVCTCModel(nn.Module):
             if str(config.decoder_audio_conditioning) != "full":
                 raise ValueError("Only decoder_audio_conditioning='full' is supported.")
             decoder_config = self._resolve_decoder_config(config)
-            if decoder_config.vocab_size != int(config.vocab_size):
-                raise ValueError(
-                    "Decoder vocabulary size must match the shared text vocabulary size: "
-                    f"{decoder_config.vocab_size} != {config.vocab_size}"
-                )
             self.decoder = RWKV7DecoderLM(decoder_config)
             if config.decoder_checkpoint_path is not None:
                 self.decoder.load_official_checkpoint(config.decoder_checkpoint_path)
-            if int(config.n_embd) == int(decoder_config.n_embd):
+            if encoder_output_dim == int(decoder_config.n_embd):
                 self.decoder_prefix_proj = nn.Identity()
             else:
-                self.decoder_prefix_proj = nn.Linear(config.n_embd, decoder_config.n_embd, bias=False)
+                self.decoder_prefix_proj = nn.Linear(encoder_output_dim, decoder_config.n_embd, bias=False)
             self.decoder_bos = nn.Parameter(torch.zeros(1, 1, decoder_config.n_embd))
 
     @staticmethod
@@ -337,7 +779,10 @@ class RWKVCTCModel(nn.Module):
         if config.decoder_checkpoint_path is not None:
             inferred = infer_rwkv7_decoder_config_from_checkpoint(config.decoder_checkpoint_path)
         return RWKV7DecoderConfig(
-            vocab_size=int(config.vocab_size),
+            vocab_size=int(
+                config.decoder_vocab_size
+                or (inferred.vocab_size if inferred is not None else config.vocab_size)
+            ),
             n_embd=int(config.decoder_n_embd or (inferred.n_embd if inferred is not None else config.n_embd)),
             num_layers=int(config.decoder_num_layers or (inferred.num_layers if inferred is not None else config.num_layers)),
             head_size=int(config.decoder_head_size or (inferred.head_size if inferred is not None else config.head_size)),
@@ -349,8 +794,158 @@ class RWKVCTCModel(nn.Module):
             ),
         )
 
+    def load_funasr_nano_ctc_checkpoint(
+        self,
+        path: str,
+        *,
+        load_ctc_decoder: bool = True,
+        load_ctc_head: bool = True,
+        load_encoder: bool = False,
+        load_encoder_attention: bool = True,
+        teacher_blank_id: int = 60514,
+        project_ignored_token_ids: tuple[int, ...] | list[int] = (60514,),
+        blank_bias_delta: float = 0.0,
+    ) -> dict[str, object]:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"Unsupported FunASR-Nano checkpoint payload: {type(checkpoint)!r}")
+        state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+        if not isinstance(state_dict, dict):
+            raise ValueError("FunASR-Nano checkpoint has no state dict.")
+
+        report: dict[str, object] = {
+            "encoder_loaded": 0,
+            "encoder_skipped": 0,
+            "encoder_attention_skipped": 0,
+            "ctc_bridge_loaded": 0,
+            "ctc_bridge_skipped": 0,
+            "ctc_decoder_loaded": 0,
+            "ctc_head_loaded_rows": 0,
+            "ctc_head_ignored_rows": [],
+            "ctc_head_blank_bias_delta": float(blank_bias_delta),
+        }
+        bridge_loader = getattr(self.ctc_bridge, "load_funasr_nano_bridge_state_dict", None)
+        if callable(bridge_loader):
+            bridge_report = bridge_loader(state_dict)
+            loaded = bridge_report.get("loaded", []) if isinstance(bridge_report, dict) else []
+            skipped = bridge_report.get("skipped", []) if isinstance(bridge_report, dict) else []
+            report["ctc_bridge_loaded"] = len(loaded)
+            report["ctc_bridge_skipped"] = len(skipped)
+        if load_encoder:
+            funasr_encoder = getattr(self.encoder, "funasr_nano_encoder", None)
+            if funasr_encoder is None:
+                raise ValueError("frontend_type='funasr_nano_encoder' is required to load Nano audio_encoder weights.")
+            encoder_report = funasr_encoder.load_funasr_nano_encoder_state_dict(
+                state_dict,
+                load_attention=bool(load_encoder_attention),
+            )
+            report["encoder_loaded"] = len(encoder_report["loaded"])
+            report["encoder_skipped"] = len(encoder_report["skipped"])
+            report["encoder_attention_skipped"] = len(encoder_report["attention_skipped"])
+        if load_ctc_decoder:
+            if self.ctc_decoder is None:
+                raise ValueError("ctc_decoder_type must be enabled before loading Nano ctc_decoder weights.")
+            decoder_state = {
+                key.removeprefix("ctc_decoder."): value
+                for key, value in state_dict.items()
+                if isinstance(key, str) and key.startswith("ctc_decoder.")
+            }
+            if not decoder_state:
+                raise ValueError(f"No ctc_decoder.* weights found in {path}")
+            self.ctc_decoder.load_state_dict(decoder_state, strict=True)
+            report["ctc_decoder_loaded"] = len(decoder_state)
+
+        if load_ctc_head:
+            teacher_weight = state_dict.get("ctc.ctc_lo.weight")
+            teacher_bias = state_dict.get("ctc.ctc_lo.bias")
+            if not isinstance(teacher_weight, Tensor) or not isinstance(teacher_bias, Tensor):
+                raise ValueError(f"No ctc.ctc_lo weights found in {path}")
+            if int(teacher_weight.size(1)) != int(self.ctc_head.weight.size(1)):
+                raise ValueError(
+                    "Nano CTC head input dim does not match project CTC head: "
+                    f"{int(teacher_weight.size(1))} != {int(self.ctc_head.weight.size(1))}"
+                )
+            project_blank_id = int(self.config.blank_id)
+            teacher_blank_id = int(teacher_blank_id)
+            ignored_rows: list[int] = []
+            with torch.no_grad():
+                self.ctc_head.weight.zero_()
+                self.ctc_head.bias.fill_(-1.0e4)
+                loaded_rows = 0
+                for teacher_id in range(int(teacher_weight.size(0))):
+                    project_id = project_blank_id if teacher_id == teacher_blank_id else teacher_id
+                    if not (0 <= project_id < int(self.ctc_head.weight.size(0))):
+                        continue
+                    self.ctc_head.weight[project_id].copy_(
+                        teacher_weight[teacher_id].to(dtype=self.ctc_head.weight.dtype)
+                    )
+                    self.ctc_head.bias[project_id].copy_(
+                        teacher_bias[teacher_id].to(dtype=self.ctc_head.bias.dtype)
+                    )
+                    loaded_rows += 1
+                for ignored_id in project_ignored_token_ids:
+                    ignored_id = int(ignored_id)
+                    if ignored_id == project_blank_id:
+                        continue
+                    if 0 <= ignored_id < int(self.ctc_head.weight.size(0)):
+                        self.ctc_head.weight[ignored_id].zero_()
+                        self.ctc_head.bias[ignored_id].fill_(-1.0e4)
+                        ignored_rows.append(ignored_id)
+                if float(blank_bias_delta) != 0.0:
+                    if not (0 <= project_blank_id < int(self.ctc_head.bias.size(0))):
+                        raise ValueError(
+                            f"Project blank id {project_blank_id} is outside CTC head bias size "
+                            f"{int(self.ctc_head.bias.size(0))}"
+                        )
+                    self.ctc_head.bias[project_blank_id].add_(
+                        self.ctc_head.bias.new_tensor(float(blank_bias_delta))
+                    )
+            report["ctc_head_loaded_rows"] = loaded_rows
+            report["ctc_head_ignored_rows"] = ignored_rows
+        return report
+
     def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
         self.encoder.enable_gradient_checkpointing(enabled)
+
+    def ctc_features_from_encoded(
+        self,
+        encoded: Tensor,
+        encoded_lengths: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        ctc_encoded, ctc_encoded_lengths = self.ctc_encoder_features_from_encoded(encoded, encoded_lengths)
+        return self.ctc_features_from_ctc_encoded(ctc_encoded, ctc_encoded_lengths)
+
+    def ctc_encoder_features_from_encoded(
+        self,
+        encoded: Tensor,
+        encoded_lengths: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        return self.ctc_bridge(encoded, encoded_lengths), encoded_lengths
+
+    def ctc_features_from_ctc_encoded(
+        self,
+        ctc_encoded: Tensor,
+        ctc_encoded_lengths: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        if self.ctc_decoder is None:
+            return ctc_encoded, ctc_encoded_lengths
+        return self.ctc_decoder(ctc_encoded, ctc_encoded_lengths)
+
+    def ctc_logits_from_encoded(
+        self,
+        encoded: Tensor,
+        encoded_lengths: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        ctc_features, ctc_lengths = self.ctc_features_from_encoded(encoded, encoded_lengths)
+        return self.apply_ctc_logit_mask(self.ctc_head(ctc_features)), ctc_lengths
+
+    def apply_ctc_logit_mask(self, logits: Tensor) -> Tensor:
+        suppressed = self.ctc_suppressed_token_ids
+        if int(suppressed.numel()) == 0:
+            return logits
+        masked = logits.clone()
+        masked.index_fill_(-1, suppressed.to(device=masked.device), masked.new_tensor(-1.0e4))
+        return masked
 
     def forward(
         self,
@@ -366,8 +961,8 @@ class RWKVCTCModel(nn.Module):
             direction_mask=direction_mask,
             state=state,
         )
-        logits = self.ctc_head(encoded)
-        return logits, encoded_lengths, next_state
+        logits, logit_lengths = self.ctc_logits_from_encoded(encoded, encoded_lengths)
+        return logits, logit_lengths, next_state
 
     @staticmethod
     def _packed_targets_to_padded(
@@ -421,10 +1016,42 @@ class RWKVCTCModel(nn.Module):
         ids = torch.tensor(token_ids, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
         return self.decoder.emb(ids).to(dtype=dtype)
 
+    def _decoder_packed_token_embeds(
+        self,
+        token_ids: Tensor,
+        token_lengths: Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        if self.decoder is None:
+            raise RuntimeError("Decoder token embeddings requested but decoder is disabled.")
+        lengths = token_lengths.to(device=device, dtype=torch.long).clamp_min(0)
+        if int(lengths.numel()) != int(batch_size):
+            raise ValueError("Packed decoder prompt lengths must match batch size.")
+        max_len = int(lengths.max().item()) if batch_size > 0 else 0
+        hidden_size = int(self.decoder.hidden_size)
+        if max_len <= 0:
+            return torch.empty(batch_size, 0, hidden_size, device=device, dtype=dtype), lengths
+        output = torch.zeros(batch_size, max_len, hidden_size, device=device, dtype=dtype)
+        tokens = token_ids.to(device=device, dtype=torch.long)
+        offset = 0
+        for sample_idx, length in enumerate(lengths.tolist()):
+            length = int(length)
+            if length <= 0:
+                continue
+            sample_ids = tokens[offset : offset + length].unsqueeze(0)
+            output[sample_idx, :length] = self.decoder.emb(sample_ids).squeeze(0).to(dtype=dtype)
+            offset += length
+        return output, lengths
+
     def _decoder_template_context_embeds(
         self,
         encoded: Tensor,
         encoded_lengths: Tensor | None,
+        decoder_prompt_before_audio: Tensor | None = None,
+        decoder_prompt_before_audio_lengths: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         audio = self._project_decoder_audio_context(encoded)
         if encoded_lengths is None:
@@ -438,23 +1065,37 @@ class RWKVCTCModel(nn.Module):
             min=1,
             max=int(encoded.size(1)),
         )
-        before_ids = self._int_token_tuple(self.config.decoder_prompt_before_audio_token_ids)
         after_ids = self._int_token_tuple(self.config.decoder_prompt_after_audio_token_ids)
-        before = self._decoder_static_token_embeds(
-            before_ids,
-            batch_size=int(audio.size(0)),
-            device=audio.device,
-            dtype=audio.dtype,
-        )
+        if decoder_prompt_before_audio is not None and decoder_prompt_before_audio_lengths is not None:
+            before, before_lengths = self._decoder_packed_token_embeds(
+                decoder_prompt_before_audio,
+                decoder_prompt_before_audio_lengths,
+                batch_size=int(audio.size(0)),
+                device=audio.device,
+                dtype=audio.dtype,
+            )
+        else:
+            before_ids = self._int_token_tuple(self.config.decoder_prompt_before_audio_token_ids)
+            before = self._decoder_static_token_embeds(
+                before_ids,
+                batch_size=int(audio.size(0)),
+                device=audio.device,
+                dtype=audio.dtype,
+            )
+            before_lengths = torch.full(
+                (int(audio.size(0)),),
+                int(before.size(1)),
+                dtype=torch.long,
+                device=audio.device,
+            )
         after = self._decoder_static_token_embeds(
             after_ids,
             batch_size=int(audio.size(0)),
             device=audio.device,
             dtype=audio.dtype,
         )
-        before_len = int(before.size(1))
         after_len = int(after.size(1))
-        context_lengths = audio_lengths + before_len + after_len
+        context_lengths = audio_lengths + before_lengths + after_len
         max_context_len = int(context_lengths.max().item())
         if max_context_len <= 0:
             raise ValueError("Decoder template context must contain prompt or audio positions.")
@@ -462,8 +1103,9 @@ class RWKVCTCModel(nn.Module):
         context = audio.new_zeros(int(audio.size(0)), max_context_len, int(audio.size(-1)))
         for sample_idx, audio_len in enumerate(audio_lengths.tolist()):
             cursor = 0
+            before_len = int(before_lengths[sample_idx].item())
             if before_len > 0:
-                context[sample_idx, cursor : cursor + before_len] = before[sample_idx]
+                context[sample_idx, cursor : cursor + before_len] = before[sample_idx, :before_len]
                 cursor += before_len
             context[sample_idx, cursor : cursor + audio_len] = audio[sample_idx, :audio_len]
             cursor += audio_len
@@ -499,12 +1141,19 @@ class RWKVCTCModel(nn.Module):
         encoded: Tensor,
         encoded_lengths: Tensor | None,
         token_sequences: list[list[int]],
+        decoder_prompt_before_audio: Tensor | None = None,
+        decoder_prompt_before_audio_lengths: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         if self.decoder is None:
             raise RuntimeError("Decoder template path requested but decoder is disabled.")
         if encoded.size(0) != len(token_sequences):
             raise ValueError("Encoded batch size and token sequence count must match.")
-        context, context_lengths = self._decoder_template_context_embeds(encoded, encoded_lengths)
+        context, context_lengths = self._decoder_template_context_embeds(
+            encoded,
+            encoded_lengths,
+            decoder_prompt_before_audio=decoder_prompt_before_audio,
+            decoder_prompt_before_audio_lengths=decoder_prompt_before_audio_lengths,
+        )
         batch_size = int(context.size(0))
         max_target_len = max((len(sequence) for sequence in token_sequences), default=0)
         if max_target_len <= 0:
@@ -548,6 +1197,8 @@ class RWKVCTCModel(nn.Module):
         encoded: Tensor,
         encoded_lengths: Tensor | None,
         token_sequences: list[list[int]],
+        decoder_prompt_before_audio: Tensor | None = None,
+        decoder_prompt_before_audio_lengths: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         if self.decoder is None:
             raise RuntimeError("Decoder template path requested but decoder is disabled.")
@@ -555,6 +1206,8 @@ class RWKVCTCModel(nn.Module):
             encoded,
             encoded_lengths,
             token_sequences,
+            decoder_prompt_before_audio=decoder_prompt_before_audio,
+            decoder_prompt_before_audio_lengths=decoder_prompt_before_audio_lengths,
         )
         return self.decoder.head(hidden), target_ids
 
@@ -565,6 +1218,8 @@ class RWKVCTCModel(nn.Module):
         token_sequences: list[list[int]],
         *,
         normalize_by_length: bool = True,
+        decoder_prompt_before_audio: Tensor | None = None,
+        decoder_prompt_before_audio_lengths: Tensor | None = None,
     ) -> Tensor:
         if self.decoder is None or self.decoder_bos is None:
             raise RuntimeError("Decoder scoring requested but decoder is disabled.")
@@ -582,6 +1237,18 @@ class RWKVCTCModel(nn.Module):
         expanded_lengths = None
         if encoded_lengths is not None:
             expanded_lengths = encoded_lengths.expand(num_sequences).contiguous()
+        expanded_prompt = None
+        expanded_prompt_lengths = None
+        if decoder_prompt_before_audio is not None and decoder_prompt_before_audio_lengths is not None:
+            prompt_len = int(decoder_prompt_before_audio_lengths[0].item())
+            sample_prompt = decoder_prompt_before_audio[:prompt_len].to(device=encoded.device, dtype=torch.long)
+            expanded_prompt = sample_prompt.repeat(num_sequences)
+            expanded_prompt_lengths = torch.full(
+                (num_sequences,),
+                prompt_len,
+                dtype=torch.long,
+                device=encoded.device,
+            )
         normalized_sequences = [
             self._normalize_decoder_target_sequence(
                 torch.tensor(sequence, dtype=torch.long, device=encoded.device)
@@ -592,6 +1259,8 @@ class RWKVCTCModel(nn.Module):
             expanded_encoded,
             expanded_lengths,
             normalized_sequences,
+            decoder_prompt_before_audio=expanded_prompt,
+            decoder_prompt_before_audio_lengths=expanded_prompt_lengths,
         )
         shifted_hidden = hidden[:, :-1, :]
         shifted_targets = target_ids[:, 1:]
@@ -605,6 +1274,30 @@ class RWKVCTCModel(nn.Module):
             scores = scores / valid_count
         return scores
 
+    @staticmethod
+    def _filter_decoder_sampling_logits(
+        logits: Tensor,
+        *,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ) -> Tensor:
+        filtered = logits
+        if top_k > 0:
+            top_k_value = max(1, int(top_k))
+            top_k_value = min(filtered.size(-1), top_k_value)
+            cutoff = torch.topk(filtered, k=top_k_value, dim=-1).values[:, -1:]
+            filtered = filtered.masked_fill(filtered < cutoff, float("-inf"))
+        if top_p < 1.0:
+            probs = filtered.float().softmax(dim=-1)
+            sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+            remove_sorted = torch.cumsum(sorted_probs, dim=-1) > float(top_p)
+            remove_sorted[:, 1:] = remove_sorted[:, :-1].clone()
+            remove_sorted[:, 0] = False
+            remove_mask = torch.zeros_like(remove_sorted, dtype=torch.bool)
+            remove_mask.scatter_(1, sorted_indices, remove_sorted)
+            filtered = filtered.masked_fill(remove_mask, float("-inf"))
+        return filtered
+
     def decoder_greedy_decode(
         self,
         encoded: Tensor,
@@ -612,11 +1305,24 @@ class RWKVCTCModel(nn.Module):
         *,
         eos_token_id: int = 0,
         max_new_tokens: int = 256,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        decoder_prompt_before_audio: Tensor | None = None,
+        decoder_prompt_before_audio_lengths: Tensor | None = None,
     ) -> tuple[list[list[int]], Tensor, list[bool]]:
         if self.decoder is None or self.decoder_bos is None:
             raise RuntimeError("Decoder generation requested but decoder is disabled.")
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be >= 1")
+        if do_sample:
+            if not (temperature > 0):
+                raise ValueError("temperature must be > 0 when do_sample=True.")
+            if top_k < 0:
+                raise ValueError("top_k must be >= 0.")
+            if not (0.0 < top_p <= 1.0):
+                raise ValueError("top_p must be in the interval (0.0, 1.0].")
         if encoded_lengths is None:
             encoded_lengths = torch.full(
                 (encoded.size(0),),
@@ -632,7 +1338,19 @@ class RWKVCTCModel(nn.Module):
             sample_length = max(1, min(int(encoded_lengths[sample_idx].item()), int(encoded.size(1))))
             sample_encoded = encoded[sample_idx : sample_idx + 1, :sample_length, :]
             sample_lengths = encoded_lengths[sample_idx : sample_idx + 1]
-            priming_embeds, context_lengths = self._decoder_template_context_embeds(sample_encoded, sample_lengths)
+            sample_prompt = None
+            sample_prompt_lengths = None
+            if decoder_prompt_before_audio is not None and decoder_prompt_before_audio_lengths is not None:
+                prompt_start = int(decoder_prompt_before_audio_lengths[:sample_idx].sum().item())
+                prompt_len = int(decoder_prompt_before_audio_lengths[sample_idx].item())
+                sample_prompt = decoder_prompt_before_audio[prompt_start : prompt_start + prompt_len]
+                sample_prompt_lengths = decoder_prompt_before_audio_lengths[sample_idx : sample_idx + 1]
+            priming_embeds, context_lengths = self._decoder_template_context_embeds(
+                sample_encoded,
+                sample_lengths,
+                decoder_prompt_before_audio=sample_prompt,
+                decoder_prompt_before_audio_lengths=sample_prompt_lengths,
+            )
             hidden, state = self.decoder.forward_hidden_embeds(priming_embeds)
             next_logits = self.decoder.head(hidden[:, int(context_lengths[0].item()) - 1, :])
 
@@ -641,9 +1359,21 @@ class RWKVCTCModel(nn.Module):
             num_scored = 0
             emitted_eos = False
             for _ in range(int(max_new_tokens)):
-                log_probs = next_logits.float().log_softmax(dim=-1)
-                next_token = int(log_probs.argmax(dim=-1).item())
-                total_logprob += float(log_probs[0, next_token].item())
+                if do_sample:
+                    sample_logits = next_logits.float() / float(temperature)
+                    sample_logits = self._filter_decoder_sampling_logits(
+                        sample_logits,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
+                    filtered_probs = sample_logits.float().softmax(dim=-1)
+                    next_token_tensor = torch.multinomial(filtered_probs, num_samples=1)
+                    next_token = int(next_token_tensor[0, 0].item())
+                    total_logprob += float(filtered_probs[0, next_token].log().item())
+                else:
+                    log_probs = next_logits.float().log_softmax(dim=-1)
+                    next_token = int(log_probs.argmax(dim=-1).item())
+                    total_logprob += float(log_probs[0, next_token].item())
                 num_scored += 1
                 if next_token == int(eos_token_id):
                     emitted_eos = True
@@ -664,6 +1394,8 @@ class RWKVCTCModel(nn.Module):
         encoded_lengths: Tensor | None,
         targets: Tensor,
         target_lengths: Tensor,
+        decoder_prompt_before_audio: Tensor | None = None,
+        decoder_prompt_before_audio_lengths: Tensor | None = None,
     ) -> Tensor:
         if self.decoder is None or self.decoder_bos is None:
             raise RuntimeError("Decoder loss requested but decoder is disabled.")
@@ -672,6 +1404,8 @@ class RWKVCTCModel(nn.Module):
             encoded,
             encoded_lengths,
             token_sequences,
+            decoder_prompt_before_audio=decoder_prompt_before_audio,
+            decoder_prompt_before_audio_lengths=decoder_prompt_before_audio_lengths,
         )
         batch_size = int(hidden.size(0))
         shifted_hidden = hidden[:, :-1, :]
@@ -715,6 +1449,10 @@ class RWKVCTCModel(nn.Module):
         targets: Tensor,
         target_lengths: Tensor,
         *,
+        decoder_targets: Tensor | None = None,
+        decoder_target_lengths: Tensor | None = None,
+        decoder_prompt_before_audio: Tensor | None = None,
+        decoder_prompt_before_audio_lengths: Tensor | None = None,
         direction_mask: DirectionMask | None = None,
         state: RWKVConformerEncoderState | None = None,
     ) -> dict[str, Tensor | Tensor | RWKVConformerEncoderState | None]:
@@ -724,25 +1462,43 @@ class RWKVCTCModel(nn.Module):
             direction_mask=direction_mask,
             state=state,
         )
-        logits = self.ctc_head(encoded)
-        if encoded_lengths is None:
-            raise ValueError("CTC training requires feature lengths.")
-        ctc_loss = self.ctc_loss(logits, encoded_lengths, targets, target_lengths)
-        if self.decoder is None or self.config.decoder_loss_weight <= 0:
-            decoder_loss = ctc_loss.new_zeros(())
-            total_loss = ctc_loss * float(self.config.ctc_loss_weight)
-        else:
-            decoder_loss = self.decoder_ar_loss(encoded, encoded_lengths, targets, target_lengths)
-            total_loss = (
-                ctc_loss * float(self.config.ctc_loss_weight)
-                + decoder_loss * float(self.config.decoder_loss_weight)
+        ctc_encoded, ctc_encoded_lengths = self.ctc_encoder_features_from_encoded(encoded, encoded_lengths)
+        ctc_features, logit_lengths = self.ctc_features_from_ctc_encoded(ctc_encoded, ctc_encoded_lengths)
+        logits = self.apply_ctc_logit_mask(self.ctc_head(ctc_features))
+        if logit_lengths is None:
+            raise ValueError("CTC training/distillation requires feature lengths.")
+        ctc_loss_weight = float(self.config.ctc_loss_weight)
+        decoder_loss_weight = float(self.config.decoder_loss_weight)
+        zero_loss = logits.float().sum() * 0.0
+        ctc_loss = (
+            self.ctc_loss(logits, logit_lengths, targets, target_lengths)
+            if ctc_loss_weight > 0.0
+            else zero_loss
+        )
+        decoder_loss = zero_loss
+        total_loss = ctc_loss * ctc_loss_weight
+        if decoder_loss_weight > 0.0:
+            if self.decoder is None:
+                raise ValueError("decoder_loss_weight > 0 requires decoder_enabled=True.")
+            decoder_loss = self.decoder_ar_loss(
+                encoded,
+                encoded_lengths,
+                decoder_targets if decoder_targets is not None else targets,
+                decoder_target_lengths if decoder_target_lengths is not None else target_lengths,
+                decoder_prompt_before_audio=decoder_prompt_before_audio,
+                decoder_prompt_before_audio_lengths=decoder_prompt_before_audio_lengths,
             )
+            total_loss = total_loss + decoder_loss * decoder_loss_weight
         return {
             "loss": total_loss,
             "ctc_loss": ctc_loss,
             "decoder_loss": decoder_loss,
+            "encoded": encoded,
+            "encoded_lengths": encoded_lengths,
+            "ctc_encoded": ctc_encoded,
+            "ctc_encoded_lengths": ctc_encoded_lengths,
             "logits": logits,
-            "logit_lengths": encoded_lengths,
+            "logit_lengths": logit_lengths,
             "state": next_state,
         }
 

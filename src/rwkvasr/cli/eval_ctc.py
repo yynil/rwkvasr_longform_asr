@@ -22,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", default=4, type=int)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--modes", nargs="+", default=["bi", "l2r", "alt"])
+    parser.add_argument("--feature-extractor-type", default="wenet_fbank")
     parser.add_argument("--vocab-size", default=None, type=int)
     parser.add_argument("--input-dim", default=80, type=int)
     parser.add_argument("--n-embd", default=512, type=int)
@@ -51,6 +52,7 @@ def _resolve_model_config(args: argparse.Namespace) -> RWKVCTCModelConfig:
     if args.vocab_size is None:
         raise ValueError("Either --config-yaml or --vocab-size plus model shape arguments must be provided.")
     return RWKVCTCModelConfig(
+        feature_extractor_type=args.feature_extractor_type,
         input_dim=args.input_dim,
         n_embd=args.n_embd,
         dim_att=args.dim_att,

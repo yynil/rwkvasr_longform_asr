@@ -1,0 +1,23 @@
+RWKV-7 clampw_v3 CUDA kernel
+
+The files rwkv7_clampw_v3.cpp and rwkv7_clampw_v3_for_h100_alt.cu in this
+directory are adapted from:
+  https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7/train_temp/cuda
+
+Upstream project:
+  BlinkDL/RWKV-LM
+
+Upstream commit tested locally:
+  f3a67cacc585ba86d11d0e345358405fae550225
+
+License:
+  Apache License 2.0
+
+Local changes:
+  - Rename the TORCH_LIBRARY namespace from rwkv7_clampw_v3 to
+    rwkvasr_rwkv7_clampw_v3 to avoid extension-registration collisions.
+  - Use the upstream *_for_h100_alt CUDA source because it compiles on RTX
+    4090 / sm_89 and uses fewer forward registers than the non-alt variant
+    in local compile output.
+  - Keep the upstream kernel interface and compile-time _N_ / _CHUNK_LEN_
+    contract unchanged.

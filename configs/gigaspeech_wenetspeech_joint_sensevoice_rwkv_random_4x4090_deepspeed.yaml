@@ -1,0 +1,105 @@
+output_dir: runs/gigaspeech_wenetspeech_joint_sensevoice_rwkv_random_bs8_zero1_nockpt_4x4090
+webdataset_root: /media/usbhd/training_data/asr/mix/gigaspeech_xl_wenetspeech_l_webdataset
+webdataset_index_path: /media/usbhd/training_data/asr/mix/gigaspeech_xl_wenetspeech_l_webdataset/webdataset_index.json
+webdataset_length_index_path: /media/usbhd/training_data/asr/mix/gigaspeech_xl_wenetspeech_l_webdataset/webdataset_lengths.jsonl
+webdataset_bucket_manifest_path: /media/usbhd/training_data/asr/mix/gigaspeech_xl_wenetspeech_l_webdataset/webdataset_buckets_audio_text/manifest.json
+webdataset_split: train
+webdataset_eval_ratio: 0.01
+webdataset_hash_seed: 0
+webdataset_split_by: shard_name
+webdataset_utt_id_key: id
+text_normalization: runtime
+tokenizer_type: rwkv
+tokenizer_model_path: third_party/RWKV-LM/RWKV-v7/rwkv_vocab_v20230424.txt
+tokenizer_language: null
+tokenizer_task: null
+tokenizer_append_eos: true
+vocab_size: 65536
+blank_id: 65536
+feature_extractor_type: sensevoice_lfr_fbank
+
+decoder_enabled: true
+decoder_checkpoint_path: assets/rwkv7/rwkv7-g1d-0.1b-20260129-ctx8192.pth
+decoder_num_layers: 12
+decoder_n_embd: 768
+decoder_ffn_hidden_size: 3072
+decoder_head_size: 64
+decoder_audio_conditioning: full
+decoder_prefix_tokens: 0
+decoder_loss_chunk_size: 512
+decoder_text_token_budget: 2048
+decoder_prompt_before_audio: 'User: Transcribe the audio to text in its own language.
+
+  '
+decoder_prompt_after_audio: '
+
+  Assistant: '
+decoder_target_suffix: '
+
+  '
+decoder_eos_token_id: 0
+ctc_loss_weight: 0.5
+decoder_loss_weight: 0.5
+
+device: cuda
+encoder_init_checkpoint_path: null
+wandb_enabled: true
+wandb_project: rwkvasr_longform_asr_gigaspeech_wenetspeech
+wandb_run_name: gigaspeech_wenetspeech_joint_sensevoice_rwkv_random_bs8_zero1_nockpt_4x4090
+wandb_base_url: https://api.wandb.ai
+wandb_init_timeout_sec: 30.0
+
+batch_size: 8
+batch_token_budget: 8000
+length_bucket_frame_budget: 8000
+target_gpu_memory_gib: 23.0
+skip_oversized_samples: true
+num_workers: 8
+decoded_batch_prefetch: 2
+max_open_shards_per_worker: 8
+epochs: 1
+save_every: 1000
+log_every: 10
+gradient_checkpointing: false
+eval_mode: bi
+max_eval_samples: 4096
+eval_batch_size: 1
+step_eval_batch_size: 1
+step_eval_every: 1000
+step_eval_samples: 256
+top_k_step_checkpoints: 3
+
+# SenseVoiceEncoderSmall scale with SANM attention replaced by bidirectional RWKV-7 TimeMixer.
+# Random ablation: do not load Fun-ASR-Nano non-attention encoder weights.
+input_dim: 560
+n_embd: 512
+encoder_output_dim: 512
+dim_att: 512
+dim_ff: 2048
+num_layers: 70
+sensevoice_tp_blocks: 20
+head_size: 64
+backend: cuda_clampw
+dropout: 0.1
+frontend_type: sensevoice_rwkv
+cmvn_file: null
+cmvn_is_json: true
+
+lr: 0.0002
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.99
+eps: 1.0e-08
+direction_variant: drop_both
+p_start: 0.2
+p_max: 0.2
+warmup_steps: 0
+ramp_steps: 0
+bucket_source_interleave: true
+
+deepspeed:
+  train_micro_batch_size_per_gpu: 8
+  gradient_accumulation_steps: 4
+  gradient_clipping: 1.0
+  zero_optimization:
+    stage: 1

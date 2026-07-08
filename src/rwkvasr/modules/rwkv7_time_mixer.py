@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .rwkv7_cuda import fused_wkv7
+from .rwkv7_cuda import fused_wkv7, fused_wkv7_clampw
 
 
 @dataclass
@@ -86,6 +86,10 @@ def _native_wkv7(
         y_out.append(yt.to(dtype=v.dtype))
 
     return torch.stack(y_out, dim=1), work_state
+
+
+def _soft_clamp_w(raw_w: Tensor) -> Tensor:
+    return -F.softplus(-raw_w) - 0.5
 
 
 class RWKV7TimeMixer(nn.Module):
@@ -202,7 +206,7 @@ class RWKV7TimeMixer(nn.Module):
         b = b.view(b.size(0), b.size(1), self.n_head, self.head_size)
 
         backend = self.config.backend.lower()
-        if backend == "native" or (backend in {"cuda", "fused"} and state is not None):
+        if backend == "native" or (backend in {"cuda", "fused", "cuda_clampw", "clampw_v3"} and state is not None):
             y, new_att_state = _native_wkv7(r, w, k, v, a, b, state=att_state)
         elif backend in {"cuda", "fused"}:
             y = fused_wkv7(
@@ -218,6 +222,25 @@ class RWKV7TimeMixer(nn.Module):
             # The upstream fused training kernel does not accept or return an arbitrary
             # recurrent state. Training paths ignore this state; stateful streaming
             # calls are routed to the native backend above.
+            new_att_state = torch.empty(
+                r.size(0),
+                self.n_head,
+                self.head_size,
+                self.head_size,
+                dtype=torch.float32,
+                device=r.device,
+            )
+        elif backend in {"cuda_clampw", "clampw_v3"}:
+            y = fused_wkv7_clampw(
+                r.view(r.size(0), r.size(1), -1),
+                w.view(w.size(0), w.size(1), -1),
+                k.view(k.size(0), k.size(1), -1),
+                v.view(v.size(0), v.size(1), -1),
+                a.view(a.size(0), a.size(1), -1),
+                b.view(b.size(0), b.size(1), -1),
+                head_size=self.head_size,
+                chunk_len=self.config.chunk_len,
+            ).view(r.size(0), r.size(1), self.n_head, self.head_size)
             new_att_state = torch.empty(
                 r.size(0),
                 self.n_head,
@@ -249,7 +272,9 @@ class RWKV7TimeMixer(nn.Module):
         xg = x + xx * self.x_g
 
         r = self.receptance(xr)
-        w = -F.softplus(-(self.w0 + torch.tanh(xw @ self.w1) @ self.w2)) - 0.5
+        raw_w = self.w0 + torch.tanh(xw @ self.w1) @ self.w2
+        backend = self.config.backend.lower()
+        w = raw_w if backend in {"cuda_clampw", "clampw_v3"} and state is None else _soft_clamp_w(raw_w)
         k = self.key(xk)
         v = self.value(xv)
 

@@ -16,6 +16,7 @@ from rwkvasr.data import (
     MAX_IN_MEMORY_LENGTH_INDEX_BYTES,
     StableHashSplitConfig,
     WebDatasetConfig,
+    build_audio_feature_extractor,
     build_bucketed_webdataset_loader,
     build_length_bucketed_webdataset_dataloader,
     build_text_tokenizer,
@@ -33,6 +34,7 @@ from rwkvasr.data import (
     resolve_webdataset_bucket_manifest_path,
     resolve_webdataset_length_index_path,
     resolve_webdataset_index_path,
+    ctc_suppressed_token_ids_for_tokenizer,
     tokenizer_eos_token_id,
     validate_webdataset_index,
 )
@@ -44,7 +46,13 @@ from rwkvasr.modules import (
     infer_rwkv7_decoder_config_from_checkpoint,
 )
 
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import (
+    extract_epoch_batch_offset,
+    load_checkpoint,
+    load_latest_checkpoint_state,
+    save_checkpoint,
+    write_latest_checkpoint_state,
+)
 from .batch_budget import (
     ctc_batch_token_stats,
     effective_batch_token_budget,
@@ -56,11 +64,97 @@ from .ctc_task import RWKVDualModeCTCTrainer
 from .epoch_metrics import save_epoch_metrics, save_step_checkpoint_metrics
 from .optimizer import RWKVOptimizerConfig, build_rwkv_optimizer
 from .progress import start_training_progress, update_training_progress
+from .spec_augment import apply_spec_augment
 from .wandb_logger import finish_wandb, init_wandb_run, log_wandb
 
 
 def _log(message: str) -> None:
     print(f"[rwkvasr] {message}", flush=True)
+
+
+def _resolve_resume_from_path(config: TrainConfig) -> str | None:
+    if config.resume_from is None:
+        return None
+    if config.resume_from != "latest":
+        return str(config.resume_from)
+
+    latest_state = load_latest_checkpoint_state(config.output_dir)
+    resume_path = latest_state.get("checkpoint_path")
+    if not isinstance(resume_path, str) or not resume_path:
+        raise FileNotFoundError("resume_from='latest' requires latest_checkpoint.yaml with checkpoint_path")
+    return resume_path
+
+
+def _skip_batches(
+    loader_iter: Any,
+    count: int,
+    *,
+    progress_interval: int = 0,
+    progress_callback: Any | None = None,
+) -> int:
+    skipped = 0
+    while skipped < count:
+        try:
+            next(loader_iter)
+        except StopIteration:
+            break
+        skipped += 1
+        if progress_callback is not None and progress_interval > 0 and skipped % progress_interval == 0:
+            progress_callback(skipped)
+    return skipped
+
+
+def _iter_loader_after_resume_offset(
+    loader: Any,
+    epoch_batch_offset: int,
+    *,
+    progress_callback: Any | None = None,
+) -> tuple[Any, int, str]:
+    if epoch_batch_offset <= 0:
+        return iter(loader), 0, "none"
+
+    fast_forward = getattr(loader, "iter_from_batch_offset", None)
+    if callable(fast_forward):
+        loader_iter, skipped = fast_forward(
+            epoch_batch_offset,
+            progress_interval=1000,
+            progress_callback=progress_callback,
+        )
+        return iter(loader_iter), int(skipped), "metadata"
+
+    loader_iter = iter(loader)
+    skipped = _skip_batches(
+        loader_iter,
+        epoch_batch_offset,
+        progress_interval=1000,
+        progress_callback=progress_callback,
+    )
+    return loader_iter, skipped, "decoded"
+
+
+def _checkpoint_latest_payload(
+    *,
+    checkpoint_type: str,
+    checkpoint_path: Path | None,
+    step: int,
+    epoch: int,
+    epoch_batch_offset: int,
+    deepspeed_checkpoint_dir: str | None = None,
+    resume_tag: str | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "checkpoint_type": str(checkpoint_type),
+        "step": int(step),
+        "epoch": int(epoch),
+        "epoch_batch_offset": int(epoch_batch_offset),
+    }
+    if checkpoint_path is not None:
+        payload["checkpoint_path"] = str(checkpoint_path)
+    if deepspeed_checkpoint_dir is not None:
+        payload["deepspeed_checkpoint_dir"] = str(deepspeed_checkpoint_dir)
+    if resume_tag is not None:
+        payload["resume_tag"] = str(resume_tag)
+    return payload
 
 
 @dataclass(frozen=True)
@@ -83,6 +177,7 @@ class TrainConfig:
     webdataset_hash_seed: int = 0
     webdataset_split_by: str = "shard_name"
     webdataset_utt_id_key: str = "sid"
+    feature_extractor_type: str = "wenet_fbank"
     input_dim: int = 80
     n_embd: int = 512
     dim_att: int = 512
@@ -93,6 +188,14 @@ class TrainConfig:
     conv_kernel_size: int = 31
     dropout: float = 0.1
     frontend_type: str = "conv2d6"
+    encoder_output_dim: int | None = None
+    aut_downsample_hidden_size: int = 480
+    aut_activation_function: str = "gelu"
+    aut_activation_dropout: float = 0.0
+    aut_max_source_positions: int = 1500
+    aut_scale_embedding: bool = False
+    aut_conv_chunksize: int = 500
+    sensevoice_tp_blocks: int = 20
     cmvn_file: str | None = None
     cmvn_is_json: bool = True
     blank_id: int = 0
@@ -120,17 +223,48 @@ class TrainConfig:
     decoder_loss_chunk_size: int = 1024
     decoder_text_token_budget: int | None = None
     decoder_prompt_before_audio: str = ""
+    decoder_ctc_draft_cache_path: str | None = None
+    decoder_ctc_draft_prompt_template: str = ""
+    decoder_ctc_draft_text_key: str = "pred_text"
+    decoder_ctc_draft_missing_policy: str = "empty"
+    decoder_ctc_draft_dropout_prob: float = 0.0
+    decoder_ctc_draft_language_mismatch_dropout_prob: float = 0.0
+    decoder_ctc_draft_dropout_seed: int = 0
+    ctc_label_override_cache_path: str | None = None
+    ctc_label_override_text_key: str = "pred_text"
     decoder_prompt_after_audio: str = ""
     decoder_target_suffix: str = ""
     decoder_eos_token_id: int = 0
     ctc_loss_weight: float = 1.0
     decoder_loss_weight: float = 0.0
-    direction_variant: str = "drop_both"
-    p_start: float = 0.2
-    p_max: float = 0.2
+    ctc_decoder_type: str = "none"
+    ctc_decoder_downsample_rate: int = 1
+    ctc_decoder_dim: int | None = None
+    ctc_decoder_ffn_dim: int = 2048
+    ctc_decoder_num_layers: int = 5
+    ctc_decoder_attention_heads: int = 8
+    ctc_decoder_dropout: float = 0.0
+    ctc_decoder_attention_dropout: float = 0.0
+    ctc_bridge_type: str = "none"
+    ctc_bridge_hidden_dim: int | None = None
+    ctc_bridge_dropout: float = 0.0
+    ctc_suppress_non_pronunciation_tokens: bool = False
+    ctc_suppressed_token_ids: tuple[int, ...] | list[int] = ()
+    funasr_nano_ctc_init_checkpoint_path: str | None = None
+    funasr_nano_ctc_init_load_decoder: bool = True
+    funasr_nano_ctc_init_load_head: bool = True
+    funasr_nano_ctc_teacher_blank_id: int = 60514
+    funasr_nano_ctc_init_blank_bias_delta: float = 0.0
+    freeze_encoder: bool = False
+    freeze_ctc_decoder: bool = False
+    freeze_ctc_head: bool = False
+    direction_variant: str = "none"
+    p_start: float = 0.0
+    p_max: float = 0.0
     warmup_steps: int = 0
     ramp_steps: int = 0
     device: str = "cpu"
+    encoder_init_checkpoint_path: str | None = None
     resume_from: str | None = None
     wandb_enabled: bool = False
     wandb_project: str | None = None
@@ -149,6 +283,11 @@ class TrainConfig:
     length_bucket_frame_budget: int | None = None
     target_gpu_memory_gib: float = 22.0
     skip_oversized_samples: bool = True
+    specaugment_enabled: bool = False
+    specaugment_time_masks: int = 2
+    specaugment_time_width: int = 40
+    specaugment_freq_masks: int = 2
+    specaugment_freq_width: int = 15
 
 
 def _resolve_data_source(config: TrainConfig) -> tuple[str, str]:
@@ -159,6 +298,28 @@ def _resolve_data_source(config: TrainConfig) -> tuple[str, str]:
     if has_manifest:
         return "manifest", str(config.manifest_path)
     return "webdataset", str(config.webdataset_root)
+
+
+class _SyntheticTokenizer:
+    def __init__(self, vocab_size: int):
+        if vocab_size <= 1:
+            raise ValueError("Synthetic tokenizer vocab_size must be greater than 1.")
+        self._vocab_size = int(vocab_size)
+
+    def encode(self, text: str) -> list[int]:
+        usable = self._vocab_size - 1
+        return [1 + (ord(char) % usable) for char in text]
+
+    def decode(self, token_ids: list[int]) -> str:
+        return " ".join(str(int(token_id)) for token_id in token_ids)
+
+    @property
+    def vocab_size(self) -> int:
+        return self._vocab_size
+
+    @property
+    def eos_token_id(self) -> int | None:
+        return None
 
 
 def _resolve_vocab_size(config: TrainConfig) -> int:
@@ -180,18 +341,21 @@ def _resolve_vocab_size(config: TrainConfig) -> int:
                 f"{config.vocab_size} != {decoder_vocab_size}"
             )
     if config.vocab_size is not None:
-        if config.tokenizer_type == "sentencepiece" and config.tokenizer_model_path is not None:
-            tokenizer_vocab_size = int(tokenizer.vocab_size)
-            if int(config.vocab_size) != tokenizer_vocab_size:
-                raise ValueError(
-                    "Configured vocab_size does not match the resolved SentencePiece vocabulary size: "
-                    f"{config.vocab_size} != {tokenizer_vocab_size}"
-                )
+        tokenizer_vocab_size = int(tokenizer.vocab_size)
+        if int(config.vocab_size) != tokenizer_vocab_size:
+            raise ValueError(
+                "Configured vocab_size does not match the resolved tokenizer vocabulary size: "
+                f"{config.vocab_size} != {tokenizer_vocab_size}"
+            )
         return int(config.vocab_size)
     return int(tokenizer.vocab_size)
 
 
 def _resolve_text_tokenizer(config: TrainConfig):
+    if config.tokenizer_type == "synthetic":
+        if config.vocab_size is None:
+            raise ValueError("tokenizer_type='synthetic' requires vocab_size.")
+        return _SyntheticTokenizer(int(config.vocab_size))
     return build_text_tokenizer(
         config.tokenizer_type,
         model_path=config.tokenizer_model_path,
@@ -218,9 +382,10 @@ def _resolved_tokenizer_config_payload(config: TrainConfig, *, vocab_size: int) 
 
 def _resolve_decoder_template_token_ids(config: TrainConfig) -> dict[str, Any]:
     tokenizer = _resolve_text_tokenizer(config)
+    prompt_before_audio = "" if config.decoder_ctc_draft_prompt_template else config.decoder_prompt_before_audio
     return {
         "decoder_prompt_before_audio_token_ids": tuple(
-            int(token_id) for token_id in tokenizer.encode(config.decoder_prompt_before_audio or "")
+            int(token_id) for token_id in tokenizer.encode(prompt_before_audio or "")
         ),
         "decoder_prompt_after_audio_token_ids": tuple(
             int(token_id) for token_id in tokenizer.encode(config.decoder_prompt_after_audio or "")
@@ -232,10 +397,32 @@ def _resolve_decoder_template_token_ids(config: TrainConfig) -> dict[str, Any]:
     }
 
 
+def _resolve_ctc_suppressed_token_ids(
+    config: Any,
+    *,
+    vocab_size: int,
+    tokenizer: Any | None = None,
+) -> tuple[int, ...]:
+    suppressed = {int(token_id) for token_id in getattr(config, "ctc_suppressed_token_ids", ())}
+    if bool(getattr(config, "ctc_suppress_non_pronunciation_tokens", False)):
+        if tokenizer is None:
+            tokenizer = _resolve_text_tokenizer(config)
+        suppressed.update(
+            ctc_suppressed_token_ids_for_tokenizer(
+                tokenizer,
+                blank_id=int(getattr(config, "blank_id", 0)),
+            )
+        )
+    blank_id = int(getattr(config, "blank_id", 0))
+    ctc_vocab_size = max(int(vocab_size), blank_id + 1)
+    return tuple(sorted(token_id for token_id in suppressed if 0 <= token_id < ctc_vocab_size and token_id != blank_id))
+
+
 def _build_webdataset_config(
     config: TrainConfig,
     *,
     shuffle_shards: bool,
+    skip_decode_errors: bool = False,
 ) -> WebDatasetConfig:
     length_bucket_frame_budget = config.length_bucket_frame_budget
     if length_bucket_frame_budget is None:
@@ -254,6 +441,18 @@ def _build_webdataset_config(
         bucket_source_interleave=config.bucket_source_interleave,
         append_eos=config.tokenizer_append_eos,
         text_normalization=config.text_normalization,
+        decoder_ctc_draft_cache_path=config.decoder_ctc_draft_cache_path,
+        decoder_ctc_draft_prompt_template=config.decoder_ctc_draft_prompt_template,
+        decoder_ctc_draft_text_key=config.decoder_ctc_draft_text_key,
+        decoder_ctc_draft_missing_policy=config.decoder_ctc_draft_missing_policy,
+        decoder_ctc_draft_dropout_prob=config.decoder_ctc_draft_dropout_prob,
+        decoder_ctc_draft_language_mismatch_dropout_prob=(
+            config.decoder_ctc_draft_language_mismatch_dropout_prob
+        ),
+        decoder_ctc_draft_dropout_seed=config.decoder_ctc_draft_dropout_seed,
+        ctc_label_override_cache_path=config.ctc_label_override_cache_path,
+        ctc_label_override_text_key=config.ctc_label_override_text_key,
+        skip_decode_errors=skip_decode_errors,
     )
 
 
@@ -265,7 +464,14 @@ def _resolve_candidate_length_index_path(data_path: str, configured_path: str | 
     return length_index_path
 
 
-def _resolve_bucket_manifest_path(data_path: str, configured_path: str | None) -> str | None:
+def _resolve_bucket_manifest_path(
+    data_path: str,
+    configured_path: str | None,
+    *,
+    configured_length_index_path: str | None = None,
+) -> str | None:
+    if configured_path is None and configured_length_index_path is not None:
+        return None
     manifest_path = resolve_webdataset_bucket_manifest_path(data_path, configured_path)
     if manifest_path.exists():
         return str(manifest_path)
@@ -318,7 +524,11 @@ def _resolve_max_steps(config: TrainConfig) -> tuple[int, int | None]:
             ),
         )
         num_samples = index_split_sample_count(index_data, config.webdataset_split)
-        bucket_manifest_path = _resolve_bucket_manifest_path(data_path, config.webdataset_bucket_manifest_path)
+        bucket_manifest_path = _resolve_bucket_manifest_path(
+            data_path,
+            config.webdataset_bucket_manifest_path,
+            configured_length_index_path=config.webdataset_length_index_path,
+        )
         if bucket_manifest_path is not None:
             manifest = load_webdataset_bucket_manifest(bucket_manifest_path)
             steps_per_epoch = estimate_bucket_manifest_steps(
@@ -378,14 +588,116 @@ def _resolve_cmvn_file(config: TrainConfig, output_dir: Path) -> str | None:
     return str(cmvn_path)
 
 
+def _maybe_load_encoder_init_checkpoint(model: RWKVCTCModel, checkpoint_path: str | None) -> None:
+    if checkpoint_path is None:
+        return
+    aut_encoder = getattr(model.encoder, "aut_encoder", None)
+    load_fn = getattr(aut_encoder, "load_qwen3_asr_non_attention_checkpoint", None)
+    if callable(load_fn):
+        report = load_fn(checkpoint_path)
+        _log(
+            "Loaded AuRWKV non-attention encoder init: "
+            f"path={checkpoint_path} loaded={len(report['loaded'])} skipped={len(report['skipped'])}"
+        )
+        return
+    qwen3_transformer_encoder = getattr(model.encoder, "qwen3_transformer_encoder", None)
+    load_fn = getattr(qwen3_transformer_encoder, "load_qwen3_asr_checkpoint", None)
+    if callable(load_fn):
+        report = load_fn(checkpoint_path)
+        _log(
+            "Loaded Qwen3 Transformer audio encoder init: "
+            f"path={checkpoint_path} loaded={len(report['loaded'])} skipped={len(report['skipped'])}"
+        )
+        return
+    sensevoice_encoder = getattr(model.encoder, "sensevoice_encoder", None)
+    load_fn = getattr(sensevoice_encoder, "load_sensevoice_non_attention_checkpoint", None)
+    if callable(load_fn):
+        report = load_fn(checkpoint_path)
+        _log(
+            "Loaded SenseVoiceRWKV non-attention encoder init: "
+            f"path={checkpoint_path} loaded={len(report['loaded'])} skipped={len(report['skipped'])}"
+        )
+        return
+    sensevoice_conformer_encoder = getattr(model.encoder, "sensevoice_conformer_encoder", None)
+    load_fn = getattr(sensevoice_conformer_encoder, "load_sensevoice_non_attention_checkpoint", None)
+    if callable(load_fn):
+        report = load_fn(checkpoint_path)
+        _log(
+            "Loaded SenseVoice Conformer-conv non-attention encoder init: "
+            f"path={checkpoint_path} loaded={len(report['loaded'])} skipped={len(report['skipped'])}"
+        )
+        return
+    raise ValueError(
+        "encoder_init_checkpoint_path is only supported by "
+        "frontend_type='aut_rwkv', 'qwen3_transformer', 'sensevoice_rwkv', "
+        "or 'sensevoice_conformer_conv'."
+    )
+
+
+def _maybe_load_funasr_nano_ctc_init(model: RWKVCTCModel, config: TrainConfig) -> None:
+    if config.funasr_nano_ctc_init_checkpoint_path is None:
+        return
+    report = model.load_funasr_nano_ctc_checkpoint(
+        config.funasr_nano_ctc_init_checkpoint_path,
+        load_ctc_decoder=bool(config.funasr_nano_ctc_init_load_decoder),
+        load_ctc_head=bool(config.funasr_nano_ctc_init_load_head),
+        teacher_blank_id=int(config.funasr_nano_ctc_teacher_blank_id),
+        blank_bias_delta=float(config.funasr_nano_ctc_init_blank_bias_delta),
+    )
+    _log(
+        "Loaded FunASR-Nano CTC init: "
+        f"path={config.funasr_nano_ctc_init_checkpoint_path} "
+        f"bridge_tensors={report.get('ctc_bridge_loaded', 0)} "
+        f"bridge_skipped={report.get('ctc_bridge_skipped', 0)} "
+        f"decoder_tensors={report['ctc_decoder_loaded']} "
+        f"head_rows={report['ctc_head_loaded_rows']} "
+        f"ignored_rows={report['ctc_head_ignored_rows']} "
+        f"blank_bias_delta={report['ctc_head_blank_bias_delta']}"
+    )
+
+
+def _apply_training_freeze(model: RWKVCTCModel, config: TrainConfig) -> None:
+    frozen_names: list[str] = []
+    if config.freeze_encoder:
+        for name, parameter in model.encoder.named_parameters(prefix="encoder"):
+            parameter.requires_grad_(False)
+            frozen_names.append(name)
+    if config.freeze_ctc_decoder and model.ctc_decoder is not None:
+        for name, parameter in model.ctc_decoder.named_parameters(prefix="ctc_decoder"):
+            parameter.requires_grad_(False)
+            frozen_names.append(name)
+    if config.freeze_ctc_head:
+        for name, parameter in model.ctc_head.named_parameters(prefix="ctc_head"):
+            parameter.requires_grad_(False)
+            frozen_names.append(name)
+    trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    if trainable_params <= 0:
+        raise ValueError("Training freeze settings left no trainable parameters.")
+    if frozen_names:
+        _log(
+            "Applied parameter freeze: "
+            f"freeze_encoder={bool(config.freeze_encoder)} "
+            f"freeze_ctc_decoder={bool(config.freeze_ctc_decoder)} "
+            f"freeze_ctc_head={bool(config.freeze_ctc_head)} "
+            f"frozen_tensors={len(frozen_names)} "
+            f"trainable_params={trainable_params}"
+        )
+
+
 def _build_train_loader(config: TrainConfig) -> DataLoader:
     data_source, data_path = _resolve_data_source(config)
     tokenizer = _resolve_text_tokenizer(config)
+    feature_extractor = build_audio_feature_extractor(
+        config.feature_extractor_type,
+        input_dim=int(config.input_dim),
+    )
     if data_source == "manifest":
         dataset = ASRManifestDataset(
             data_path,
             tokenizer=tokenizer,
+            feature_extractor=feature_extractor,
             append_eos=config.tokenizer_append_eos,
+            text_normalization=config.text_normalization,
         )
         return DataLoader(
             dataset,
@@ -394,13 +706,22 @@ def _build_train_loader(config: TrainConfig) -> DataLoader:
             num_workers=config.num_workers,
             collate_fn=FeatureCollator(),
         )
-    webdataset_config = _build_webdataset_config(config, shuffle_shards=True)
-    bucket_manifest_path = _resolve_bucket_manifest_path(data_path, config.webdataset_bucket_manifest_path)
+    webdataset_config = _build_webdataset_config(
+        config,
+        shuffle_shards=True,
+        skip_decode_errors=True,
+    )
+    bucket_manifest_path = _resolve_bucket_manifest_path(
+        data_path,
+        config.webdataset_bucket_manifest_path,
+        configured_length_index_path=config.webdataset_length_index_path,
+    )
     if bucket_manifest_path is not None:
         return build_bucketed_webdataset_loader(
             data_path,
             bucket_manifest_path=bucket_manifest_path,
             tokenizer=tokenizer,
+            feature_extractor=feature_extractor,
             config=webdataset_config,
             batch_size=config.batch_size,
             num_workers=config.num_workers,
@@ -416,6 +737,7 @@ def _build_train_loader(config: TrainConfig) -> DataLoader:
             data_path,
             length_index_path=length_index_path,
             tokenizer=tokenizer,
+            feature_extractor=feature_extractor,
             config=webdataset_config,
             batch_size=config.batch_size,
             num_workers=config.num_workers,
@@ -424,6 +746,7 @@ def _build_train_loader(config: TrainConfig) -> DataLoader:
     return build_webdataset_dataloader(
         data_path,
         tokenizer=tokenizer,
+        feature_extractor=feature_extractor,
         config=webdataset_config,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
@@ -437,7 +760,12 @@ def _build_eval_loader(config: TrainConfig, *, shuffle_shards: bool = False, ste
         dataset = ASRManifestDataset(
             data_path,
             tokenizer=_resolve_text_tokenizer(config),
+            feature_extractor=build_audio_feature_extractor(
+                config.feature_extractor_type,
+                input_dim=int(config.input_dim),
+            ),
             append_eos=config.tokenizer_append_eos,
+            text_normalization=config.text_normalization,
         )
         return DataLoader(
             dataset,
@@ -448,14 +776,27 @@ def _build_eval_loader(config: TrainConfig, *, shuffle_shards: bool = False, ste
         )
 
     tokenizer = _resolve_text_tokenizer(config)
+    feature_extractor = build_audio_feature_extractor(
+        config.feature_extractor_type,
+        input_dim=int(config.input_dim),
+    )
     webdataset_config = _build_webdataset_config(config, shuffle_shards=shuffle_shards)
-    webdataset_config = replace(webdataset_config, split="eval")
-    bucket_manifest_path = _resolve_bucket_manifest_path(data_path, config.webdataset_bucket_manifest_path)
+    webdataset_config = replace(
+        webdataset_config,
+        split="eval",
+        ctc_label_override_cache_path=None,
+    )
+    bucket_manifest_path = _resolve_bucket_manifest_path(
+        data_path,
+        config.webdataset_bucket_manifest_path,
+        configured_length_index_path=config.webdataset_length_index_path,
+    )
     if bucket_manifest_path is not None:
         return build_bucketed_webdataset_loader(
             data_path,
             bucket_manifest_path=bucket_manifest_path,
             tokenizer=tokenizer,
+            feature_extractor=feature_extractor,
             config=webdataset_config,
             batch_size=eval_batch_size,
             num_workers=config.num_workers,
@@ -471,6 +812,7 @@ def _build_eval_loader(config: TrainConfig, *, shuffle_shards: bool = False, ste
             data_path,
             length_index_path=length_index_path,
             tokenizer=tokenizer,
+            feature_extractor=feature_extractor,
             config=webdataset_config,
             batch_size=eval_batch_size,
             num_workers=config.num_workers,
@@ -479,6 +821,7 @@ def _build_eval_loader(config: TrainConfig, *, shuffle_shards: bool = False, ste
     return build_webdataset_dataloader(
         data_path,
         tokenizer=tokenizer,
+        feature_extractor=feature_extractor,
         config=webdataset_config,
         batch_size=eval_batch_size,
         num_workers=config.num_workers,
@@ -605,6 +948,7 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
         active_bucket_manifest_path = _resolve_bucket_manifest_path(
             config.webdataset_root,
             config.webdataset_bucket_manifest_path,
+            configured_length_index_path=config.webdataset_length_index_path,
         )
         active_length_index_path = _resolve_in_memory_length_index_path(
             config.webdataset_root,
@@ -631,6 +975,7 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
             f"frame_budget={frame_budget}"
         )
     model_config = RWKVCTCModelConfig(
+        feature_extractor_type=config.feature_extractor_type,
         input_dim=config.input_dim,
         n_embd=config.n_embd,
         dim_att=config.dim_att,
@@ -643,6 +988,14 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
         dropout=config.dropout,
         blank_id=config.blank_id,
         frontend_type=config.frontend_type,
+        encoder_output_dim=config.encoder_output_dim,
+        aut_downsample_hidden_size=config.aut_downsample_hidden_size,
+        aut_activation_function=config.aut_activation_function,
+        aut_activation_dropout=config.aut_activation_dropout,
+        aut_max_source_positions=config.aut_max_source_positions,
+        aut_scale_embedding=config.aut_scale_embedding,
+        aut_conv_chunksize=config.aut_conv_chunksize,
+        sensevoice_tp_blocks=config.sensevoice_tp_blocks,
         cmvn_file=resolved_cmvn_file,
         cmvn_is_json=config.cmvn_is_json,
         decoder_enabled=config.decoder_enabled,
@@ -657,6 +1010,21 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
         **_resolve_decoder_template_token_ids(config),
         ctc_loss_weight=config.ctc_loss_weight,
         decoder_loss_weight=config.decoder_loss_weight,
+        ctc_decoder_type=config.ctc_decoder_type,
+        ctc_decoder_downsample_rate=config.ctc_decoder_downsample_rate,
+        ctc_decoder_dim=config.ctc_decoder_dim,
+        ctc_decoder_ffn_dim=config.ctc_decoder_ffn_dim,
+        ctc_decoder_num_layers=config.ctc_decoder_num_layers,
+        ctc_decoder_attention_heads=config.ctc_decoder_attention_heads,
+        ctc_decoder_dropout=config.ctc_decoder_dropout,
+        ctc_decoder_attention_dropout=config.ctc_decoder_attention_dropout,
+        ctc_bridge_type=config.ctc_bridge_type,
+        ctc_bridge_hidden_dim=config.ctc_bridge_hidden_dim,
+        ctc_bridge_dropout=config.ctc_bridge_dropout,
+        ctc_suppressed_token_ids=_resolve_ctc_suppressed_token_ids(
+            config,
+            vocab_size=max(int(resolved_vocab_size), int(config.blank_id) + 1),
+        ),
     )
     decoder_text_tokens_per_sample_extra = int(model_config.decoder_text_tokens_per_sample_extra)
     save_yaml(output_dir / "model_config.yaml", model_config)
@@ -688,10 +1056,26 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
     )
 
     model = RWKVCTCModel(model_config)
+    _maybe_load_encoder_init_checkpoint(model, config.encoder_init_checkpoint_path)
+    _maybe_load_funasr_nano_ctc_init(model, config)
+    _apply_training_freeze(model, config)
     if feature_dtype is not None:
         model = model.to(device=device, dtype=feature_dtype)
     else:
         model = model.to(device)
+    if (
+        config.direction_variant != "none"
+        or config.p_start != 0.0
+        or config.p_max != 0.0
+        or config.warmup_steps != 0
+        or config.ramp_steps != 0
+    ):
+        raise ValueError(
+            "Direction dropout is disabled for the current stabilization runs. "
+            f"Got variant={config.direction_variant!r} p_start={config.p_start} p_max={config.p_max} "
+            f"warmup_steps={config.warmup_steps} ramp_steps={config.ramp_steps}. "
+            "Use direction_variant='none', p_start=0.0, p_max=0.0, warmup_steps=0, and ramp_steps=0."
+        )
     scheduler = DirectionDropoutScheduler(
         DirectionDropoutConfig(
             num_layers=config.num_layers,
@@ -702,6 +1086,7 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
             ramp_steps=config.ramp_steps,
         )
     )
+    _log("Direction dropout disabled; training uses full bidirectional encoder masks.")
     task = RWKVDualModeCTCTrainer(model, direction_scheduler=scheduler)
     optimizer = build_rwkv_optimizer(
         model,
@@ -715,17 +1100,25 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
     )
     start_step = 0
     start_epoch = 0
+    start_epoch_batch_offset = 0
     history: list[dict[str, float | int | str]] = []
     step_checkpoint_history: list[dict[str, Any]] = []
     best_step_checkpoints: list[dict[str, Any]] = []
     best_epoch = 0
     best_eval_loss = float("inf")
     best_train_loss = float("inf")
-    if config.resume_from is not None:
-        restored = load_checkpoint(config.resume_from, model=model, optimizer=optimizer, map_location=device.type)
+    resolved_resume_path = _resolve_resume_from_path(config)
+    if resolved_resume_path is not None:
+        restored = load_checkpoint(
+            resolved_resume_path,
+            model=model,
+            optimizer=optimizer,
+            map_location=device.type,
+        )
         start_step = int(restored["step"])
         extra = dict(restored.get("extra", {}))
         start_epoch = int(extra.get("epoch", 0))
+        start_epoch_batch_offset = extract_epoch_batch_offset(extra.get("epoch_batch_offset", 0))
         raw_history = extra.get("history", [])
         if isinstance(raw_history, list):
             history = [dict(item) for item in raw_history if isinstance(item, dict)]
@@ -742,6 +1135,8 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
         best_train_loss = float(extra.get("best_train_loss", float("inf")))
 
     step = start_step
+    epoch = start_epoch
+    epoch_batch_offset = start_epoch_batch_offset
     loss_value = float("nan")
     progress, task_id = start_training_progress(
         total_steps=resolved_max_steps,
@@ -749,21 +1144,52 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
         description="train",
     )
     _log("The first batch can be slower because wav->fbank decoding is done online.")
+    if start_epoch_batch_offset > 0:
+        _log(
+            f"Resuming from latest state: step={start_step} epoch={start_epoch} "
+            f"epoch_batch_offset={start_epoch_batch_offset}"
+        )
+
     train_start_time = time.perf_counter()
-    epoch = start_epoch
     try:
         while step < resolved_max_steps:
-            epoch += 1
+            if epoch_batch_offset == 0:
+                epoch += 1
             epoch_loss_sum = 0.0
             epoch_sample_count = 0
             _set_loader_epoch(loader, epoch)
-            loader_iter = iter(loader)
+            if epoch_batch_offset > 0:
+                _log(f"Fast-forwarding resume offset={epoch_batch_offset} for epoch={epoch}.")
+                loader_iter, skipped_batches, skip_mode = _iter_loader_after_resume_offset(
+                    loader,
+                    epoch_batch_offset,
+                    progress_callback=lambda skipped: _log(
+                        f"Fast-forwarded resume batches {skipped}/{epoch_batch_offset} for epoch={epoch}."
+                    ),
+                )
+                _log(
+                    f"Resume fast-forward complete: skipped={skipped_batches}/{epoch_batch_offset} "
+                    f"mode={skip_mode} epoch={epoch}"
+                )
+                if skipped_batches < epoch_batch_offset:
+                    _log(
+                        f"Resume offset {epoch_batch_offset} exceeded available batches for epoch={epoch}; "
+                        f"continuing with epoch={epoch + 1}"
+                    )
+                    epoch += 1
+                    epoch_batch_offset = 0
+                    continue
+            else:
+                loader_iter = iter(loader)
+            processed_any_batch = False
             while step < resolved_max_steps:
                 fetch_start_time = time.perf_counter()
                 try:
                     candidate_batch = next(loader_iter)
                 except StopIteration:
                     break
+                processed_any_batch = True
+                epoch_batch_offset += 1
                 data_time = time.perf_counter() - fetch_start_time
                 use_padded_text_budget = bool(config.decoder_enabled and config.decoder_loss_weight > 0)
                 text_tokens_per_sample_extra = (
@@ -811,6 +1237,18 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                 if device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(device)
                 batch = batch.to(device, feature_dtype=feature_dtype)
+                if config.specaugment_enabled:
+                    batch = replace(
+                        batch,
+                        features=apply_spec_augment(
+                            batch.features,
+                            batch.feature_lengths,
+                            time_masks=config.specaugment_time_masks,
+                            time_width=config.specaugment_time_width,
+                            freq_masks=config.specaugment_freq_masks,
+                            freq_width=config.specaugment_freq_width,
+                        ),
+                    )
                 try:
                     loss, _ = task.training_loss(batch, step=step, direction_mask=mask)
                 except torch.OutOfMemoryError:
@@ -912,6 +1350,7 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                     checkpoint_extra = {
                         "loss": loss_value,
                         "epoch": epoch,
+                        "epoch_batch_offset": epoch_batch_offset,
                         "history": history,
                         "step_checkpoint_history": step_checkpoint_history,
                         "best_step_checkpoints": best_step_checkpoints,
@@ -928,6 +1367,16 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                         optimizer=optimizer,
                         step=step,
                         extra=checkpoint_extra,
+                    )
+                    write_latest_checkpoint_state(
+                        output_dir,
+                        _checkpoint_latest_payload(
+                            checkpoint_type="pytorch",
+                            checkpoint_path=step_checkpoint_path,
+                            step=step,
+                            epoch=epoch,
+                            epoch_batch_offset=epoch_batch_offset,
+                        ),
                     )
                     if step_eval_every is not None and step % step_eval_every == 0:
                         step_eval_loss, step_eval_count = _evaluate_loss(
@@ -955,20 +1404,33 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                         best_step_checkpoints = _sort_step_checkpoint_records(saved_step_records)[
                             : max(1, int(config.top_k_step_checkpoints))
                         ]
+                        checkpoint_extra["step_checkpoint_history"] = step_checkpoint_history
+                        checkpoint_extra["best_step_checkpoints"] = best_step_checkpoints
+                        save_checkpoint(
+                            step_checkpoint_path,
+                            model=model,
+                            optimizer=optimizer,
+                            step=step,
+                            extra=checkpoint_extra,
+                        )
+                        write_latest_checkpoint_state(
+                            output_dir,
+                            _checkpoint_latest_payload(
+                                checkpoint_type="pytorch",
+                                checkpoint_path=step_checkpoint_path,
+                                step=step,
+                                epoch=epoch,
+                                epoch_batch_offset=epoch_batch_offset,
+                            ),
+                        )
                         _prune_local_step_checkpoint_artifacts(
                             top_records=best_step_checkpoints,
-                            saved_records=saved_step_records,
+                            saved_records=[
+                                record
+                                for record in saved_step_records
+                                if int(record.get("step", 0)) != step
+                            ],
                         )
-                        if step_checkpoint_path.exists():
-                            checkpoint_extra["step_checkpoint_history"] = step_checkpoint_history
-                            checkpoint_extra["best_step_checkpoints"] = best_step_checkpoints
-                            save_checkpoint(
-                                step_checkpoint_path,
-                                model=model,
-                                optimizer=optimizer,
-                                step=step,
-                                extra=checkpoint_extra,
-                            )
                         save_step_checkpoint_metrics(
                             output_dir,
                             history=step_checkpoint_history,
@@ -988,6 +1450,14 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                             },
                             step=step,
                         )
+            if not processed_any_batch and epoch_batch_offset > 0:
+                _log(
+                    f"No candidate batch available after resuming offset={epoch_batch_offset} for epoch={epoch}; "
+                    f"continuing with epoch={epoch + 1}"
+                )
+                epoch += 1
+                epoch_batch_offset = 0
+                continue
             epoch_train_loss = float("nan") if epoch_sample_count == 0 else epoch_loss_sum / epoch_sample_count
             eval_limit = _resolve_epoch_eval_limit(config, epoch=epoch)
             eval_label = "full" if eval_limit is None else f"first {eval_limit}"
@@ -1020,13 +1490,15 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                     best_eval_loss = metric_value
                 best_train_loss = epoch_train_loss
                 best_epoch = epoch
+                best_checkpoint_path = output_dir / "best.pt"
                 save_checkpoint(
-                    output_dir / "best.pt",
+                    best_checkpoint_path,
                     model=model,
                     optimizer=optimizer,
                     step=step,
                     extra={
                         "loss": loss_value,
+                        "epoch_batch_offset": epoch_batch_offset,
                         "epoch": epoch,
                         "history": history,
                         "step_checkpoint_history": step_checkpoint_history,
@@ -1037,6 +1509,16 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                         "cmvn_file": resolved_cmvn_file,
                     },
                 )
+                write_latest_checkpoint_state(
+                    output_dir,
+                    _checkpoint_latest_payload(
+                        checkpoint_type="pytorch",
+                        checkpoint_path=best_checkpoint_path,
+                        step=step,
+                        epoch=epoch,
+                        epoch_batch_offset=epoch_batch_offset,
+                    ),
+                )
                 save_yaml(
                     output_dir / "best_checkpoint.yaml",
                     {
@@ -1044,7 +1526,7 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                         "step": step,
                         "eval_loss": best_eval_loss,
                         "train_loss": best_train_loss,
-                        "checkpoint_path": str(output_dir / "best.pt"),
+                        "checkpoint_path": str(best_checkpoint_path),
                         "selection_metric_name": metric_name,
                     },
                 )
@@ -1065,13 +1547,16 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                 best=best_step_checkpoints,
                 keep_top_k=int(config.top_k_step_checkpoints),
             )
+            epoch_batch_offset = 0
+            epoch_checkpoint_path = output_dir / f"epoch-{epoch}.pt"
             save_checkpoint(
-                output_dir / f"epoch-{epoch}.pt",
+                epoch_checkpoint_path,
                 model=model,
                 optimizer=optimizer,
                 step=step,
                 extra={
                     "loss": loss_value,
+                    "epoch_batch_offset": epoch_batch_offset,
                     "epoch": epoch,
                     "history": history,
                     "step_checkpoint_history": step_checkpoint_history,
@@ -1081,6 +1566,16 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
                     "best_train_loss": best_train_loss,
                     "cmvn_file": resolved_cmvn_file,
                 },
+            )
+            write_latest_checkpoint_state(
+                output_dir,
+                _checkpoint_latest_payload(
+                    checkpoint_type="pytorch",
+                    checkpoint_path=epoch_checkpoint_path,
+                    step=step,
+                    epoch=epoch,
+                    epoch_batch_offset=epoch_batch_offset,
+                ),
             )
             _log(
                 f"Epoch {epoch} complete: train_loss={epoch_train_loss:.4f} "

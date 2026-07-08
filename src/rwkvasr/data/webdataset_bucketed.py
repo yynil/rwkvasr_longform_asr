@@ -10,10 +10,15 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Iterator, TextIO
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, TextIO
 
 from .manifest import ASRBatch, FeatureCollator, TokenizerLike, WenetFbankFeatureExtractor
-from .webdataset import WebDatasetConfig, decode_webdataset_sample
+from .webdataset import (
+    WebDatasetConfig,
+    decode_webdataset_sample,
+    log_webdataset_decode_skip,
+    preload_decoder_ctc_draft_cache,
+)
 from .webdataset_lengths import WebDatasetLengthEntry, parse_webdataset_length_entry
 
 
@@ -328,6 +333,7 @@ class BucketedWebDatasetBatchLoader:
         *,
         bucket_manifest_path: str | Path,
         tokenizer: TokenizerLike | None = None,
+        decoder_tokenizer: TokenizerLike | None = None,
         feature_extractor: WenetFbankFeatureExtractor | None = None,
         config: WebDatasetConfig | None = None,
         batch_size: int = 4,
@@ -338,8 +344,10 @@ class BucketedWebDatasetBatchLoader:
         self.shard_root = Path(shard_root)
         self.manifest = load_webdataset_bucket_manifest(bucket_manifest_path)
         self.tokenizer = tokenizer
+        self.decoder_tokenizer = decoder_tokenizer
         self.feature_extractor = feature_extractor or WenetFbankFeatureExtractor()
         self.config = config or WebDatasetConfig()
+        preload_decoder_ctc_draft_cache(self.config)
         self.batch_size = int(batch_size)
         self.num_workers = max(1, int(num_workers))
         self.decoded_batch_prefetch = max(0, int(self.config.decoded_batch_prefetch))
@@ -453,12 +461,15 @@ class BucketedWebDatasetBatchLoader:
         *,
         reader_pool: _ThreadLocalTarReaderPool,
         executor: ThreadPoolExecutor | None,
-    ) -> ASRBatch:
+    ) -> ASRBatch | None:
         if executor is None:
             samples = [self._decode_entry(entry, reader_pool) for entry in local_entries]
         else:
             samples = list(executor.map(lambda entry: self._decode_entry(entry, reader_pool), local_entries))
-        return self.collator(samples)
+        decoded_samples = [sample for sample in samples if sample is not None]
+        if not decoded_samples:
+            return None
+        return self.collator(decoded_samples)
 
     def _prefetch_decoded_batches(
         self,
@@ -491,6 +502,8 @@ class BucketedWebDatasetBatchLoader:
                         reader_pool=reader_pool,
                         executor=executor,
                     )
+                    if batch is None:
+                        continue
                     if not _put(batch):
                         break
             except BaseException as exc:  # pragma: no cover - hard to force reliably in tests
@@ -516,12 +529,11 @@ class BucketedWebDatasetBatchLoader:
             stop_event.set()
             producer.join()
 
-    def __iter__(self) -> Iterable[ASRBatch]:
+    def _iter_decoded_entry_batches(self, entry_batches: Iterator[list[WebDatasetLengthEntry]]) -> Iterable[ASRBatch]:
         reader_pool = _ThreadLocalTarReaderPool(
             self.shard_root,
             max_open_shards_per_worker=self.max_open_shards_per_worker,
         )
-        entry_batches = self._prefetch_local_entry_batches() if self.num_workers > 1 else self._iter_local_entry_batches()
         executor: ThreadPoolExecutor | None = None
         if self.num_workers > 1:
             executor = ThreadPoolExecutor(
@@ -537,44 +549,146 @@ class BucketedWebDatasetBatchLoader:
                 )
             else:
                 for local_entries in entry_batches:
-                    yield self._decode_batch(
+                    batch = self._decode_batch(
                         local_entries,
                         reader_pool=reader_pool,
                         executor=executor,
                     )
+                    if batch is not None:
+                        yield batch
         finally:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=False)
             reader_pool.close()
 
+    def iter_from_batch_offset(
+        self,
+        batch_offset: int,
+        *,
+        progress_interval: int = 0,
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> tuple[Iterable[ASRBatch], int]:
+        entry_batches = self._iter_local_entry_batches()
+        skipped = 0
+        while skipped < batch_offset:
+            try:
+                next(entry_batches)
+            except StopIteration:
+                return iter(()), skipped
+            skipped += 1
+            if progress_callback is not None and progress_interval > 0 and skipped % progress_interval == 0:
+                progress_callback(skipped)
+        return self._iter_decoded_entry_batches(entry_batches), skipped
+
+    def __iter__(self) -> Iterable[ASRBatch]:
+        entry_batches = self._prefetch_local_entry_batches() if self.num_workers > 1 else self._iter_local_entry_batches()
+        yield from self._iter_decoded_entry_batches(entry_batches)
+
+    def _ctc_teacher_audio_row(
+        self,
+        entry: WebDatasetLengthEntry,
+        sample: dict[str, Any],
+        *,
+        tar_path: Path,
+    ) -> dict[str, Any]:
+        row: dict[str, Any] = {}
+        metadata = sample.get("metadata")
+        if isinstance(metadata, dict):
+            row.update(metadata)
+        if isinstance(entry.raw, dict):
+            row.update(entry.raw)
+
+        utt_id = str(sample.get("utt_id") or entry.utt_id)
+        row["utt_id"] = utt_id
+        row.setdefault("id", utt_id)
+        row.setdefault("key", entry.key)
+        row["shard_name"] = entry.shard_name
+        row["tar_path"] = str(tar_path)
+        row["audio_member"] = entry.audio_member
+        row.setdefault("wav_member", entry.audio_member)
+        row["audio_format"] = entry.audio_format
+        row["json_member"] = entry.json_member
+        if entry.audio_offset is not None:
+            row["audio_offset"] = int(entry.audio_offset)
+        if entry.audio_size is not None:
+            row["audio_size"] = int(entry.audio_size)
+        if entry.json_offset is not None:
+            row["json_offset"] = int(entry.json_offset)
+        if entry.json_size is not None:
+            row["json_size"] = int(entry.json_size)
+        row.setdefault("split", entry.split)
+        row.setdefault("num_frames", int(entry.num_frames))
+        return row
+
     def _decode_entry(
         self,
         entry: WebDatasetLengthEntry,
         reader_pool: _ThreadLocalTarReaderPool,
-    ) -> dict[str, Any]:
-        reader = reader_pool.get(entry.shard_name)
-        audio_bytes = reader.read_member(
-            entry.audio_member,
-            offset=entry.audio_offset,
-            size=entry.audio_size,
-        )
-        metadata_bytes = reader.read_member(
-            entry.json_member,
-            offset=entry.json_offset,
-            size=entry.json_size,
-        )
-        return decode_webdataset_sample(
-            key=entry.key,
-            audio_bytes=audio_bytes,
-            metadata_bytes=metadata_bytes,
-            tokenizer=self.tokenizer,
-            feature_extractor=self.feature_extractor,
-            text_key=self.config.text_key,
-            utt_id_key=self.config.utt_id_key,
-            token_ids_key=self.config.token_ids_key,
-            append_eos=self.config.append_eos,
-            text_normalization=self.config.text_normalization,
-        )
+    ) -> dict[str, Any] | None:
+        try:
+            reader = reader_pool.get(entry.shard_name)
+            audio_bytes = reader.read_member(
+                entry.audio_member,
+                offset=entry.audio_offset,
+                size=entry.audio_size,
+            )
+            metadata_bytes = reader.read_member(
+                entry.json_member,
+                offset=entry.json_offset,
+                size=entry.json_size,
+            )
+            sample = decode_webdataset_sample(
+                key=entry.key,
+                audio_bytes=audio_bytes,
+                metadata_bytes=metadata_bytes,
+                tokenizer=self.tokenizer,
+                decoder_tokenizer=self.decoder_tokenizer,
+                feature_extractor=self.feature_extractor,
+                text_key=self.config.text_key,
+                utt_id_key=self.config.utt_id_key,
+                token_ids_key=self.config.token_ids_key,
+                append_eos=self.config.append_eos,
+                decoder_append_eos=self.config.decoder_append_eos,
+                text_normalization=self.config.text_normalization,
+                decoder_text_normalization=self.config.decoder_text_normalization,
+                decoder_prompt_before_audio=self.config.decoder_prompt_before_audio,
+                decoder_prompt_before_audio_use_language=self.config.decoder_prompt_before_audio_use_language,
+                decoder_ctc_draft_cache_path=self.config.decoder_ctc_draft_cache_path,
+                decoder_ctc_draft_prompt_template=self.config.decoder_ctc_draft_prompt_template,
+                decoder_ctc_draft_text_key=self.config.decoder_ctc_draft_text_key,
+                decoder_ctc_draft_missing_policy=self.config.decoder_ctc_draft_missing_policy,
+                decoder_ctc_draft_dropout_prob=self.config.decoder_ctc_draft_dropout_prob,
+                decoder_ctc_draft_language_mismatch_dropout_prob=(
+                    self.config.decoder_ctc_draft_language_mismatch_dropout_prob
+                ),
+                decoder_ctc_draft_dropout_seed=self.config.decoder_ctc_draft_dropout_seed,
+                ctc_label_override_cache_path=self.config.ctc_label_override_cache_path,
+                ctc_label_override_text_key=self.config.ctc_label_override_text_key,
+                allow_missing_targets=self.config.allow_missing_targets,
+                decoder_target_prefix=self.config.decoder_target_prefix,
+                decoder_target_prefix_use_language=self.config.decoder_target_prefix_use_language,
+                decoder_language_confirmation_en=self.config.decoder_language_confirmation_en,
+                decoder_language_confirmation_zh=self.config.decoder_language_confirmation_zh,
+                decoder_prompt_language_label_noise_prob=self.config.decoder_prompt_language_label_noise_prob,
+                decoder_prompt_language_label_noise_seed=self.config.decoder_prompt_language_label_noise_seed,
+            )
+            sample["ctc_teacher_audio_row"] = self._ctc_teacher_audio_row(
+                entry,
+                sample,
+                tar_path=reader.shard_path,
+            )
+            return sample
+        except Exception as exc:
+            if not self.config.skip_decode_errors:
+                raise
+            log_webdataset_decode_skip(
+                key=entry.key,
+                shard_name=entry.shard_name,
+                audio_member=entry.audio_member,
+                json_member=entry.json_member,
+                exc=exc,
+            )
+            return None
 
 
 def build_bucketed_webdataset_loader(
@@ -582,6 +696,7 @@ def build_bucketed_webdataset_loader(
     *,
     bucket_manifest_path: str | Path,
     tokenizer: TokenizerLike | None = None,
+    decoder_tokenizer: TokenizerLike | None = None,
     feature_extractor: WenetFbankFeatureExtractor | None = None,
     config: WebDatasetConfig | None = None,
     batch_size: int = 4,
@@ -593,6 +708,7 @@ def build_bucketed_webdataset_loader(
         shard_root,
         bucket_manifest_path=bucket_manifest_path,
         tokenizer=tokenizer,
+        decoder_tokenizer=decoder_tokenizer,
         feature_extractor=feature_extractor,
         config=config,
         batch_size=batch_size,

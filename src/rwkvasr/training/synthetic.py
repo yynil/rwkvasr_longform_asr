@@ -34,11 +34,11 @@ class SyntheticOverfitConfig:
     lr: float = 2e-3
     weight_decay: float = 0.01
     seed: int = 42
-    direction_variant: str = "drop_both"
+    direction_variant: str = "none"
     p_start: float = 0.0
-    p_max: float = 0.2
-    warmup_steps: int = 2
-    ramp_steps: int = 6
+    p_max: float = 0.0
+    warmup_steps: int = 0
+    ramp_steps: int = 0
 
 
 def make_synthetic_ctc_batch(config: SyntheticOverfitConfig) -> CTCBatch:

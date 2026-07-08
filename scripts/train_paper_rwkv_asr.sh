@@ -14,7 +14,7 @@ MODE="dirdrop_both"
 CONFIG_YAML=""
 NUM_GPUS="${NUM_GPUS:-4}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-DRY_RUN=0
+DRY_RUN="${DRY_RUN:-0}"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do

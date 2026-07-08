@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-append-eos", dest="tokenizer_append_eos", action="store_true", default=None)
     parser.add_argument("--no-tokenizer-append-eos", dest="tokenizer_append_eos", action="store_false")
     parser.add_argument("--text-normalization", default=None)
+    parser.add_argument("--feature-extractor-type", default=None)
     parser.add_argument("--input-dim", default=None, type=int)
     parser.add_argument("--n-embd", default=None, type=int)
     parser.add_argument("--dim-att", default=None, type=int)
@@ -38,6 +39,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conv-kernel-size", default=None, type=int)
     parser.add_argument("--dropout", default=None, type=float)
     parser.add_argument("--frontend-type", default=None)
+    parser.add_argument("--encoder-output-dim", default=None, type=int)
+    parser.add_argument("--aut-downsample-hidden-size", default=None, type=int)
+    parser.add_argument("--aut-activation-function", default=None)
+    parser.add_argument("--aut-activation-dropout", default=None, type=float)
+    parser.add_argument("--aut-max-source-positions", default=None, type=int)
+    parser.add_argument("--aut-scale-embedding", dest="aut_scale_embedding", action="store_true", default=None)
+    parser.add_argument("--no-aut-scale-embedding", dest="aut_scale_embedding", action="store_false")
+    parser.add_argument("--aut-conv-chunksize", default=None, type=int)
+    parser.add_argument("--sensevoice-tp-blocks", default=None, type=int)
     parser.add_argument("--cmvn-file", default=None)
     parser.add_argument("--cmvn-is-json", dest="cmvn_is_json", action="store_true", default=None)
     parser.add_argument("--cmvn-is-bin", dest="cmvn_is_json", action="store_false")
@@ -68,18 +78,59 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder-loss-chunk-size", default=None, type=int)
     parser.add_argument("--decoder-text-token-budget", default=None, type=int)
     parser.add_argument("--decoder-prompt-before-audio", default=None)
+    parser.add_argument("--decoder-ctc-draft-cache-path", default=None)
+    parser.add_argument("--decoder-ctc-draft-prompt-template", default=None)
+    parser.add_argument("--decoder-ctc-draft-text-key", default=None)
+    parser.add_argument("--decoder-ctc-draft-missing-policy", default=None, choices=("empty", "error"))
+    parser.add_argument("--decoder-ctc-draft-dropout-prob", default=None, type=float)
+    parser.add_argument("--decoder-ctc-draft-language-mismatch-dropout-prob", default=None, type=float)
+    parser.add_argument("--decoder-ctc-draft-dropout-seed", default=None, type=int)
+    parser.add_argument("--ctc-label-override-cache-path", default=None)
+    parser.add_argument("--ctc-label-override-text-key", default=None)
     parser.add_argument("--decoder-prompt-after-audio", default=None)
     parser.add_argument("--decoder-target-suffix", default=None)
     parser.add_argument("--decoder-eos-token-id", default=None, type=int)
     parser.add_argument("--ctc-loss-weight", default=None, type=float)
     parser.add_argument("--decoder-loss-weight", default=None, type=float)
+    parser.add_argument("--ctc-decoder-type", default=None)
+    parser.add_argument("--ctc-decoder-downsample-rate", default=None, type=int)
+    parser.add_argument("--ctc-decoder-dim", default=None, type=int)
+    parser.add_argument("--ctc-decoder-ffn-dim", default=None, type=int)
+    parser.add_argument("--ctc-decoder-num-layers", default=None, type=int)
+    parser.add_argument("--ctc-decoder-attention-heads", default=None, type=int)
+    parser.add_argument("--ctc-decoder-dropout", default=None, type=float)
+    parser.add_argument("--ctc-decoder-attention-dropout", default=None, type=float)
+    parser.add_argument("--ctc-bridge-type", default=None, choices=("none", "identity", "linear", "mlp", "residual_mlp"))
+    parser.add_argument("--ctc-bridge-hidden-dim", default=None, type=int)
+    parser.add_argument("--ctc-bridge-dropout", default=None, type=float)
+    parser.add_argument(
+        "--ctc-suppress-non-pronunciation-tokens",
+        dest="ctc_suppress_non_pronunciation_tokens",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--ctc-suppressed-token-id", dest="ctc_suppressed_token_ids", action="append", type=int, default=None)
+    parser.add_argument("--funasr-nano-ctc-init-checkpoint-path", default=None)
+    parser.add_argument("--funasr-nano-ctc-init-load-decoder", dest="funasr_nano_ctc_init_load_decoder", action="store_true", default=None)
+    parser.add_argument("--no-funasr-nano-ctc-init-load-decoder", dest="funasr_nano_ctc_init_load_decoder", action="store_false")
+    parser.add_argument("--funasr-nano-ctc-init-load-head", dest="funasr_nano_ctc_init_load_head", action="store_true", default=None)
+    parser.add_argument("--no-funasr-nano-ctc-init-load-head", dest="funasr_nano_ctc_init_load_head", action="store_false")
+    parser.add_argument("--funasr-nano-ctc-teacher-blank-id", default=None, type=int)
     parser.add_argument("--direction-variant", default=None)
     parser.add_argument("--p-start", default=None, type=float)
     parser.add_argument("--p-max", default=None, type=float)
     parser.add_argument("--warmup-steps", default=None, type=int)
     parser.add_argument("--ramp-steps", default=None, type=int)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--encoder-init-checkpoint-path", default=None)
     parser.add_argument("--resume-from", default=None)
+    parser.add_argument("--freeze-encoder", dest="freeze_encoder", action="store_true", default=None)
+    parser.add_argument("--no-freeze-encoder", dest="freeze_encoder", action="store_false")
+    parser.add_argument("--funasr-nano-ctc-init-blank-bias-delta", default=None, type=float)
+    parser.add_argument("--freeze-ctc-decoder", dest="freeze_ctc_decoder", action="store_true", default=None)
+    parser.add_argument("--no-freeze-ctc-decoder", dest="freeze_ctc_decoder", action="store_false")
+    parser.add_argument("--freeze-ctc-head", dest="freeze_ctc_head", action="store_true", default=None)
+    parser.add_argument("--no-freeze-ctc-head", dest="freeze_ctc_head", action="store_false")
     parser.add_argument("--wandb-enabled", dest="wandb_enabled", action="store_true", default=None)
     parser.add_argument("--no-wandb", dest="wandb_enabled", action="store_false")
     parser.add_argument("--wandb-project", default=None)
@@ -129,6 +180,7 @@ def _resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "tokenizer_task",
         "tokenizer_append_eos",
         "text_normalization",
+        "feature_extractor_type",
         "input_dim",
         "n_embd",
         "dim_att",
@@ -139,6 +191,14 @@ def _resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "conv_kernel_size",
         "dropout",
         "frontend_type",
+        "encoder_output_dim",
+        "aut_downsample_hidden_size",
+        "aut_activation_function",
+        "aut_activation_dropout",
+        "aut_max_source_positions",
+        "aut_scale_embedding",
+        "aut_conv_chunksize",
+        "sensevoice_tp_blocks",
         "cmvn_file",
         "cmvn_is_json",
         "blank_id",
@@ -166,17 +226,48 @@ def _resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "decoder_loss_chunk_size",
         "decoder_text_token_budget",
         "decoder_prompt_before_audio",
+        "decoder_ctc_draft_cache_path",
+        "decoder_ctc_draft_prompt_template",
+        "decoder_ctc_draft_text_key",
+        "decoder_ctc_draft_missing_policy",
+        "decoder_ctc_draft_dropout_prob",
+        "decoder_ctc_draft_language_mismatch_dropout_prob",
+        "decoder_ctc_draft_dropout_seed",
+        "ctc_label_override_cache_path",
+        "ctc_label_override_text_key",
         "decoder_prompt_after_audio",
         "decoder_target_suffix",
         "decoder_eos_token_id",
         "ctc_loss_weight",
         "decoder_loss_weight",
+        "ctc_decoder_type",
+        "ctc_decoder_downsample_rate",
+        "ctc_decoder_dim",
+        "ctc_decoder_ffn_dim",
+        "ctc_decoder_num_layers",
+        "ctc_decoder_attention_heads",
+        "ctc_decoder_dropout",
+        "ctc_decoder_attention_dropout",
+        "ctc_bridge_type",
+        "ctc_bridge_hidden_dim",
+        "ctc_bridge_dropout",
+        "ctc_suppress_non_pronunciation_tokens",
+        "ctc_suppressed_token_ids",
+        "funasr_nano_ctc_init_checkpoint_path",
+        "funasr_nano_ctc_init_load_decoder",
+        "funasr_nano_ctc_init_load_head",
+        "funasr_nano_ctc_teacher_blank_id",
+        "funasr_nano_ctc_init_blank_bias_delta",
+        "freeze_encoder",
+        "freeze_ctc_decoder",
+        "freeze_ctc_head",
         "direction_variant",
         "p_start",
         "p_max",
         "warmup_steps",
         "ramp_steps",
         "device",
+        "encoder_init_checkpoint_path",
         "resume_from",
         "wandb_enabled",
         "wandb_project",

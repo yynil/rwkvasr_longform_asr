@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
+import json
 import math
-import shutil
 import time
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import deepspeed
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -21,6 +23,8 @@ from rwkvasr.data import (
     FeatureCollator,
     StableHashSplitConfig,
     WebDatasetConfig,
+    build_audio_feature_extractor,
+    build_text_tokenizer,
     build_bucketed_webdataset_loader,
     build_length_bucketed_webdataset_dataloader,
     build_webdataset_dataloader,
@@ -31,11 +35,18 @@ from rwkvasr.data import (
     load_webdataset_index,
     load_webdataset_length_entries,
     resolve_webdataset_index_path,
+    tokenizer_eos_token_id,
     validate_webdataset_index,
 )
 from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, DirectionMask, RWKVCTCModel, RWKVCTCModelConfig
 
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import (
+    extract_epoch_batch_offset,
+    load_checkpoint,
+    load_latest_checkpoint_state,
+    save_checkpoint,
+    write_latest_checkpoint_state,
+)
 from .batch_budget import (
     ctc_batch_token_stats,
     effective_batch_token_budget,
@@ -45,19 +56,113 @@ from .batch_budget import (
 )
 from .ctc_task import RWKVDualModeCTCTrainer
 from .epoch_metrics import save_epoch_metrics, save_step_checkpoint_metrics
+from .funasr_online_teacher import FunASRNanoCTCTopKOnlineTeacher, FunASROnlineCTCTeacherConfig
 from .optimizer import build_rwkv_param_groups
 from .progress import start_training_progress, update_training_progress
+from .spec_augment import apply_spec_augment
 from .wandb_logger import finish_wandb, init_wandb_run, log_wandb
 from .train_loop import (
+    _iter_loader_after_resume_offset,
     _resolve_bucket_manifest_path,
     _resolve_cmvn_file,
     _resolve_data_source,
     _resolve_decoder_template_token_ids,
+    _resolve_ctc_suppressed_token_ids,
     _resolve_in_memory_length_index_path,
     _resolve_text_tokenizer,
-    _resolve_vocab_size,
     _resolved_tokenizer_config_payload,
 )
+
+
+def _parse_deepspeed_checkpoint_tag(value: Any) -> str | None:
+    tag = str(value).strip()
+    if not tag:
+        return None
+    if tag == "best":
+        return "best"
+    if tag.startswith("step-"):
+        suffix = tag.removeprefix("step-")
+        if suffix and suffix.isdigit():
+            return tag
+    if tag.startswith("epoch-"):
+        suffix = tag.removeprefix("epoch-")
+        if suffix and suffix.isdigit():
+            return tag
+    return None
+
+
+def _parse_deepspeed_checkpoint_step(value: Any) -> int:
+    tag = _parse_deepspeed_checkpoint_tag(value)
+    if tag is None:
+        return 0
+    if not tag.startswith("step-"):
+        return 0
+    try:
+        return int(tag.removeprefix("step-"))
+    except ValueError:
+        return 0
+
+
+def _resolve_latest_deepspeed_checkpoint(
+    output_dir: str | Path,
+) -> tuple[Path, str] | None:
+    ds_checkpoint_root = Path(output_dir) / "ds_checkpoints"
+    if not ds_checkpoint_root.is_dir():
+        return None
+
+    best_path: Path | None = None
+    best_step: int = -1
+    best_step_path: Path | None = None
+    best_epoch: int = -1
+    best_epoch_path: Path | None = None
+
+    for candidate in ds_checkpoint_root.iterdir():
+        if not candidate.is_dir():
+            continue
+        tag = _parse_deepspeed_checkpoint_tag(candidate.name)
+        if tag is None:
+            continue
+        if tag == "best":
+            best_path = candidate
+            continue
+        if tag.startswith("epoch-"):
+            try:
+                epoch = int(tag.removeprefix("epoch-"))
+            except ValueError:
+                continue
+            if epoch > best_epoch:
+                best_epoch = epoch
+                best_epoch_path = candidate
+            continue
+        try:
+            step = int(tag.removeprefix("step-"))
+        except ValueError:
+            continue
+        if step > best_step:
+            best_step = step
+            best_step_path = candidate
+
+    if best_step_path is not None:
+        return best_step_path, best_step_path.name
+    if best_epoch_path is not None:
+        return best_epoch_path, best_epoch_path.name
+    if best_path is not None:
+        return best_path, "best"
+    return None
+
+
+def _load_export_checkpoint_extra_state(output_dir: Path, step: int) -> dict[str, Any]:
+    export_path = output_dir / f"step-{step}.pt"
+    if not export_path.is_file():
+        return {}
+    try:
+        checkpoint = torch.load(export_path, map_location="cpu", weights_only=False)
+    except Exception:
+        return {}
+    extra = checkpoint.get("extra")
+    if isinstance(extra, dict):
+        return extra
+    return {}
 
 
 @dataclass(frozen=True)
@@ -81,6 +186,7 @@ class DeepSpeedTrainConfig:
     webdataset_hash_seed: int = 0
     webdataset_split_by: str = "shard_name"
     webdataset_utt_id_key: str = "sid"
+    feature_extractor_type: str = "wenet_fbank"
     input_dim: int = 80
     n_embd: int = 512
     dim_att: int = 512
@@ -91,6 +197,14 @@ class DeepSpeedTrainConfig:
     conv_kernel_size: int = 31
     dropout: float = 0.1
     frontend_type: str = "conv2d6"
+    encoder_output_dim: int | None = None
+    aut_downsample_hidden_size: int = 480
+    aut_activation_function: str = "gelu"
+    aut_activation_dropout: float = 0.0
+    aut_max_source_positions: int = 1500
+    aut_scale_embedding: bool = False
+    aut_conv_chunksize: int = 500
+    sensevoice_tp_blocks: int = 20
     cmvn_file: str | None = None
     cmvn_is_json: bool = True
     blank_id: int = 0
@@ -112,23 +226,112 @@ class DeepSpeedTrainConfig:
     decoder_num_layers: int | None = None
     decoder_n_embd: int | None = None
     decoder_ffn_hidden_size: int | None = None
+    decoder_vocab_size: int | None = None
+    decoder_tokenizer_type: str | None = None
+    decoder_tokenizer_model_path: str | None = None
+    decoder_tokenizer_language: str | None = None
+    decoder_tokenizer_task: str | None = None
+    decoder_tokenizer_append_eos: bool = False
+    decoder_text_normalization: str | None = None
     decoder_head_size: int = 64
     decoder_audio_conditioning: str = "full"
     decoder_prefix_tokens: int = 32
     decoder_loss_chunk_size: int = 1024
     decoder_text_token_budget: int | None = None
     decoder_prompt_before_audio: str = ""
+    decoder_prompt_before_audio_use_language: bool = False
+    decoder_ctc_draft_cache_path: str | None = None
+    decoder_ctc_draft_prompt_template: str = ""
+    decoder_ctc_draft_text_key: str = "pred_text"
+    decoder_ctc_draft_missing_policy: str = "empty"
+    decoder_ctc_draft_dropout_prob: float = 0.0
+    decoder_ctc_draft_language_mismatch_dropout_prob: float = 0.0
+    decoder_ctc_draft_dropout_seed: int = 0
+    ctc_label_override_cache_path: str | None = None
+    ctc_label_override_text_key: str = "pred_text"
+    allow_missing_targets: bool = False
     decoder_prompt_after_audio: str = ""
+    decoder_target_prefix: str = ""
+    decoder_target_prefix_use_language: bool = False
     decoder_target_suffix: str = ""
+    decoder_language_confirmation_en: str = "This is English text."
+    decoder_language_confirmation_zh: str = "这是中文文字。"
+    decoder_prompt_language_label_noise_prob: float = 0.0
+    decoder_prompt_language_label_noise_seed: int = 0
     decoder_eos_token_id: int = 0
     ctc_loss_weight: float = 1.0
     decoder_loss_weight: float = 0.0
-    direction_variant: str = "drop_both"
-    p_start: float = 0.2
-    p_max: float = 0.2
+    encoder_anchor_checkpoint_path: str | None = None
+    encoder_anchor_loss_weight: float = 0.0
+    ctc_logit_anchor_loss_weight: float = 0.0
+    ctc_logit_anchor_chunk_frames: int = 32
+    ctc_teacher_topk_cache_path: str | None = None
+    ctc_teacher_topk_loss_weight: float = 0.0
+    ctc_teacher_topk_blank_loss_weight: float = 0.0
+    ctc_teacher_topk_mass_loss_weight: float = 0.0
+    ctc_teacher_topk_time_map: str = "nearest"
+    ctc_teacher_frame_filter: str = "all"
+    ctc_teacher_frame_filter_neighbor_radius: int = 0
+    ctc_teacher_frame_filter_min_nonblank_prob: float = 0.0
+    ctc_teacher_topk_missing_policy: str = "skip"
+    ctc_teacher_online_model_path: str | None = None
+    ctc_teacher_online_loss_weight: float = 0.0
+    ctc_teacher_online_blank_loss_weight: float = 0.0
+    ctc_teacher_online_mass_loss_weight: float = 0.0
+    ctc_teacher_online_full_loss_weight: float = 0.0
+    ctc_teacher_online_full_temperature: float = 1.0
+    ctc_teacher_online_full_frame_filter: str | None = None
+    ctc_teacher_online_encoder_loss_weight: float = 0.0
+    ctc_teacher_online_sequence_loss_weight: float = 0.0
+    ctc_teacher_online_sequence_presence_loss_weight: float = 0.0
+    ctc_teacher_online_sequence_window_loss_weight: float = 0.0
+    ctc_teacher_online_sequence_window_radius: int = 2
+    ctc_teacher_online_sequence_window_temperature: float = 0.2
+    ctc_teacher_online_nonblank_hard_loss_weight: float = 0.0
+    ctc_teacher_online_nonblank_margin_loss_weight: float = 0.0
+    ctc_teacher_online_nonblank_margin: float = 0.0
+    ctc_teacher_online_nonblank_window_loss_weight: float = 0.0
+    ctc_teacher_online_nonblank_window_margin_loss_weight: float = 0.0
+    ctc_teacher_online_nonblank_window_topk_loss_weight: float = 0.0
+    ctc_teacher_online_nonblank_window_radius: int = 2
+    ctc_teacher_online_nonblank_window_temperature: float = 0.0
+    ctc_teacher_online_top_k: int = 16
+    ctc_teacher_online_audio_index_path: str | None = None
+    ctc_teacher_online_webdataset_index_path: str | None = None
+    ctc_teacher_online_audio_cache_dir: str | None = None
+    ctc_teacher_online_keep_audio_cache: bool = True
+    ctc_teacher_online_device: str | None = None
+    ctc_teacher_online_project_ignored_token_ids: tuple[int, ...] | list[int] = (60514,)
+    ctc_decoder_type: str = "none"
+    ctc_decoder_downsample_rate: int = 1
+    ctc_decoder_dim: int | None = None
+    ctc_decoder_ffn_dim: int = 2048
+    ctc_decoder_num_layers: int = 5
+    ctc_decoder_attention_heads: int = 8
+    ctc_decoder_dropout: float = 0.0
+    ctc_decoder_attention_dropout: float = 0.0
+    ctc_bridge_type: str = "none"
+    ctc_bridge_hidden_dim: int | None = None
+    ctc_bridge_dropout: float = 0.0
+    ctc_suppress_non_pronunciation_tokens: bool = False
+    ctc_suppressed_token_ids: tuple[int, ...] | list[int] = ()
+    funasr_nano_ctc_init_checkpoint_path: str | None = None
+    funasr_nano_ctc_init_load_encoder: bool = False
+    funasr_nano_ctc_init_load_encoder_attention: bool = True
+    funasr_nano_ctc_init_load_decoder: bool = True
+    funasr_nano_ctc_init_load_head: bool = True
+    funasr_nano_ctc_teacher_blank_id: int = 60514
+    funasr_nano_ctc_init_blank_bias_delta: float = 0.0
+    freeze_encoder: bool = False
+    freeze_ctc_decoder: bool = False
+    freeze_ctc_head: bool = False
+    direction_variant: str = "none"
+    p_start: float = 0.0
+    p_max: float = 0.0
     warmup_steps: int = 0
     ramp_steps: int = 0
     device: str = "cuda"
+    encoder_init_checkpoint_path: str | None = None
     init_checkpoint_path: str | None = None
     resume_from: str | None = None
     resume_tag: str | None = None
@@ -143,7 +346,9 @@ class DeepSpeedTrainConfig:
     step_eval_batch_size: int | None = None
     step_eval_every: int | None = None
     step_eval_samples: int | None = None
+    step_eval_split: str | None = None
     top_k_step_checkpoints: int = 3
+    save_deepspeed_sharded_checkpoints: bool = True
     local_rank: int = -1
     log_every: int = 10
     gradient_checkpointing: bool = True
@@ -151,6 +356,11 @@ class DeepSpeedTrainConfig:
     length_bucket_frame_budget: int | None = None
     target_gpu_memory_gib: float = 22.0
     skip_oversized_samples: bool = True
+    specaugment_enabled: bool = False
+    specaugment_time_masks: int = 2
+    specaugment_time_width: int = 40
+    specaugment_freq_masks: int = 2
+    specaugment_freq_width: int = 15
 
 
 def _maybe_load_initial_model_checkpoint(
@@ -160,18 +370,54 @@ def _maybe_load_initial_model_checkpoint(
     if config.init_checkpoint_path is None:
         return None
     if config.resume_from is not None:
-        raise ValueError("`init_checkpoint_path` and `resume_from` cannot both be set.")
+        _rank_zero_log(
+            f"resume_from is set ({config.resume_from}); skipping init_checkpoint_path={config.init_checkpoint_path}"
+        )
+        return None
     restored = load_checkpoint(
         config.init_checkpoint_path,
         model=model,
         optimizer=None,
         map_location="cpu",
+        strict=False,
     )
+    extra = restored.get("extra", {})
+    missing_keys = extra.get("missing_keys", []) if isinstance(extra, dict) else []
+    unexpected_keys = extra.get("unexpected_keys", []) if isinstance(extra, dict) else []
     _rank_zero_log(
         "Loaded initial model weights from "
-        f"{config.init_checkpoint_path} step={int(restored.get('step', 0))}"
+        f"{config.init_checkpoint_path} step={int(restored.get('step', 0))} "
+        f"missing={len(missing_keys)} unexpected={len(unexpected_keys)}"
     )
     return restored
+
+
+def _maybe_load_funasr_nano_ctc_init_distributed(model: RWKVCTCModel, config: DeepSpeedTrainConfig) -> None:
+    if config.funasr_nano_ctc_init_checkpoint_path is None:
+        return
+    report = model.load_funasr_nano_ctc_checkpoint(
+        config.funasr_nano_ctc_init_checkpoint_path,
+        load_encoder=bool(config.funasr_nano_ctc_init_load_encoder),
+        load_encoder_attention=bool(config.funasr_nano_ctc_init_load_encoder_attention),
+        load_ctc_decoder=bool(config.funasr_nano_ctc_init_load_decoder),
+        load_ctc_head=bool(config.funasr_nano_ctc_init_load_head),
+        teacher_blank_id=int(config.funasr_nano_ctc_teacher_blank_id),
+        project_ignored_token_ids=tuple(int(value) for value in config.ctc_teacher_online_project_ignored_token_ids),
+        blank_bias_delta=float(config.funasr_nano_ctc_init_blank_bias_delta),
+    )
+    _rank_zero_log(
+        "Loaded FunASR-Nano CTC init: "
+        f"path={config.funasr_nano_ctc_init_checkpoint_path} "
+        f"encoder_tensors={report['encoder_loaded']} "
+        f"encoder_skipped={report['encoder_skipped']} "
+        f"encoder_attention_skipped={report['encoder_attention_skipped']} "
+        f"bridge_tensors={report.get('ctc_bridge_loaded', 0)} "
+        f"bridge_skipped={report.get('ctc_bridge_skipped', 0)} "
+        f"decoder_tensors={report['ctc_decoder_loaded']} "
+        f"head_rows={report['ctc_head_loaded_rows']} "
+        f"ignored_rows={report['ctc_head_ignored_rows']} "
+        f"blank_bias_delta={report['ctc_head_blank_bias_delta']}"
+    )
 
 
 def _rank() -> int:
@@ -232,6 +478,72 @@ def _sample_direction_mask_distributed(
     return DirectionMask(forward=forward, backward=backward)
 
 
+def _resolve_deepspeed_resume_source(config: DeepSpeedTrainConfig) -> tuple[str | None, str | None]:
+    if config.resume_from is None:
+        return None, None
+    if config.resume_from != "latest":
+        resolved_path = Path(config.resume_from)
+        if resolved_path.is_dir():
+            if not config.resume_tag and resolved_path.parent.name == "ds_checkpoints":
+                return str(resolved_path.parent), resolved_path.name
+            if resolved_path.name and (resolved_path.name == "best" or resolved_path.name.startswith("step-")):
+                return str(resolved_path), config.resume_tag
+        return str(resolved_path), config.resume_tag
+
+    latest_state = load_latest_checkpoint_state(config.output_dir)
+    latest_tag = latest_state.get("resume_tag")
+    latest_tag = str(latest_tag) if isinstance(latest_tag, str) and latest_tag else None
+    latest_checkpoint = _resolve_latest_deepspeed_checkpoint(config.output_dir)
+    latest_ds_dir = latest_state.get("deepspeed_checkpoint_dir")
+    if isinstance(latest_ds_dir, str) and latest_ds_dir:
+        ds_dir = Path(latest_ds_dir)
+        parsed_tag = _parse_deepspeed_checkpoint_tag(ds_dir.name)
+        if ds_dir.exists():
+            if parsed_tag is not None:
+                if latest_checkpoint is not None:
+                    resolved_path, resolved_tag = latest_checkpoint
+                    resolved_step = _parse_deepspeed_checkpoint_step(resolved_tag)
+                    yaml_step = _parse_deepspeed_checkpoint_step(latest_tag or parsed_tag)
+                    if resolved_step > yaml_step:
+                        _rank_zero_log(
+                            f"latest_checkpoint.yaml points to stale tag={latest_tag or parsed_tag}; "
+                            f"falling back to latest DeepSpeed checkpoint {resolved_tag}"
+                        )
+                        return str(resolved_path.parent), resolved_tag
+                if ds_dir.parent.name == "ds_checkpoints":
+                    return str(ds_dir.parent), latest_tag or parsed_tag
+                if ds_dir.is_dir() and (ds_dir.name == "best" or ds_dir.name.startswith("step-")):
+                    return str(ds_dir), latest_tag or ds_dir.name
+            if ds_dir.is_dir():
+                _rank_zero_log(f"Ignoring invalid resume checkpoint directory tag: {ds_dir}")
+        else:
+            _rank_zero_log(f"latest_checkpoint.yaml points to missing ds_checkpoint_dir={ds_dir}; trying latest valid checkpoint.")
+
+    if latest_checkpoint is not None:
+        resolved_path, resolved_tag = latest_checkpoint
+        if latest_tag is not None and latest_tag != resolved_tag:
+            _rank_zero_log(
+                f"latest_checkpoint.yaml requested tag={latest_tag} is unavailable; "
+                f"falling back to {resolved_tag}"
+            )
+        return str(resolved_path.parent), resolved_tag
+
+    raise FileNotFoundError(
+        "resume_from='latest' requires latest_checkpoint.yaml with deepspeed_checkpoint_dir and resume_tag"
+    )
+
+
+def _skip_batches(loader_iter: Any, count: int) -> int:
+    skipped = 0
+    while skipped < count:
+        try:
+            next(loader_iter)
+        except StopIteration:
+            break
+        skipped += 1
+    return skipped
+
+
 def _normalize_deepspeed_config(config: DeepSpeedTrainConfig) -> dict[str, Any]:
     ds_config = dict(config.deepspeed)
     if "optimizer" in ds_config:
@@ -242,7 +554,10 @@ def _normalize_deepspeed_config(config: DeepSpeedTrainConfig) -> dict[str, Any]:
     ds_config["gradient_accumulation_steps"] = grad_accum
     ds_config["train_batch_size"] = micro_batch * grad_accum * _world_size()
     zero_optimization = dict(ds_config.get("zero_optimization", {}))
-    zero_optimization["stage"] = 2
+    zero_stage = int(zero_optimization.get("stage", 2))
+    if zero_stage not in {1, 2}:
+        raise ValueError(f"Only DeepSpeed ZeRO stage 1 or 2 is supported, got stage={zero_stage}.")
+    zero_optimization["stage"] = zero_stage
     offload_optimizer = dict(zero_optimization.get("offload_optimizer", {}))
     offload_device = str(offload_optimizer.get("device", "")).lower().strip()
     if offload_device in {"", "none", "null"}:
@@ -255,8 +570,13 @@ def _normalize_deepspeed_config(config: DeepSpeedTrainConfig) -> dict[str, Any]:
     ds_config["zero_optimization"] = zero_optimization
     ds_config["gradient_clipping"] = float(ds_config.get("gradient_clipping", 1.0))
     use_cuda = torch.cuda.is_available() and config.device.startswith("cuda")
+    requested_bf16 = None
+    if isinstance(ds_config.get("bf16"), dict) and "enabled" in ds_config["bf16"]:
+        requested_bf16 = bool(ds_config["bf16"]["enabled"])
     if use_cuda:
-        ds_config["bf16"] = {"enabled": True}
+        ds_config["bf16"] = {"enabled": True if requested_bf16 is None else requested_bf16}
+        if not bool(ds_config["bf16"]["enabled"]):
+            ds_config["fp16"] = {"enabled": False}
     else:
         ds_config["bf16"] = {"enabled": False}
         ds_config["fp16"] = {"enabled": False}
@@ -302,10 +622,40 @@ def _build_deepspeed_optimizer(
     return optimizer, "AdamW"
 
 
+def _apply_training_freeze(model: RWKVCTCModel, config: DeepSpeedTrainConfig) -> None:
+    frozen_names: list[str] = []
+    if config.freeze_encoder:
+        for name, parameter in model.encoder.named_parameters(prefix="encoder"):
+            parameter.requires_grad_(False)
+            frozen_names.append(name)
+    if config.freeze_ctc_decoder and model.ctc_decoder is not None:
+        for name, parameter in model.ctc_decoder.named_parameters(prefix="ctc_decoder"):
+            parameter.requires_grad_(False)
+            frozen_names.append(name)
+    if config.freeze_ctc_head:
+        for name, parameter in model.ctc_head.named_parameters(prefix="ctc_head"):
+            parameter.requires_grad_(False)
+            frozen_names.append(name)
+    trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    if trainable_params <= 0:
+        raise ValueError("Training freeze settings left no trainable parameters.")
+    if frozen_names:
+        _rank_zero_log(
+            "Applied parameter freeze: "
+            f"freeze_encoder={bool(config.freeze_encoder)} "
+            f"freeze_ctc_decoder={bool(config.freeze_ctc_decoder)} "
+            f"freeze_ctc_head={bool(config.freeze_ctc_head)} "
+            f"frozen_tensors={len(frozen_names)} "
+            f"trainable_params={trainable_params}"
+        )
+
+
 def _build_webdataset_config(
     config: DeepSpeedTrainConfig,
     *,
     shuffle_shards: bool,
+    skip_decode_errors: bool = False,
+    apply_decoder_prompt_language_label_noise: bool = False,
 ) -> WebDatasetConfig:
     length_bucket_frame_budget = config.length_bucket_frame_budget
     if length_bucket_frame_budget is None:
@@ -324,7 +674,135 @@ def _build_webdataset_config(
         bucket_source_interleave=config.bucket_source_interleave,
         append_eos=config.tokenizer_append_eos,
         text_normalization=config.text_normalization,
+        decoder_append_eos=config.decoder_tokenizer_append_eos,
+        decoder_text_normalization=config.decoder_text_normalization or config.text_normalization,
+        decoder_prompt_before_audio=config.decoder_prompt_before_audio,
+        decoder_prompt_before_audio_use_language=config.decoder_prompt_before_audio_use_language,
+        decoder_ctc_draft_cache_path=config.decoder_ctc_draft_cache_path,
+        decoder_ctc_draft_prompt_template=config.decoder_ctc_draft_prompt_template,
+        decoder_ctc_draft_text_key=config.decoder_ctc_draft_text_key,
+        decoder_ctc_draft_missing_policy=config.decoder_ctc_draft_missing_policy,
+        decoder_ctc_draft_dropout_prob=config.decoder_ctc_draft_dropout_prob,
+        decoder_ctc_draft_language_mismatch_dropout_prob=(
+            config.decoder_ctc_draft_language_mismatch_dropout_prob
+        ),
+        decoder_ctc_draft_dropout_seed=config.decoder_ctc_draft_dropout_seed,
+        ctc_label_override_cache_path=config.ctc_label_override_cache_path,
+        ctc_label_override_text_key=config.ctc_label_override_text_key,
+        allow_missing_targets=config.allow_missing_targets,
+        decoder_target_prefix=config.decoder_target_prefix,
+        decoder_target_prefix_use_language=config.decoder_target_prefix_use_language,
+        decoder_language_confirmation_en=config.decoder_language_confirmation_en,
+        decoder_language_confirmation_zh=config.decoder_language_confirmation_zh,
+        decoder_prompt_language_label_noise_prob=(
+            config.decoder_prompt_language_label_noise_prob
+            if apply_decoder_prompt_language_label_noise
+            else 0.0
+        ),
+        decoder_prompt_language_label_noise_seed=config.decoder_prompt_language_label_noise_seed,
+        skip_decode_errors=skip_decode_errors,
     )
+
+
+def _decoder_targets_enabled(config: DeepSpeedTrainConfig) -> bool:
+    return bool(config.decoder_enabled and config.decoder_loss_weight > 0)
+
+
+def _resolve_decoder_text_tokenizer(config: DeepSpeedTrainConfig):
+    if not _decoder_targets_enabled(config):
+        return None
+    tokenizer_type = config.decoder_tokenizer_type or config.tokenizer_type
+    tokenizer_model_path = config.decoder_tokenizer_model_path or config.tokenizer_model_path
+    tokenizer_language = config.decoder_tokenizer_language or config.tokenizer_language
+    tokenizer_task = config.decoder_tokenizer_task or config.tokenizer_task
+    return build_text_tokenizer(
+        tokenizer_type,
+        model_path=tokenizer_model_path,
+        language=tokenizer_language,
+        task=tokenizer_task,
+    )
+
+
+def _resolve_decoder_vocab_size(config: DeepSpeedTrainConfig) -> int | None:
+    if config.decoder_vocab_size is not None:
+        return int(config.decoder_vocab_size)
+    tokenizer = _resolve_decoder_text_tokenizer(config)
+    if tokenizer is None:
+        return None
+    return int(tokenizer.vocab_size)
+
+
+def _resolve_ctc_vocab_size_for_deepspeed(config: DeepSpeedTrainConfig) -> int:
+    tokenizer = _resolve_text_tokenizer(config)
+    if config.tokenizer_append_eos and tokenizer_eos_token_id(tokenizer) is None:
+        raise ValueError(
+            "tokenizer_append_eos=True requires a tokenizer with a defined eos_token_id. "
+            f"tokenizer_type={config.tokenizer_type!r} does not provide one."
+        )
+    tokenizer_vocab_size = int(tokenizer.vocab_size)
+    if config.vocab_size is None:
+        return tokenizer_vocab_size
+    if int(config.vocab_size) != tokenizer_vocab_size:
+        raise ValueError(
+            "Configured CTC vocab_size does not match the resolved CTC tokenizer vocabulary size: "
+            f"{config.vocab_size} != {tokenizer_vocab_size}"
+        )
+    return int(config.vocab_size)
+
+
+def _resolve_decoder_template_token_ids_for_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, Any]:
+    tokenizer = _resolve_decoder_text_tokenizer(config)
+    if tokenizer is None:
+        return _resolve_decoder_template_token_ids(config)
+    prompt_before_audio = (
+        ""
+        if config.decoder_prompt_before_audio_use_language or config.decoder_ctc_draft_prompt_template
+        else config.decoder_prompt_before_audio
+    )
+    return {
+        "decoder_prompt_before_audio_token_ids": tuple(tokenizer.encode(prompt_before_audio)),
+        "decoder_prompt_after_audio_token_ids": tuple(tokenizer.encode(config.decoder_prompt_after_audio)),
+        "decoder_target_suffix_token_ids": tuple(tokenizer.encode(config.decoder_target_suffix)),
+    }
+
+
+def _resolved_tokenizer_config_payload_for_deepspeed(
+    config: DeepSpeedTrainConfig,
+    *,
+    vocab_size: int,
+) -> dict[str, object]:
+    payload = _resolved_tokenizer_config_payload(config, vocab_size=vocab_size)
+    if _decoder_targets_enabled(config):
+        payload.update(
+            {
+                "decoder_tokenizer_type": config.decoder_tokenizer_type or config.tokenizer_type,
+                "decoder_tokenizer_model_path": config.decoder_tokenizer_model_path or config.tokenizer_model_path,
+                "decoder_tokenizer_language": config.decoder_tokenizer_language or config.tokenizer_language,
+                "decoder_tokenizer_task": config.decoder_tokenizer_task or config.tokenizer_task,
+                "decoder_tokenizer_append_eos": bool(config.decoder_tokenizer_append_eos),
+                "decoder_text_normalization": config.decoder_text_normalization or config.text_normalization,
+                "decoder_vocab_size": _resolve_decoder_vocab_size(config),
+                "decoder_prompt_before_audio": config.decoder_prompt_before_audio,
+                "decoder_prompt_before_audio_use_language": bool(config.decoder_prompt_before_audio_use_language),
+                "decoder_ctc_draft_cache_path": config.decoder_ctc_draft_cache_path,
+                "decoder_ctc_draft_prompt_template": config.decoder_ctc_draft_prompt_template,
+                "decoder_ctc_draft_text_key": config.decoder_ctc_draft_text_key,
+                "decoder_ctc_draft_missing_policy": config.decoder_ctc_draft_missing_policy,
+                "decoder_ctc_draft_dropout_prob": float(config.decoder_ctc_draft_dropout_prob),
+                "decoder_ctc_draft_language_mismatch_dropout_prob": float(
+                    config.decoder_ctc_draft_language_mismatch_dropout_prob
+                ),
+                "decoder_ctc_draft_dropout_seed": int(config.decoder_ctc_draft_dropout_seed),
+                "decoder_prompt_after_audio": config.decoder_prompt_after_audio,
+                "decoder_target_prefix": config.decoder_target_prefix,
+                "decoder_target_prefix_use_language": bool(config.decoder_target_prefix_use_language),
+                "decoder_language_confirmation_en": config.decoder_language_confirmation_en,
+                "decoder_language_confirmation_zh": config.decoder_language_confirmation_zh,
+                "decoder_prompt_language_label_noise_prob": float(config.decoder_prompt_language_label_noise_prob),
+                "decoder_prompt_language_label_noise_seed": int(config.decoder_prompt_language_label_noise_seed),
+            }
+        )
+    return payload
 
 
 def _resolve_max_steps(config: DeepSpeedTrainConfig, grad_accum: int) -> tuple[int, int | None]:
@@ -353,7 +831,11 @@ def _resolve_max_steps(config: DeepSpeedTrainConfig, grad_accum: int) -> tuple[i
             ),
         )
         num_samples = index_split_sample_count(index_data, config.webdataset_split)
-        bucket_manifest_path = _resolve_bucket_manifest_path(data_path, config.webdataset_bucket_manifest_path)
+        bucket_manifest_path = _resolve_bucket_manifest_path(
+            data_path,
+            config.webdataset_bucket_manifest_path,
+            configured_length_index_path=config.webdataset_length_index_path,
+        )
         if bucket_manifest_path is not None:
             manifest = load_webdataset_bucket_manifest(bucket_manifest_path)
             steps_per_epoch = estimate_bucket_manifest_steps(
@@ -409,14 +891,87 @@ def _resolve_cmvn_file_distributed(config: DeepSpeedTrainConfig, output_dir: Pat
     return resolved
 
 
+def _maybe_load_encoder_init_checkpoint_distributed(model: RWKVCTCModel, checkpoint_path: str | None) -> None:
+    if checkpoint_path is None:
+        return
+    aut_encoder = getattr(model.encoder, "aut_encoder", None)
+    load_fn = getattr(aut_encoder, "load_qwen3_asr_non_attention_checkpoint", None)
+    if callable(load_fn):
+        report = load_fn(checkpoint_path)
+        _rank_zero_log(
+            "Loaded AuRWKV non-attention encoder init: "
+            f"path={checkpoint_path} loaded={len(report['loaded'])} skipped={len(report['skipped'])}"
+        )
+        return
+    qwen3_transformer_encoder = getattr(model.encoder, "qwen3_transformer_encoder", None)
+    load_fn = getattr(qwen3_transformer_encoder, "load_qwen3_asr_checkpoint", None)
+    if callable(load_fn):
+        report = load_fn(checkpoint_path)
+        _rank_zero_log(
+            "Loaded Qwen3 Transformer audio encoder init: "
+            f"path={checkpoint_path} loaded={len(report['loaded'])} skipped={len(report['skipped'])}"
+        )
+        return
+    sensevoice_encoder = getattr(model.encoder, "sensevoice_encoder", None)
+    load_fn = getattr(sensevoice_encoder, "load_sensevoice_non_attention_checkpoint", None)
+    if callable(load_fn):
+        report = load_fn(checkpoint_path)
+        _rank_zero_log(
+            "Loaded SenseVoiceRWKV non-attention encoder init: "
+            f"path={checkpoint_path} loaded={len(report['loaded'])} skipped={len(report['skipped'])}"
+        )
+        return
+    sensevoice_conformer_encoder = getattr(model.encoder, "sensevoice_conformer_encoder", None)
+    load_fn = getattr(sensevoice_conformer_encoder, "load_sensevoice_non_attention_checkpoint", None)
+    if callable(load_fn):
+        report = load_fn(checkpoint_path)
+        _rank_zero_log(
+            "Loaded SenseVoice Conformer-conv non-attention encoder init: "
+            f"path={checkpoint_path} loaded={len(report['loaded'])} skipped={len(report['skipped'])}"
+        )
+        return
+    raise ValueError(
+        "encoder_init_checkpoint_path is only supported by "
+        "frontend_type='aut_rwkv', 'qwen3_transformer', 'sensevoice_rwkv', "
+        "or 'sensevoice_conformer_conv'."
+    )
+
+
 def _build_train_loader(config: DeepSpeedTrainConfig) -> tuple[DataLoader, Any | None]:
     data_source, data_path = _resolve_data_source(config)
     tokenizer = _resolve_text_tokenizer(config)
+    decoder_tokenizer = _resolve_decoder_text_tokenizer(config)
+    feature_extractor = build_audio_feature_extractor(
+        config.feature_extractor_type,
+        input_dim=int(config.input_dim),
+    )
     if data_source == "manifest":
         dataset = ASRManifestDataset(
             data_path,
             tokenizer=tokenizer,
+            decoder_tokenizer=decoder_tokenizer,
+            feature_extractor=feature_extractor,
             append_eos=config.tokenizer_append_eos,
+            text_normalization=config.text_normalization,
+            decoder_append_eos=config.decoder_tokenizer_append_eos,
+            decoder_text_normalization=config.decoder_text_normalization or config.text_normalization,
+            decoder_prompt_before_audio=config.decoder_prompt_before_audio,
+            decoder_prompt_before_audio_use_language=config.decoder_prompt_before_audio_use_language,
+            decoder_ctc_draft_cache_path=config.decoder_ctc_draft_cache_path,
+            decoder_ctc_draft_prompt_template=config.decoder_ctc_draft_prompt_template,
+            decoder_ctc_draft_text_key=config.decoder_ctc_draft_text_key,
+            decoder_ctc_draft_missing_policy=config.decoder_ctc_draft_missing_policy,
+            decoder_ctc_draft_dropout_prob=config.decoder_ctc_draft_dropout_prob,
+            decoder_ctc_draft_language_mismatch_dropout_prob=(
+                config.decoder_ctc_draft_language_mismatch_dropout_prob
+            ),
+            decoder_ctc_draft_dropout_seed=config.decoder_ctc_draft_dropout_seed,
+            decoder_target_prefix=config.decoder_target_prefix,
+            decoder_target_prefix_use_language=config.decoder_target_prefix_use_language,
+            decoder_language_confirmation_en=config.decoder_language_confirmation_en,
+            decoder_language_confirmation_zh=config.decoder_language_confirmation_zh,
+            decoder_prompt_language_label_noise_prob=config.decoder_prompt_language_label_noise_prob,
+            decoder_prompt_language_label_noise_seed=config.decoder_prompt_language_label_noise_seed,
         )
         sampler = None
         if _is_distributed():
@@ -437,13 +992,24 @@ def _build_train_loader(config: DeepSpeedTrainConfig) -> tuple[DataLoader, Any |
         )
         return loader, sampler
 
-    webdataset_config = _build_webdataset_config(config, shuffle_shards=True)
-    bucket_manifest_path = _resolve_bucket_manifest_path(data_path, config.webdataset_bucket_manifest_path)
+    webdataset_config = _build_webdataset_config(
+        config,
+        shuffle_shards=True,
+        skip_decode_errors=True,
+        apply_decoder_prompt_language_label_noise=True,
+    )
+    bucket_manifest_path = _resolve_bucket_manifest_path(
+        data_path,
+        config.webdataset_bucket_manifest_path,
+        configured_length_index_path=config.webdataset_length_index_path,
+    )
     if bucket_manifest_path is not None:
         loader = build_bucketed_webdataset_loader(
             data_path,
             bucket_manifest_path=bucket_manifest_path,
             tokenizer=tokenizer,
+            decoder_tokenizer=decoder_tokenizer,
+            feature_extractor=feature_extractor,
             config=webdataset_config,
             batch_size=config.batch_size,
             num_workers=config.num_workers,
@@ -461,6 +1027,8 @@ def _build_train_loader(config: DeepSpeedTrainConfig) -> tuple[DataLoader, Any |
             data_path,
             length_index_path=length_index_path,
             tokenizer=tokenizer,
+            decoder_tokenizer=decoder_tokenizer,
+            feature_extractor=feature_extractor,
             config=webdataset_config,
             batch_size=config.batch_size,
             num_workers=config.num_workers,
@@ -471,6 +1039,8 @@ def _build_train_loader(config: DeepSpeedTrainConfig) -> tuple[DataLoader, Any |
     loader = build_webdataset_dataloader(
         data_path,
         tokenizer=tokenizer,
+        decoder_tokenizer=decoder_tokenizer,
+        feature_extractor=feature_extractor,
         config=webdataset_config,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
@@ -490,7 +1060,32 @@ def _build_eval_loader(
         dataset = ASRManifestDataset(
             data_path,
             tokenizer=_resolve_text_tokenizer(config),
+            decoder_tokenizer=_resolve_decoder_text_tokenizer(config),
+            feature_extractor=build_audio_feature_extractor(
+                config.feature_extractor_type,
+                input_dim=int(config.input_dim),
+            ),
             append_eos=config.tokenizer_append_eos,
+            text_normalization=config.text_normalization,
+            decoder_append_eos=config.decoder_tokenizer_append_eos,
+            decoder_text_normalization=config.decoder_text_normalization or config.text_normalization,
+            decoder_prompt_before_audio=config.decoder_prompt_before_audio,
+            decoder_prompt_before_audio_use_language=config.decoder_prompt_before_audio_use_language,
+            decoder_ctc_draft_cache_path=config.decoder_ctc_draft_cache_path,
+            decoder_ctc_draft_prompt_template=config.decoder_ctc_draft_prompt_template,
+            decoder_ctc_draft_text_key=config.decoder_ctc_draft_text_key,
+            decoder_ctc_draft_missing_policy=config.decoder_ctc_draft_missing_policy,
+            decoder_ctc_draft_dropout_prob=config.decoder_ctc_draft_dropout_prob,
+            decoder_ctc_draft_language_mismatch_dropout_prob=(
+                config.decoder_ctc_draft_language_mismatch_dropout_prob
+            ),
+            decoder_ctc_draft_dropout_seed=config.decoder_ctc_draft_dropout_seed,
+            decoder_target_prefix=config.decoder_target_prefix,
+            decoder_target_prefix_use_language=config.decoder_target_prefix_use_language,
+            decoder_language_confirmation_en=config.decoder_language_confirmation_en,
+            decoder_language_confirmation_zh=config.decoder_language_confirmation_zh,
+            decoder_prompt_language_label_noise_prob=config.decoder_prompt_language_label_noise_prob,
+            decoder_prompt_language_label_noise_seed=config.decoder_prompt_language_label_noise_seed,
         )
         sampler = None
         if _is_distributed():
@@ -512,16 +1107,34 @@ def _build_eval_loader(
         return loader, sampler
 
     tokenizer = _resolve_text_tokenizer(config)
-    webdataset_config = _build_webdataset_config(config, shuffle_shards=shuffle_shards)
-    webdataset_config = WebDatasetConfig(
-        **{**webdataset_config.__dict__, "split": "eval"}
+    decoder_tokenizer = _resolve_decoder_text_tokenizer(config)
+    feature_extractor = build_audio_feature_extractor(
+        config.feature_extractor_type,
+        input_dim=int(config.input_dim),
     )
-    bucket_manifest_path = _resolve_bucket_manifest_path(data_path, config.webdataset_bucket_manifest_path)
+    webdataset_config = _build_webdataset_config(config, shuffle_shards=shuffle_shards)
+    eval_split = "eval"
+    if step_subset and config.step_eval_split is not None:
+        eval_split = str(config.step_eval_split)
+    webdataset_config = WebDatasetConfig(
+        **{
+            **webdataset_config.__dict__,
+            "split": eval_split,
+            "ctc_label_override_cache_path": None,
+        }
+    )
+    bucket_manifest_path = _resolve_bucket_manifest_path(
+        data_path,
+        config.webdataset_bucket_manifest_path,
+        configured_length_index_path=config.webdataset_length_index_path,
+    )
     if bucket_manifest_path is not None:
         loader = build_bucketed_webdataset_loader(
             data_path,
             bucket_manifest_path=bucket_manifest_path,
             tokenizer=tokenizer,
+            decoder_tokenizer=decoder_tokenizer,
+            feature_extractor=feature_extractor,
             config=webdataset_config,
             batch_size=eval_batch_size,
             num_workers=config.num_workers,
@@ -539,6 +1152,8 @@ def _build_eval_loader(
             data_path,
             length_index_path=length_index_path,
             tokenizer=tokenizer,
+            decoder_tokenizer=decoder_tokenizer,
+            feature_extractor=feature_extractor,
             config=webdataset_config,
             batch_size=eval_batch_size,
             num_workers=config.num_workers,
@@ -549,6 +1164,8 @@ def _build_eval_loader(
     loader = build_webdataset_dataloader(
         data_path,
         tokenizer=tokenizer,
+        decoder_tokenizer=decoder_tokenizer,
+        feature_extractor=feature_extractor,
         config=webdataset_config,
         batch_size=eval_batch_size,
         num_workers=config.num_workers,
@@ -577,6 +1194,230 @@ def _all_reduce_mean(sum_value: float, count_value: int, *, device: torch.device
     return total_sum / total_count
 
 
+def _online_ctc_teacher_distillation_loss(
+    *,
+    config: DeepSpeedTrainConfig,
+    losses: dict[str, Any],
+    batch: Any,
+    ctc_teacher_online_records: dict[str, dict[str, Any]],
+) -> torch.Tensor:
+    total = losses.get("loss")
+    if not isinstance(total, torch.Tensor):
+        raise RuntimeError("joint_losses did not return a tensor loss.")
+
+    ctc_teacher_frame_filter = str(config.ctc_teacher_frame_filter or "all")
+    ctc_teacher_online_full_frame_filter = (
+        ctc_teacher_frame_filter
+        if config.ctc_teacher_online_full_frame_filter is None
+        else str(config.ctc_teacher_online_full_frame_filter)
+    )
+    ignored_token_ids = tuple(int(value) for value in config.ctc_teacher_online_project_ignored_token_ids)
+
+    def student_logits_and_lengths() -> tuple[torch.Tensor, torch.Tensor | None]:
+        student_logits = losses.get("logits")
+        if not isinstance(student_logits, torch.Tensor):
+            raise RuntimeError("joint_losses did not return logits tensor for online CTC teacher distillation.")
+        student_lengths = losses.get("logit_lengths")
+        if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+            raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+        return student_logits, student_lengths
+
+    def student_encoded_and_lengths() -> tuple[torch.Tensor, torch.Tensor | None]:
+        student_encoded = losses.get("ctc_encoded", losses.get("encoded"))
+        if not isinstance(student_encoded, torch.Tensor):
+            raise RuntimeError("joint_losses did not return encoded tensor for online CTC teacher distillation.")
+        student_lengths = losses.get("ctc_encoded_lengths", losses.get("encoded_lengths"))
+        if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+            raise RuntimeError("joint_losses returned non-tensor encoded_lengths.")
+        return student_encoded, student_lengths
+
+    online_weight = float(config.ctc_teacher_online_loss_weight)
+    if online_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        loss_value, _, _ = _ctc_teacher_topk_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            time_map=config.ctc_teacher_topk_time_map,
+            frame_filter=ctc_teacher_frame_filter,
+            frame_filter_neighbor_radius=int(config.ctc_teacher_frame_filter_neighbor_radius),
+            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+        )
+        total = total + loss_value * online_weight
+
+    blank_weight = float(config.ctc_teacher_online_blank_loss_weight)
+    if blank_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        loss_value, _, _ = _ctc_teacher_blank_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            time_map=config.ctc_teacher_topk_time_map,
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+        )
+        total = total + loss_value * blank_weight
+
+    mass_weight = float(config.ctc_teacher_online_mass_loss_weight)
+    if mass_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        loss_value, _, _ = _ctc_teacher_mass_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            time_map=config.ctc_teacher_topk_time_map,
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+        )
+        total = total + loss_value * mass_weight
+
+    full_weight = float(config.ctc_teacher_online_full_loss_weight)
+    if full_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        loss_value, _, _ = _ctc_teacher_full_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            time_map=config.ctc_teacher_topk_time_map,
+            frame_filter=ctc_teacher_online_full_frame_filter,
+            frame_filter_neighbor_radius=int(config.ctc_teacher_frame_filter_neighbor_radius),
+            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+            temperature=float(config.ctc_teacher_online_full_temperature),
+        )
+        total = total + loss_value * full_weight
+
+    encoder_weight = float(config.ctc_teacher_online_encoder_loss_weight)
+    if encoder_weight > 0.0:
+        student_encoded, student_lengths = student_encoded_and_lengths()
+        loss_value, _, _ = _ctc_teacher_hidden_loss(
+            student_encoded,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            teacher_field="encoder_out",
+            time_map=config.ctc_teacher_topk_time_map,
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+            blank_id=int(config.blank_id),
+            frame_filter=ctc_teacher_frame_filter,
+            frame_filter_neighbor_radius=int(config.ctc_teacher_frame_filter_neighbor_radius),
+            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+        )
+        total = total + loss_value * encoder_weight
+
+    sequence_weight = float(config.ctc_teacher_online_sequence_loss_weight)
+    if sequence_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        loss_value, _, _ = _ctc_teacher_sequence_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            ignored_token_ids=ignored_token_ids,
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+        )
+        total = total + loss_value * sequence_weight
+
+    sequence_window_weight = float(config.ctc_teacher_online_sequence_window_loss_weight)
+    if sequence_window_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        loss_value, _, _, _ = _ctc_teacher_sequence_window_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            ignored_token_ids=ignored_token_ids,
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+            radius=int(config.ctc_teacher_online_sequence_window_radius),
+            temperature=float(config.ctc_teacher_online_sequence_window_temperature),
+        )
+        total = total + loss_value * sequence_window_weight
+
+    sequence_presence_weight = float(config.ctc_teacher_online_sequence_presence_loss_weight)
+    if sequence_presence_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        loss_value, _, _, _ = _ctc_teacher_sequence_presence_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            ignored_token_ids=ignored_token_ids,
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+        )
+        total = total + loss_value * sequence_presence_weight
+
+    nonblank_hard_weight = float(config.ctc_teacher_online_nonblank_hard_loss_weight)
+    nonblank_margin_weight = float(config.ctc_teacher_online_nonblank_margin_loss_weight)
+    if nonblank_hard_weight > 0.0 or nonblank_margin_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        hard_loss, margin_loss, _, _ = _ctc_teacher_nonblank_hard_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            time_map=config.ctc_teacher_topk_time_map,
+            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+            margin=float(config.ctc_teacher_online_nonblank_margin),
+        )
+        if nonblank_hard_weight > 0.0:
+            total = total + hard_loss * nonblank_hard_weight
+        if nonblank_margin_weight > 0.0:
+            total = total + margin_loss * nonblank_margin_weight
+
+    nonblank_window_weight = float(config.ctc_teacher_online_nonblank_window_loss_weight)
+    nonblank_window_margin_weight = float(config.ctc_teacher_online_nonblank_window_margin_loss_weight)
+    if nonblank_window_weight > 0.0 or nonblank_window_margin_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        window_loss, margin_loss, _, _, _ = _ctc_teacher_nonblank_window_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            time_map=config.ctc_teacher_topk_time_map,
+            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+            margin=float(config.ctc_teacher_online_nonblank_margin),
+            window_radius=int(config.ctc_teacher_online_nonblank_window_radius),
+            temperature=float(config.ctc_teacher_online_nonblank_window_temperature),
+        )
+        if nonblank_window_weight > 0.0:
+            total = total + window_loss * nonblank_window_weight
+        if nonblank_window_margin_weight > 0.0:
+            total = total + margin_loss * nonblank_window_margin_weight
+
+    nonblank_window_topk_weight = float(config.ctc_teacher_online_nonblank_window_topk_loss_weight)
+    if nonblank_window_topk_weight > 0.0:
+        student_logits, student_lengths = student_logits_and_lengths()
+        loss_value, _, _, _ = _ctc_teacher_nonblank_window_topk_loss(
+            student_logits,
+            student_lengths,
+            batch.utt_ids,
+            ctc_teacher_online_records,
+            blank_id=int(config.blank_id),
+            time_map=config.ctc_teacher_topk_time_map,
+            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+            missing_policy=config.ctc_teacher_topk_missing_policy,
+            window_radius=int(config.ctc_teacher_online_nonblank_window_radius),
+            temperature=float(config.ctc_teacher_online_nonblank_window_temperature),
+        )
+        total = total + loss_value * nonblank_window_topk_weight
+
+    return total
+
+
 @torch.no_grad()
 def _evaluate_epoch_loss(
     *,
@@ -588,6 +1429,8 @@ def _evaluate_epoch_loss(
     feature_dtype: torch.dtype | None,
     mode: str,
     max_eval_samples: int | None = None,
+    config: DeepSpeedTrainConfig | None = None,
+    ctc_teacher_online: FunASRNanoCTCTopKOnlineTeacher | None = None,
 ) -> tuple[float, int]:
     if loader is None:
         return float("nan"), 0
@@ -611,7 +1454,33 @@ def _evaluate_epoch_loss(
         if remaining is not None and int(batch.features.size(0)) > remaining:
             batch = batch.prefix(remaining)
         batch = batch.to(device, feature_dtype=feature_dtype)
-        loss = trainer.eval_loss(batch, mode=mode)
+        if config is not None and ctc_teacher_online is not None:
+            if batch.utt_ids is None:
+                raise RuntimeError("Online CTC teacher eval requires batch.utt_ids.")
+            ctc_teacher_online_records = ctc_teacher_online.topk_records(
+                batch.utt_ids,
+                batch.ctc_teacher_audio_rows,
+            )
+            mask = trainer.eval_direction_mask(mode, device=batch.features.device)
+            losses = model.joint_losses(
+                batch.features,
+                batch.feature_lengths,
+                batch.targets,
+                batch.target_lengths,
+                decoder_targets=batch.decoder_targets,
+                decoder_target_lengths=batch.decoder_target_lengths,
+                decoder_prompt_before_audio=batch.decoder_prompt_before_audio,
+                decoder_prompt_before_audio_lengths=batch.decoder_prompt_before_audio_lengths,
+                direction_mask=mask,
+            )
+            loss = _online_ctc_teacher_distillation_loss(
+                config=config,
+                losses=losses,
+                batch=batch,
+                ctc_teacher_online_records=ctc_teacher_online_records,
+            )
+        else:
+            loss = trainer.eval_loss(batch, mode=mode)
         batch_size = int(batch.features.size(0))
         local_loss_sum += float(loss.item()) * batch_size
         local_sample_count += batch_size
@@ -623,6 +1492,2070 @@ def _evaluate_epoch_loss(
         dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
         global_sample_count = int(round(float(count_tensor.item())))
     return _all_reduce_mean(local_loss_sum, local_sample_count, device=device), global_sample_count
+
+
+def _load_encoder_anchor_model(
+    *,
+    model_config: RWKVCTCModelConfig,
+    checkpoint_path: str | None,
+) -> RWKVCTCModel | None:
+    if checkpoint_path is None:
+        return None
+    path = Path(checkpoint_path)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"encoder_anchor_checkpoint_path missing or empty: {path}")
+    anchor = RWKVCTCModel(model_config)
+    restored = load_checkpoint(path, model=anchor, map_location="cpu", strict=True)
+    for parameter in anchor.parameters():
+        parameter.requires_grad_(False)
+    anchor.eval()
+    _rank_zero_log(
+        "Loaded encoder anchor checkpoint: "
+        f"path={path} step={int(restored.get('step', 0))} "
+        f"missing={len(restored['extra'].get('missing_keys', []))} "
+        f"unexpected={len(restored['extra'].get('unexpected_keys', []))}"
+    )
+    return anchor
+
+
+@torch.no_grad()
+def _encoder_anchor_forward(
+    *,
+    anchor_model: RWKVCTCModel,
+    features: torch.Tensor,
+    feature_lengths: torch.Tensor | None,
+    direction_mask: DirectionMask,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    encoded, encoded_lengths, _ = anchor_model.encoder(
+        features,
+        lengths=feature_lengths,
+        direction_mask=direction_mask,
+    )
+    return encoded, encoded_lengths
+
+
+def _masked_encoder_mse_loss(
+    student_encoded: torch.Tensor,
+    teacher_encoded: torch.Tensor,
+    lengths: torch.Tensor | None,
+) -> torch.Tensor:
+    time = min(int(student_encoded.size(1)), int(teacher_encoded.size(1)))
+    if time <= 0:
+        return student_encoded.new_zeros(())
+    student = student_encoded[:, :time].float()
+    teacher = teacher_encoded[:, :time].float()
+    squared = (student - teacher).pow(2).mean(dim=-1)
+    if lengths is None:
+        return squared.mean()
+    clipped_lengths = lengths.to(device=squared.device).clamp(min=0, max=time)
+    positions = torch.arange(time, device=squared.device).unsqueeze(0)
+    mask = positions < clipped_lengths.unsqueeze(1)
+    denom = mask.sum().clamp_min(1)
+    return squared.masked_select(mask).sum() / denom
+
+
+def _masked_ctc_logit_kl_loss(
+    student_logits: torch.Tensor,
+    teacher_encoded: torch.Tensor,
+    lengths: torch.Tensor | None,
+    *,
+    anchor_model: RWKVCTCModel,
+    chunk_frames: int,
+) -> torch.Tensor:
+    if getattr(anchor_model, "ctc_decoder", None) is not None:
+        raise ValueError("ctc_logit_anchor_loss is not supported when the anchor uses a CTC decoder.")
+    time = min(int(student_logits.size(1)), int(teacher_encoded.size(1)))
+    if time <= 0:
+        return student_logits.new_zeros(())
+    chunk_frames = max(1, int(chunk_frames))
+    total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    clipped_lengths = None
+    if lengths is not None:
+        clipped_lengths = lengths.to(device=student_logits.device).clamp(min=0, max=time)
+
+    for start in range(0, time, chunk_frames):
+        end = min(start + chunk_frames, time)
+        student_slice = student_logits[:, start:end].float()
+        with torch.no_grad():
+            teacher_logits = anchor_model.ctc_head(teacher_encoded[:, start:end]).float()
+            teacher_probs = torch.softmax(teacher_logits, dim=-1)
+        student_log_probs = F.log_softmax(student_slice, dim=-1)
+        frame_kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=-1)
+        if clipped_lengths is None:
+            total = total + frame_kl.sum()
+            denom = denom + frame_kl.new_tensor(float(frame_kl.numel()))
+            continue
+        positions = torch.arange(start, end, device=frame_kl.device).unsqueeze(0)
+        mask = positions < clipped_lengths.unsqueeze(1)
+        total = total + frame_kl.masked_select(mask).sum()
+        denom = denom + mask.sum().to(dtype=torch.float32, device=frame_kl.device)
+    return total / denom.clamp_min(1.0)
+
+
+def _load_ctc_teacher_topk_cache(cache_path: str | None) -> dict[str, dict[str, Any]]:
+    if cache_path is None:
+        return {}
+    path = Path(cache_path)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"ctc_teacher_topk_cache_path missing or empty: {path}")
+
+    cache: dict[str, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid CTC teacher top-k JSONL at {path}:{line_number}") from exc
+            utt_id = record.get("utt_id") or record.get("id") or record.get("key")
+            if utt_id is None or not str(utt_id).strip():
+                raise ValueError(f"CTC teacher top-k cache row has no utt_id/id/key at {path}:{line_number}")
+            row = dict(record)
+            row["_cache_base_dir"] = str(path.parent)
+            cache[str(utt_id)] = row
+    return cache
+
+
+def _materialize_ctc_teacher_topk_record(record: dict[str, Any]) -> dict[str, Any]:
+    if "topk_token_ids" in record and "topk_log_probs" in record:
+        return record
+
+    tensor_path_value = (
+        record.get("topk_tensor_path")
+        or record.get("topk_path")
+        or record.get("tensor_path")
+    )
+    if tensor_path_value is None:
+        return record
+
+    tensor_path = Path(str(tensor_path_value))
+    if not tensor_path.is_absolute():
+        tensor_path = Path(str(record.get("_cache_base_dir") or ".")) / tensor_path
+    payload = torch.load(tensor_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"CTC teacher top-k tensor payload must be a dict: {tensor_path}")
+
+    materialized = dict(record)
+    for key in ("topk_token_ids", "topk_ids", "token_ids", "ids"):
+        if key in payload:
+            materialized["topk_token_ids"] = payload[key]
+            break
+    for key in ("topk_log_probs", "topk_logprobs", "log_probs", "logprobs"):
+        if key in payload:
+            materialized["topk_log_probs"] = payload[key]
+            break
+    if "topk_token_ids" not in materialized or "topk_log_probs" not in materialized:
+        raise ValueError(f"CTC teacher top-k tensor payload missing ids/log_probs: {tensor_path}")
+    record.update(materialized)
+    return record
+
+
+def _ctc_teacher_topk_field(record: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in record:
+            return record[name]
+    return None
+
+
+def _ctc_teacher_topk_frame_ce(
+    student_log_probs: torch.Tensor,
+    teacher_ids: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    *,
+    ignored_token_ids: tuple[int, ...],
+) -> torch.Tensor:
+    if teacher_ids.numel() == 0 or teacher_log_probs.numel() == 0:
+        return student_log_probs.new_zeros((int(student_log_probs.size(0)),), dtype=torch.float32)
+    vocab_size = int(student_log_probs.size(-1))
+    teacher_ids = teacher_ids.to(device=student_log_probs.device, dtype=torch.long)
+    teacher_log_probs = teacher_log_probs.to(device=student_log_probs.device, dtype=torch.float32)
+    valid = (teacher_ids >= 0) & (teacher_ids < vocab_size)
+    for ignored_id in ignored_token_ids:
+        valid = valid & (teacher_ids != int(ignored_id))
+    safe_ids = teacher_ids.masked_fill(~valid, 0)
+    teacher_probs = teacher_log_probs.exp().masked_fill(~valid, 0.0)
+    teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    gathered_student = student_log_probs.gather(dim=-1, index=safe_ids)
+    return -(teacher_probs * gathered_student).sum(dim=-1)
+
+
+def _ctc_teacher_frame_filter_mask(
+    teacher_ids: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    *,
+    frame_filter: str,
+    blank_id: int,
+    ignored_token_ids: tuple[int, ...],
+    neighbor_radius: int,
+    min_nonblank_prob: float,
+    device: torch.device,
+) -> torch.Tensor | None:
+    frame_filter = str(frame_filter or "all")
+    if frame_filter == "all":
+        return None
+    if frame_filter not in {"nonblank", "nonblank_neighbors"}:
+        raise ValueError(
+            "ctc_teacher_frame_filter must be 'all', 'nonblank', or 'nonblank_neighbors', "
+            f"got {frame_filter!r}."
+        )
+    if teacher_ids.numel() == 0 or teacher_log_probs.numel() == 0:
+        return torch.zeros((int(teacher_ids.size(0)),), dtype=torch.bool, device=device)
+    if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2:
+        raise ValueError(
+            "CTC teacher frame filtering expects 2-D ids/log_probs, "
+            f"got ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+        )
+    top1_ids = teacher_ids[:, 0].to(dtype=torch.long)
+    top1_probs = teacher_log_probs[:, 0].to(dtype=torch.float32).exp()
+    mask = top1_ids.ne(int(blank_id))
+    for ignored_id in ignored_token_ids:
+        mask = mask & top1_ids.ne(int(ignored_id))
+    min_prob = float(min_nonblank_prob)
+    if min_prob > 0.0:
+        mask = mask & top1_probs.ge(min_prob)
+    if frame_filter == "nonblank_neighbors" and int(neighbor_radius) > 0 and bool(mask.any().item()):
+        radius = int(neighbor_radius)
+        expanded = mask.clone()
+        indices = mask.nonzero(as_tuple=False).flatten()
+        time = int(mask.numel())
+        for offset in range(1, radius + 1):
+            left = (indices - offset).clamp(min=0, max=time - 1)
+            right = (indices + offset).clamp(min=0, max=time - 1)
+            expanded[left] = True
+            expanded[right] = True
+        mask = expanded
+    return mask.to(device=device)
+
+
+def _logsumexp_without_index(logits: torch.Tensor, *, index: int) -> torch.Tensor:
+    if int(index) < 0 or int(index) >= int(logits.size(-1)):
+        raise ValueError(f"blank_id={index} is outside logits vocab size={logits.size(-1)}")
+    masked = logits.float().clone()
+    masked[..., int(index)] = float("-inf")
+    return torch.logsumexp(masked, dim=-1)
+
+
+def _ctc_teacher_blank_log_probs_from_record(
+    record: dict[str, Any],
+    *,
+    teacher_ids: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    student_blank_id: int,
+) -> torch.Tensor | None:
+    raw_blank = _ctc_teacher_topk_field(
+        record,
+        "blank_log_probs",
+        "blank_logprobs",
+        "blank_log_probs_tensor",
+        "blank_logprobs_tensor",
+    )
+    if raw_blank is not None:
+        blank = torch.as_tensor(raw_blank, dtype=torch.float32)
+        if blank.ndim == 1:
+            return blank
+        if blank.ndim == 2 and int(blank.size(-1)) == 1:
+            return blank.squeeze(-1)
+        raise ValueError(f"CTC teacher blank_log_probs must be 1-D, got {tuple(blank.shape)}")
+
+    project_blank_id = int(record.get("project_blank_id", student_blank_id))
+    blank_mask = teacher_ids.eq(project_blank_id)
+    if not bool(blank_mask.any().item()):
+        return None
+    blank_values = teacher_log_probs.masked_fill(~blank_mask, float("-inf")).amax(dim=-1)
+    return blank_values
+
+
+def _ctc_teacher_nonblank_hard_frame_losses(
+    student_logits: torch.Tensor,
+    teacher_ids: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    *,
+    blank_id: int,
+    ignored_token_ids: tuple[int, ...],
+    min_nonblank_prob: float,
+    margin: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if teacher_ids.numel() == 0 or teacher_log_probs.numel() == 0:
+        zeros = student_logits.new_zeros((int(student_logits.size(0)),), dtype=torch.float32)
+        mask = torch.zeros((int(student_logits.size(0)),), dtype=torch.bool, device=student_logits.device)
+        return zeros, zeros, mask
+    if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2:
+        raise ValueError(
+            "CTC teacher nonblank hard loss expects 2-D ids/log_probs, "
+            f"got ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+        )
+    if int(teacher_ids.size(0)) != int(student_logits.size(0)):
+        raise ValueError(
+            "CTC teacher nonblank hard loss time mismatch: "
+            f"student={int(student_logits.size(0))} teacher={int(teacher_ids.size(0))}"
+        )
+    vocab_size = int(student_logits.size(-1))
+    blank_id = int(blank_id)
+    if blank_id < 0 or blank_id >= vocab_size:
+        raise ValueError(f"blank_id={blank_id} is outside logits vocab size={vocab_size}")
+
+    teacher_ids = teacher_ids.to(device=student_logits.device, dtype=torch.long)
+    teacher_log_probs = teacher_log_probs.to(device=student_logits.device, dtype=torch.float32)
+    top1_ids = teacher_ids[:, 0]
+    top1_probs = teacher_log_probs[:, 0].exp()
+    selected = (top1_ids >= 0) & (top1_ids < vocab_size) & top1_ids.ne(blank_id)
+    for ignored_id in ignored_token_ids:
+        selected = selected & top1_ids.ne(int(ignored_id))
+    min_prob = float(min_nonblank_prob)
+    if min_prob > 0.0:
+        selected = selected & top1_probs.ge(min_prob)
+
+    safe_ids = top1_ids.masked_fill(~selected, 0)
+    student_log_probs = F.log_softmax(student_logits.float(), dim=-1)
+    hard_loss = -student_log_probs.gather(dim=-1, index=safe_ids.unsqueeze(-1)).squeeze(-1)
+
+    target_logits = student_logits.float().gather(dim=-1, index=safe_ids.unsqueeze(-1)).squeeze(-1)
+    blank_logits = student_logits.float()[:, blank_id]
+    margin_loss = F.relu(float(margin) + blank_logits - target_logits)
+    return hard_loss, margin_loss, selected
+
+
+def _ctc_teacher_nonblank_hard_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    time_map: str,
+    frame_filter_min_nonblank_prob: float,
+    missing_policy: str,
+    margin: float,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("Online CTC teacher nonblank hard distillation requires batch.utt_ids.")
+    if time_map not in {"nearest", "linear"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    hard_total = student_logits.new_zeros((), dtype=torch.float32)
+    margin_total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing online CTC teacher nonblank hard record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
+        raw_log_probs = _ctc_teacher_topk_field(
+            record,
+            "topk_log_probs",
+            "topk_logprobs",
+            "log_probs",
+            "logprobs",
+        )
+        if raw_ids is None or raw_log_probs is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"Online CTC teacher nonblank hard record missing ids/log_probs for utt_id={utt_id!r}")
+            continue
+
+        teacher_ids = torch.as_tensor(raw_ids, dtype=torch.long)
+        teacher_log_probs = torch.as_tensor(raw_log_probs, dtype=torch.float32)
+        if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2 or teacher_ids.shape != teacher_log_probs.shape:
+            raise ValueError(
+                f"Online CTC teacher nonblank hard record has invalid shape for utt_id={utt_id!r}: "
+                f"ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+            )
+        teacher_time = int(teacher_ids.size(0))
+        student_time = int(clipped_lengths[sample_idx].item())
+        if teacher_time <= 0 or student_time <= 0:
+            continue
+
+        matched += 1
+        student_slice = student_logits[sample_idx, :student_time].float()
+        ignored_values = record.get("project_ignored_token_ids")
+        if ignored_values is None:
+            ignored_values = [60514]
+        ignored_ids = tuple(int(value) for value in ignored_values)
+        project_blank_id = int(record.get("project_blank_id", int(blank_id)))
+
+        if time_map == "nearest" or student_time == 1 or teacher_time == 1:
+            if student_time == 1 or teacher_time == 1:
+                frame_indices = torch.zeros(student_time, device=student_logits.device, dtype=torch.long)
+            else:
+                positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+                frame_indices = torch.round(positions * float(teacher_time - 1) / float(student_time - 1)).to(
+                    dtype=torch.long
+                )
+            frame_indices = frame_indices.clamp(min=0, max=teacher_time - 1).cpu()
+            selected_ids = teacher_ids.index_select(0, frame_indices)
+            selected_log_probs = teacher_log_probs.index_select(0, frame_indices)
+            hard_loss, margin_loss, selected_mask = _ctc_teacher_nonblank_hard_frame_losses(
+                student_slice,
+                selected_ids,
+                selected_log_probs,
+                blank_id=project_blank_id,
+                ignored_token_ids=ignored_ids,
+                min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                margin=float(margin),
+            )
+            weights = selected_mask.to(dtype=torch.float32)
+            hard_loss = hard_loss * weights
+            margin_loss = margin_loss * weights
+        else:
+            positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+            scaled = positions * float(teacher_time - 1) / float(student_time - 1)
+            lo = torch.floor(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            hi = torch.ceil(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            alpha = (scaled - lo.to(dtype=torch.float32)).to(dtype=torch.float32)
+            lo_ids = teacher_ids.index_select(0, lo.cpu())
+            lo_log_probs = teacher_log_probs.index_select(0, lo.cpu())
+            hi_ids = teacher_ids.index_select(0, hi.cpu())
+            hi_log_probs = teacher_log_probs.index_select(0, hi.cpu())
+            lo_hard, lo_margin, lo_mask = _ctc_teacher_nonblank_hard_frame_losses(
+                student_slice,
+                lo_ids,
+                lo_log_probs,
+                blank_id=project_blank_id,
+                ignored_token_ids=ignored_ids,
+                min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                margin=float(margin),
+            )
+            hi_hard, hi_margin, hi_mask = _ctc_teacher_nonblank_hard_frame_losses(
+                student_slice,
+                hi_ids,
+                hi_log_probs,
+                blank_id=project_blank_id,
+                ignored_token_ids=ignored_ids,
+                min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                margin=float(margin),
+            )
+            lo_weight = lo_mask.to(dtype=torch.float32) * (1.0 - alpha)
+            hi_weight = hi_mask.to(dtype=torch.float32) * alpha
+            hard_loss = lo_hard * lo_weight + hi_hard * hi_weight
+            margin_loss = lo_margin * lo_weight + hi_margin * hi_weight
+            weights = lo_weight + hi_weight
+
+        selected_count = float(weights.sum().detach().item())
+        if selected_count <= 0.0:
+            continue
+        hard_total = hard_total + hard_loss.sum()
+        margin_total = margin_total + margin_loss.sum()
+        denom = denom + weights.new_tensor(selected_count)
+
+    denom = denom.clamp_min(1.0)
+    return hard_total / denom, margin_total / denom, matched, missing
+
+
+def _ctc_teacher_window_reduce(values: torch.Tensor, temperature: float) -> torch.Tensor:
+    if values.numel() == 0:
+        return values.new_zeros(())
+    temperature = float(temperature)
+    if temperature <= 0.0 or int(values.numel()) == 1:
+        return values.min()
+    scaled = -values.float() / temperature
+    return -temperature * (torch.logsumexp(scaled, dim=0) - math.log(float(values.numel())))
+
+
+def _ctc_teacher_nonblank_peak_indices(
+    top1_ids: torch.Tensor,
+    top1_probs: torch.Tensor,
+    selected: torch.Tensor,
+) -> list[int]:
+    indices = torch.nonzero(selected, as_tuple=False).flatten().tolist()
+    if not indices:
+        return []
+    peaks: list[int] = []
+    best_idx = int(indices[0])
+    best_prob = float(top1_probs[best_idx].item())
+    prev_idx = best_idx
+    prev_id = int(top1_ids[best_idx].item())
+    for raw_idx in indices[1:]:
+        idx = int(raw_idx)
+        token_id = int(top1_ids[idx].item())
+        prob = float(top1_probs[idx].item())
+        if idx == prev_idx + 1 and token_id == prev_id:
+            if prob > best_prob:
+                best_idx = idx
+                best_prob = prob
+        else:
+            peaks.append(best_idx)
+            best_idx = idx
+            best_prob = prob
+        prev_idx = idx
+        prev_id = token_id
+    peaks.append(best_idx)
+    return peaks
+
+
+def _ctc_teacher_nonblank_window_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    time_map: str,
+    frame_filter_min_nonblank_prob: float,
+    missing_policy: str,
+    margin: float,
+    window_radius: int,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("Online CTC teacher nonblank window distillation requires batch.utt_ids.")
+    if time_map not in {"nearest", "linear"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+    window_radius = int(window_radius)
+    if window_radius < 0:
+        raise ValueError(f"ctc_teacher_online_nonblank_window_radius must be >= 0, got {window_radius!r}.")
+    if float(temperature) < 0.0:
+        raise ValueError(
+            "ctc_teacher_online_nonblank_window_temperature must be >= 0, "
+            f"got {float(temperature)!r}."
+        )
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    token_total = student_logits.new_zeros((), dtype=torch.float32)
+    margin_total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    event_count = 0
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing online CTC teacher nonblank window record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
+        raw_log_probs = _ctc_teacher_topk_field(
+            record,
+            "topk_log_probs",
+            "topk_logprobs",
+            "log_probs",
+            "logprobs",
+        )
+        if raw_ids is None or raw_log_probs is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"Online CTC teacher nonblank window record missing ids/log_probs for utt_id={utt_id!r}")
+            continue
+
+        teacher_ids = torch.as_tensor(raw_ids, dtype=torch.long)
+        teacher_log_probs = torch.as_tensor(raw_log_probs, dtype=torch.float32)
+        if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2 or teacher_ids.shape != teacher_log_probs.shape:
+            raise ValueError(
+                f"Online CTC teacher nonblank window record has invalid shape for utt_id={utt_id!r}: "
+                f"ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+            )
+        teacher_time = int(teacher_ids.size(0))
+        student_time = int(clipped_lengths[sample_idx].item())
+        if teacher_time <= 0 or student_time <= 0:
+            continue
+
+        matched += 1
+        vocab_size = int(student_logits.size(-1))
+        ignored_values = record.get("project_ignored_token_ids")
+        if ignored_values is None:
+            ignored_values = [60514]
+        ignored_ids = tuple(int(value) for value in ignored_values)
+        project_blank_id = int(record.get("project_blank_id", int(blank_id)))
+        if project_blank_id < 0 or project_blank_id >= vocab_size:
+            raise ValueError(f"blank_id={project_blank_id} is outside logits vocab size={vocab_size}")
+
+        top1_ids = teacher_ids[:, 0]
+        top1_probs = teacher_log_probs[:, 0].exp()
+        selected = (top1_ids >= 0) & (top1_ids < vocab_size) & top1_ids.ne(project_blank_id)
+        for ignored_id in ignored_ids:
+            selected = selected & top1_ids.ne(int(ignored_id))
+        min_prob = float(frame_filter_min_nonblank_prob)
+        if min_prob > 0.0:
+            selected = selected & top1_probs.ge(min_prob)
+        peak_indices = _ctc_teacher_nonblank_peak_indices(top1_ids, top1_probs, selected)
+        if not peak_indices:
+            continue
+
+        student_slice = student_logits[sample_idx, :student_time].float()
+        student_log_probs = F.log_softmax(student_slice, dim=-1)
+        blank_logits = student_slice[:, project_blank_id]
+        for teacher_idx in peak_indices:
+            target_id = int(top1_ids[teacher_idx].item())
+            if teacher_time == 1 or student_time == 1:
+                center = 0
+            else:
+                scaled = float(teacher_idx) * float(student_time - 1) / float(teacher_time - 1)
+                center = int(round(scaled))
+            center = max(0, min(center, student_time - 1))
+            lo = max(0, center - window_radius)
+            hi = min(student_time, center + window_radius + 1)
+            if hi <= lo:
+                continue
+            token_ce = -student_log_probs[lo:hi, target_id]
+            token_total = token_total + _ctc_teacher_window_reduce(token_ce, float(temperature))
+            target_logits = student_slice[lo:hi, target_id]
+            margin_values = F.relu(float(margin) + blank_logits[lo:hi] - target_logits)
+            margin_total = margin_total + _ctc_teacher_window_reduce(margin_values, float(temperature))
+            denom = denom + student_logits.new_tensor(1.0, dtype=torch.float32)
+            event_count += 1
+
+    denom = denom.clamp_min(1.0)
+    return token_total / denom, margin_total / denom, matched, missing, event_count
+
+
+def _ctc_teacher_nonblank_window_topk_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    time_map: str,
+    frame_filter_min_nonblank_prob: float,
+    missing_policy: str,
+    window_radius: int,
+    temperature: float,
+) -> tuple[torch.Tensor, int, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("Online CTC teacher nonblank window top-k distillation requires batch.utt_ids.")
+    if time_map not in {"nearest", "linear"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+    window_radius = int(window_radius)
+    if window_radius < 0:
+        raise ValueError(f"ctc_teacher_online_nonblank_window_radius must be >= 0, got {window_radius!r}.")
+    if float(temperature) < 0.0:
+        raise ValueError(
+            "ctc_teacher_online_nonblank_window_temperature must be >= 0, "
+            f"got {float(temperature)!r}."
+        )
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    event_count = 0
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing online CTC teacher nonblank window top-k record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
+        raw_log_probs = _ctc_teacher_topk_field(
+            record,
+            "topk_log_probs",
+            "topk_logprobs",
+            "log_probs",
+            "logprobs",
+        )
+        if raw_ids is None or raw_log_probs is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(
+                    f"Online CTC teacher nonblank window top-k record missing ids/log_probs for utt_id={utt_id!r}"
+                )
+            continue
+
+        teacher_ids = torch.as_tensor(raw_ids, dtype=torch.long)
+        teacher_log_probs = torch.as_tensor(raw_log_probs, dtype=torch.float32)
+        if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2 or teacher_ids.shape != teacher_log_probs.shape:
+            raise ValueError(
+                f"Online CTC teacher nonblank window top-k record has invalid shape for utt_id={utt_id!r}: "
+                f"ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+            )
+        teacher_time = int(teacher_ids.size(0))
+        student_time = int(clipped_lengths[sample_idx].item())
+        if teacher_time <= 0 or student_time <= 0:
+            continue
+
+        matched += 1
+        vocab_size = int(student_logits.size(-1))
+        ignored_values = record.get("project_ignored_token_ids")
+        if ignored_values is None:
+            ignored_values = [60514]
+        ignored_ids = tuple(int(value) for value in ignored_values)
+        project_blank_id = int(record.get("project_blank_id", int(blank_id)))
+        if project_blank_id < 0 or project_blank_id >= vocab_size:
+            raise ValueError(f"blank_id={project_blank_id} is outside logits vocab size={vocab_size}")
+
+        top1_ids = teacher_ids[:, 0]
+        top1_probs = teacher_log_probs[:, 0].exp()
+        selected = (top1_ids >= 0) & (top1_ids < vocab_size) & top1_ids.ne(project_blank_id)
+        for ignored_id in ignored_ids:
+            selected = selected & top1_ids.ne(int(ignored_id))
+        min_prob = float(frame_filter_min_nonblank_prob)
+        if min_prob > 0.0:
+            selected = selected & top1_probs.ge(min_prob)
+        peak_indices = _ctc_teacher_nonblank_peak_indices(top1_ids, top1_probs, selected)
+        if not peak_indices:
+            continue
+
+        student_log_probs = F.log_softmax(student_logits[sample_idx, :student_time].float(), dim=-1)
+        for teacher_idx in peak_indices:
+            peak_ids = teacher_ids[teacher_idx].to(device=student_logits.device, dtype=torch.long)
+            peak_log_probs = teacher_log_probs[teacher_idx].to(device=student_logits.device, dtype=torch.float32)
+            valid = (peak_ids >= 0) & (peak_ids < vocab_size) & peak_ids.ne(project_blank_id)
+            for ignored_id in ignored_ids:
+                valid = valid & peak_ids.ne(int(ignored_id))
+            if not bool(valid.any().item()):
+                continue
+            safe_ids = peak_ids.masked_select(valid)
+            teacher_probs = peak_log_probs.masked_select(valid).exp()
+            teacher_probs = teacher_probs / teacher_probs.sum().clamp_min(1.0e-8)
+
+            if teacher_time == 1 or student_time == 1:
+                center = 0
+            else:
+                scaled = float(teacher_idx) * float(student_time - 1) / float(teacher_time - 1)
+                center = int(round(scaled))
+            center = max(0, min(center, student_time - 1))
+            lo = max(0, center - window_radius)
+            hi = min(student_time, center + window_radius + 1)
+            if hi <= lo:
+                continue
+            window_log_probs = student_log_probs[lo:hi].index_select(dim=-1, index=safe_ids)
+            frame_ce = -(window_log_probs * teacher_probs.unsqueeze(0)).sum(dim=-1)
+            total = total + _ctc_teacher_window_reduce(frame_ce, float(temperature))
+            denom = denom + student_logits.new_tensor(1.0, dtype=torch.float32)
+            event_count += 1
+
+    return total / denom.clamp_min(1.0), matched, missing, event_count
+
+
+def _ctc_teacher_blank_frame_bce(
+    student_logits: torch.Tensor,
+    teacher_blank_log_probs: torch.Tensor,
+    *,
+    blank_id: int,
+) -> torch.Tensor:
+    if teacher_blank_log_probs.numel() == 0:
+        return student_logits.new_zeros((int(student_logits.size(0)),), dtype=torch.float32)
+    blank_id = int(blank_id)
+    student_blank_logits = student_logits.float()[..., blank_id]
+    student_nonblank_lse = _logsumexp_without_index(student_logits, index=blank_id)
+    student_blank_vs_nonblank = student_blank_logits - student_nonblank_lse
+    teacher_blank_probs = teacher_blank_log_probs.to(
+        device=student_logits.device,
+        dtype=torch.float32,
+    ).exp()
+    teacher_blank_probs = teacher_blank_probs.clamp(min=0.0, max=1.0)
+    return F.binary_cross_entropy_with_logits(
+        student_blank_vs_nonblank,
+        teacher_blank_probs,
+        reduction="none",
+    )
+
+
+def _ctc_teacher_mass_frame_ce(
+    student_log_probs: torch.Tensor,
+    teacher_ids: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    teacher_blank_log_probs: torch.Tensor,
+    *,
+    blank_id: int,
+    ignored_token_ids: tuple[int, ...],
+) -> torch.Tensor:
+    if teacher_ids.numel() == 0 or teacher_log_probs.numel() == 0 or teacher_blank_log_probs.numel() == 0:
+        return student_log_probs.new_zeros((int(student_log_probs.size(0)),), dtype=torch.float32)
+    vocab_size = int(student_log_probs.size(-1))
+    blank_id = int(blank_id)
+    if blank_id < 0 or blank_id >= vocab_size:
+        raise ValueError(f"blank_id={blank_id} is outside logits vocab size={vocab_size}")
+
+    teacher_ids = teacher_ids.to(device=student_log_probs.device, dtype=torch.long)
+    teacher_log_probs = teacher_log_probs.to(device=student_log_probs.device, dtype=torch.float32)
+    teacher_blank_probs = teacher_blank_log_probs.to(
+        device=student_log_probs.device,
+        dtype=torch.float32,
+    ).exp()
+    teacher_blank_probs = teacher_blank_probs.clamp(min=0.0, max=1.0)
+
+    valid = (teacher_ids >= 0) & (teacher_ids < vocab_size) & (teacher_ids != blank_id)
+    for ignored_id in ignored_token_ids:
+        valid = valid & (teacher_ids != int(ignored_id))
+    safe_ids = teacher_ids.masked_fill(~valid, blank_id)
+    teacher_selected_probs = teacher_log_probs.exp().masked_fill(~valid, 0.0)
+    selected_mass = teacher_selected_probs.sum(dim=-1)
+    teacher_other_probs = (1.0 - teacher_blank_probs - selected_mass).clamp(min=0.0, max=1.0)
+
+    selected_student = student_log_probs.gather(dim=-1, index=safe_ids).masked_fill(~valid, 0.0)
+    student_other_log_probs = student_log_probs.float().clone()
+    student_other_log_probs[..., blank_id] = float("-inf")
+    for ignored_id in ignored_token_ids:
+        ignored_id = int(ignored_id)
+        if 0 <= ignored_id < vocab_size:
+            student_other_log_probs[..., ignored_id] = float("-inf")
+    student_other_log_probs = student_other_log_probs.scatter(
+        dim=-1,
+        index=safe_ids,
+        src=torch.full_like(safe_ids, float("-inf"), dtype=student_other_log_probs.dtype),
+    )
+    student_other_log_prob = torch.logsumexp(student_other_log_probs, dim=-1)
+    other_term = torch.where(
+        teacher_other_probs > 0.0,
+        teacher_other_probs * student_other_log_prob,
+        torch.zeros_like(teacher_other_probs),
+    )
+
+    return -(
+        teacher_blank_probs * student_log_probs[..., blank_id]
+        + (teacher_selected_probs * selected_student).sum(dim=-1)
+        + other_term
+    )
+
+
+def _ctc_teacher_topk_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    time_map: str,
+    frame_filter: str,
+    frame_filter_neighbor_radius: int,
+    frame_filter_min_nonblank_prob: float,
+    missing_policy: str,
+) -> tuple[torch.Tensor, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("CTC teacher top-k distillation requires batch.utt_ids.")
+    if time_map not in {"nearest", "linear"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing CTC teacher top-k record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
+        raw_log_probs = _ctc_teacher_topk_field(
+            record,
+            "topk_log_probs",
+            "topk_logprobs",
+            "log_probs",
+            "logprobs",
+        )
+        if raw_ids is None or raw_log_probs is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"CTC teacher top-k record missing ids/log_probs for utt_id={utt_id!r}")
+            continue
+
+        teacher_ids = torch.as_tensor(raw_ids, dtype=torch.long)
+        teacher_log_probs = torch.as_tensor(raw_log_probs, dtype=torch.float32)
+        if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2 or teacher_ids.shape != teacher_log_probs.shape:
+            raise ValueError(
+                f"CTC teacher top-k record has invalid shape for utt_id={utt_id!r}: "
+                f"ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+            )
+        teacher_time = int(teacher_ids.size(0))
+        student_time = int(clipped_lengths[sample_idx].item())
+        if teacher_time <= 0 or student_time <= 0:
+            continue
+
+        matched += 1
+        student_slice = F.log_softmax(student_logits[sample_idx, :student_time].float(), dim=-1)
+        ignored_values = record.get("project_ignored_token_ids")
+        if ignored_values is None:
+            ignored_values = [60514]
+        ignored_ids = tuple(int(value) for value in ignored_values)
+        project_blank_id = int(record.get("project_blank_id", int(blank_id)))
+        if time_map == "nearest" or student_time == 1 or teacher_time == 1:
+            if student_time == 1 or teacher_time == 1:
+                frame_indices = torch.zeros(student_time, device=student_logits.device, dtype=torch.long)
+            else:
+                positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+                frame_indices = torch.round(positions * float(teacher_time - 1) / float(student_time - 1)).to(
+                    dtype=torch.long
+                )
+            frame_indices = frame_indices.clamp(min=0, max=teacher_time - 1).cpu()
+            selected_ids = teacher_ids.index_select(0, frame_indices)
+            selected_log_probs = teacher_log_probs.index_select(0, frame_indices)
+            frame_loss = _ctc_teacher_topk_frame_ce(
+                student_slice,
+                selected_ids,
+                selected_log_probs,
+                ignored_token_ids=ignored_ids,
+            )
+            selected_mask = _ctc_teacher_frame_filter_mask(
+                selected_ids,
+                selected_log_probs,
+                frame_filter=frame_filter,
+                blank_id=project_blank_id,
+                ignored_token_ids=ignored_ids,
+                neighbor_radius=int(frame_filter_neighbor_radius),
+                min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                device=frame_loss.device,
+            )
+        else:
+            positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+            scaled = positions * float(teacher_time - 1) / float(student_time - 1)
+            lo = torch.floor(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            hi = torch.ceil(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            alpha = (scaled - lo.to(dtype=torch.float32)).to(dtype=torch.float32)
+            lo_ids = teacher_ids.index_select(0, lo.cpu())
+            lo_log_probs = teacher_log_probs.index_select(0, lo.cpu())
+            hi_ids = teacher_ids.index_select(0, hi.cpu())
+            hi_log_probs = teacher_log_probs.index_select(0, hi.cpu())
+            lo_loss = _ctc_teacher_topk_frame_ce(
+                student_slice,
+                lo_ids,
+                lo_log_probs,
+                ignored_token_ids=ignored_ids,
+            )
+            hi_loss = _ctc_teacher_topk_frame_ce(
+                student_slice,
+                hi_ids,
+                hi_log_probs,
+                ignored_token_ids=ignored_ids,
+            )
+            frame_loss = lo_loss * (1.0 - alpha) + hi_loss * alpha
+            selected_mask = _ctc_teacher_frame_filter_mask(
+                lo_ids,
+                lo_log_probs,
+                frame_filter=frame_filter,
+                blank_id=project_blank_id,
+                ignored_token_ids=ignored_ids,
+                neighbor_radius=int(frame_filter_neighbor_radius),
+                min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                device=frame_loss.device,
+            )
+            hi_mask = _ctc_teacher_frame_filter_mask(
+                hi_ids,
+                hi_log_probs,
+                frame_filter=frame_filter,
+                blank_id=project_blank_id,
+                ignored_token_ids=ignored_ids,
+                neighbor_radius=int(frame_filter_neighbor_radius),
+                min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                device=frame_loss.device,
+            )
+            if selected_mask is not None and hi_mask is not None:
+                selected_mask = selected_mask | hi_mask
+        if selected_mask is not None:
+            if not bool(selected_mask.any().item()):
+                continue
+            frame_loss = frame_loss[selected_mask]
+            denom = denom + frame_loss.new_tensor(float(int(selected_mask.sum().item())))
+        else:
+            denom = denom + frame_loss.new_tensor(float(student_time))
+        total = total + frame_loss.sum()
+
+    return total / denom.clamp_min(1.0), matched, missing
+
+
+def _ctc_teacher_blank_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    time_map: str,
+    missing_policy: str,
+) -> tuple[torch.Tensor, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("CTC teacher blank distillation requires batch.utt_ids.")
+    if time_map not in {"nearest", "linear"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing CTC teacher blank record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
+        raw_log_probs = _ctc_teacher_topk_field(
+            record,
+            "topk_log_probs",
+            "topk_logprobs",
+            "log_probs",
+            "logprobs",
+        )
+        if raw_ids is None or raw_log_probs is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"CTC teacher blank record missing ids/log_probs for utt_id={utt_id!r}")
+            continue
+
+        teacher_ids = torch.as_tensor(raw_ids, dtype=torch.long)
+        teacher_log_probs = torch.as_tensor(raw_log_probs, dtype=torch.float32)
+        if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2 or teacher_ids.shape != teacher_log_probs.shape:
+            raise ValueError(
+                f"CTC teacher blank record has invalid top-k shape for utt_id={utt_id!r}: "
+                f"ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+            )
+        teacher_blank_log_probs = _ctc_teacher_blank_log_probs_from_record(
+            record,
+            teacher_ids=teacher_ids,
+            teacher_log_probs=teacher_log_probs,
+            student_blank_id=int(blank_id),
+        )
+        if teacher_blank_log_probs is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"CTC teacher blank record has no blank probabilities for utt_id={utt_id!r}")
+            continue
+        teacher_time = int(teacher_blank_log_probs.numel())
+        student_time = int(clipped_lengths[sample_idx].item())
+        if teacher_time <= 0 or student_time <= 0:
+            continue
+
+        matched += 1
+        student_slice = student_logits[sample_idx, :student_time].float()
+        if time_map == "nearest" or student_time == 1 or teacher_time == 1:
+            if student_time == 1 or teacher_time == 1:
+                frame_indices = torch.zeros(student_time, device=student_logits.device, dtype=torch.long)
+            else:
+                positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+                frame_indices = torch.round(positions * float(teacher_time - 1) / float(student_time - 1)).to(
+                    dtype=torch.long
+                )
+            frame_indices = frame_indices.clamp(min=0, max=teacher_time - 1).cpu()
+            selected_blank = teacher_blank_log_probs.index_select(0, frame_indices)
+        else:
+            positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+            scaled = positions * float(teacher_time - 1) / float(student_time - 1)
+            lo = torch.floor(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            hi = torch.ceil(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            alpha = (scaled - lo.to(dtype=torch.float32)).to(dtype=torch.float32).cpu()
+            lo_blank = teacher_blank_log_probs.index_select(0, lo.cpu()).exp()
+            hi_blank = teacher_blank_log_probs.index_select(0, hi.cpu()).exp()
+            selected_prob = lo_blank * (1.0 - alpha) + hi_blank * alpha
+            selected_blank = selected_prob.clamp(min=1.0e-8, max=1.0).log()
+        frame_loss = _ctc_teacher_blank_frame_bce(
+            student_slice,
+            selected_blank,
+            blank_id=int(blank_id),
+        )
+        total = total + frame_loss.sum()
+        denom = denom + frame_loss.new_tensor(float(student_time))
+
+    return total / denom.clamp_min(1.0), matched, missing
+
+
+def _ctc_teacher_mass_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    time_map: str,
+    missing_policy: str,
+) -> tuple[torch.Tensor, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("CTC teacher mass distillation requires batch.utt_ids.")
+    if time_map not in {"nearest", "linear"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing CTC teacher mass record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
+        raw_log_probs = _ctc_teacher_topk_field(
+            record,
+            "topk_log_probs",
+            "topk_logprobs",
+            "log_probs",
+            "logprobs",
+        )
+        if raw_ids is None or raw_log_probs is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"CTC teacher mass record missing ids/log_probs for utt_id={utt_id!r}")
+            continue
+
+        teacher_ids = torch.as_tensor(raw_ids, dtype=torch.long)
+        teacher_log_probs = torch.as_tensor(raw_log_probs, dtype=torch.float32)
+        if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2 or teacher_ids.shape != teacher_log_probs.shape:
+            raise ValueError(
+                f"CTC teacher mass record has invalid top-k shape for utt_id={utt_id!r}: "
+                f"ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+            )
+        teacher_blank_log_probs = _ctc_teacher_blank_log_probs_from_record(
+            record,
+            teacher_ids=teacher_ids,
+            teacher_log_probs=teacher_log_probs,
+            student_blank_id=int(blank_id),
+        )
+        if teacher_blank_log_probs is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"CTC teacher mass record has no blank probabilities for utt_id={utt_id!r}")
+            continue
+        if int(teacher_blank_log_probs.numel()) != int(teacher_ids.size(0)):
+            raise ValueError(
+                f"CTC teacher mass blank length mismatch for utt_id={utt_id!r}: "
+                f"blank={int(teacher_blank_log_probs.numel())} topk={int(teacher_ids.size(0))}"
+            )
+        teacher_time = int(teacher_ids.size(0))
+        student_time = int(clipped_lengths[sample_idx].item())
+        if teacher_time <= 0 or student_time <= 0:
+            continue
+
+        matched += 1
+        student_slice = F.log_softmax(student_logits[sample_idx, :student_time].float(), dim=-1)
+        ignored_values = record.get("project_ignored_token_ids")
+        if ignored_values is None:
+            ignored_values = [60514]
+        ignored_ids = tuple(int(value) for value in ignored_values)
+        if time_map == "nearest" or student_time == 1 or teacher_time == 1:
+            if student_time == 1 or teacher_time == 1:
+                frame_indices = torch.zeros(student_time, device=student_logits.device, dtype=torch.long)
+            else:
+                positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+                frame_indices = torch.round(positions * float(teacher_time - 1) / float(student_time - 1)).to(
+                    dtype=torch.long
+                )
+            frame_indices = frame_indices.clamp(min=0, max=teacher_time - 1).cpu()
+            selected_ids = teacher_ids.index_select(0, frame_indices)
+            selected_log_probs = teacher_log_probs.index_select(0, frame_indices)
+            selected_blank = teacher_blank_log_probs.index_select(0, frame_indices)
+            frame_loss = _ctc_teacher_mass_frame_ce(
+                student_slice,
+                selected_ids,
+                selected_log_probs,
+                selected_blank,
+                blank_id=int(blank_id),
+                ignored_token_ids=ignored_ids,
+            )
+        else:
+            positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+            scaled = positions * float(teacher_time - 1) / float(student_time - 1)
+            lo = torch.floor(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            hi = torch.ceil(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            alpha = (scaled - lo.to(dtype=torch.float32)).to(dtype=torch.float32)
+            lo_ids = teacher_ids.index_select(0, lo.cpu())
+            lo_log_probs = teacher_log_probs.index_select(0, lo.cpu())
+            lo_blank = teacher_blank_log_probs.index_select(0, lo.cpu())
+            hi_ids = teacher_ids.index_select(0, hi.cpu())
+            hi_log_probs = teacher_log_probs.index_select(0, hi.cpu())
+            hi_blank = teacher_blank_log_probs.index_select(0, hi.cpu())
+            lo_loss = _ctc_teacher_mass_frame_ce(
+                student_slice,
+                lo_ids,
+                lo_log_probs,
+                lo_blank,
+                blank_id=int(blank_id),
+                ignored_token_ids=ignored_ids,
+            )
+            hi_loss = _ctc_teacher_mass_frame_ce(
+                student_slice,
+                hi_ids,
+                hi_log_probs,
+                hi_blank,
+                blank_id=int(blank_id),
+                ignored_token_ids=ignored_ids,
+            )
+            frame_loss = lo_loss * (1.0 - alpha) + hi_loss * alpha
+        total = total + frame_loss.sum()
+        denom = denom + frame_loss.new_tensor(float(student_time))
+
+    return total / denom.clamp_min(1.0), matched, missing
+
+
+def _ctc_teacher_full_log_probs_from_record(record: dict[str, Any]) -> torch.Tensor | None:
+    raw_full = _ctc_teacher_topk_field(
+        record,
+        "full_log_probs",
+        "full_logprobs",
+        "ctc_log_probs",
+        "ctc_logprobs",
+        "log_probs_full",
+        "logprobs_full",
+    )
+    if raw_full is None:
+        return None
+    full = torch.as_tensor(raw_full, dtype=torch.float32)
+    if full.ndim != 2:
+        raise ValueError(f"CTC teacher full log_probs must be 2-D, got {tuple(full.shape)}")
+    return full
+
+
+def _match_teacher_full_vocab(
+    teacher_log_probs: torch.Tensor,
+    *,
+    vocab_size: int,
+) -> torch.Tensor:
+    teacher_vocab = int(teacher_log_probs.size(-1))
+    vocab_size = int(vocab_size)
+    if teacher_vocab == vocab_size:
+        return teacher_log_probs
+    if teacher_vocab > vocab_size:
+        return teacher_log_probs[..., :vocab_size]
+    pad_shape = (*teacher_log_probs.shape[:-1], vocab_size - teacher_vocab)
+    pad = teacher_log_probs.new_full(pad_shape, float("-inf"))
+    return torch.cat([teacher_log_probs, pad], dim=-1)
+
+
+def _project_ctc_teacher_full_log_probs(
+    teacher_log_probs: torch.Tensor,
+    *,
+    vocab_size: int,
+    blank_id: int,
+    teacher_blank_id: int | None,
+    project_blank_id: int | None,
+    ignored_token_ids: tuple[int, ...],
+) -> torch.Tensor:
+    target_vocab_size = max(
+        int(vocab_size),
+        int(blank_id) + 1,
+        int(project_blank_id) + 1 if project_blank_id is not None else 0,
+        *(int(value) + 1 for value in ignored_token_ids),
+    )
+    projected = _match_teacher_full_vocab(teacher_log_probs, vocab_size=target_vocab_size)
+
+    if teacher_blank_id is not None:
+        teacher_blank_id = int(teacher_blank_id)
+        project_blank_id = int(blank_id if project_blank_id is None else project_blank_id)
+        if (
+            teacher_blank_id != project_blank_id
+            and 0 <= teacher_blank_id < int(teacher_log_probs.size(-1))
+            and 0 <= project_blank_id < int(projected.size(-1))
+        ):
+            teacher_blank_log_probs = teacher_log_probs[..., teacher_blank_id]
+            if bool(torch.isfinite(teacher_blank_log_probs).any().item()):
+                projected = projected.clone()
+                projected[..., project_blank_id] = teacher_blank_log_probs
+                projected[..., teacher_blank_id] = float("-inf")
+
+    for ignored_id in ignored_token_ids:
+        ignored_id = int(ignored_id)
+        if ignored_id == int(blank_id):
+            continue
+        if 0 <= ignored_id < int(projected.size(-1)):
+            if projected is teacher_log_probs:
+                projected = projected.clone()
+            projected[..., ignored_id] = float("-inf")
+    return projected
+
+
+def _ctc_teacher_full_frame_kl(
+    student_logits: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    *,
+    temperature: float,
+) -> torch.Tensor:
+    if teacher_log_probs.numel() == 0:
+        return student_logits.new_zeros((int(student_logits.size(0)),), dtype=torch.float32)
+    temperature = max(float(temperature), 1.0e-6)
+    teacher_log_probs = _match_teacher_full_vocab(
+        teacher_log_probs,
+        vocab_size=int(student_logits.size(-1)),
+    ).to(device=student_logits.device, dtype=torch.float32)
+    if temperature != 1.0:
+        teacher_log_probs = F.log_softmax(teacher_log_probs / temperature, dim=-1)
+        student_log_probs = F.log_softmax(student_logits.float() / temperature, dim=-1)
+    else:
+        student_log_probs = F.log_softmax(student_logits.float(), dim=-1)
+    teacher_probs = teacher_log_probs.exp()
+    safe_teacher_log_probs = torch.where(
+        torch.isfinite(teacher_log_probs),
+        teacher_log_probs,
+        torch.zeros_like(teacher_log_probs),
+    )
+    frame_kl = (teacher_probs * (safe_teacher_log_probs - student_log_probs)).sum(dim=-1)
+    return frame_kl * (temperature * temperature)
+
+
+def _ctc_teacher_full_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    time_map: str,
+    frame_filter: str,
+    frame_filter_neighbor_radius: int,
+    frame_filter_min_nonblank_prob: float,
+    missing_policy: str,
+    temperature: float,
+) -> tuple[torch.Tensor, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("CTC teacher full-logits distillation requires batch.utt_ids.")
+    if time_map not in {"nearest", "linear"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing CTC teacher full record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        teacher_full_log_probs = _ctc_teacher_full_log_probs_from_record(record)
+        if teacher_full_log_probs is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"CTC teacher full record has no full_log_probs for utt_id={utt_id!r}")
+            continue
+        teacher_ids = None
+        teacher_log_probs = None
+        ignored_values = record.get("project_ignored_token_ids")
+        if ignored_values is None:
+            ignored_values = [60514]
+        ignored_ids = tuple(int(value) for value in ignored_values)
+        project_blank_id = int(record.get("project_blank_id", int(blank_id)))
+        raw_teacher_blank_id = record.get("teacher_blank_id")
+        teacher_blank_id = None if raw_teacher_blank_id is None else int(raw_teacher_blank_id)
+        teacher_full_log_probs = _project_ctc_teacher_full_log_probs(
+            teacher_full_log_probs,
+            vocab_size=int(student_logits.size(-1)),
+            blank_id=int(blank_id),
+            teacher_blank_id=teacher_blank_id,
+            project_blank_id=project_blank_id,
+            ignored_token_ids=ignored_ids,
+        )
+        if str(frame_filter or "all") != "all":
+            raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
+            raw_log_probs = _ctc_teacher_topk_field(
+                record,
+                "topk_log_probs",
+                "topk_logprobs",
+                "log_probs",
+                "logprobs",
+            )
+            if raw_ids is None or raw_log_probs is None:
+                missing += 1
+                if missing_policy == "error":
+                    raise ValueError(
+                        f"CTC teacher full record needs top-k ids/log_probs for frame filtering: utt_id={utt_id!r}"
+                    )
+                continue
+            teacher_ids = torch.as_tensor(raw_ids, dtype=torch.long)
+            teacher_log_probs = torch.as_tensor(raw_log_probs, dtype=torch.float32)
+            if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2 or teacher_ids.shape != teacher_log_probs.shape:
+                raise ValueError(
+                    f"CTC teacher full record has invalid top-k shape for utt_id={utt_id!r}: "
+                    f"ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+                )
+        teacher_time = int(teacher_full_log_probs.size(0))
+        student_time = int(clipped_lengths[sample_idx].item())
+        if teacher_time <= 0 or student_time <= 0:
+            continue
+        if teacher_ids is not None and int(teacher_ids.size(0)) != teacher_time:
+            raise ValueError(
+                f"CTC teacher full/top-k length mismatch for utt_id={utt_id!r}: "
+                f"full={teacher_time} topk={int(teacher_ids.size(0))}"
+            )
+
+        matched += 1
+        student_slice = student_logits[sample_idx, :student_time].float()
+        if time_map == "nearest" or student_time == 1 or teacher_time == 1:
+            if student_time == 1 or teacher_time == 1:
+                frame_indices = torch.zeros(student_time, device=student_logits.device, dtype=torch.long)
+            else:
+                positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+                frame_indices = torch.round(positions * float(teacher_time - 1) / float(student_time - 1)).to(
+                    dtype=torch.long
+                )
+            frame_indices = frame_indices.clamp(min=0, max=teacher_time - 1).cpu()
+            selected_log_probs = teacher_full_log_probs.index_select(0, frame_indices)
+            if teacher_ids is not None and teacher_log_probs is not None:
+                selected_ids = teacher_ids.index_select(0, frame_indices)
+                selected_topk_log_probs = teacher_log_probs.index_select(0, frame_indices)
+                selected_mask = _ctc_teacher_frame_filter_mask(
+                    selected_ids,
+                    selected_topk_log_probs,
+                    frame_filter=frame_filter,
+                    blank_id=project_blank_id,
+                    ignored_token_ids=ignored_ids,
+                    neighbor_radius=int(frame_filter_neighbor_radius),
+                    min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                    device=student_logits.device,
+                )
+            else:
+                selected_mask = None
+        else:
+            positions = torch.arange(student_time, device=student_logits.device, dtype=torch.float32)
+            scaled = positions * float(teacher_time - 1) / float(student_time - 1)
+            lo = torch.floor(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            hi = torch.ceil(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            alpha = (scaled - lo.to(dtype=torch.float32)).to(dtype=torch.float32).cpu().unsqueeze(-1)
+            lo_log_probs = teacher_full_log_probs.index_select(0, lo.cpu())
+            hi_log_probs = teacher_full_log_probs.index_select(0, hi.cpu())
+            selected_probs = lo_log_probs.exp() * (1.0 - alpha) + hi_log_probs.exp() * alpha
+            selected_log_probs = selected_probs.log()
+            if teacher_ids is not None and teacher_log_probs is not None:
+                lo_ids = teacher_ids.index_select(0, lo.cpu())
+                lo_topk_log_probs = teacher_log_probs.index_select(0, lo.cpu())
+                hi_ids = teacher_ids.index_select(0, hi.cpu())
+                hi_topk_log_probs = teacher_log_probs.index_select(0, hi.cpu())
+                selected_mask = _ctc_teacher_frame_filter_mask(
+                    lo_ids,
+                    lo_topk_log_probs,
+                    frame_filter=frame_filter,
+                    blank_id=project_blank_id,
+                    ignored_token_ids=ignored_ids,
+                    neighbor_radius=int(frame_filter_neighbor_radius),
+                    min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                    device=student_logits.device,
+                )
+                hi_mask = _ctc_teacher_frame_filter_mask(
+                    hi_ids,
+                    hi_topk_log_probs,
+                    frame_filter=frame_filter,
+                    blank_id=project_blank_id,
+                    ignored_token_ids=ignored_ids,
+                    neighbor_radius=int(frame_filter_neighbor_radius),
+                    min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                    device=student_logits.device,
+                )
+                if selected_mask is not None and hi_mask is not None:
+                    selected_mask = selected_mask | hi_mask
+            else:
+                selected_mask = None
+        frame_loss = _ctc_teacher_full_frame_kl(
+            student_slice,
+            selected_log_probs,
+            temperature=float(temperature),
+        )
+        if selected_mask is not None:
+            if not bool(selected_mask.any().item()):
+                continue
+            frame_loss = frame_loss[selected_mask]
+            denom = denom + frame_loss.new_tensor(float(int(selected_mask.sum().item())))
+        else:
+            denom = denom + frame_loss.new_tensor(float(student_time))
+        total = total + frame_loss.sum()
+
+    return total / denom.clamp_min(1.0), matched, missing
+
+
+def _ctc_teacher_hidden_loss(
+    student_hidden: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    teacher_field: str,
+    time_map: str,
+    missing_policy: str,
+    blank_id: int = 0,
+    frame_filter: str = "all",
+    frame_filter_neighbor_radius: int = 0,
+    frame_filter_min_nonblank_prob: float = 0.0,
+) -> tuple[torch.Tensor, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("CTC teacher hidden distillation requires batch.utt_ids.")
+    if time_map not in {"nearest", "linear"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+
+    batch_size = min(int(student_hidden.size(0)), len(utt_ids))
+    total = student_hidden.new_zeros((), dtype=torch.float32)
+    denom = student_hidden.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    max_student_time = int(student_hidden.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_hidden.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_hidden.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing CTC teacher hidden record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        raw_hidden = record.get(teacher_field)
+        if raw_hidden is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"CTC teacher hidden record has no {teacher_field!r} for utt_id={utt_id!r}")
+            continue
+        teacher_hidden = torch.as_tensor(raw_hidden, dtype=torch.float32)
+        if teacher_hidden.ndim != 2:
+            raise ValueError(
+                f"CTC teacher hidden record field {teacher_field!r} must be 2-D for utt_id={utt_id!r}, "
+                f"got {tuple(teacher_hidden.shape)}"
+            )
+        if int(teacher_hidden.size(-1)) != int(student_hidden.size(-1)):
+            raise ValueError(
+                f"CTC teacher hidden dim mismatch for utt_id={utt_id!r}: "
+                f"teacher={int(teacher_hidden.size(-1))} student={int(student_hidden.size(-1))}"
+            )
+        teacher_time = int(teacher_hidden.size(0))
+        student_time = int(clipped_lengths[sample_idx].item())
+        if teacher_time <= 0 or student_time <= 0:
+            continue
+
+        matched += 1
+        student_slice = student_hidden[sample_idx, :student_time].float()
+        teacher_filter_mask: torch.Tensor | None = None
+        if str(frame_filter or "all") != "all":
+            raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
+            raw_log_probs = _ctc_teacher_topk_field(
+                record,
+                "topk_log_probs",
+                "topk_logprobs",
+                "log_probs",
+                "logprobs",
+            )
+            if raw_ids is None or raw_log_probs is None:
+                missing += 1
+                if missing_policy == "error":
+                    raise ValueError(
+                        f"CTC teacher hidden frame filtering needs ids/log_probs for utt_id={utt_id!r}"
+                    )
+                continue
+            teacher_ids = torch.as_tensor(raw_ids, dtype=torch.long)
+            teacher_log_probs = torch.as_tensor(raw_log_probs, dtype=torch.float32)
+            if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2 or teacher_ids.shape != teacher_log_probs.shape:
+                raise ValueError(
+                    f"CTC teacher hidden frame filter has invalid shape for utt_id={utt_id!r}: "
+                    f"ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}"
+                )
+            ignored_values = record.get("project_ignored_token_ids")
+            if ignored_values is None:
+                ignored_values = [60514]
+            teacher_filter_mask = _ctc_teacher_frame_filter_mask(
+                teacher_ids,
+                teacher_log_probs,
+                frame_filter=str(frame_filter),
+                blank_id=int(record.get("project_blank_id", int(blank_id))),
+                ignored_token_ids=tuple(int(value) for value in ignored_values),
+                neighbor_radius=int(frame_filter_neighbor_radius),
+                min_nonblank_prob=float(frame_filter_min_nonblank_prob),
+                device=student_hidden.device,
+            )
+            if teacher_filter_mask is not None and int(teacher_filter_mask.numel()) != teacher_time:
+                filter_time = int(teacher_filter_mask.numel())
+                if filter_time <= 0:
+                    teacher_filter_mask = torch.zeros((teacher_time,), dtype=torch.bool, device=student_hidden.device)
+                elif teacher_time == 1 or filter_time == 1:
+                    teacher_filter_mask = teacher_filter_mask[:1].expand(teacher_time)
+                else:
+                    filter_positions = torch.arange(teacher_time, device=student_hidden.device, dtype=torch.float32)
+                    filter_indices = torch.round(
+                        filter_positions * float(filter_time - 1) / float(teacher_time - 1)
+                    ).to(dtype=torch.long)
+                    filter_indices = filter_indices.clamp(min=0, max=filter_time - 1)
+                    teacher_filter_mask = teacher_filter_mask.index_select(0, filter_indices)
+        if time_map == "nearest" or student_time == 1 or teacher_time == 1:
+            if student_time == 1 or teacher_time == 1:
+                frame_indices_device = torch.zeros(student_time, device=student_hidden.device, dtype=torch.long)
+            else:
+                positions = torch.arange(student_time, device=student_hidden.device, dtype=torch.float32)
+                frame_indices_device = torch.round(positions * float(teacher_time - 1) / float(student_time - 1)).to(
+                    dtype=torch.long
+                )
+            frame_indices_device = frame_indices_device.clamp(min=0, max=teacher_time - 1)
+            selected_hidden = teacher_hidden.index_select(0, frame_indices_device.cpu())
+            selected_frame_mask = (
+                teacher_filter_mask.index_select(0, frame_indices_device)
+                if teacher_filter_mask is not None
+                else None
+            )
+        else:
+            positions = torch.arange(student_time, device=student_hidden.device, dtype=torch.float32)
+            scaled = positions * float(teacher_time - 1) / float(student_time - 1)
+            lo = torch.floor(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            hi = torch.ceil(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
+            alpha = (scaled - lo.to(dtype=torch.float32)).to(dtype=torch.float32).cpu().unsqueeze(-1)
+            lo_hidden = teacher_hidden.index_select(0, lo.cpu())
+            hi_hidden = teacher_hidden.index_select(0, hi.cpu())
+            selected_hidden = lo_hidden * (1.0 - alpha) + hi_hidden * alpha
+            selected_frame_mask = (
+                teacher_filter_mask.index_select(0, lo) | teacher_filter_mask.index_select(0, hi)
+                if teacher_filter_mask is not None
+                else None
+            )
+        selected_hidden = selected_hidden.to(device=student_hidden.device, dtype=torch.float32)
+        frame_loss = F.mse_loss(student_slice, selected_hidden, reduction="none").mean(dim=-1)
+        if selected_frame_mask is not None:
+            selected_frame_mask = selected_frame_mask.to(device=frame_loss.device, dtype=torch.bool)
+            if not bool(selected_frame_mask.any().item()):
+                continue
+            frame_loss = frame_loss.masked_select(selected_frame_mask)
+        total = total + frame_loss.sum()
+        denom = denom + frame_loss.new_tensor(float(frame_loss.numel()))
+
+    return total / denom.clamp_min(1.0), matched, missing
+
+
+def _ctc_teacher_sequence_token_ids_from_record(
+    record: dict[str, Any],
+    *,
+    vocab_size: int,
+    blank_id: int,
+    ignored_token_ids: tuple[int, ...],
+) -> torch.Tensor | None:
+    raw_tokens = _ctc_teacher_topk_field(
+        record,
+        "argmax_token_ids",
+        "ctc_argmax_token_ids",
+        "token_ids",
+        "funasr_ctc_token_ids",
+    )
+    if raw_tokens is None:
+        return None
+    tokens = torch.as_tensor(raw_tokens, dtype=torch.long).flatten()
+    if tokens.numel() == 0:
+        return tokens
+    valid = (tokens >= 0) & (tokens < int(vocab_size)) & (tokens != int(blank_id))
+    for ignored_id in ignored_token_ids:
+        valid = valid & (tokens != int(ignored_id))
+    return tokens[valid].contiguous()
+
+
+def _ctc_teacher_sequence_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    ignored_token_ids: tuple[int, ...],
+    missing_policy: str,
+) -> tuple[torch.Tensor, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("Online CTC teacher sequence distillation requires batch.utt_ids.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    selected_indices: list[int] = []
+    target_chunks: list[torch.Tensor] = []
+    target_lengths: list[int] = []
+    matched = 0
+    missing = 0
+    vocab_size = int(student_logits.size(-1))
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing online CTC teacher sequence record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        token_ids = _ctc_teacher_sequence_token_ids_from_record(
+            record,
+            vocab_size=vocab_size,
+            blank_id=int(blank_id),
+            ignored_token_ids=ignored_token_ids,
+        )
+        if token_ids is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"Online CTC teacher record has no argmax_token_ids for utt_id={utt_id!r}")
+            continue
+        input_length = int(clipped_lengths[sample_idx].item())
+        target_length = int(token_ids.numel())
+        if input_length <= 0 or target_length > input_length:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(
+                    "Online CTC teacher sequence target is incompatible with student length "
+                    f"for utt_id={utt_id!r}: target_length={target_length} input_length={input_length}"
+                )
+            continue
+        selected_indices.append(sample_idx)
+        target_chunks.append(token_ids)
+        target_lengths.append(target_length)
+        matched += 1
+
+    if not selected_indices:
+        return student_logits.new_zeros((), dtype=torch.float32), matched, missing
+
+    index = torch.tensor(selected_indices, device=student_logits.device, dtype=torch.long)
+    selected_logits = student_logits.index_select(0, index).float()
+    selected_lengths = clipped_lengths.index_select(0, index)
+    if target_chunks:
+        targets = torch.cat(target_chunks).to(device=student_logits.device, dtype=torch.long)
+    else:
+        targets = torch.empty((0,), device=student_logits.device, dtype=torch.long)
+    target_lengths_tensor = torch.tensor(target_lengths, device=student_logits.device, dtype=torch.long)
+    log_probs = F.log_softmax(selected_logits, dim=-1).transpose(0, 1).contiguous()
+    loss = F.ctc_loss(
+        log_probs,
+        targets,
+        selected_lengths,
+        target_lengths_tensor,
+        blank=int(blank_id),
+        reduction="mean",
+        zero_infinity=True,
+    )
+    return loss, matched, missing
+
+
+def _ctc_teacher_sequence_presence_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    ignored_token_ids: tuple[int, ...],
+    missing_policy: str,
+) -> tuple[torch.Tensor, int, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("Online CTC teacher sequence presence distillation requires batch.utt_ids.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    token_count = 0
+    vocab_size = int(student_logits.size(-1))
+    eps = 1.0e-6
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing online CTC teacher sequence presence record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        token_ids = _ctc_teacher_sequence_token_ids_from_record(
+            record,
+            vocab_size=vocab_size,
+            blank_id=int(blank_id),
+            ignored_token_ids=ignored_token_ids,
+        )
+        if token_ids is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"Online CTC teacher record has no argmax_token_ids for utt_id={utt_id!r}")
+            continue
+        input_length = int(clipped_lengths[sample_idx].item())
+        if input_length <= 0:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(
+                    f"Online CTC teacher sequence presence has no student frames for utt_id={utt_id!r}"
+                )
+            continue
+        matched += 1
+        if int(token_ids.numel()) <= 0:
+            continue
+
+        targets = token_ids.to(device=student_logits.device, dtype=torch.long)
+        frame_probs = F.softmax(student_logits[sample_idx, :input_length].float(), dim=-1)
+        token_probs = frame_probs.index_select(dim=-1, index=targets).clamp(min=0.0, max=1.0 - eps)
+        log_no_presence = torch.log1p(-token_probs).sum(dim=0)
+        presence_probs = (-torch.expm1(log_no_presence)).clamp(min=1.0e-8, max=1.0)
+        token_losses = -torch.log(presence_probs)
+        total = total + token_losses.sum()
+        denom = denom + token_losses.new_tensor(float(int(token_losses.numel())))
+        token_count += int(token_losses.numel())
+
+    return total / denom.clamp_min(1.0), matched, missing, token_count
+
+
+def _ctc_teacher_sequence_window_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    ignored_token_ids: tuple[int, ...],
+    missing_policy: str,
+    radius: int,
+    temperature: float,
+) -> tuple[torch.Tensor, int, int, int]:
+    if utt_ids is None:
+        raise RuntimeError("Online CTC teacher sequence-window distillation requires batch.utt_ids.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+    if radius < 0:
+        raise ValueError(f"ctc_teacher_online_sequence_window_radius must be >= 0, got {radius}.")
+    if temperature < 0.0:
+        raise ValueError(
+            f"ctc_teacher_online_sequence_window_temperature must be >= 0, got {temperature}."
+        )
+
+    batch_size = min(int(student_logits.size(0)), len(utt_ids))
+    max_student_time = int(student_logits.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=student_logits.device,
+        )
+    else:
+        clipped_lengths = student_lengths.to(device=student_logits.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    log_probs = F.log_softmax(student_logits.float(), dim=-1)
+    total = student_logits.new_zeros((), dtype=torch.float32)
+    denom = student_logits.new_zeros((), dtype=torch.float32)
+    matched = 0
+    missing = 0
+    events = 0
+    vocab_size = int(student_logits.size(-1))
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_cache.get(utt_id)
+        if record is None:
+            missing += 1
+            if missing_policy == "error":
+                raise KeyError(f"Missing online CTC teacher sequence-window record for utt_id={utt_id!r}")
+            continue
+        record = _materialize_ctc_teacher_topk_record(record)
+        token_ids = _ctc_teacher_sequence_token_ids_from_record(
+            record,
+            vocab_size=vocab_size,
+            blank_id=int(blank_id),
+            ignored_token_ids=ignored_token_ids,
+        )
+        if token_ids is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(f"Online CTC teacher record has no argmax_token_ids for utt_id={utt_id!r}")
+            continue
+        input_length = int(clipped_lengths[sample_idx].item())
+        if input_length <= 0:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(
+                    "Online CTC teacher sequence-window target is incompatible with student length "
+                    f"for utt_id={utt_id!r}: input_length={input_length}"
+                )
+            continue
+        matched += 1
+        target_length = int(token_ids.numel())
+        if target_length == 0:
+            continue
+        tokens = token_ids.to(device=student_logits.device, dtype=torch.long)
+        if target_length == 1:
+            centers = torch.full((1,), input_length // 2, device=student_logits.device, dtype=torch.long)
+        else:
+            positions = torch.arange(target_length, device=student_logits.device, dtype=torch.float32)
+            centers = torch.round(positions * float(input_length - 1) / float(target_length - 1)).to(
+                dtype=torch.long
+            )
+        sample_log_probs = log_probs[sample_idx, :input_length]
+        for center, token_id in zip(centers.tolist(), tokens.tolist(), strict=True):
+            lo = max(0, int(center) - int(radius))
+            hi = min(input_length - 1, int(center) + int(radius))
+            frame_losses = -sample_log_probs[lo : hi + 1, int(token_id)]
+            if float(temperature) > 0.0:
+                window_loss = -float(temperature) * torch.logsumexp(
+                    -frame_losses / float(temperature),
+                    dim=0,
+                )
+            else:
+                window_loss = frame_losses.min()
+            total = total + window_loss
+            denom = denom + frame_losses.new_tensor(1.0)
+            events += 1
+
+    if events == 0:
+        return student_logits.new_zeros((), dtype=torch.float32), matched, missing, events
+    return total / denom.clamp_min(1.0), matched, missing, events
 
 
 def _resolve_epoch_eval_limit(config: DeepSpeedTrainConfig, *, epoch: int) -> int | None:
@@ -757,6 +3690,24 @@ def _init_deepspeed_runtime(config: DeepSpeedTrainConfig) -> tuple[int, torch.de
     return local_rank, torch.device("cpu")
 
 
+def _resolve_ctc_teacher_online_device(
+    configured_device: str | None,
+    runtime_device: torch.device,
+    *,
+    local_rank: int,
+) -> str:
+    if configured_device is not None:
+        return str(configured_device)
+    if runtime_device.type != "cuda":
+        return str(runtime_device)
+    device_index = runtime_device.index
+    if device_index is None and local_rank >= 0:
+        device_index = local_rank
+    if device_index is None:
+        device_index = 0
+    return f"cuda:{int(device_index)}"
+
+
 def _save_export_checkpoints(
     *,
     engine: deepspeed.DeepSpeedEngine,
@@ -766,15 +3717,21 @@ def _save_export_checkpoints(
     step: int,
     zero_stage: int,
     extra_state: dict[str, Any],
+    save_deepspeed_sharded: bool = True,
 ) -> dict[str, str | None]:
-    ds_checkpoint_root = output_dir / "ds_checkpoints"
-    ds_checkpoint_root.mkdir(parents=True, exist_ok=True)
-    ds_checkpoint_dir = ds_checkpoint_root / tag
-    engine.save_checkpoint(
-        str(ds_checkpoint_root),
-        tag=tag,
-        client_state={"step": step, **extra_state},
-    )
+    if "epoch_batch_offset" not in extra_state:
+        raise ValueError("extra_state must include epoch_batch_offset for latest checkpoint tracking.")
+
+    ds_checkpoint_dir: Path | None = None
+    if save_deepspeed_sharded:
+        ds_checkpoint_root = output_dir / "ds_checkpoints"
+        ds_checkpoint_root.mkdir(parents=True, exist_ok=True)
+        ds_checkpoint_dir = ds_checkpoint_root / tag
+        engine.save_checkpoint(
+            str(ds_checkpoint_root),
+            tag=tag,
+            client_state={"step": step, **extra_state},
+        )
     export_path: Path | None = None
     if _is_rank_zero() and zero_stage < 3:
         export_path = output_dir / export_name
@@ -784,17 +3741,36 @@ def _save_export_checkpoints(
             step=step,
             extra=extra_state,
         )
+    if _is_rank_zero():
+        latest_state: dict[str, Any] = {
+            "checkpoint_type": "deepspeed" if save_deepspeed_sharded else "export",
+            "step": int(step),
+            "epoch": int(extra_state.get("epoch", 0)),
+            "epoch_batch_offset": int(extra_state["epoch_batch_offset"]),
+        }
+        if export_path is not None:
+            latest_state["checkpoint_path"] = str(export_path)
+        if ds_checkpoint_dir is not None:
+            latest_state["deepspeed_checkpoint_dir"] = str(ds_checkpoint_dir)
+            latest_state["resume_tag"] = tag
+        write_latest_checkpoint_state(output_dir, latest_state)
     return {
         "checkpoint_path": str(export_path) if export_path is not None else None,
-        "deepspeed_checkpoint_dir": str(ds_checkpoint_dir),
-        "resume_tag": tag,
+        "deepspeed_checkpoint_dir": str(ds_checkpoint_dir) if ds_checkpoint_dir is not None else None,
+        "resume_tag": tag if ds_checkpoint_dir is not None else None,
     }
 
 
 def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float | int | str]:
     ds_config = _normalize_deepspeed_config(config)
     feature_dtype = torch.bfloat16 if bool(ds_config.get("bf16", {}).get("enabled")) else None
+    if config.frontend_type == "funasr_nano_encoder":
+        # FunASR SenseVoice's FSMN conv path keeps fp32 weights under DeepSpeed
+        # bf16, so feeding bf16 features triggers a dtype mismatch.
+        feature_dtype = None
     zero_stage = int(ds_config.get("zero_optimization", {}).get("stage", 0))
+    if not bool(config.save_deepspeed_sharded_checkpoints) and zero_stage >= 3:
+        raise ValueError("save_deepspeed_sharded_checkpoints=False is only supported for ZeRO stage < 3.")
     grad_accum = int(ds_config["gradient_accumulation_steps"])
     local_rank, device = _init_deepspeed_runtime(config)
     _rank_zero_log(
@@ -807,13 +3783,14 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         (output_dir / "ds_checkpoints").mkdir(parents=True, exist_ok=True)
     _maybe_barrier()
 
-    resolved_vocab_size = _resolve_vocab_size(config)
+    resolved_vocab_size = _resolve_ctc_vocab_size_for_deepspeed(config)
     resolved_max_steps, steps_per_epoch = _resolve_max_steps(config, grad_accum)
     resolved_cmvn_file = _resolve_cmvn_file_distributed(config, output_dir)
     _rank_zero_log(
         f"Training config resolved. vocab_size={resolved_vocab_size} max_steps={resolved_max_steps} steps_per_epoch={steps_per_epoch}"
     )
     model_config = RWKVCTCModelConfig(
+        feature_extractor_type=config.feature_extractor_type,
         input_dim=config.input_dim,
         n_embd=config.n_embd,
         dim_att=config.dim_att,
@@ -826,6 +3803,14 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         dropout=config.dropout,
         blank_id=config.blank_id,
         frontend_type=config.frontend_type,
+        encoder_output_dim=config.encoder_output_dim,
+        aut_downsample_hidden_size=config.aut_downsample_hidden_size,
+        aut_activation_function=config.aut_activation_function,
+        aut_activation_dropout=config.aut_activation_dropout,
+        aut_max_source_positions=config.aut_max_source_positions,
+        aut_scale_embedding=config.aut_scale_embedding,
+        aut_conv_chunksize=config.aut_conv_chunksize,
+        sensevoice_tp_blocks=config.sensevoice_tp_blocks,
         cmvn_file=resolved_cmvn_file,
         cmvn_is_json=config.cmvn_is_json,
         decoder_enabled=config.decoder_enabled,
@@ -833,21 +3818,37 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         decoder_num_layers=config.decoder_num_layers,
         decoder_n_embd=config.decoder_n_embd,
         decoder_ffn_hidden_size=config.decoder_ffn_hidden_size,
+        decoder_vocab_size=_resolve_decoder_vocab_size(config),
         decoder_head_size=config.decoder_head_size,
         decoder_audio_conditioning=config.decoder_audio_conditioning,
         decoder_prefix_tokens=config.decoder_prefix_tokens,
         decoder_loss_chunk_size=config.decoder_loss_chunk_size,
-        **_resolve_decoder_template_token_ids(config),
+        **_resolve_decoder_template_token_ids_for_deepspeed(config),
         ctc_loss_weight=config.ctc_loss_weight,
-        decoder_loss_weight=config.decoder_loss_weight,
-    )
+            decoder_loss_weight=config.decoder_loss_weight,
+            ctc_decoder_type=config.ctc_decoder_type,
+            ctc_decoder_downsample_rate=config.ctc_decoder_downsample_rate,
+            ctc_decoder_dim=config.ctc_decoder_dim,
+            ctc_decoder_ffn_dim=config.ctc_decoder_ffn_dim,
+            ctc_decoder_num_layers=config.ctc_decoder_num_layers,
+            ctc_decoder_attention_heads=config.ctc_decoder_attention_heads,
+            ctc_decoder_dropout=config.ctc_decoder_dropout,
+            ctc_decoder_attention_dropout=config.ctc_decoder_attention_dropout,
+            ctc_bridge_type=config.ctc_bridge_type,
+            ctc_bridge_hidden_dim=config.ctc_bridge_hidden_dim,
+            ctc_bridge_dropout=config.ctc_bridge_dropout,
+            ctc_suppressed_token_ids=_resolve_ctc_suppressed_token_ids(
+                config,
+                vocab_size=max(int(resolved_vocab_size), int(config.blank_id) + 1),
+            ),
+        )
     decoder_text_tokens_per_sample_extra = int(model_config.decoder_text_tokens_per_sample_extra)
 
     if _is_rank_zero():
         save_yaml(output_dir / "model_config.yaml", model_config)
         save_yaml(
             output_dir / "tokenizer_config.yaml",
-            _resolved_tokenizer_config_payload(config, vocab_size=resolved_vocab_size),
+            _resolved_tokenizer_config_payload_for_deepspeed(config, vocab_size=resolved_vocab_size),
         )
         save_yaml(
             output_dir / "train_config.yaml",
@@ -877,7 +3878,10 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
 
     model = RWKVCTCModel(model_config)
     model.enable_gradient_checkpointing(config.gradient_checkpointing)
+    _maybe_load_encoder_init_checkpoint_distributed(model, config.encoder_init_checkpoint_path)
     _maybe_load_initial_model_checkpoint(model, config)
+    _maybe_load_funasr_nano_ctc_init_distributed(model, config)
+    _apply_training_freeze(model, config)
     _rank_zero_log("Model constructed. Initializing DeepSpeed engine...")
     optimizer, optimizer_name = _build_deepspeed_optimizer(model, config, ds_config)
     offload_device = _optimizer_offload_device(ds_config) or "none"
@@ -888,8 +3892,314 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         config=ds_config,
         dist_init_required=False,
     )
+    encoder_anchor_model: RWKVCTCModel | None = None
+    encoder_anchor_weight = float(config.encoder_anchor_loss_weight)
+    ctc_logit_anchor_weight = float(config.ctc_logit_anchor_loss_weight)
+    if encoder_anchor_weight > 0.0 or ctc_logit_anchor_weight > 0.0:
+        if config.encoder_anchor_checkpoint_path is None:
+            raise ValueError(
+                "anchor loss weights require encoder_anchor_checkpoint_path "
+                "(encoder_anchor_loss_weight or ctc_logit_anchor_loss_weight > 0)."
+            )
+        encoder_anchor_model = _load_encoder_anchor_model(
+            model_config=model_config,
+            checkpoint_path=config.encoder_anchor_checkpoint_path,
+        )
+        encoder_anchor_model.to(engine.device)
+        if feature_dtype is not None:
+            encoder_anchor_model.to(dtype=feature_dtype)
+        encoder_anchor_model.eval()
+        _rank_zero_log(
+            "Anchor teacher enabled: "
+            f"encoder_hidden_weight={encoder_anchor_weight:g} ctc_logit_weight={ctc_logit_anchor_weight:g} "
+            f"ctc_chunk={int(config.ctc_logit_anchor_chunk_frames)} "
+            f"checkpoint={config.encoder_anchor_checkpoint_path}"
+        )
+    ctc_teacher_topk_weight = float(config.ctc_teacher_topk_loss_weight)
+    ctc_teacher_topk_blank_weight = float(config.ctc_teacher_topk_blank_loss_weight)
+    ctc_teacher_topk_mass_weight = float(config.ctc_teacher_topk_mass_loss_weight)
+    ctc_teacher_frame_filter = str(config.ctc_teacher_frame_filter or "all")
+    ctc_teacher_frame_filter_neighbor_radius = int(config.ctc_teacher_frame_filter_neighbor_radius)
+    ctc_teacher_frame_filter_min_nonblank_prob = float(config.ctc_teacher_frame_filter_min_nonblank_prob)
+    ctc_teacher_online_weight = float(config.ctc_teacher_online_loss_weight)
+    ctc_teacher_online_blank_weight = float(config.ctc_teacher_online_blank_loss_weight)
+    ctc_teacher_online_mass_weight = float(config.ctc_teacher_online_mass_loss_weight)
+    ctc_teacher_online_full_weight = float(config.ctc_teacher_online_full_loss_weight)
+    ctc_teacher_online_full_temperature = float(config.ctc_teacher_online_full_temperature)
+    ctc_teacher_online_full_frame_filter = (
+        ctc_teacher_frame_filter
+        if config.ctc_teacher_online_full_frame_filter is None
+        else str(config.ctc_teacher_online_full_frame_filter)
+    )
+    ctc_teacher_online_encoder_weight = float(config.ctc_teacher_online_encoder_loss_weight)
+    ctc_teacher_online_sequence_weight = float(config.ctc_teacher_online_sequence_loss_weight)
+    ctc_teacher_online_sequence_presence_weight = float(
+        config.ctc_teacher_online_sequence_presence_loss_weight
+    )
+    ctc_teacher_online_sequence_window_weight = float(config.ctc_teacher_online_sequence_window_loss_weight)
+    ctc_teacher_online_sequence_window_radius = int(config.ctc_teacher_online_sequence_window_radius)
+    ctc_teacher_online_sequence_window_temperature = float(
+        config.ctc_teacher_online_sequence_window_temperature
+    )
+    ctc_teacher_online_nonblank_hard_weight = float(config.ctc_teacher_online_nonblank_hard_loss_weight)
+    ctc_teacher_online_nonblank_margin_weight = float(config.ctc_teacher_online_nonblank_margin_loss_weight)
+    ctc_teacher_online_nonblank_margin = float(config.ctc_teacher_online_nonblank_margin)
+    ctc_teacher_online_nonblank_window_weight = float(config.ctc_teacher_online_nonblank_window_loss_weight)
+    ctc_teacher_online_nonblank_window_margin_weight = float(
+        config.ctc_teacher_online_nonblank_window_margin_loss_weight
+    )
+    ctc_teacher_online_nonblank_window_topk_weight = float(
+        config.ctc_teacher_online_nonblank_window_topk_loss_weight
+    )
+    ctc_teacher_online_nonblank_window_radius = int(config.ctc_teacher_online_nonblank_window_radius)
+    ctc_teacher_online_nonblank_window_temperature = float(
+        config.ctc_teacher_online_nonblank_window_temperature
+    )
+    if config.allow_missing_targets and (
+        float(config.ctc_loss_weight) > 0.0 or float(config.decoder_loss_weight) > 0.0
+    ):
+        raise ValueError(
+            "allow_missing_targets=True is only valid for unsupervised/distillation runs; "
+            "set ctc_loss_weight=0.0 and decoder_loss_weight=0.0."
+        )
+    if (
+        float(config.ctc_loss_weight) <= 0.0
+        and float(config.decoder_loss_weight) <= 0.0
+        and encoder_anchor_weight <= 0.0
+        and ctc_logit_anchor_weight <= 0.0
+        and ctc_teacher_topk_weight <= 0.0
+        and ctc_teacher_topk_blank_weight <= 0.0
+        and ctc_teacher_topk_mass_weight <= 0.0
+        and ctc_teacher_online_weight <= 0.0
+        and ctc_teacher_online_blank_weight <= 0.0
+        and ctc_teacher_online_mass_weight <= 0.0
+        and ctc_teacher_online_full_weight <= 0.0
+        and ctc_teacher_online_encoder_weight <= 0.0
+        and ctc_teacher_online_sequence_weight <= 0.0
+        and ctc_teacher_online_sequence_presence_weight <= 0.0
+        and ctc_teacher_online_sequence_window_weight <= 0.0
+        and ctc_teacher_online_nonblank_hard_weight <= 0.0
+        and ctc_teacher_online_nonblank_margin_weight <= 0.0
+        and ctc_teacher_online_nonblank_window_weight <= 0.0
+        and ctc_teacher_online_nonblank_window_margin_weight <= 0.0
+        and ctc_teacher_online_nonblank_window_topk_weight <= 0.0
+    ):
+        raise ValueError("Training objective is empty: all supervised, anchor, and teacher loss weights are zero.")
+    ctc_teacher_topk_cache: dict[str, dict[str, Any]] = {}
+    if (
+        ctc_teacher_topk_weight > 0.0
+        or ctc_teacher_topk_blank_weight > 0.0
+        or ctc_teacher_topk_mass_weight > 0.0
+        or ctc_teacher_online_weight > 0.0
+        or ctc_teacher_online_blank_weight > 0.0
+        or ctc_teacher_online_mass_weight > 0.0
+        or ctc_teacher_online_full_weight > 0.0
+        or ctc_teacher_online_encoder_weight > 0.0
+        or ctc_teacher_online_sequence_weight > 0.0
+        or ctc_teacher_online_sequence_presence_weight > 0.0
+        or ctc_teacher_online_sequence_window_weight > 0.0
+        or ctc_teacher_online_nonblank_hard_weight > 0.0
+        or ctc_teacher_online_nonblank_margin_weight > 0.0
+        or ctc_teacher_online_nonblank_window_weight > 0.0
+        or ctc_teacher_online_nonblank_window_margin_weight > 0.0
+        or ctc_teacher_online_nonblank_window_topk_weight > 0.0
+    ):
+        if config.ctc_teacher_topk_time_map not in {"nearest", "linear"}:
+            raise ValueError(
+                "ctc_teacher_topk_time_map must be 'nearest' or 'linear', "
+                f"got {config.ctc_teacher_topk_time_map!r}."
+            )
+        if config.ctc_teacher_topk_missing_policy not in {"skip", "error"}:
+            raise ValueError(
+                "ctc_teacher_topk_missing_policy must be 'skip' or 'error', "
+                f"got {config.ctc_teacher_topk_missing_policy!r}."
+            )
+        if ctc_teacher_frame_filter not in {"all", "nonblank", "nonblank_neighbors"}:
+            raise ValueError(
+                "ctc_teacher_frame_filter must be 'all', 'nonblank', or 'nonblank_neighbors', "
+                f"got {ctc_teacher_frame_filter!r}."
+            )
+        if ctc_teacher_online_full_frame_filter not in {"all", "nonblank", "nonblank_neighbors"}:
+            raise ValueError(
+                "ctc_teacher_online_full_frame_filter must be null, 'all', 'nonblank', or 'nonblank_neighbors', "
+                f"got {ctc_teacher_online_full_frame_filter!r}."
+            )
+        if ctc_teacher_frame_filter_neighbor_radius < 0:
+            raise ValueError(
+                "ctc_teacher_frame_filter_neighbor_radius must be >= 0, "
+                f"got {ctc_teacher_frame_filter_neighbor_radius!r}."
+            )
+        if ctc_teacher_frame_filter_min_nonblank_prob < 0.0 or ctc_teacher_frame_filter_min_nonblank_prob > 1.0:
+            raise ValueError(
+                "ctc_teacher_frame_filter_min_nonblank_prob must be in [0, 1], "
+                f"got {ctc_teacher_frame_filter_min_nonblank_prob!r}."
+            )
+        if ctc_teacher_online_full_temperature <= 0.0:
+            raise ValueError(
+                "ctc_teacher_online_full_temperature must be > 0, "
+                f"got {ctc_teacher_online_full_temperature!r}."
+            )
+        if ctc_teacher_online_nonblank_margin < 0.0:
+            raise ValueError(
+                "ctc_teacher_online_nonblank_margin must be >= 0, "
+                f"got {ctc_teacher_online_nonblank_margin!r}."
+            )
+        if ctc_teacher_online_nonblank_window_radius < 0:
+            raise ValueError(
+                "ctc_teacher_online_nonblank_window_radius must be >= 0, "
+                f"got {ctc_teacher_online_nonblank_window_radius!r}."
+            )
+        if ctc_teacher_online_nonblank_window_temperature < 0.0:
+            raise ValueError(
+                "ctc_teacher_online_nonblank_window_temperature must be >= 0, "
+                f"got {ctc_teacher_online_nonblank_window_temperature!r}."
+            )
+        if ctc_teacher_online_sequence_window_radius < 0:
+            raise ValueError(
+                "ctc_teacher_online_sequence_window_radius must be >= 0, "
+                f"got {ctc_teacher_online_sequence_window_radius!r}."
+            )
+        if ctc_teacher_online_sequence_window_temperature < 0.0:
+            raise ValueError(
+                "ctc_teacher_online_sequence_window_temperature must be >= 0, "
+                f"got {ctc_teacher_online_sequence_window_temperature!r}."
+            )
+        if (
+            ctc_teacher_online_full_weight > 0.0
+            and ctc_teacher_online_full_frame_filter != "all"
+            and ctc_teacher_online_blank_weight <= 0.0
+            and ctc_teacher_online_mass_weight <= 0.0
+        ):
+            _rank_zero_log(
+                "Warning: online full CTC KL is not using all frames and no blank/mass loss is enabled; "
+                "CTC blank prior may be under-supervised."
+            )
+    if (
+        ctc_teacher_topk_weight > 0.0
+        or ctc_teacher_topk_blank_weight > 0.0
+        or ctc_teacher_topk_mass_weight > 0.0
+    ):
+        if config.ctc_teacher_topk_cache_path is None:
+            raise ValueError("Cached CTC teacher distillation requires ctc_teacher_topk_cache_path.")
+        ctc_teacher_topk_cache = _load_ctc_teacher_topk_cache(config.ctc_teacher_topk_cache_path)
+        if not ctc_teacher_topk_cache:
+            raise ValueError(f"CTC teacher top-k cache is empty: {config.ctc_teacher_topk_cache_path}")
+        _rank_zero_log(
+            "CTC teacher top-k distillation enabled: "
+            f"weight={ctc_teacher_topk_weight:g} blank_weight={ctc_teacher_topk_blank_weight:g} "
+            f"mass_weight={ctc_teacher_topk_mass_weight:g} "
+            f"records={len(ctc_teacher_topk_cache)} "
+            f"time_map={config.ctc_teacher_topk_time_map} "
+            f"frame_filter={ctc_teacher_frame_filter} "
+            f"filter_radius={ctc_teacher_frame_filter_neighbor_radius} "
+            f"filter_min_nonblank={ctc_teacher_frame_filter_min_nonblank_prob:g} "
+            f"missing_policy={config.ctc_teacher_topk_missing_policy} "
+            f"cache={config.ctc_teacher_topk_cache_path}"
+        )
+    ctc_teacher_online: FunASRNanoCTCTopKOnlineTeacher | None = None
+    if (
+        ctc_teacher_online_weight > 0.0
+        or ctc_teacher_online_blank_weight > 0.0
+        or ctc_teacher_online_mass_weight > 0.0
+        or ctc_teacher_online_full_weight > 0.0
+        or ctc_teacher_online_encoder_weight > 0.0
+        or ctc_teacher_online_sequence_weight > 0.0
+        or ctc_teacher_online_sequence_presence_weight > 0.0
+        or ctc_teacher_online_sequence_window_weight > 0.0
+        or ctc_teacher_online_nonblank_hard_weight > 0.0
+        or ctc_teacher_online_nonblank_margin_weight > 0.0
+        or ctc_teacher_online_nonblank_window_weight > 0.0
+        or ctc_teacher_online_nonblank_window_margin_weight > 0.0
+        or ctc_teacher_online_nonblank_window_topk_weight > 0.0
+    ):
+        if config.ctc_teacher_online_model_path is None:
+            raise ValueError("Online CTC teacher distillation requires ctc_teacher_online_model_path.")
+        audio_index_path = config.ctc_teacher_online_audio_index_path
+        if audio_index_path is None and config.webdataset_bucket_manifest_path is None:
+            audio_index_path = config.webdataset_length_index_path or config.manifest_path
+        if audio_index_path is None and config.webdataset_bucket_manifest_path is None:
+            raise ValueError(
+                "Online CTC teacher distillation requires ctc_teacher_online_audio_index_path, "
+                "webdataset_length_index_path, manifest_path, or a bucketed WebDataset batch "
+                "with inline audio rows."
+            )
+        online_device = _resolve_ctc_teacher_online_device(
+            config.ctc_teacher_online_device,
+            device,
+            local_rank=local_rank,
+        )
+        online_audio_cache_dir = config.ctc_teacher_online_audio_cache_dir
+        if online_audio_cache_dir is None:
+            online_audio_cache_dir = str(output_dir / "funasr_online_audio_cache" / f"rank{_rank()}")
+        ctc_teacher_online = FunASRNanoCTCTopKOnlineTeacher(
+            FunASROnlineCTCTeacherConfig(
+                model_path=str(config.ctc_teacher_online_model_path),
+                audio_index_path=str(audio_index_path) if audio_index_path is not None else None,
+                webdataset_index_path=(
+                    config.ctc_teacher_online_webdataset_index_path or config.webdataset_index_path
+                ),
+                webdataset_root=config.webdataset_root,
+                audio_cache_dir=online_audio_cache_dir,
+                keep_audio_cache=bool(config.ctc_teacher_online_keep_audio_cache),
+                device=str(online_device),
+                split=str(config.webdataset_split or "train"),
+                top_k=int(config.ctc_teacher_online_top_k),
+                project_blank_id=int(config.blank_id),
+                project_vocab_size=int(model_config.ctc_vocab_size),
+                project_ignored_token_ids=tuple(
+                    int(value) for value in config.ctc_teacher_online_project_ignored_token_ids
+                ),
+                return_full_log_probs=ctc_teacher_online_full_weight > 0.0,
+                return_encoder_out=ctc_teacher_online_encoder_weight > 0.0,
+            )
+        )
+        _rank_zero_log(
+            "CTC online FunASR-Nano top-k distillation enabled: "
+            f"weight={ctc_teacher_online_weight:g} blank_weight={ctc_teacher_online_blank_weight:g} "
+            f"mass_weight={ctc_teacher_online_mass_weight:g} full_weight={ctc_teacher_online_full_weight:g} "
+            f"encoder_weight={ctc_teacher_online_encoder_weight:g} "
+            f"sequence_weight={ctc_teacher_online_sequence_weight:g} "
+            f"sequence_presence_weight={ctc_teacher_online_sequence_presence_weight:g} "
+            f"sequence_window_weight={ctc_teacher_online_sequence_window_weight:g} "
+            f"sequence_window_radius={ctc_teacher_online_sequence_window_radius} "
+            f"sequence_window_temperature={ctc_teacher_online_sequence_window_temperature:g} "
+            f"nonblank_hard_weight={ctc_teacher_online_nonblank_hard_weight:g} "
+            f"nonblank_margin_weight={ctc_teacher_online_nonblank_margin_weight:g} "
+            f"nonblank_margin={ctc_teacher_online_nonblank_margin:g} "
+            f"nonblank_window_weight={ctc_teacher_online_nonblank_window_weight:g} "
+            f"nonblank_window_margin_weight={ctc_teacher_online_nonblank_window_margin_weight:g} "
+            f"nonblank_window_topk_weight={ctc_teacher_online_nonblank_window_topk_weight:g} "
+            f"nonblank_window_radius={ctc_teacher_online_nonblank_window_radius} "
+            f"nonblank_window_temperature={ctc_teacher_online_nonblank_window_temperature:g} "
+            f"full_temperature={ctc_teacher_online_full_temperature:g} "
+            f"rows={ctc_teacher_online.num_audio_rows} "
+            f"top_k={int(config.ctc_teacher_online_top_k)} "
+            f"time_map={config.ctc_teacher_topk_time_map} "
+            f"frame_filter={ctc_teacher_frame_filter} "
+            f"full_frame_filter={ctc_teacher_online_full_frame_filter} "
+            f"filter_radius={ctc_teacher_frame_filter_neighbor_radius} "
+            f"filter_min_nonblank={ctc_teacher_frame_filter_min_nonblank_prob:g} "
+            f"missing_policy={config.ctc_teacher_topk_missing_policy} "
+            f"device={online_device} "
+            f"audio_index={audio_index_path if audio_index_path is not None else 'batch_inline'} "
+            f"audio_cache_dir={online_audio_cache_dir} "
+            f"keep_audio_cache={bool(config.ctc_teacher_online_keep_audio_cache)}"
+        )
     _rank_zero_log("DeepSpeed engine initialized. Building dataloader...")
 
+    if (
+        config.direction_variant != "none"
+        or config.p_start != 0.0
+        or config.p_max != 0.0
+        or config.warmup_steps != 0
+        or config.ramp_steps != 0
+    ):
+        raise ValueError(
+            "Direction dropout is disabled for the current stabilization runs. "
+            f"Got variant={config.direction_variant!r} p_start={config.p_start} p_max={config.p_max} "
+            f"warmup_steps={config.warmup_steps} ramp_steps={config.ramp_steps}. "
+            "Use direction_variant='none', p_start=0.0, p_max=0.0, warmup_steps=0, and ramp_steps=0."
+        )
     scheduler = DirectionDropoutScheduler(
         DirectionDropoutConfig(
             num_layers=config.num_layers,
@@ -900,6 +4210,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             ramp_steps=config.ramp_steps,
         )
     )
+    _rank_zero_log("Direction dropout disabled; training uses full bidirectional encoder masks.")
 
     loader, sampler = _build_train_loader(config)
     eval_loader, eval_sampler = _build_eval_loader(config)
@@ -912,6 +4223,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         active_bucket_manifest_path = _resolve_bucket_manifest_path(
             config.webdataset_root,
             config.webdataset_bucket_manifest_path,
+            configured_length_index_path=config.webdataset_length_index_path,
         )
         active_length_index_path = _resolve_in_memory_length_index_path(
             config.webdataset_root,
@@ -946,18 +4258,94 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     _rank_zero_log("The first batch can be slower because workers start up and wav->fbank decoding is done online.")
     start_step = 0
     start_epoch = 0
+    start_epoch_batch_offset = 0
     history: list[dict[str, float | int | str]] = []
     step_checkpoint_history: list[dict[str, Any]] = []
     best_step_checkpoints: list[dict[str, Any]] = []
     best_epoch = 0
     best_eval_loss = float("inf")
     best_train_loss = float("inf")
-    if config.resume_from is not None:
-        load_path, client_state = engine.load_checkpoint(config.resume_from, tag=config.resume_tag)
+    resume_from, resume_tag = _resolve_deepspeed_resume_source(config)
+    if resume_from is not None:
+        load_path, client_state = engine.load_checkpoint(resume_from, tag=resume_tag)
         if load_path is None:
-            raise FileNotFoundError(f"Unable to load DeepSpeed checkpoint from {config.resume_from}")
-        start_step = int(client_state.get("step", 0))
-        start_epoch = int(client_state.get("epoch", 0))
+            raise FileNotFoundError(f"Unable to load DeepSpeed checkpoint from {resume_from}")
+        client_step = int(client_state.get("step", 0))
+        client_epoch = int(client_state.get("epoch", 0))
+        client_offset = extract_epoch_batch_offset(client_state.get("epoch_batch_offset", 0))
+        fallback_state = load_latest_checkpoint_state(config.output_dir)
+        fallback_step_hint = _parse_deepspeed_checkpoint_step(resume_tag)
+        if not fallback_step_hint:
+            fallback_step_hint = int(fallback_state.get("step", 0))
+        latest_state = load_latest_checkpoint_state(config.output_dir)
+        latest_step = int(latest_state.get("step", 0))
+        latest_epoch = int(latest_state.get("epoch", 0))
+        latest_offset = extract_epoch_batch_offset(latest_state.get("epoch_batch_offset", 0))
+
+        if client_step == 0 and fallback_step_hint > 0:
+            client_step = fallback_step_hint
+            if config.resume_from == "latest" and fallback_step_hint != latest_step and latest_step > 0:
+                _all_rank_log(
+                    f"resume_from=latest had no step in DeepSpeed client_state; "
+                    f"falling back to resolved tag step={fallback_step_hint} "
+                    f"(latest yaml step={latest_step})"
+                )
+            else:
+                _all_rank_log(
+                    f"resume_from={config.resume_from} had no step in DeepSpeed client_state; "
+                    f"falling back to step={fallback_step_hint}"
+                )
+
+        if client_step == 0 and config.resume_from == "latest" and latest_step > 0:
+            client_step = latest_step
+            _all_rank_log(
+                f"resume_from=latest had no step in DeepSpeed client_state; "
+                f"fallback to latest_checkpoint.yaml step={latest_step}"
+            )
+
+        export_extra_state: dict[str, Any] = {}
+        if fallback_step_hint > 0:
+            export_extra_state = _load_export_checkpoint_extra_state(
+                output_dir=Path(config.output_dir), step=fallback_step_hint
+            )
+        if client_epoch == 0 and "epoch" in export_extra_state:
+            candidate_epoch = int(export_extra_state.get("epoch", 0))
+            if candidate_epoch > 0:
+                client_epoch = candidate_epoch
+                _all_rank_log(
+                    f"resume_from={config.resume_from} recovered epoch={client_epoch} "
+                    f"from step-{fallback_step_hint}.pt"
+                )
+        if client_epoch == 0 and config.resume_from == "latest" and latest_epoch > 0:
+            client_epoch = latest_epoch
+            _all_rank_log(
+                f"resume_from=latest had no epoch in DeepSpeed client_state; "
+                f"falling back to latest_checkpoint.yaml epoch={latest_epoch}"
+            )
+
+        if client_offset == 0:
+            if "epoch_batch_offset" in export_extra_state:
+                fallback_offset = extract_epoch_batch_offset(export_extra_state.get("epoch_batch_offset", 0))
+                if fallback_offset > 0:
+                    client_offset = fallback_offset
+                    _all_rank_log(
+                        f"resume_from={config.resume_from} recovered epoch_batch_offset={client_offset} "
+                        f"from step-{fallback_step_hint}.pt"
+                    )
+            if client_offset == 0 and config.resume_from == "latest" and latest_offset > 0 and fallback_step_hint == latest_step:
+                client_offset = latest_offset
+        start_step = client_step
+        start_epoch = client_epoch
+        start_epoch_batch_offset = client_offset
+        if start_epoch_batch_offset == 0 and config.resume_from == "latest":
+            latest_state = load_latest_checkpoint_state(config.output_dir)
+            latest_offset = extract_epoch_batch_offset(latest_state.get("epoch_batch_offset", 0))
+            if latest_offset and fallback_step_hint == latest_step:
+                start_epoch_batch_offset = latest_offset
+                _all_rank_log(
+                    f"resume_from=latest had no epoch_batch_offset in DeepSpeed client state; "
+                    f"falling back to latest_checkpoint.yaml offset={latest_offset}"
+                )
         raw_history = client_state.get("history", [])
         if isinstance(raw_history, list):
             history = [dict(item) for item in raw_history if isinstance(item, dict)]
@@ -975,9 +4363,16 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
 
     step = start_step
     epoch = start_epoch
+    epoch_batch_offset = start_epoch_batch_offset
     loss_value = float("nan")
+    encoder_anchor_loss_value = 0.0
     progress = None
     task_id = None
+    if start_epoch_batch_offset > 0:
+        _all_rank_log(
+            f"Resuming from latest state: step={start_step} epoch={start_epoch} "
+            f"epoch_batch_offset={start_epoch_batch_offset}"
+        )
     if _is_rank_zero():
         progress, task_id = start_training_progress(
             total_steps=resolved_max_steps,
@@ -987,17 +4382,43 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     train_start_time = time.perf_counter()
     try:
         while step < resolved_max_steps:
+            if epoch_batch_offset == 0:
+                epoch += 1
             _set_loader_epoch(loader, sampler, epoch)
-            epoch += 1
             epoch_loss_sum = 0.0
             epoch_sample_count = 0
-            loader_iter = iter(loader)
+            processed_any_batch = False
+            if epoch_batch_offset > 0:
+                _rank_zero_log(f"Fast-forwarding resume offset={epoch_batch_offset} for epoch={epoch}.")
+                loader_iter, skipped_batches, skip_mode = _iter_loader_after_resume_offset(
+                    loader,
+                    epoch_batch_offset,
+                    progress_callback=lambda skipped: _rank_zero_log(
+                        f"Fast-forwarded resume batches {skipped}/{epoch_batch_offset} for epoch={epoch}."
+                    ),
+                )
+                _rank_zero_log(
+                    f"Resume fast-forward complete: skipped={skipped_batches}/{epoch_batch_offset} "
+                    f"mode={skip_mode} epoch={epoch}"
+                )
+                if skipped_batches < epoch_batch_offset:
+                    _all_rank_log(
+                        f"Resume offset {epoch_batch_offset} exceeded available batches for epoch={epoch}; "
+                        f"continuing with epoch={epoch + 1}"
+                    )
+                    epoch += 1
+                    epoch_batch_offset = 0
+                    continue
+            else:
+                loader_iter = iter(loader)
             while step < resolved_max_steps:
                 fetch_start_time = time.perf_counter()
                 try:
                     candidate_batch = next(loader_iter)
                 except StopIteration:
                     break
+                processed_any_batch = True
+                epoch_batch_offset += 1
                 data_time = time.perf_counter() - fetch_start_time
                 use_padded_text_budget = bool(config.decoder_enabled and config.decoder_loss_weight > 0)
                 text_tokens_per_sample_extra = (
@@ -1050,12 +4471,47 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 if engine.device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(engine.device)
                 batch = batch.to(engine.device, feature_dtype=feature_dtype)
+                if config.specaugment_enabled:
+                    batch = replace(
+                        batch,
+                        features=apply_spec_augment(
+                            batch.features,
+                            batch.feature_lengths,
+                            time_masks=config.specaugment_time_masks,
+                            time_width=config.specaugment_time_width,
+                            freq_masks=config.specaugment_freq_masks,
+                            freq_width=config.specaugment_freq_width,
+                        ),
+                    )
+                ctc_teacher_online_records: dict[str, dict[str, Any]] = {}
+                ctc_teacher_online_forward_time = 0.0
+                if ctc_teacher_online is not None:
+                    if batch.utt_ids is None:
+                        raise RuntimeError("Online CTC teacher distillation requires batch.utt_ids.")
+                    online_teacher_start = time.perf_counter()
+                    try:
+                        ctc_teacher_online_records = ctc_teacher_online.topk_records(
+                            batch.utt_ids,
+                            batch.ctc_teacher_audio_rows,
+                        )
+                    except torch.OutOfMemoryError:
+                        _all_rank_log(
+                            "OOM during FunASR-Nano online teacher forward "
+                            f"step={step + 1} batch={executed_token_stats.batch_size} "
+                            f"budget={executed_budget_tokens} total={executed_token_stats.total_tokens}"
+                        )
+                        raise
+                    ctc_teacher_online_forward_time = time.perf_counter() - online_teacher_start
                 try:
                     losses = engine.module.joint_losses(
                         batch.features,
                         batch.feature_lengths,
                         batch.targets,
                         batch.target_lengths,
+                        decoder_targets=batch.decoder_targets,
+                        decoder_target_lengths=batch.decoder_target_lengths,
+                        decoder_prompt_before_audio=batch.decoder_prompt_before_audio,
+                        decoder_prompt_before_audio_lengths=batch.decoder_prompt_before_audio_lengths,
                         direction_mask=mask,
                     )
                 except torch.OutOfMemoryError:
@@ -1072,6 +4528,499 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 loss = losses["loss"]
                 ctc_loss_value = float(losses["ctc_loss"].detach().item())
                 decoder_loss_value = float(losses["decoder_loss"].detach().item())
+                encoder_anchor_loss_value = 0.0
+                ctc_logit_anchor_loss_value = 0.0
+                ctc_teacher_topk_loss_value = 0.0
+                ctc_teacher_topk_matched = 0
+                ctc_teacher_topk_missing = 0
+                ctc_teacher_topk_blank_loss_value = 0.0
+                ctc_teacher_topk_blank_matched = 0
+                ctc_teacher_topk_blank_missing = 0
+                ctc_teacher_topk_mass_loss_value = 0.0
+                ctc_teacher_topk_mass_matched = 0
+                ctc_teacher_topk_mass_missing = 0
+                ctc_teacher_online_loss_value = 0.0
+                ctc_teacher_online_matched = 0
+                ctc_teacher_online_missing = 0
+                ctc_teacher_online_blank_loss_value = 0.0
+                ctc_teacher_online_blank_matched = 0
+                ctc_teacher_online_blank_missing = 0
+                ctc_teacher_online_mass_loss_value = 0.0
+                ctc_teacher_online_mass_matched = 0
+                ctc_teacher_online_mass_missing = 0
+                ctc_teacher_online_full_loss_value = 0.0
+                ctc_teacher_online_full_matched = 0
+                ctc_teacher_online_full_missing = 0
+                ctc_teacher_online_encoder_loss_value = 0.0
+                ctc_teacher_online_encoder_matched = 0
+                ctc_teacher_online_encoder_missing = 0
+                ctc_teacher_online_sequence_loss_value = 0.0
+                ctc_teacher_online_sequence_matched = 0
+                ctc_teacher_online_sequence_missing = 0
+                ctc_teacher_online_sequence_presence_loss_value = 0.0
+                ctc_teacher_online_sequence_presence_matched = 0
+                ctc_teacher_online_sequence_presence_missing = 0
+                ctc_teacher_online_sequence_presence_tokens = 0
+                ctc_teacher_online_sequence_window_loss_value = 0.0
+                ctc_teacher_online_sequence_window_matched = 0
+                ctc_teacher_online_sequence_window_missing = 0
+                ctc_teacher_online_sequence_window_events = 0
+                ctc_teacher_online_nonblank_hard_loss_value = 0.0
+                ctc_teacher_online_nonblank_margin_loss_value = 0.0
+                ctc_teacher_online_nonblank_matched = 0
+                ctc_teacher_online_nonblank_missing = 0
+                ctc_teacher_online_nonblank_window_loss_value = 0.0
+                ctc_teacher_online_nonblank_window_margin_loss_value = 0.0
+                ctc_teacher_online_nonblank_window_matched = 0
+                ctc_teacher_online_nonblank_window_missing = 0
+                ctc_teacher_online_nonblank_window_events = 0
+                ctc_teacher_online_nonblank_window_topk_loss_value = 0.0
+                ctc_teacher_online_nonblank_window_topk_matched = 0
+                ctc_teacher_online_nonblank_window_topk_missing = 0
+                ctc_teacher_online_nonblank_window_topk_events = 0
+                if encoder_anchor_model is not None and (
+                    encoder_anchor_weight > 0.0 or ctc_logit_anchor_weight > 0.0
+                ):
+                    teacher_encoded, teacher_lengths = _encoder_anchor_forward(
+                        anchor_model=encoder_anchor_model,
+                        features=batch.features,
+                        feature_lengths=batch.feature_lengths,
+                        direction_mask=mask,
+                    )
+                    anchor_lengths = teacher_lengths if teacher_lengths is not None else batch.feature_lengths
+                    if encoder_anchor_weight > 0.0:
+                        student_encoded = losses.get("encoded")
+                        if not isinstance(student_encoded, torch.Tensor):
+                            raise RuntimeError("joint_losses did not return encoded tensor for encoder anchoring.")
+                        encoder_anchor_loss = _masked_encoder_mse_loss(
+                            student_encoded,
+                            teacher_encoded,
+                            anchor_lengths,
+                        )
+                        encoder_anchor_loss_value = float(encoder_anchor_loss.detach().item())
+                        loss = loss + encoder_anchor_loss * encoder_anchor_weight
+                    if ctc_logit_anchor_weight > 0.0:
+                        student_logits = losses.get("logits")
+                        if not isinstance(student_logits, torch.Tensor):
+                            raise RuntimeError("joint_losses did not return logits tensor for CTC logit anchoring.")
+                        ctc_logit_anchor_loss = _masked_ctc_logit_kl_loss(
+                            student_logits,
+                            teacher_encoded,
+                            anchor_lengths,
+                            anchor_model=encoder_anchor_model,
+                            chunk_frames=int(config.ctc_logit_anchor_chunk_frames),
+                        )
+                        ctc_logit_anchor_loss_value = float(ctc_logit_anchor_loss.detach().item())
+                        loss = loss + ctc_logit_anchor_loss * ctc_logit_anchor_weight
+                if ctc_teacher_topk_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError("joint_losses did not return logits tensor for CTC teacher distillation.")
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    ctc_teacher_topk_loss, ctc_teacher_topk_matched, ctc_teacher_topk_missing = (
+                        _ctc_teacher_topk_loss(
+                            student_logits,
+                            student_lengths,
+                            batch.utt_ids,
+                            ctc_teacher_topk_cache,
+                            blank_id=int(config.blank_id),
+                            time_map=config.ctc_teacher_topk_time_map,
+                            frame_filter=ctc_teacher_frame_filter,
+                            frame_filter_neighbor_radius=ctc_teacher_frame_filter_neighbor_radius,
+                            frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
+                            missing_policy=config.ctc_teacher_topk_missing_policy,
+                        )
+                    )
+                    ctc_teacher_topk_loss_value = float(ctc_teacher_topk_loss.detach().item())
+                    loss = loss + ctc_teacher_topk_loss * ctc_teacher_topk_weight
+                if ctc_teacher_topk_blank_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError("joint_losses did not return logits tensor for CTC teacher blank distillation.")
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_topk_blank_loss,
+                        ctc_teacher_topk_blank_matched,
+                        ctc_teacher_topk_blank_missing,
+                    ) = _ctc_teacher_blank_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_topk_cache,
+                        blank_id=int(config.blank_id),
+                        time_map=config.ctc_teacher_topk_time_map,
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                    )
+                    ctc_teacher_topk_blank_loss_value = float(ctc_teacher_topk_blank_loss.detach().item())
+                    loss = loss + ctc_teacher_topk_blank_loss * ctc_teacher_topk_blank_weight
+                if ctc_teacher_topk_mass_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError("joint_losses did not return logits tensor for CTC teacher mass distillation.")
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_topk_mass_loss,
+                        ctc_teacher_topk_mass_matched,
+                        ctc_teacher_topk_mass_missing,
+                    ) = _ctc_teacher_mass_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_topk_cache,
+                        blank_id=int(config.blank_id),
+                        time_map=config.ctc_teacher_topk_time_map,
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                    )
+                    ctc_teacher_topk_mass_loss_value = float(ctc_teacher_topk_mass_loss.detach().item())
+                    loss = loss + ctc_teacher_topk_mass_loss * ctc_teacher_topk_mass_weight
+                if ctc_teacher_online_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError("joint_losses did not return logits tensor for online CTC teacher distillation.")
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    ctc_teacher_online_loss, ctc_teacher_online_matched, ctc_teacher_online_missing = (
+                        _ctc_teacher_topk_loss(
+                            student_logits,
+                            student_lengths,
+                            batch.utt_ids,
+                            ctc_teacher_online_records,
+                            blank_id=int(config.blank_id),
+                            time_map=config.ctc_teacher_topk_time_map,
+                            frame_filter=ctc_teacher_frame_filter,
+                            frame_filter_neighbor_radius=ctc_teacher_frame_filter_neighbor_radius,
+                            frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
+                            missing_policy=config.ctc_teacher_topk_missing_policy,
+                        )
+                    )
+                    ctc_teacher_online_loss_value = float(ctc_teacher_online_loss.detach().item())
+                    loss = loss + ctc_teacher_online_loss * ctc_teacher_online_weight
+                if ctc_teacher_online_blank_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError("joint_losses did not return logits tensor for online CTC teacher blank distillation.")
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_online_blank_loss,
+                        ctc_teacher_online_blank_matched,
+                        ctc_teacher_online_blank_missing,
+                    ) = _ctc_teacher_blank_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        blank_id=int(config.blank_id),
+                        time_map=config.ctc_teacher_topk_time_map,
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                    )
+                    ctc_teacher_online_blank_loss_value = float(ctc_teacher_online_blank_loss.detach().item())
+                    loss = loss + ctc_teacher_online_blank_loss * ctc_teacher_online_blank_weight
+                if ctc_teacher_online_mass_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError("joint_losses did not return logits tensor for online CTC teacher mass distillation.")
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_online_mass_loss,
+                        ctc_teacher_online_mass_matched,
+                        ctc_teacher_online_mass_missing,
+                    ) = _ctc_teacher_mass_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        blank_id=int(config.blank_id),
+                        time_map=config.ctc_teacher_topk_time_map,
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                    )
+                    ctc_teacher_online_mass_loss_value = float(ctc_teacher_online_mass_loss.detach().item())
+                    loss = loss + ctc_teacher_online_mass_loss * ctc_teacher_online_mass_weight
+                if ctc_teacher_online_full_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError("joint_losses did not return logits tensor for online CTC teacher full distillation.")
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_online_full_loss,
+                        ctc_teacher_online_full_matched,
+                        ctc_teacher_online_full_missing,
+                    ) = _ctc_teacher_full_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        blank_id=int(config.blank_id),
+                        time_map=config.ctc_teacher_topk_time_map,
+                        frame_filter=ctc_teacher_online_full_frame_filter,
+                        frame_filter_neighbor_radius=ctc_teacher_frame_filter_neighbor_radius,
+                        frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                        temperature=ctc_teacher_online_full_temperature,
+                    )
+                    ctc_teacher_online_full_loss_value = float(ctc_teacher_online_full_loss.detach().item())
+                    loss = loss + ctc_teacher_online_full_loss * ctc_teacher_online_full_weight
+                if ctc_teacher_online_encoder_weight > 0.0:
+                    student_encoded = losses.get("ctc_encoded", losses.get("encoded"))
+                    if not isinstance(student_encoded, torch.Tensor):
+                        raise RuntimeError(
+                            "joint_losses did not return encoded tensor for online CTC teacher encoder distillation."
+                        )
+                    student_encoded_lengths = losses.get("ctc_encoded_lengths", losses.get("encoded_lengths"))
+                    if student_encoded_lengths is not None and not isinstance(student_encoded_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor encoded_lengths.")
+                    (
+                        ctc_teacher_online_encoder_loss,
+                        ctc_teacher_online_encoder_matched,
+                        ctc_teacher_online_encoder_missing,
+                    ) = _ctc_teacher_hidden_loss(
+                        student_encoded,
+                        student_encoded_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        teacher_field="encoder_out",
+                        time_map=config.ctc_teacher_topk_time_map,
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                        blank_id=int(config.blank_id),
+                        frame_filter=ctc_teacher_frame_filter,
+                        frame_filter_neighbor_radius=ctc_teacher_frame_filter_neighbor_radius,
+                        frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
+                    )
+                    ctc_teacher_online_encoder_loss_value = float(
+                        ctc_teacher_online_encoder_loss.detach().item()
+                    )
+                    loss = loss + ctc_teacher_online_encoder_loss * ctc_teacher_online_encoder_weight
+                if ctc_teacher_online_sequence_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError(
+                            "joint_losses did not return logits tensor for online CTC teacher sequence distillation."
+                        )
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_online_sequence_loss,
+                        ctc_teacher_online_sequence_matched,
+                        ctc_teacher_online_sequence_missing,
+                    ) = _ctc_teacher_sequence_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        blank_id=int(config.blank_id),
+                        ignored_token_ids=tuple(
+                            int(value) for value in config.ctc_teacher_online_project_ignored_token_ids
+                        ),
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                    )
+                    ctc_teacher_online_sequence_loss_value = float(
+                        ctc_teacher_online_sequence_loss.detach().item()
+                    )
+                    loss = loss + ctc_teacher_online_sequence_loss * ctc_teacher_online_sequence_weight
+                if ctc_teacher_online_sequence_window_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError(
+                            "joint_losses did not return logits tensor for online CTC teacher sequence-window distillation."
+                        )
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_online_sequence_window_loss,
+                        ctc_teacher_online_sequence_window_matched,
+                        ctc_teacher_online_sequence_window_missing,
+                        ctc_teacher_online_sequence_window_events,
+                    ) = _ctc_teacher_sequence_window_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        blank_id=int(config.blank_id),
+                        ignored_token_ids=tuple(
+                            int(value) for value in config.ctc_teacher_online_project_ignored_token_ids
+                        ),
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                        radius=ctc_teacher_online_sequence_window_radius,
+                        temperature=ctc_teacher_online_sequence_window_temperature,
+                    )
+                    ctc_teacher_online_sequence_window_loss_value = float(
+                        ctc_teacher_online_sequence_window_loss.detach().item()
+                    )
+                    loss = (
+                        loss
+                        + ctc_teacher_online_sequence_window_loss
+                        * ctc_teacher_online_sequence_window_weight
+                    )
+                if ctc_teacher_online_sequence_presence_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError(
+                            "joint_losses did not return logits tensor for online CTC teacher sequence presence distillation."
+                        )
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_online_sequence_presence_loss,
+                        ctc_teacher_online_sequence_presence_matched,
+                        ctc_teacher_online_sequence_presence_missing,
+                        ctc_teacher_online_sequence_presence_tokens,
+                    ) = _ctc_teacher_sequence_presence_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        blank_id=int(config.blank_id),
+                        ignored_token_ids=tuple(
+                            int(value) for value in config.ctc_teacher_online_project_ignored_token_ids
+                        ),
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                    )
+                    ctc_teacher_online_sequence_presence_loss_value = float(
+                        ctc_teacher_online_sequence_presence_loss.detach().item()
+                    )
+                    loss = loss + (
+                        ctc_teacher_online_sequence_presence_loss
+                        * ctc_teacher_online_sequence_presence_weight
+                    )
+                if (
+                    ctc_teacher_online_nonblank_hard_weight > 0.0
+                    or ctc_teacher_online_nonblank_margin_weight > 0.0
+                ):
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError(
+                            "joint_losses did not return logits tensor for online CTC teacher nonblank hard distillation."
+                        )
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_online_nonblank_hard_loss,
+                        ctc_teacher_online_nonblank_margin_loss,
+                        ctc_teacher_online_nonblank_matched,
+                        ctc_teacher_online_nonblank_missing,
+                    ) = _ctc_teacher_nonblank_hard_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        blank_id=int(config.blank_id),
+                        time_map=config.ctc_teacher_topk_time_map,
+                        frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                        margin=ctc_teacher_online_nonblank_margin,
+                    )
+                    ctc_teacher_online_nonblank_hard_loss_value = float(
+                        ctc_teacher_online_nonblank_hard_loss.detach().item()
+                    )
+                    ctc_teacher_online_nonblank_margin_loss_value = float(
+                        ctc_teacher_online_nonblank_margin_loss.detach().item()
+                    )
+                    if ctc_teacher_online_nonblank_hard_weight > 0.0:
+                        loss = loss + (
+                            ctc_teacher_online_nonblank_hard_loss
+                            * ctc_teacher_online_nonblank_hard_weight
+                        )
+                    if ctc_teacher_online_nonblank_margin_weight > 0.0:
+                        loss = loss + (
+                            ctc_teacher_online_nonblank_margin_loss
+                            * ctc_teacher_online_nonblank_margin_weight
+                        )
+                if (
+                    ctc_teacher_online_nonblank_window_weight > 0.0
+                    or ctc_teacher_online_nonblank_window_margin_weight > 0.0
+                ):
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError(
+                            "joint_losses did not return logits tensor for online CTC teacher nonblank window distillation."
+                        )
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_online_nonblank_window_loss,
+                        ctc_teacher_online_nonblank_window_margin_loss,
+                        ctc_teacher_online_nonblank_window_matched,
+                        ctc_teacher_online_nonblank_window_missing,
+                        ctc_teacher_online_nonblank_window_events,
+                    ) = _ctc_teacher_nonblank_window_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        blank_id=int(config.blank_id),
+                        time_map=config.ctc_teacher_topk_time_map,
+                        frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                        margin=ctc_teacher_online_nonblank_margin,
+                        window_radius=ctc_teacher_online_nonblank_window_radius,
+                        temperature=ctc_teacher_online_nonblank_window_temperature,
+                    )
+                    ctc_teacher_online_nonblank_window_loss_value = float(
+                        ctc_teacher_online_nonblank_window_loss.detach().item()
+                    )
+                    ctc_teacher_online_nonblank_window_margin_loss_value = float(
+                        ctc_teacher_online_nonblank_window_margin_loss.detach().item()
+                    )
+                    if ctc_teacher_online_nonblank_window_weight > 0.0:
+                        loss = loss + (
+                            ctc_teacher_online_nonblank_window_loss
+                            * ctc_teacher_online_nonblank_window_weight
+                        )
+                    if ctc_teacher_online_nonblank_window_margin_weight > 0.0:
+                        loss = loss + (
+                            ctc_teacher_online_nonblank_window_margin_loss
+                            * ctc_teacher_online_nonblank_window_margin_weight
+                        )
+                if ctc_teacher_online_nonblank_window_topk_weight > 0.0:
+                    student_logits = losses.get("logits")
+                    if not isinstance(student_logits, torch.Tensor):
+                        raise RuntimeError(
+                            "joint_losses did not return logits tensor for online CTC teacher nonblank window top-k distillation."
+                        )
+                    student_lengths = losses.get("logit_lengths")
+                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    (
+                        ctc_teacher_online_nonblank_window_topk_loss,
+                        ctc_teacher_online_nonblank_window_topk_matched,
+                        ctc_teacher_online_nonblank_window_topk_missing,
+                        ctc_teacher_online_nonblank_window_topk_events,
+                    ) = _ctc_teacher_nonblank_window_topk_loss(
+                        student_logits,
+                        student_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        blank_id=int(config.blank_id),
+                        time_map=config.ctc_teacher_topk_time_map,
+                        frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                        window_radius=ctc_teacher_online_nonblank_window_radius,
+                        temperature=ctc_teacher_online_nonblank_window_temperature,
+                    )
+                    ctc_teacher_online_nonblank_window_topk_loss_value = float(
+                        ctc_teacher_online_nonblank_window_topk_loss.detach().item()
+                    )
+                    loss = loss + (
+                        ctc_teacher_online_nonblank_window_topk_loss
+                        * ctc_teacher_online_nonblank_window_topk_weight
+                    )
                 engine.backward(loss)
                 engine.step()
                 step_time = time.perf_counter() - step_start_time
@@ -1113,7 +5062,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
 
                 if _is_rank_zero() and step == start_step + 1:
                     _rank_zero_log(
-                        f"First step timings: data={data_time:.2f}s compute={step_time:.2f}s total={data_time + step_time:.2f}s"
+                        f"First step timings: data={data_time:.2f}s compute={step_time:.2f}s "
+                        f"online_teacher={ctc_teacher_online_forward_time:.2f}s "
+                        f"total={data_time + step_time:.2f}s"
                     )
                     _rank_zero_log(
                         "Batch stats "
@@ -1140,7 +5091,58 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     print(
                         "[deepspeed-train] "
                         f"step={step} loss={loss_value:.4f} ctc={ctc_loss_value:.4f} "
-                        f"decoder={decoder_loss_value:.4f} device={device}",
+                        f"decoder={decoder_loss_value:.4f} anchor={encoder_anchor_loss_value:.4f} "
+                        f"ctc_anchor={ctc_logit_anchor_loss_value:.4f} "
+                        f"ctc_teacher_topk={ctc_teacher_topk_loss_value:.4f} "
+                        f"teacher_match={ctc_teacher_topk_matched}/{batch_stats.batch_size} "
+                        f"teacher_missing={ctc_teacher_topk_missing} "
+                        f"ctc_teacher_blank={ctc_teacher_topk_blank_loss_value:.4f} "
+                        f"teacher_blank_match={ctc_teacher_topk_blank_matched}/{batch_stats.batch_size} "
+                        f"teacher_blank_missing={ctc_teacher_topk_blank_missing} "
+                        f"ctc_teacher_mass={ctc_teacher_topk_mass_loss_value:.4f} "
+                        f"teacher_mass_match={ctc_teacher_topk_mass_matched}/{batch_stats.batch_size} "
+                        f"teacher_mass_missing={ctc_teacher_topk_mass_missing} "
+                        f"online_ctc_teacher={ctc_teacher_online_loss_value:.4f} "
+                        f"online_teacher_match={ctc_teacher_online_matched}/{batch_stats.batch_size} "
+                        f"online_teacher_missing={ctc_teacher_online_missing} "
+                        f"online_ctc_blank={ctc_teacher_online_blank_loss_value:.4f} "
+                        f"online_blank_match={ctc_teacher_online_blank_matched}/{batch_stats.batch_size} "
+                        f"online_blank_missing={ctc_teacher_online_blank_missing} "
+                        f"online_ctc_mass={ctc_teacher_online_mass_loss_value:.4f} "
+                        f"online_mass_match={ctc_teacher_online_mass_matched}/{batch_stats.batch_size} "
+                        f"online_mass_missing={ctc_teacher_online_mass_missing} "
+                        f"online_ctc_full={ctc_teacher_online_full_loss_value:.4f} "
+                        f"online_full_match={ctc_teacher_online_full_matched}/{batch_stats.batch_size} "
+                        f"online_full_missing={ctc_teacher_online_full_missing} "
+                        f"online_ctc_encoder={ctc_teacher_online_encoder_loss_value:.4f} "
+                        f"online_encoder_match={ctc_teacher_online_encoder_matched}/{batch_stats.batch_size} "
+                        f"online_encoder_missing={ctc_teacher_online_encoder_missing} "
+                        f"online_ctc_sequence={ctc_teacher_online_sequence_loss_value:.4f} "
+                        f"online_sequence_match={ctc_teacher_online_sequence_matched}/{batch_stats.batch_size} "
+                        f"online_sequence_missing={ctc_teacher_online_sequence_missing} "
+                        f"online_ctc_sequence_presence={ctc_teacher_online_sequence_presence_loss_value:.4f} "
+                        f"online_sequence_presence_match={ctc_teacher_online_sequence_presence_matched}/{batch_stats.batch_size} "
+                        f"online_sequence_presence_missing={ctc_teacher_online_sequence_presence_missing} "
+                        f"online_sequence_presence_tokens={ctc_teacher_online_sequence_presence_tokens} "
+                        f"online_ctc_sequence_window={ctc_teacher_online_sequence_window_loss_value:.4f} "
+                        f"online_sequence_window_match={ctc_teacher_online_sequence_window_matched}/{batch_stats.batch_size} "
+                        f"online_sequence_window_missing={ctc_teacher_online_sequence_window_missing} "
+                        f"online_sequence_window_events={ctc_teacher_online_sequence_window_events} "
+                        f"online_ctc_nonblank_hard={ctc_teacher_online_nonblank_hard_loss_value:.4f} "
+                        f"online_ctc_nonblank_margin={ctc_teacher_online_nonblank_margin_loss_value:.4f} "
+                        f"online_nonblank_match={ctc_teacher_online_nonblank_matched}/{batch_stats.batch_size} "
+                        f"online_nonblank_missing={ctc_teacher_online_nonblank_missing} "
+                        f"online_ctc_nonblank_window={ctc_teacher_online_nonblank_window_loss_value:.4f} "
+                        f"online_ctc_nonblank_window_margin={ctc_teacher_online_nonblank_window_margin_loss_value:.4f} "
+                        f"online_nonblank_window_match={ctc_teacher_online_nonblank_window_matched}/{batch_stats.batch_size} "
+                        f"online_nonblank_window_missing={ctc_teacher_online_nonblank_window_missing} "
+                        f"online_nonblank_window_events={ctc_teacher_online_nonblank_window_events} "
+                        f"online_ctc_nonblank_window_topk={ctc_teacher_online_nonblank_window_topk_loss_value:.4f} "
+                        f"online_nonblank_window_topk_match={ctc_teacher_online_nonblank_window_topk_matched}/{batch_stats.batch_size} "
+                        f"online_nonblank_window_topk_missing={ctc_teacher_online_nonblank_window_topk_missing} "
+                        f"online_nonblank_window_topk_events={ctc_teacher_online_nonblank_window_topk_events} "
+                        f"online_teacher_time={ctc_teacher_online_forward_time:.2f}s "
+                        f"device={device}",
                         flush=True,
                     )
                     total_elapsed = time.perf_counter() - train_start_time
@@ -1153,6 +5155,95 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             "train/loss": loss_value,
                             "train/ctc_loss": ctc_loss_value,
                             "train/decoder_loss": decoder_loss_value,
+                            "train/encoder_anchor_loss": encoder_anchor_loss_value,
+                            "train/ctc_logit_anchor_loss": ctc_logit_anchor_loss_value,
+                            "train/ctc_teacher_topk_loss": ctc_teacher_topk_loss_value,
+                            "train/ctc_teacher_topk_matched": ctc_teacher_topk_matched,
+                            "train/ctc_teacher_topk_missing": ctc_teacher_topk_missing,
+                            "train/ctc_teacher_topk_blank_loss": ctc_teacher_topk_blank_loss_value,
+                            "train/ctc_teacher_topk_blank_matched": ctc_teacher_topk_blank_matched,
+                            "train/ctc_teacher_topk_blank_missing": ctc_teacher_topk_blank_missing,
+                            "train/ctc_teacher_topk_mass_loss": ctc_teacher_topk_mass_loss_value,
+                            "train/ctc_teacher_topk_mass_matched": ctc_teacher_topk_mass_matched,
+                            "train/ctc_teacher_topk_mass_missing": ctc_teacher_topk_mass_missing,
+                            "train/ctc_teacher_online_loss": ctc_teacher_online_loss_value,
+                            "train/ctc_teacher_online_matched": ctc_teacher_online_matched,
+                            "train/ctc_teacher_online_missing": ctc_teacher_online_missing,
+                            "train/ctc_teacher_online_blank_loss": ctc_teacher_online_blank_loss_value,
+                            "train/ctc_teacher_online_blank_matched": ctc_teacher_online_blank_matched,
+                            "train/ctc_teacher_online_blank_missing": ctc_teacher_online_blank_missing,
+                            "train/ctc_teacher_online_mass_loss": ctc_teacher_online_mass_loss_value,
+                            "train/ctc_teacher_online_mass_matched": ctc_teacher_online_mass_matched,
+                            "train/ctc_teacher_online_mass_missing": ctc_teacher_online_mass_missing,
+                            "train/ctc_teacher_online_full_loss": ctc_teacher_online_full_loss_value,
+                            "train/ctc_teacher_online_full_matched": ctc_teacher_online_full_matched,
+                            "train/ctc_teacher_online_full_missing": ctc_teacher_online_full_missing,
+                            "train/ctc_teacher_online_encoder_loss": ctc_teacher_online_encoder_loss_value,
+                            "train/ctc_teacher_online_encoder_matched": ctc_teacher_online_encoder_matched,
+                            "train/ctc_teacher_online_encoder_missing": ctc_teacher_online_encoder_missing,
+                            "train/ctc_teacher_online_sequence_loss": ctc_teacher_online_sequence_loss_value,
+                            "train/ctc_teacher_online_sequence_matched": ctc_teacher_online_sequence_matched,
+                            "train/ctc_teacher_online_sequence_missing": ctc_teacher_online_sequence_missing,
+                            "train/ctc_teacher_online_sequence_presence_loss": (
+                                ctc_teacher_online_sequence_presence_loss_value
+                            ),
+                            "train/ctc_teacher_online_sequence_presence_matched": (
+                                ctc_teacher_online_sequence_presence_matched
+                            ),
+                            "train/ctc_teacher_online_sequence_presence_missing": (
+                                ctc_teacher_online_sequence_presence_missing
+                            ),
+                            "train/ctc_teacher_online_sequence_presence_tokens": (
+                                ctc_teacher_online_sequence_presence_tokens
+                            ),
+                            "train/ctc_teacher_online_sequence_window_loss": (
+                                ctc_teacher_online_sequence_window_loss_value
+                            ),
+                            "train/ctc_teacher_online_sequence_window_matched": (
+                                ctc_teacher_online_sequence_window_matched
+                            ),
+                            "train/ctc_teacher_online_sequence_window_missing": (
+                                ctc_teacher_online_sequence_window_missing
+                            ),
+                            "train/ctc_teacher_online_sequence_window_events": (
+                                ctc_teacher_online_sequence_window_events
+                            ),
+                            "train/ctc_teacher_online_nonblank_hard_loss": (
+                                ctc_teacher_online_nonblank_hard_loss_value
+                            ),
+                            "train/ctc_teacher_online_nonblank_margin_loss": (
+                                ctc_teacher_online_nonblank_margin_loss_value
+                            ),
+                            "train/ctc_teacher_online_nonblank_matched": ctc_teacher_online_nonblank_matched,
+                            "train/ctc_teacher_online_nonblank_missing": ctc_teacher_online_nonblank_missing,
+                            "train/ctc_teacher_online_nonblank_window_loss": (
+                                ctc_teacher_online_nonblank_window_loss_value
+                            ),
+                            "train/ctc_teacher_online_nonblank_window_margin_loss": (
+                                ctc_teacher_online_nonblank_window_margin_loss_value
+                            ),
+                            "train/ctc_teacher_online_nonblank_window_matched": (
+                                ctc_teacher_online_nonblank_window_matched
+                            ),
+                            "train/ctc_teacher_online_nonblank_window_missing": (
+                                ctc_teacher_online_nonblank_window_missing
+                            ),
+                            "train/ctc_teacher_online_nonblank_window_events": (
+                                ctc_teacher_online_nonblank_window_events
+                            ),
+                            "train/ctc_teacher_online_nonblank_window_topk_loss": (
+                                ctc_teacher_online_nonblank_window_topk_loss_value
+                            ),
+                            "train/ctc_teacher_online_nonblank_window_topk_matched": (
+                                ctc_teacher_online_nonblank_window_topk_matched
+                            ),
+                            "train/ctc_teacher_online_nonblank_window_topk_missing": (
+                                ctc_teacher_online_nonblank_window_topk_missing
+                            ),
+                            "train/ctc_teacher_online_nonblank_window_topk_events": (
+                                ctc_teacher_online_nonblank_window_topk_events
+                            ),
+                            "train/ctc_teacher_online_forward_time": ctc_teacher_online_forward_time,
                             "train/epoch": epoch,
                             "train/data_time": data_time,
                             "train/step_time": step_time,
@@ -1179,6 +5270,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     checkpoint_extra = {
                         "loss": loss_value,
                         "epoch": epoch,
+                        "epoch_batch_offset": epoch_batch_offset,
                         "history": history,
                         "step_checkpoint_history": step_checkpoint_history,
                         "best_step_checkpoints": best_step_checkpoints,
@@ -1197,6 +5289,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         step=step,
                         zero_stage=zero_stage,
                         extra_state=checkpoint_extra,
+                        save_deepspeed_sharded=bool(config.save_deepspeed_sharded_checkpoints),
                     )
                     if step_eval_every is not None and step % step_eval_every == 0:
                         step_eval_loss, step_eval_count = _evaluate_epoch_loss(
@@ -1208,28 +5301,27 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             feature_dtype=feature_dtype,
                             mode=config.eval_mode,
                             max_eval_samples=int(config.step_eval_samples),
+                            config=config,
+                            ctc_teacher_online=ctc_teacher_online,
                         )
-                        step_record = {
-                            "step": step,
-                            "epoch": epoch,
-                            "eval_loss": step_eval_loss,
-                            "eval_samples": step_eval_count,
-                            **saved_artifacts,
-                        }
-                        step_checkpoint_history.append(step_record)
-                        saved_step_records = [
-                            record
-                            for record in step_checkpoint_history
-                            if record.get("deepspeed_checkpoint_dir") or record.get("checkpoint_path")
-                        ]
-                        best_step_checkpoints = _sort_step_checkpoint_records(saved_step_records)[
-                            : max(1, int(config.top_k_step_checkpoints))
-                        ]
-                        keep_current_step = _step_checkpoint_record_is_retained(
-                            record=step_record,
-                            top_records=best_step_checkpoints,
-                        )
-                        if keep_current_step:
+                        step_eval_valid = step_eval_count > 0 and math.isfinite(step_eval_loss)
+                        if step_eval_valid:
+                            step_record = {
+                                "step": step,
+                                "epoch": epoch,
+                                "eval_loss": step_eval_loss,
+                                "eval_samples": step_eval_count,
+                                **saved_artifacts,
+                            }
+                            step_checkpoint_history.append(step_record)
+                            saved_step_records = [
+                                record
+                                for record in step_checkpoint_history
+                                if record.get("deepspeed_checkpoint_dir") or record.get("checkpoint_path")
+                            ]
+                            best_step_checkpoints = _sort_step_checkpoint_records(saved_step_records)[
+                                : max(1, int(config.top_k_step_checkpoints))
+                            ]
                             checkpoint_extra["step_checkpoint_history"] = step_checkpoint_history
                             checkpoint_extra["best_step_checkpoints"] = best_step_checkpoints
                             _save_export_checkpoints(
@@ -1240,34 +5332,61 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                 step=step,
                                 zero_stage=zero_stage,
                                 extra_state=checkpoint_extra,
+                                save_deepspeed_sharded=bool(config.save_deepspeed_sharded_checkpoints),
                             )
-                        _maybe_barrier()
-                        if _is_rank_zero():
-                            _prune_deepspeed_step_checkpoint_artifacts(
-                                top_records=best_step_checkpoints,
-                                saved_records=saved_step_records,
-                            )
-                        _maybe_barrier()
-                        if _is_rank_zero():
-                            save_step_checkpoint_metrics(
-                                output_dir,
-                                history=step_checkpoint_history,
-                                best=best_step_checkpoints,
-                                keep_top_k=int(config.top_k_step_checkpoints),
-                            )
+                            _maybe_barrier()
+                            if _is_rank_zero():
+                                _prune_deepspeed_step_checkpoint_artifacts(
+                                    top_records=best_step_checkpoints,
+                                    saved_records=[
+                                        record
+                                        for record in saved_step_records
+                                        if int(record.get("step", 0)) != step
+                                    ],
+                                )
+                            _maybe_barrier()
+                            if _is_rank_zero():
+                                save_step_checkpoint_metrics(
+                                    output_dir,
+                                    history=step_checkpoint_history,
+                                    best=best_step_checkpoints,
+                                    keep_top_k=int(config.top_k_step_checkpoints),
+                                )
+                                _rank_zero_log(
+                                    f"Step checkpoint eval: step={step} eval_loss={step_eval_loss:.4f} "
+                                    f"eval_samples={step_eval_count} kept_top_k={len(best_step_checkpoints)}"
+                                )
+                                log_wandb(
+                                    wandb_run,
+                                    {
+                                        "eval/step_eval_loss": step_eval_loss,
+                                        "eval/step_eval_samples": step_eval_count,
+                                        "checkpoint/top_k_kept": len(best_step_checkpoints),
+                                    },
+                                    step=step,
+                                )
+                        elif _is_rank_zero():
                             _rank_zero_log(
-                                f"Step checkpoint eval: step={step} eval_loss={step_eval_loss:.4f} "
-                                f"eval_samples={step_eval_count} kept_top_k={len(best_step_checkpoints)}"
+                                f"Step checkpoint eval skipped: step={step} "
+                                f"eval_samples={step_eval_count}; checkpoint saved but not ranked"
                             )
                             log_wandb(
                                 wandb_run,
                                 {
-                                    "eval/step_eval_loss": step_eval_loss,
                                     "eval/step_eval_samples": step_eval_count,
+                                    "eval/step_eval_skipped": 1,
                                     "checkpoint/top_k_kept": len(best_step_checkpoints),
                                 },
                                 step=step,
                             )
+            if not processed_any_batch and epoch_batch_offset > 0:
+                _all_rank_log(
+                    f"No candidate batch available after resuming offset={epoch_batch_offset} for epoch={epoch}; "
+                    f"continuing with epoch={epoch + 1}"
+                )
+                epoch += 1
+                epoch_batch_offset = 0
+                continue
             epoch_train_loss = _all_reduce_mean(epoch_loss_sum, epoch_sample_count, device=engine.device)
             eval_limit = _resolve_epoch_eval_limit(config, epoch=epoch)
             eval_label = "full" if eval_limit is None else f"first {eval_limit}"
@@ -1282,18 +5401,22 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 feature_dtype=feature_dtype,
                 mode=config.eval_mode,
                 max_eval_samples=eval_limit,
+                config=config,
+                ctc_teacher_online=ctc_teacher_online,
             )
             epoch_eval_full = eval_limit is None
-            metric_value = epoch_eval_loss if not math.isnan(epoch_eval_loss) else epoch_train_loss
-            metric_name = "eval_loss" if not math.isnan(epoch_eval_loss) else "train_loss"
+            epoch_eval_valid = epoch_eval_samples > 0 and math.isfinite(epoch_eval_loss)
+            metric_value = epoch_eval_loss if epoch_eval_valid else epoch_train_loss
+            metric_name = "eval_loss" if epoch_eval_valid else "train_loss"
             history.append(
                 {
                     "epoch": epoch,
                     "step": step,
                     "train_loss": epoch_train_loss,
-                    "eval_loss": epoch_eval_loss,
+                    "eval_loss": epoch_eval_loss if epoch_eval_valid else None,
                     "eval_samples": epoch_eval_samples,
                     "eval_full": epoch_eval_full,
+                    "eval_skipped": not epoch_eval_valid,
                     "selection_metric": metric_value,
                     "selection_metric_name": metric_name,
                 }
@@ -1305,6 +5428,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 best_epoch = epoch
                 best_extra = {
                     "loss": loss_value,
+                    "epoch_batch_offset": epoch_batch_offset,
                     "epoch": epoch,
                     "history": history,
                     "step_checkpoint_history": step_checkpoint_history,
@@ -1323,20 +5447,23 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     step=step,
                     zero_stage=zero_stage,
                     extra_state=best_extra,
+                    save_deepspeed_sharded=bool(config.save_deepspeed_sharded_checkpoints),
                 )
                 if _is_rank_zero():
+                    best_checkpoint: dict[str, Any] = {
+                        "epoch": best_epoch,
+                        "step": step,
+                        "eval_loss": best_eval_loss,
+                        "train_loss": best_train_loss,
+                        "checkpoint_path": str(output_dir / "best.pt"),
+                        "selection_metric_name": metric_name,
+                    }
+                    if config.save_deepspeed_sharded_checkpoints:
+                        best_checkpoint["deepspeed_checkpoint_dir"] = str(output_dir / "ds_checkpoints")
+                        best_checkpoint["resume_tag"] = "best"
                     save_yaml(
                         output_dir / "best_checkpoint.yaml",
-                        {
-                            "epoch": best_epoch,
-                            "step": step,
-                            "eval_loss": best_eval_loss,
-                            "train_loss": best_train_loss,
-                            "checkpoint_path": str(output_dir / "best.pt"),
-                            "deepspeed_checkpoint_dir": str(output_dir / "ds_checkpoints"),
-                            "resume_tag": "best",
-                            "selection_metric_name": metric_name,
-                        },
+                        best_checkpoint,
                     )
             if _is_rank_zero():
                 save_epoch_metrics(
@@ -1356,8 +5483,12 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     best=best_step_checkpoints,
                     keep_top_k=int(config.top_k_step_checkpoints),
                 )
+            completed_epoch_batch_count = epoch_batch_offset
+            epoch_batch_offset = 0
             epoch_extra = {
                 "loss": loss_value,
+                "epoch_batch_offset": epoch_batch_offset,
+                "completed_epoch_batch_count": completed_epoch_batch_count,
                 "epoch": epoch,
                 "history": history,
                 "step_checkpoint_history": step_checkpoint_history,
@@ -1367,7 +5498,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 "best_train_loss": best_train_loss,
                 "cmvn_file": resolved_cmvn_file,
                 "train_loss": epoch_train_loss,
-                "eval_loss": epoch_eval_loss,
+                "eval_loss": epoch_eval_loss if epoch_eval_valid else None,
             }
             _save_export_checkpoints(
                 engine=engine,
@@ -1377,26 +5508,28 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 step=step,
                 zero_stage=zero_stage,
                 extra_state=epoch_extra,
+                save_deepspeed_sharded=bool(config.save_deepspeed_sharded_checkpoints),
             )
             if _is_rank_zero():
+                eval_loss_text = f"{epoch_eval_loss:.4f}" if epoch_eval_valid else "skipped"
                 _rank_zero_log(
                     f"Epoch {epoch} complete: train_loss={epoch_train_loss:.4f} "
-                    f"eval_loss={epoch_eval_loss:.4f} eval_samples={epoch_eval_samples} "
+                    f"eval_loss={eval_loss_text} eval_samples={epoch_eval_samples} "
                     f"eval_full={epoch_eval_full} best_epoch={best_epoch}"
                 )
-                log_wandb(
-                    wandb_run,
-                    {
-                        "epoch/index": epoch,
-                        "epoch/train_loss": epoch_train_loss,
-                        "epoch/eval_loss": epoch_eval_loss,
-                        "epoch/eval_samples": epoch_eval_samples,
-                        "epoch/eval_full": int(epoch_eval_full),
-                        "checkpoint/best_epoch": best_epoch,
-                        "checkpoint/best_eval_loss": best_eval_loss,
-                    },
-                    step=step,
-                )
+                epoch_wandb_payload = {
+                    "epoch/index": epoch,
+                    "epoch/train_loss": epoch_train_loss,
+                    "epoch/eval_samples": epoch_eval_samples,
+                    "epoch/eval_full": int(epoch_eval_full),
+                    "checkpoint/best_epoch": best_epoch,
+                }
+                if epoch_eval_valid:
+                    epoch_wandb_payload["epoch/eval_loss"] = epoch_eval_loss
+                    epoch_wandb_payload["checkpoint/best_eval_loss"] = best_eval_loss
+                else:
+                    epoch_wandb_payload["epoch/eval_skipped"] = 1
+                log_wandb(wandb_run, epoch_wandb_payload, step=step)
     finally:
         if progress is not None:
             progress.stop()

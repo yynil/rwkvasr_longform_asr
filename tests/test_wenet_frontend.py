@@ -1,11 +1,19 @@
 import torch
 
-from rwkvasr.data import WenetFbankFeatureExtractor
+from rwkvasr.data import (
+    Qwen3ASRFeatureExtractor,
+    SenseVoiceLFRFbankFeatureExtractor,
+    WenetFbankFeatureExtractor,
+    apply_lfr_stacking,
+    build_audio_feature_extractor,
+)
 from rwkvasr.modules import (
+    Qwen3ASRFeatureConfig,
     RWKVConformerEncoder,
     RWKVConformerEncoderConfig,
     WenetConv2dSubsampling6,
     WenetFbankConfig,
+    compute_qwen3_asr_log_mel,
     compute_wenet_fbank,
     conv2d6_out_lengths,
 )
@@ -27,6 +35,50 @@ def test_wenet_fbank_extractor_resamples_and_returns_80_bins() -> None:
 
     assert feats.dim() == 2
     assert feats.size(1) == 80
+
+
+def test_qwen3_asr_feature_extractor_matches_whisper_log_mel_layout() -> None:
+    sample_rate = 16000
+    waveform = torch.randn(sample_rate)
+    config = Qwen3ASRFeatureConfig()
+
+    feats = compute_qwen3_asr_log_mel(waveform, sample_rate, config)
+
+    import whisper.audio as whisper_audio
+
+    expected = whisper_audio.log_mel_spectrogram(waveform, n_mels=128).transpose(0, 1)
+    assert feats.shape == expected.shape
+    assert torch.allclose(feats, expected, atol=1e-6)
+
+
+def test_qwen3_asr_feature_extractor_resamples_and_returns_128_bins() -> None:
+    extractor = Qwen3ASRFeatureExtractor()
+    waveform = torch.randn(1, 8000)
+    feats = extractor(waveform, sample_rate=8000)
+
+    assert feats.dim() == 2
+    assert feats.size(1) == 128
+
+
+def test_build_audio_feature_extractor_selects_qwen3_asr() -> None:
+    extractor = build_audio_feature_extractor("qwen3_asr", input_dim=128)
+
+    assert isinstance(extractor, Qwen3ASRFeatureExtractor)
+
+
+def test_lfr_stacking_uses_last_frame_padding() -> None:
+    features = torch.arange(10 * 2, dtype=torch.float32).reshape(10, 2)
+    stacked = apply_lfr_stacking(features, lfr_m=7, lfr_n=6)
+
+    assert stacked.shape == (2, 14)
+    assert torch.equal(stacked[0, :4], torch.tensor([0.0, 1.0, 2.0, 3.0]))
+    assert torch.equal(stacked[1, -4:], torch.tensor([18.0, 19.0, 18.0, 19.0]))
+
+
+def test_build_audio_feature_extractor_selects_sensevoice_lfr_fbank() -> None:
+    extractor = build_audio_feature_extractor("sensevoice_lfr_fbank", input_dim=560)
+
+    assert isinstance(extractor, SenseVoiceLFRFbankFeatureExtractor)
 
 
 def test_conv2d6_subsampling_lengths_match_output_time() -> None:
