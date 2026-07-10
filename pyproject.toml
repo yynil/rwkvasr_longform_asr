@@ -34,6 +34,7 @@ rwkvasr-inspect-webdataset-lengths = "rwkvasr.cli.inspect_webdataset_lengths:mai
 rwkvasr-train-ctc = "rwkvasr.cli.train_ctc:main"
 rwkvasr-train-ctc-deepspeed = "rwkvasr.cli.train_ctc_deepspeed:main"
 rwkvasr-eval-ctc = "rwkvasr.cli.eval_ctc:main"
+rwkvasr-eval-online-ctc-distill = "rwkvasr.cli.eval_online_ctc_distill:main"
 rwkvasr-predict-ctc = "rwkvasr.cli.predict_ctc:main"
 rwkvasr-predict-ctc-labeled = "rwkvasr.cli.predict_ctc_labeled:main"
 rwkvasr-predict-rwkv-decoder-labeled = "rwkvasr.cli.predict_rwkv_decoder_labeled:main"
