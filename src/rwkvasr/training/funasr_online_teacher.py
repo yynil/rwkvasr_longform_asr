@@ -67,6 +67,7 @@ class FunASROnlineCTCTeacherConfig:
     return_encoder_input: bool = False
     return_layer_hiddens: bool = False
     keep_layer_hiddens_on_device: bool = False
+    keep_full_log_probs_on_device: bool = False
 
 
 @dataclass(frozen=True)
@@ -372,6 +373,12 @@ class FunASRNanoCTCTopKOnlineTeacher:
             value = value.cpu()
         return value.to(dtype=torch.float16)
 
+    def _full_log_probs_record_tensor(self, value: torch.Tensor) -> torch.Tensor:
+        value = value.detach()
+        if not self.config.keep_full_log_probs_on_device:
+            value = value.cpu()
+        return value.to(dtype=torch.float16)
+
     def _prepare_device_layer_hiddens(self, hidden_capture: dict[str, Any]) -> None:
         if not self.config.keep_layer_hiddens_on_device:
             return
@@ -488,7 +495,7 @@ class FunASRNanoCTCTopKOnlineTeacher:
                 ignored_id = int(ignored_id)
                 if ignored_id != int(self.config.project_blank_id) and 0 <= ignored_id < project_vocab_size:
                     full_log_probs[:, ignored_id] = float("-inf")
-            result["full_log_probs"] = full_log_probs.detach().cpu().to(dtype=torch.float16)
+            result["full_log_probs"] = self._full_log_probs_record_tensor(full_log_probs)
         return result
 
     def _forward_one(

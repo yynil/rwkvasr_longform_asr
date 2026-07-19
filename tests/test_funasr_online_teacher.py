@@ -157,3 +157,15 @@ def test_feature_records_batches_teacher_forward_and_preserves_student_features(
     resident_mixer = device_resident["utt-b"]["encoder_layer_hiddens"]["0"]["mixer"]
     assert resident_mixer.device == features.device
     assert resident_mixer.dtype == torch.float16
+
+    teacher.config = replace(
+        teacher.config,
+        return_full_log_probs=True,
+        keep_full_log_probs_on_device=True,
+        project_ignored_token_ids=(),
+    )
+    full_records = teacher.feature_records(["utt-a", "utt-b"], features, lengths)
+    full_log_probs = full_records["utt-b"]["full_log_probs"]
+    assert full_log_probs.shape == (3, 8)
+    assert full_log_probs.device == features.device
+    assert full_log_probs.dtype == torch.float16

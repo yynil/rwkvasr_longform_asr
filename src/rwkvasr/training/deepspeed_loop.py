@@ -305,6 +305,7 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_project_ignored_token_ids: tuple[int, ...] | list[int] = (60514,)
     ctc_teacher_online_use_batch_features: bool = False
     ctc_teacher_online_keep_layer_hiddens_on_device: bool = False
+    ctc_teacher_online_keep_full_log_probs_on_device: bool = False
     ctc_teacher_online_layer_mixer_loss_weight: float = 0.0
     ctc_teacher_online_layer_ffn_loss_weight: float = 0.0
     ctc_teacher_online_layer_block_loss_weight: float = 0.0
@@ -5090,6 +5091,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 keep_layer_hiddens_on_device=bool(
                     config.ctc_teacher_online_keep_layer_hiddens_on_device
                 ),
+                keep_full_log_probs_on_device=bool(
+                    config.ctc_teacher_online_keep_full_log_probs_on_device
+                ),
             )
         )
         _rank_zero_log(
@@ -5117,6 +5121,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"layer_frame_tolerance={int(config.ctc_teacher_online_layer_frame_tolerance)} "
             f"layer_input_mode={ctc_teacher_online_layer_input_mode} "
             f"layer_hiddens_on_device={bool(config.ctc_teacher_online_keep_layer_hiddens_on_device)} "
+            f"full_log_probs_on_device={bool(config.ctc_teacher_online_keep_full_log_probs_on_device)} "
             f"layer_hidden_only={ctc_teacher_online_layer_only} "
             f"full_temperature={ctc_teacher_online_full_temperature:g} "
             f"rows={ctc_teacher_online.num_audio_rows} "
