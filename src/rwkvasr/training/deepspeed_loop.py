@@ -1255,6 +1255,21 @@ def _select_layer_hidden_ids(
     return tuple(sorted((*anchors, *extras)))
 
 
+def _select_eval_layer_hidden_ids(
+    *,
+    batch_index: int,
+    num_layers: int,
+    sample_count: int,
+) -> tuple[int, ...]:
+    return _select_layer_hidden_ids(
+        step=batch_index,
+        num_layers=num_layers,
+        sample_count=sample_count,
+        boundary_ids=(),
+        include_boundaries=False,
+    )
+
+
 def _teacher_layer_capture_ids(
     layer_ids: tuple[int, ...],
     *,
@@ -2114,12 +2129,10 @@ def _evaluate_epoch_loss(
             layer_hidden_enabled = any(value > 0.0 for value in layer_component_weights.values())
             layer_hidden_only = _is_layer_hidden_only_objective(config)
             selected_layer_ids = (
-                _select_layer_hidden_ids(
-                    step=eval_batch_index,
+                _select_eval_layer_hidden_ids(
+                    batch_index=eval_batch_index,
                     num_layers=int(config.num_layers),
                     sample_count=int(config.ctc_teacher_online_layer_sample_count),
-                    boundary_ids=config.ctc_teacher_online_layer_boundary_ids,
-                    include_boundaries=True,
                 )
                 if layer_hidden_enabled
                 else ()

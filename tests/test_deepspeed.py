@@ -18,6 +18,7 @@ from rwkvasr.training.deepspeed_loop import (
     _resolve_ctc_teacher_online_device,
     _resolve_max_steps as resolve_deepspeed_max_steps,
     _save_export_checkpoints,
+    _select_eval_layer_hidden_ids,
     _sample_direction_mask_distributed,
     _select_layer_hidden_ids,
     _step_checkpoint_record_is_retained,
@@ -83,6 +84,26 @@ def test_layer_hidden_sampler_keeps_boundaries_and_covers_every_layer() -> None:
     assert all(len(selection) == 8 for selection in selections)
     assert set().union(*map(set, selections)) == set(range(70))
     assert {0, 49, 50, 69}.issubset(boundary_selection)
+
+
+def test_fixed_eval_layer_sampler_covers_layers_uniformly() -> None:
+    selections = [
+        _select_eval_layer_hidden_ids(
+            batch_index=batch_index,
+            num_layers=70,
+            sample_count=8,
+        )
+        for batch_index in range(64)
+    ]
+    counts = {
+        layer_id: sum(layer_id in selection for selection in selections)
+        for layer_id in range(70)
+    }
+
+    assert all(len(selection) == 8 for selection in selections)
+    assert set().union(*map(set, selections)) == set(range(70))
+    assert min(counts.values()) >= 7
+    assert max(counts.values()) <= 8
 
 
 def test_teacher_forced_layer_alignment_uses_teacher_inputs_and_layer_zero_v_first() -> None:

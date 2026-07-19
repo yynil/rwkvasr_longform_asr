@@ -80,7 +80,7 @@ PHASES: dict[str, AlignmentPhase] = {
 
 def _default_output_dir(phase: AlignmentPhase) -> Path:
     suffix = (
-        "stage209_nanoqkv_exactfrontend_easy1490h_1ep_hidden_localenergy_statsbatch_lr1e5_4x4090"
+        "stage209_nanoqkv_exactfrontend_easy1490h_1ep_hidden_localenergy_uniformeval_lr1e5_4x4090"
         if phase.name == "subblock"
         else "stage210a_easy1490h_1ep_hidden_fullblock_lr3e6_4x4090"
     )
