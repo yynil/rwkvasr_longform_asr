@@ -142,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument(
+        "--ctc-teacher-online-keep-layer-hiddens-on-device",
+        dest="ctc_teacher_online_keep_layer_hiddens_on_device",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--ctc-teacher-online-layer-mixer-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-layer-ffn-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-layer-block-loss-weight", default=None, type=float)
@@ -406,6 +412,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "ctc_teacher_online_keep_audio_cache",
         "ctc_teacher_online_device",
         "ctc_teacher_online_use_batch_features",
+        "ctc_teacher_online_keep_layer_hiddens_on_device",
         "ctc_teacher_online_layer_mixer_loss_weight",
         "ctc_teacher_online_layer_ffn_loss_weight",
         "ctc_teacher_online_layer_block_loss_weight",

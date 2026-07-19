@@ -304,6 +304,7 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_device: str | None = None
     ctc_teacher_online_project_ignored_token_ids: tuple[int, ...] | list[int] = (60514,)
     ctc_teacher_online_use_batch_features: bool = False
+    ctc_teacher_online_keep_layer_hiddens_on_device: bool = False
     ctc_teacher_online_layer_mixer_loss_weight: float = 0.0
     ctc_teacher_online_layer_ffn_loss_weight: float = 0.0
     ctc_teacher_online_layer_block_loss_weight: float = 0.0
@@ -1360,7 +1361,7 @@ def _teacher_forced_hidden_batch(
     device: torch.device,
     dtype: torch.dtype,
     missing_policy: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
     rows: list[torch.Tensor | None] = []
     feature_dim: int | None = None
     for utt_id_value in utt_ids:
@@ -1393,19 +1394,20 @@ def _teacher_forced_hidden_batch(
         rows.append(tensor)
     if feature_dim is None:
         raise RuntimeError(f"No teacher-forced {component} tensors matched layer={layer_id}.")
+    row_lengths = tuple(0 if row is None else int(row.size(0)) for row in rows)
     lengths = torch.tensor(
-        [0 if row is None else int(row.size(0)) for row in rows],
+        row_lengths,
         device=device,
         dtype=torch.long,
     )
-    max_time = max(int(lengths.max().item()), 1)
+    max_time = max(max(row_lengths, default=0), 1)
     batch = torch.zeros((len(rows), max_time, feature_dim), device=device, dtype=dtype)
     for sample_idx, row in enumerate(rows):
         if row is None or int(row.size(0)) <= 0:
             continue
         row_on_device = row.to(device=device, dtype=dtype)
         batch[sample_idx, : int(row_on_device.size(0)), :] = row_on_device
-    return batch, lengths
+    return batch, lengths, row_lengths
 
 
 def _teacher_forced_student_layer_hiddens(
@@ -1430,7 +1432,7 @@ def _teacher_forced_student_layer_hiddens(
     device = parameter.device
     dtype = parameter.dtype
 
-    layer_zero_input, layer_zero_lengths = _teacher_forced_hidden_batch(
+    layer_zero_input, layer_zero_lengths, layer_zero_row_lengths = _teacher_forced_hidden_batch(
         teacher_records,
         utt_ids,
         layer_id=0,
@@ -1456,7 +1458,7 @@ def _teacher_forced_student_layer_hiddens(
             lengths = layer_zero_lengths
             mixed = layer_zero_mixed
         else:
-            layer_input, lengths = _teacher_forced_hidden_batch(
+            layer_input, lengths, row_lengths = _teacher_forced_hidden_batch(
                 teacher_records,
                 utt_ids,
                 layer_id=int(layer_id),
@@ -1465,7 +1467,7 @@ def _teacher_forced_student_layer_hiddens(
                 dtype=dtype,
                 missing_policy=missing_policy,
             )
-            if not torch.equal(lengths, layer_zero_lengths):
+            if row_lengths != layer_zero_row_lengths:
                 raise ValueError(
                     f"Teacher-forced layer lengths differ between layer 0 and layer {layer_id}."
                 )
@@ -1627,6 +1629,9 @@ def _ctc_teacher_layer_hidden_loss(
     events = 0
     max_frame_delta = 0
 
+    student_times = tuple(
+        int(value) for value in clipped_lengths[:batch_size].detach().cpu().tolist()
+    )
     for sample_idx in range(batch_size):
         utt_id = str(utt_ids[sample_idx])
         record = teacher_records.get(utt_id)
@@ -1641,7 +1646,7 @@ def _ctc_teacher_layer_hidden_loss(
             if missing_policy == "error":
                 raise ValueError(f"Nano record has no encoder_layer_hiddens for utt_id={utt_id!r}.")
             continue
-        student_time = int(clipped_lengths[sample_idx].item())
+        student_time = student_times[sample_idx]
         if student_time <= 0:
             continue
 
@@ -1757,10 +1762,13 @@ def _ctc_teacher_layer_hidden_loss(
         name: component_sums[name] / component_denoms[name].clamp_min(1.0)
         for name in active_components
     }
+    layer_denom_values = torch.stack(
+        [layer_denoms[layer_id] for layer_id in layer_ids]
+    ).detach().cpu().tolist()
     layer_losses = {
         layer_id: layer_sums[layer_id] / layer_denoms[layer_id].clamp_min(1.0)
-        for layer_id in layer_ids
-        if float(layer_denoms[layer_id].detach().item()) > 0.0
+        for layer_id, denom in zip(layer_ids, layer_denom_values, strict=True)
+        if float(denom) > 0.0
     }
     total = sum(
         component_losses[name] * component_weight
@@ -4982,6 +4990,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 return_full_log_probs=ctc_teacher_online_full_weight > 0.0,
                 return_encoder_out=ctc_teacher_online_encoder_weight > 0.0,
                 return_layer_hiddens=ctc_teacher_online_layer_enabled,
+                keep_layer_hiddens_on_device=bool(
+                    config.ctc_teacher_online_keep_layer_hiddens_on_device
+                ),
             )
         )
         _rank_zero_log(
@@ -5008,6 +5019,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"layer_boundaries={tuple(int(value) for value in config.ctc_teacher_online_layer_boundary_ids)} "
             f"layer_frame_tolerance={int(config.ctc_teacher_online_layer_frame_tolerance)} "
             f"layer_input_mode={ctc_teacher_online_layer_input_mode} "
+            f"layer_hiddens_on_device={bool(config.ctc_teacher_online_keep_layer_hiddens_on_device)} "
             f"layer_hidden_only={ctc_teacher_online_layer_only} "
             f"full_temperature={ctc_teacher_online_full_temperature:g} "
             f"rows={ctc_teacher_online.num_audio_rows} "

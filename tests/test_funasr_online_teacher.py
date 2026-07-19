@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 from torch import nn
@@ -141,3 +143,17 @@ def test_feature_records_batches_teacher_forward_and_preserves_student_features(
     assert "num_frames" not in hidden_only["utt-a"]
     assert hidden_only["utt-b"]["encoder_layer_hiddens"]["0"]["input"].shape == (3, 6)
     assert hidden_only["utt-b"]["encoder_layer_hiddens"]["0"]["mixer"].shape == (3, 6)
+    assert hidden_only["utt-b"]["encoder_layer_hiddens"]["0"]["mixer"].device.type == "cpu"
+    assert hidden_only["utt-b"]["encoder_layer_hiddens"]["0"]["mixer"].dtype == torch.float16
+
+    teacher.config = replace(teacher.config, keep_layer_hiddens_on_device=True)
+    device_resident = teacher.feature_records(
+        ["utt-a", "utt-b"],
+        features,
+        lengths,
+        layer_ids=[0],
+        include_ctc_outputs=False,
+    )
+    resident_mixer = device_resident["utt-b"]["encoder_layer_hiddens"]["0"]["mixer"]
+    assert resident_mixer.device == features.device
+    assert resident_mixer.dtype == torch.float16

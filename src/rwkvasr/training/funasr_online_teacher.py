@@ -66,6 +66,7 @@ class FunASROnlineCTCTeacherConfig:
     return_encoder_out: bool = False
     return_encoder_input: bool = False
     return_layer_hiddens: bool = False
+    keep_layer_hiddens_on_device: bool = False
 
 
 @dataclass(frozen=True)
@@ -365,6 +366,21 @@ class FunASRNanoCTCTopKOnlineTeacher:
     def num_audio_rows(self) -> int:
         return len(self.audio_rows)
 
+    def _layer_hidden_record_tensor(self, value: torch.Tensor) -> torch.Tensor:
+        value = value.detach()
+        if not self.config.keep_layer_hiddens_on_device:
+            value = value.cpu()
+        return value.to(dtype=torch.float16)
+
+    def _prepare_device_layer_hiddens(self, hidden_capture: dict[str, Any]) -> None:
+        if not self.config.keep_layer_hiddens_on_device:
+            return
+        for components in hidden_capture.get("layers", {}).values():
+            for name in ("input", "mixer", "ffn", "block"):
+                value = components.get(name)
+                if isinstance(value, torch.Tensor):
+                    components[name] = value.detach().to(dtype=torch.float16)
+
     def _build_record(
         self,
         *,
@@ -449,10 +465,9 @@ class FunASRNanoCTCTopKOnlineTeacher:
                         f"layer={layer_id}: missing={missing_components}"
                     )
                 layer_hiddens[str(layer_id)] = {
-                    name: captured_components[name][sample_idx, :encoder_frame_count, :]
-                    .detach()
-                    .cpu()
-                    .to(dtype=torch.float16)
+                    name: self._layer_hidden_record_tensor(
+                        captured_components[name][sample_idx, :encoder_frame_count, :]
+                    )
                     for name in ("input", "mixer", "ffn", "block")
                 }
             result["encoder_layer_hiddens"] = layer_hiddens
@@ -520,6 +535,7 @@ class FunASRNanoCTCTopKOnlineTeacher:
                     encoder_out_lens = meta_data["encoder_out_lens"]
                     decoder_out, decoder_out_lens = self.model.ctc_decoder(encoder_out, encoder_out_lens)
                     ctc_logp = self.model.ctc.log_softmax(decoder_out)
+            self._prepare_device_layer_hiddens(hidden_capture)
             return self._build_record(
                 utt_id=utt_id,
                 source=source,
@@ -572,6 +588,10 @@ class FunASRNanoCTCTopKOnlineTeacher:
                     decoder_out_lens = None
                     ctc_logp = None
 
+        self._prepare_device_layer_hiddens(hidden_capture)
+        encoder_frame_counts = [
+            int(value) for value in encoder_out_lens[:batch_size].detach().cpu().tolist()
+        ]
         records: dict[str, dict[str, Any]] = {}
         for sample_idx in range(batch_size):
             utt_id = str(utt_ids[sample_idx])
@@ -598,7 +618,7 @@ class FunASRNanoCTCTopKOnlineTeacher:
                 )
                 continue
 
-            encoder_frame_count = int(encoder_out_lens[sample_idx].item())
+            encoder_frame_count = encoder_frame_counts[sample_idx]
             captured_layers = hidden_capture.get("layers", {})
             layer_hiddens: dict[str, dict[str, torch.Tensor]] = {}
             for layer_id in capture_layer_ids:
@@ -613,10 +633,9 @@ class FunASRNanoCTCTopKOnlineTeacher:
                         f"layer={layer_id}: missing={missing_components}"
                     )
                 layer_hiddens[str(layer_id)] = {
-                    name: captured_components[name][sample_idx, :encoder_frame_count, :]
-                    .detach()
-                    .cpu()
-                    .to(dtype=torch.float16)
+                    name: self._layer_hidden_record_tensor(
+                        captured_components[name][sample_idx, :encoder_frame_count, :]
+                    )
                     for name in ("input", "mixer", "ffn", "block")
                 }
             hidden_record: dict[str, Any] = {

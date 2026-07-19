@@ -177,6 +177,7 @@ def _phase_config(
             "ctc_teacher_topk_mass_loss_weight": 0.0,
             "ctc_teacher_online_model_path": str(NANO_MODEL_DIR),
             "ctc_teacher_online_use_batch_features": True,
+            "ctc_teacher_online_keep_layer_hiddens_on_device": True,
             "ctc_teacher_online_keep_audio_cache": False,
             "ctc_teacher_online_loss_weight": 0.0,
             "ctc_teacher_online_blank_loss_weight": 0.0,

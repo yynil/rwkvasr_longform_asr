@@ -35,6 +35,7 @@ def test_stage210_subblock_uses_exact_features_and_nano_initialization(tmp_path:
     assert config["dropout"] == 0.0
     assert config["specaugment_enabled"] is False
     assert config["ctc_teacher_online_use_batch_features"] is True
+    assert config["ctc_teacher_online_keep_layer_hiddens_on_device"] is True
     assert config["ctc_teacher_online_layer_frame_tolerance"] == 0
     assert config["ctc_teacher_online_layer_input_mode"] == "teacher_forced"
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(1.0)
