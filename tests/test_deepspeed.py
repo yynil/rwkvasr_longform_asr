@@ -1,4 +1,5 @@
 import json
+import inspect
 import shutil
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from rwkvasr.cli.train_ctc_deepspeed import _resolve_deepspeed_train_config, bui
 from rwkvasr.config import load_yaml
 from rwkvasr.training.deepspeed_loop import (
     DeepSpeedTrainConfig,
+    _ctc_teacher_layer_hidden_loss,
     _maybe_load_initial_model_checkpoint,
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
@@ -17,7 +19,10 @@ from rwkvasr.training.deepspeed_loop import (
     _resolve_max_steps as resolve_deepspeed_max_steps,
     _save_export_checkpoints,
     _sample_direction_mask_distributed,
+    _select_layer_hidden_ids,
     _step_checkpoint_record_is_retained,
+    _teacher_forced_student_layer_hiddens,
+    _teacher_layer_capture_ids,
     train_ctc_model_deepspeed,
 )
 from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, RWKVCTCModel, RWKVCTCModelConfig
@@ -49,6 +54,162 @@ def test_online_ctc_teacher_device_uses_cuda_zero_for_single_process_debug() -> 
     assert _resolve_ctc_teacher_online_device(None, torch.device("cuda", 2), local_rank=2) == "cuda:2"
     assert _resolve_ctc_teacher_online_device("cuda:1", torch.device("cuda"), local_rank=-1) == "cuda:1"
     assert _resolve_ctc_teacher_online_device(None, torch.device("cpu"), local_rank=-1) == "cpu"
+
+
+def test_deepspeed_loop_leaves_gradient_accumulation_to_engine() -> None:
+    source = inspect.getsource(train_ctc_model_deepspeed)
+
+    assert "engine.zero_grad()" not in source
+
+
+def test_layer_hidden_sampler_keeps_boundaries_and_covers_every_layer() -> None:
+    selections = [
+        _select_layer_hidden_ids(
+            step=step,
+            num_layers=70,
+            sample_count=8,
+            boundary_ids=(0, 49, 50, 69),
+        )
+        for step in range(70)
+    ]
+    boundary_selection = _select_layer_hidden_ids(
+        step=0,
+        num_layers=70,
+        sample_count=8,
+        boundary_ids=(0, 49, 50, 69),
+        include_boundaries=True,
+    )
+
+    assert all(len(selection) == 8 for selection in selections)
+    assert set().union(*map(set, selections)) == set(range(70))
+    assert {0, 49, 50, 69}.issubset(boundary_selection)
+
+
+def test_teacher_forced_layer_alignment_uses_teacher_inputs_and_layer_zero_v_first() -> None:
+    torch.manual_seed(2703)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    records: dict[str, dict[str, object]] = {}
+    for utt_id, length in (("utt-a", 5), ("utt-b", 3)):
+        records[utt_id] = {
+            "encoder_layer_hiddens": {
+                "0": {"input": torch.randn(length, 80)},
+                "1": {"input": torch.randn(length, 64)},
+                "2": {"input": torch.randn(length, 64)},
+            }
+        }
+
+    selected = (1, 2)
+    assert _teacher_layer_capture_ids(selected, input_mode="teacher_forced") == (0, 1, 2)
+    outputs, lengths = _teacher_forced_student_layer_hiddens(
+        model,
+        records,
+        ("utt-a", "utt-b"),
+        layer_ids=selected,
+        missing_policy="error",
+    )
+
+    assert torch.equal(lengths, torch.tensor([5, 3]))
+    assert set(outputs) == {1, 2}
+    for components in outputs.values():
+        assert set(components) == {"mixer", "ffn", "block"}
+        assert components["mixer"].shape == (2, 5, 64)
+    sum(component.sum() for components in outputs.values() for component in components.values()).backward()
+    encoder = model.encoder.sensevoice_encoder
+    assert encoder.layers[0].time_mixer.forward_mixer.value.weight.grad is not None
+    assert encoder.layers[1].time_mixer.forward_mixer.value.weight.grad is not None
+
+
+def test_layer_hidden_loss_matches_identical_sampled_components() -> None:
+    student_hiddens = {
+        layer_id: {
+            component: torch.randn(2, 4, 6, requires_grad=True)
+            for component in ("mixer", "ffn", "block")
+        }
+        for layer_id in (0, 2)
+    }
+    records: dict[str, dict[str, object]] = {}
+    for sample_idx, (utt_id, length) in enumerate((("utt-a", 4), ("utt-b", 3))):
+        records[utt_id] = {
+            "encoder_layer_hiddens": {
+                str(layer_id): {
+                    component: student_hiddens[layer_id][component][sample_idx, :length].detach().clone()
+                    for component in ("mixer", "ffn", "block")
+                }
+                for layer_id in (0, 2)
+            }
+        }
+
+    result = _ctc_teacher_layer_hidden_loss(
+        student_hiddens,
+        torch.tensor([4, 3]),
+        ["utt-a", "utt-b"],
+        records,
+        layer_ids=(0, 2),
+        component_weights={"mixer": 1.0, "ffn": 0.0, "block": 0.5},
+        normalized_mse_weight=1.0,
+        cosine_weight=0.25,
+        energy_mse_weight=0.5,
+        log_rms_weight=0.1,
+        raw_mse_weight=0.1,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+
+    assert result.loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert result.matched_samples == 2
+    assert result.missing_samples == 0
+    assert result.events == 8
+    assert result.max_frame_delta == 0
+    result.loss.backward()
+    assert student_hiddens[0]["mixer"].grad is not None
+
+
+def test_layer_hidden_energy_mse_is_bounded_and_detects_scale_mismatch() -> None:
+    teacher = torch.randn(1, 3, 8)
+    student = (teacher * 10.0).requires_grad_()
+    result = _ctc_teacher_layer_hidden_loss(
+        {0: {"mixer": student}},
+        torch.tensor([3]),
+        ["utt-a"],
+        {
+            "utt-a": {
+                "encoder_layer_hiddens": {
+                    "0": {"mixer": teacher[0]},
+                }
+            }
+        },
+        layer_ids=(0,),
+        component_weights={"mixer": 1.0},
+        normalized_mse_weight=0.0,
+        cosine_weight=0.0,
+        energy_mse_weight=1.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=0.0,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+
+    assert result.loss.item() == pytest.approx(162.0 / 101.0, rel=1.0e-4)
+    assert 0.0 < result.component_energy_mse["mixer"] <= 4.0
+    assert result.component_rms_ratio["mixer"] == pytest.approx(10.0, rel=1.0e-5)
+    assert result.component_log_rms["mixer"] > 0.0
+    assert result.component_cosine["mixer"] == pytest.approx(1.0, abs=1.0e-5)
+    result.loss.backward()
+    assert student.grad is not None
 
 
 def test_deepspeed_cli_config_can_be_loaded_from_yaml_and_overridden(tmp_path: Path) -> None:
@@ -211,6 +372,56 @@ def test_deepspeed_resolve_max_steps_supports_custom_utt_id_key(tmp_path: Path) 
     assert resolved_max_steps == 6
 
 
+def test_deepspeed_resolve_max_steps_uses_bucket_manifest_without_webdataset_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    bucket_manifest = tmp_path / "buckets" / "manifest.json"
+    bucket_manifest.parent.mkdir(parents=True)
+    bucket_manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "root": "/",
+                "source_length_index_path": str(tmp_path / "lengths.jsonl"),
+                "bucket_width": 200,
+                "entries_per_part": 100,
+                "splits": {
+                    "train": {
+                        "num_samples": 48,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": 48,
+                                "parts": [],
+                            }
+                        ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved_max_steps, steps_per_epoch = resolve_deepspeed_max_steps(
+        DeepSpeedTrainConfig(
+            output_dir=str(tmp_path / "out"),
+            deepspeed={"gradient_accumulation_steps": 1},
+            webdataset_root="/",
+            webdataset_bucket_manifest_path=str(bucket_manifest),
+            webdataset_length_index_path=str(tmp_path / "lengths.jsonl"),
+            webdataset_split="train",
+            batch_size=3,
+            epochs=2,
+        ),
+        grad_accum=1,
+    )
+
+    assert steps_per_epoch == 4
+    assert resolved_max_steps == 8
+
+
 @pytest.mark.filterwarnings("ignore:Can't initialize NVML")
 def test_train_ctc_model_deepspeed_smoke_single_process(tmp_path: Path) -> None:
     pytest.importorskip("deepspeed")
@@ -221,9 +432,10 @@ def test_train_ctc_model_deepspeed_smoke_single_process(tmp_path: Path) -> None:
 
     result = train_ctc_model_deepspeed(
         DeepSpeedTrainConfig(
-            output_dir=str(out_dir),
-            manifest_path=str(manifest),
-            vocab_size=8,
+                output_dir=str(out_dir),
+                manifest_path=str(manifest),
+                vocab_size=8,
+                tokenizer_type="synthetic",
             input_dim=80,
             n_embd=128,
             dim_att=128,
@@ -278,9 +490,10 @@ def test_train_ctc_model_deepspeed_keeps_top_k_step_checkpoints(tmp_path: Path) 
 
     result = train_ctc_model_deepspeed(
         DeepSpeedTrainConfig(
-            output_dir=str(out_dir),
-            manifest_path=str(manifest),
-            vocab_size=8,
+                output_dir=str(out_dir),
+                manifest_path=str(manifest),
+                vocab_size=8,
+                tokenizer_type="synthetic",
             input_dim=80,
             n_embd=128,
             dim_att=128,

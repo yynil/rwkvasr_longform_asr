@@ -802,6 +802,7 @@ class RWKVCTCModel(nn.Module):
         load_ctc_head: bool = True,
         load_encoder: bool = False,
         load_encoder_attention: bool = True,
+        load_rwkv_encoder_from_qkv: bool = False,
         teacher_blank_id: int = 60514,
         project_ignored_token_ids: tuple[int, ...] | list[int] = (60514,),
         blank_bias_delta: float = 0.0,
@@ -817,6 +818,9 @@ class RWKVCTCModel(nn.Module):
             "encoder_loaded": 0,
             "encoder_skipped": 0,
             "encoder_attention_skipped": 0,
+            "rwkv_encoder_loaded": 0,
+            "rwkv_encoder_skipped": 0,
+            "rwkv_encoder_first_layer_reconstruction_errors": {},
             "ctc_bridge_loaded": 0,
             "ctc_bridge_skipped": 0,
             "ctc_decoder_loaded": 0,
@@ -842,6 +846,23 @@ class RWKVCTCModel(nn.Module):
             report["encoder_loaded"] = len(encoder_report["loaded"])
             report["encoder_skipped"] = len(encoder_report["skipped"])
             report["encoder_attention_skipped"] = len(encoder_report["attention_skipped"])
+        if load_rwkv_encoder_from_qkv:
+            sensevoice_encoder = getattr(self.encoder, "sensevoice_encoder", None)
+            if sensevoice_encoder is None:
+                raise ValueError(
+                    "frontend_type='sensevoice_rwkv' is required to initialize BiRWKV from Nano QKV weights."
+                )
+            non_attention_report = sensevoice_encoder.load_sensevoice_non_attention_state_dict(state_dict)
+            qkv_report = sensevoice_encoder.load_sensevoice_qkv_state_dict(state_dict)
+            report["rwkv_encoder_loaded"] = len(
+                set(non_attention_report["loaded"]) | set(qkv_report["loaded"])
+            )
+            report["rwkv_encoder_skipped"] = len(
+                set(non_attention_report["skipped"]) | set(qkv_report["skipped"])
+            )
+            report["rwkv_encoder_first_layer_reconstruction_errors"] = qkv_report[
+                "first_layer_reconstruction_errors"
+            ]
         if load_ctc_decoder:
             if self.ctc_decoder is None:
                 raise ValueError("ctc_decoder_type must be enabled before loading Nano ctc_decoder weights.")

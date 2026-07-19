@@ -10,7 +10,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .direction_dropout import DirectionMask, LayerDirectionMask
-from .rwkv7_bidirectional import BidirectionalRWKVTimeMixer, BidirectionalTimeMixerState, BidirectionalVFirstState
+from .rwkv7_bidirectional import BidirectionalRWKVTimeMixer, BidirectionalVFirstState
 from .rwkv7_time_mixer import RWKV7TimeMixerConfig
 from .rwkv_conformer import CausalConvolutionModule, RWKVConformerBlockState
 
@@ -467,6 +467,121 @@ class SenseVoiceRWKVEncoder(nn.Module):
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
         return self.load_sensevoice_non_attention_state_dict(state_dict)
+
+    def load_sensevoice_qkv_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Any]:
+        """Warm-start BiRWKV projections from mapped SenseVoice SANM Q/K/V weights."""
+
+        source_roots = (
+            "",
+            "audio_encoder.",
+            "encoder.",
+            "model.encoder.",
+            "model.audio_encoder.",
+        )
+        loaded: list[str] = []
+        skipped: list[str] = []
+        reconstruction_errors: dict[str, float] = {}
+
+        def source_tensor(source_key: str) -> Tensor | None:
+            for root in source_roots:
+                value = state_dict.get(root + source_key)
+                if isinstance(value, Tensor):
+                    return value
+            return None
+
+        def canonical_svd_basis(weight: Tensor, rank: int) -> Tensor:
+            _, _, vh = torch.linalg.svd(weight.float(), full_matrices=False)
+            basis = vh[:rank].contiguous()
+            max_indices = basis.abs().argmax(dim=1)
+            row_indices = torch.arange(int(basis.size(0)), device=basis.device)
+            signs = basis[row_indices, max_indices].sign()
+            signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+            return basis * signs.unsqueeze(1)
+
+        with torch.no_grad():
+            for layer_idx, layer in enumerate(self.layers):
+                prefix = self._source_layer_prefix(layer_idx)
+                qkv_key = f"{prefix}.self_attn.linear_q_k_v.weight"
+                output_key = f"{prefix}.self_attn.linear_out.weight"
+                qkv_weight = source_tensor(qkv_key)
+                output_weight = source_tensor(output_key)
+                layer_prefix = f"layers.{layer_idx}.time_mixer"
+
+                if qkv_weight is None or qkv_weight.ndim != 2 or int(qkv_weight.size(0)) != 3 * self.config.n_embd:
+                    skipped.extend(
+                        f"{layer_prefix}.{direction}.{name}.weight"
+                        for direction in ("forward_mixer", "backward_mixer")
+                        for name in ("receptance", "key", "value")
+                    )
+                    continue
+
+                q_weight, k_weight, v_weight = qkv_weight.float().chunk(3, dim=0)
+                if layer_idx == 0:
+                    if layer.input_proj is None:
+                        raise ValueError("The first SenseVoiceRWKV layer requires a 560 -> 512 input projection.")
+                    stacked = torch.cat((q_weight, k_weight, v_weight), dim=0)
+                    basis = canonical_svd_basis(stacked, int(self.config.n_embd))
+                    if tuple(basis.shape) != tuple(layer.input_proj.weight.shape):
+                        raise ValueError(
+                            "First-layer Nano QKV SVD basis shape does not match the RWKV input projection: "
+                            f"{tuple(basis.shape)} != {tuple(layer.input_proj.weight.shape)}"
+                        )
+                    layer.input_proj.weight.copy_(basis.to(dtype=layer.input_proj.weight.dtype))
+                    loaded.append(f"layers.{layer_idx}.input_proj.weight")
+                    projected_weights = tuple(weight @ basis.transpose(0, 1) for weight in (q_weight, k_weight, v_weight))
+                    for name, source, projected in zip(
+                        ("q", "k", "v"),
+                        (q_weight, k_weight, v_weight),
+                        projected_weights,
+                        strict=True,
+                    ):
+                        reconstructed = projected @ basis
+                        relative_error = (reconstructed - source).norm() / source.norm().clamp_min(1.0e-12)
+                        reconstruction_errors[name] = float(relative_error.item())
+                else:
+                    projected_weights = (q_weight, k_weight, v_weight)
+
+                for direction_name, mixer in (
+                    ("forward_mixer", layer.time_mixer.forward_mixer),
+                    ("backward_mixer", layer.time_mixer.backward_mixer),
+                ):
+                    for target_name, target, source in (
+                        ("receptance", mixer.receptance.weight, projected_weights[0]),
+                        ("key", mixer.key.weight, projected_weights[1]),
+                        ("value", mixer.value.weight, projected_weights[2]),
+                    ):
+                        if tuple(target.shape) != tuple(source.shape):
+                            skipped.append(f"{layer_prefix}.{direction_name}.{target_name}.weight")
+                            continue
+                        target.copy_(source.to(dtype=target.dtype))
+                        loaded.append(f"{layer_prefix}.{direction_name}.{target_name}.weight")
+
+                    output_name = f"{layer_prefix}.{direction_name}.output.weight"
+                    if output_weight is None or tuple(mixer.output.weight.shape) != tuple(output_weight.shape):
+                        skipped.append(output_name)
+                    else:
+                        mixer.output.weight.copy_(output_weight.to(dtype=mixer.output.weight.dtype))
+                        loaded.append(output_name)
+
+                skipped.extend(
+                    (
+                        f"{prefix}.self_attn.linear_q_k_v.bias",
+                        f"{prefix}.self_attn.linear_out.bias",
+                        f"{prefix}.self_attn.fsmn_block.weight",
+                    )
+                )
+
+        if reconstruction_errors:
+            for name, value in reconstruction_errors.items():
+                if not math.isfinite(value) or value > 0.25:
+                    raise ValueError(
+                        f"First-layer Nano {name.upper()} reconstruction error is invalid or too large: {value:.6f}"
+                    )
+        return {
+            "loaded": sorted(set(loaded)),
+            "skipped": sorted(set(skipped)),
+            "first_layer_reconstruction_errors": reconstruction_errors,
+        }
 
 
 class SenseVoiceConformerConvEncoder(nn.Module):

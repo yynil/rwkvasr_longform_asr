@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import tarfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
@@ -63,12 +64,110 @@ class FunASROnlineCTCTeacherConfig:
     project_vocab_size: int | None = None
     return_full_log_probs: bool = False
     return_encoder_out: bool = False
+    return_encoder_input: bool = False
+    return_layer_hiddens: bool = False
 
 
 @dataclass(frozen=True)
 class _ResolvedAudioPath:
     path: str
     temporary: bool = False
+
+
+def _first_tensor(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (tuple, list)) and value and isinstance(value[0], torch.Tensor):
+        return value[0]
+    raise TypeError(f"Expected tensor module output, got {type(value)!r}.")
+
+
+def _funasr_encoder_layers(audio_encoder: Any) -> list[Any]:
+    return [
+        *list(audio_encoder.encoders0),
+        *list(audio_encoder.encoders),
+        *list(audio_encoder.tp_encoders),
+    ]
+
+
+@contextmanager
+def _capture_funasr_encoder_hiddens(
+    audio_encoder: Any,
+    layer_ids: tuple[int, ...],
+    *,
+    capture_input: bool,
+) -> Iterator[dict[str, Any]]:
+    layers = _funasr_encoder_layers(audio_encoder)
+    invalid = [layer_id for layer_id in layer_ids if not 0 <= int(layer_id) < len(layers)]
+    if invalid:
+        raise ValueError(f"Nano encoder layer ids are out of range: {invalid}; layers={len(layers)}")
+
+    captured: dict[str, Any] = {"layers": {}}
+    handles: list[Any] = []
+    if capture_input:
+        def capture_encoder_input(_module: Any, args: tuple[Any, ...]) -> None:
+            if not args:
+                raise RuntimeError("Nano audio encoder pre-hook received no inputs.")
+            # SenseVoiceEncoderSmall scales its input in-place, so the audit
+            # snapshot must not share storage with the live encoder tensor.
+            captured["encoder_input"] = _first_tensor(args[0]).detach().clone()
+            if len(args) > 1 and isinstance(args[1], torch.Tensor):
+                captured["encoder_input_lengths"] = args[1].detach()
+
+        handles.append(audio_encoder.register_forward_pre_hook(capture_encoder_input))
+
+    for layer_id in layer_ids:
+        layer_capture: dict[str, torch.Tensor] = {}
+        captured["layers"][int(layer_id)] = layer_capture
+        layer = layers[int(layer_id)]
+
+        def capture_layer_input(
+            _module: Any,
+            args: tuple[Any, ...],
+            *,
+            target: dict[str, torch.Tensor] = layer_capture,
+        ) -> None:
+            if not args:
+                raise RuntimeError("Nano encoder layer pre-hook received no inputs.")
+            target["input"] = _first_tensor(args[0]).detach()
+
+        def capture_mixer(
+            _module: Any,
+            _args: tuple[Any, ...],
+            output: Any,
+            *,
+            target: dict[str, torch.Tensor] = layer_capture,
+        ) -> None:
+            target["mixer"] = _first_tensor(output).detach()
+
+        def capture_ffn(
+            _module: Any,
+            _args: tuple[Any, ...],
+            output: Any,
+            *,
+            target: dict[str, torch.Tensor] = layer_capture,
+        ) -> None:
+            target["ffn"] = _first_tensor(output).detach()
+
+        def capture_block(
+            _module: Any,
+            _args: tuple[Any, ...],
+            output: Any,
+            *,
+            target: dict[str, torch.Tensor] = layer_capture,
+        ) -> None:
+            target["block"] = _first_tensor(output).detach()
+
+        handles.append(layer.register_forward_pre_hook(capture_layer_input))
+        handles.append(layer.self_attn.register_forward_hook(capture_mixer))
+        handles.append(layer.feed_forward.register_forward_hook(capture_ffn))
+        handles.append(layer.register_forward_hook(capture_block))
+
+    try:
+        yield captured
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def _iter_jsonl(path: Path):
@@ -266,75 +365,38 @@ class FunASRNanoCTCTopKOnlineTeacher:
     def num_audio_rows(self) -> int:
         return len(self.audio_rows)
 
-    def _forward_one(self, *, utt_id: str, row: dict[str, Any]) -> dict[str, Any]:
-        resolved_audio = _resolve_audio_path(
-            row,
-            utt_id,
-            shard_paths=self.shard_paths,
-            audio_cache_dir=self.audio_cache_dir,
-            keep_audio_cache=bool(self.config.keep_audio_cache),
-        )
-        audio_path = resolved_audio.path
-        try:
-            source = _source_from_row(row)
-            language = SOURCE_LANGUAGES.get(source)
-            kwargs = dict(self.auto_model.kwargs)
-            tokenizer = kwargs.pop("tokenizer")
-            frontend = kwargs.pop("frontend")
-            kwargs["disable_pbar"] = True
-            prompt = self.model.get_prompt([], language, True)
-            chatml = self.model.generate_chatml(prompt, audio_path)
-            with torch.inference_mode():
-                _, _, _, _, meta_data = self.model.inference_prepare(
-                    [chatml],
-                    key=[utt_id],
-                    tokenizer=tokenizer,
-                    frontend=frontend,
-                    **kwargs,
-                )
-                encoder_out = meta_data["encoder_out"]
-                encoder_out_lens = meta_data["encoder_out_lens"]
-                decoder_out, decoder_out_lens = self.model.ctc_decoder(encoder_out, encoder_out_lens)
-                ctc_logp = self.model.ctc.log_softmax(decoder_out)
-                frame_count = int(decoder_out_lens[0].item())
-                encoder_frame_count = int(encoder_out_lens[0].item())
-                x = ctc_logp[0, :frame_count, :].float()
-                vocab_size = int(x.shape[-1])
-                yseq = x.argmax(dim=-1)
-                yseq = torch.unique_consecutive(yseq, dim=-1)
-                k = min(max(1, int(self.config.top_k)), vocab_size)
-                topk_log_probs, topk_ids = torch.topk(x, k=k, dim=-1)
-                teacher_blank_id = int(self.model.blank_id)
-                argmax_token_ids = yseq[yseq != teacher_blank_id].to(dtype=torch.int32)
-                blank_log_probs = x[:, teacher_blank_id]
-                blank_in_topk = topk_ids.eq(teacher_blank_id).any(dim=-1)
-                if frame_count > 0:
-                    topk_ids = topk_ids.clone()
-                    topk_log_probs = topk_log_probs.clone()
-                    topk_ids[~blank_in_topk, -1] = teacher_blank_id
-                    topk_log_probs[~blank_in_topk, -1] = blank_log_probs[~blank_in_topk]
-                mapped_ids = topk_ids.clone()
-                mapped_ids[mapped_ids == teacher_blank_id] = int(self.config.project_blank_id)
-                full_log_probs = None
-                if self.config.return_full_log_probs:
-                    project_vocab_size = max(
-                        int(self.config.project_vocab_size or 0),
-                        vocab_size,
-                        int(self.config.project_blank_id) + 1,
-                        *(int(value) + 1 for value in self.config.project_ignored_token_ids),
-                    )
-                    full_log_probs = x.new_full((frame_count, project_vocab_size), float("-inf"))
-                    full_log_probs[:, :vocab_size] = x
-                    if teacher_blank_id != int(self.config.project_blank_id):
-                        full_log_probs[:, int(self.config.project_blank_id)] = x[:, teacher_blank_id]
-                        full_log_probs[:, teacher_blank_id] = float("-inf")
-                    for ignored_id in self.config.project_ignored_token_ids:
-                        ignored_id = int(ignored_id)
-                        if ignored_id != int(self.config.project_blank_id) and 0 <= ignored_id < project_vocab_size:
-                            full_log_probs[:, ignored_id] = float("-inf")
-        finally:
-            if resolved_audio.temporary:
-                Path(audio_path).unlink(missing_ok=True)
+    def _build_record(
+        self,
+        *,
+        utt_id: str,
+        source: str,
+        language: str | None,
+        ctc_logp: torch.Tensor,
+        decoder_out_lens: torch.Tensor,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        hidden_capture: dict[str, Any],
+        capture_layer_ids: tuple[int, ...],
+        sample_idx: int,
+    ) -> dict[str, Any]:
+        frame_count = int(decoder_out_lens[sample_idx].item())
+        encoder_frame_count = int(encoder_out_lens[sample_idx].item())
+        x = ctc_logp[sample_idx, :frame_count, :].float()
+        vocab_size = int(x.shape[-1])
+        yseq = torch.unique_consecutive(x.argmax(dim=-1), dim=-1)
+        k = min(max(1, int(self.config.top_k)), vocab_size)
+        topk_log_probs, topk_ids = torch.topk(x, k=k, dim=-1)
+        teacher_blank_id = int(self.model.blank_id)
+        argmax_token_ids = yseq[yseq != teacher_blank_id].to(dtype=torch.int32)
+        blank_log_probs = x[:, teacher_blank_id]
+        blank_in_topk = topk_ids.eq(teacher_blank_id).any(dim=-1)
+        if frame_count > 0:
+            topk_ids = topk_ids.clone()
+            topk_log_probs = topk_log_probs.clone()
+            topk_ids[~blank_in_topk, -1] = teacher_blank_id
+            topk_log_probs[~blank_in_topk, -1] = blank_log_probs[~blank_in_topk]
+        mapped_ids = topk_ids.clone()
+        mapped_ids[mapped_ids == teacher_blank_id] = int(self.config.project_blank_id)
 
         result = {
             "format": "funasr_nano_ctc_topk_online_v1",
@@ -355,19 +417,248 @@ class FunASRNanoCTCTopKOnlineTeacher:
         }
         if self.config.return_encoder_out:
             result["encoder_out"] = (
-                encoder_out[0, :encoder_frame_count, :].detach().cpu().to(dtype=torch.float16)
+                encoder_out[sample_idx, :encoder_frame_count, :].detach().cpu().to(dtype=torch.float16)
             )
             result["encoder_out_lens"] = int(encoder_frame_count)
-        if full_log_probs is not None:
+        if self.config.return_encoder_input:
+            encoder_input = hidden_capture.get("encoder_input")
+            if not isinstance(encoder_input, torch.Tensor):
+                raise RuntimeError(f"Nano encoder input capture is missing for utt_id={utt_id!r}.")
+            encoder_input_lengths = hidden_capture.get("encoder_input_lengths")
+            input_frame_count = (
+                int(encoder_input_lengths.flatten()[sample_idx].item())
+                if isinstance(encoder_input_lengths, torch.Tensor)
+                else int(encoder_input.size(1))
+            )
+            result["encoder_input"] = (
+                encoder_input[sample_idx, :input_frame_count, :].detach().cpu().to(dtype=torch.float16)
+            )
+            result["encoder_input_lens"] = int(input_frame_count)
+        if capture_layer_ids:
+            layer_hiddens: dict[str, dict[str, torch.Tensor]] = {}
+            captured_layers = hidden_capture.get("layers", {})
+            for layer_id in capture_layer_ids:
+                captured_components = captured_layers.get(layer_id, {})
+                missing_components = [
+                    name for name in ("input", "mixer", "ffn", "block")
+                    if not isinstance(captured_components.get(name), torch.Tensor)
+                ]
+                if missing_components:
+                    raise RuntimeError(
+                        f"Nano layer hidden capture is incomplete for utt_id={utt_id!r} "
+                        f"layer={layer_id}: missing={missing_components}"
+                    )
+                layer_hiddens[str(layer_id)] = {
+                    name: captured_components[name][sample_idx, :encoder_frame_count, :]
+                    .detach()
+                    .cpu()
+                    .to(dtype=torch.float16)
+                    for name in ("input", "mixer", "ffn", "block")
+                }
+            result["encoder_layer_hiddens"] = layer_hiddens
+            result["encoder_layer_ids"] = list(capture_layer_ids)
+        if self.config.return_full_log_probs:
+            project_vocab_size = max(
+                int(self.config.project_vocab_size or 0),
+                vocab_size,
+                int(self.config.project_blank_id) + 1,
+                *(int(value) + 1 for value in self.config.project_ignored_token_ids),
+            )
+            full_log_probs = x.new_full((frame_count, project_vocab_size), float("-inf"))
+            full_log_probs[:, :vocab_size] = x
+            if teacher_blank_id != int(self.config.project_blank_id):
+                full_log_probs[:, int(self.config.project_blank_id)] = x[:, teacher_blank_id]
+                full_log_probs[:, teacher_blank_id] = float("-inf")
+            for ignored_id in self.config.project_ignored_token_ids:
+                ignored_id = int(ignored_id)
+                if ignored_id != int(self.config.project_blank_id) and 0 <= ignored_id < project_vocab_size:
+                    full_log_probs[:, ignored_id] = float("-inf")
             result["full_log_probs"] = full_log_probs.detach().cpu().to(dtype=torch.float16)
         return result
+
+    def _forward_one(
+        self,
+        *,
+        utt_id: str,
+        row: dict[str, Any],
+        layer_ids: tuple[int, ...] = (),
+    ) -> dict[str, Any]:
+        resolved_audio = _resolve_audio_path(
+            row,
+            utt_id,
+            shard_paths=self.shard_paths,
+            audio_cache_dir=self.audio_cache_dir,
+            keep_audio_cache=bool(self.config.keep_audio_cache),
+        )
+        audio_path = resolved_audio.path
+        try:
+            source = _source_from_row(row)
+            language = SOURCE_LANGUAGES.get(source)
+            kwargs = dict(self.auto_model.kwargs)
+            tokenizer = kwargs.pop("tokenizer")
+            frontend = kwargs.pop("frontend")
+            kwargs["disable_pbar"] = True
+            prompt = self.model.get_prompt([], language, True)
+            chatml = self.model.generate_chatml(prompt, audio_path)
+            capture_layer_ids = tuple(sorted(set(int(value) for value in layer_ids)))
+            if capture_layer_ids and not self.config.return_layer_hiddens:
+                raise ValueError("layer_ids were requested but return_layer_hiddens is disabled.")
+            with _capture_funasr_encoder_hiddens(
+                self.model.audio_encoder,
+                capture_layer_ids,
+                capture_input=bool(self.config.return_encoder_input),
+            ) as hidden_capture:
+                with torch.inference_mode():
+                    _, _, _, _, meta_data = self.model.inference_prepare(
+                        [chatml],
+                        key=[utt_id],
+                        tokenizer=tokenizer,
+                        frontend=frontend,
+                        **kwargs,
+                    )
+                    encoder_out = meta_data["encoder_out"]
+                    encoder_out_lens = meta_data["encoder_out_lens"]
+                    decoder_out, decoder_out_lens = self.model.ctc_decoder(encoder_out, encoder_out_lens)
+                    ctc_logp = self.model.ctc.log_softmax(decoder_out)
+            return self._build_record(
+                utt_id=utt_id,
+                source=source,
+                language=language,
+                ctc_logp=ctc_logp,
+                decoder_out_lens=decoder_out_lens,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                hidden_capture=hidden_capture,
+                capture_layer_ids=capture_layer_ids,
+                sample_idx=0,
+            )
+        finally:
+            if resolved_audio.temporary:
+                Path(audio_path).unlink(missing_ok=True)
+
+    def feature_records(
+        self,
+        utt_ids: list[str] | tuple[str, ...],
+        features: torch.Tensor,
+        feature_lengths: torch.Tensor,
+        *,
+        audio_rows: list[dict[str, Any] | None] | tuple[dict[str, Any] | None, ...] | None = None,
+        layer_ids: tuple[int, ...] | list[int] | None = None,
+        include_ctc_outputs: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        batch_size = min(len(utt_ids), int(features.size(0)), int(feature_lengths.numel()))
+        if batch_size <= 0:
+            return {}
+        if features.ndim != 3:
+            raise ValueError(f"Nano feature teacher expects [B, T, D], got {tuple(features.shape)}.")
+        capture_layer_ids = tuple(sorted(set(int(value) for value in (layer_ids or ()))))
+        if capture_layer_ids and not self.config.return_layer_hiddens:
+            raise ValueError("layer_ids were requested but return_layer_hiddens is disabled.")
+
+        teacher_device = next(self.model.audio_encoder.parameters()).device
+        teacher_features = features[:batch_size].detach().to(device=teacher_device, dtype=torch.float32).clone()
+        teacher_lengths = feature_lengths[:batch_size].detach().to(device=teacher_device, dtype=torch.long)
+        with _capture_funasr_encoder_hiddens(
+            self.model.audio_encoder,
+            capture_layer_ids,
+            capture_input=bool(self.config.return_encoder_input),
+        ) as hidden_capture:
+            with torch.inference_mode():
+                encoder_out, encoder_out_lens = self.model.audio_encoder(teacher_features, teacher_lengths)
+                if include_ctc_outputs:
+                    decoder_out, decoder_out_lens = self.model.ctc_decoder(encoder_out, encoder_out_lens)
+                    ctc_logp = self.model.ctc.log_softmax(decoder_out)
+                else:
+                    decoder_out_lens = None
+                    ctc_logp = None
+
+        records: dict[str, dict[str, Any]] = {}
+        for sample_idx in range(batch_size):
+            utt_id = str(utt_ids[sample_idx])
+            row = None
+            if audio_rows is not None and sample_idx < len(audio_rows):
+                candidate = audio_rows[sample_idx]
+                if isinstance(candidate, dict) and candidate:
+                    row = candidate
+            if row is None:
+                row = self.audio_rows.get(utt_id)
+            source = _source_from_row(row) if row is not None else "unknown"
+            if isinstance(ctc_logp, torch.Tensor) and isinstance(decoder_out_lens, torch.Tensor):
+                records[utt_id] = self._build_record(
+                    utt_id=utt_id,
+                    source=source,
+                    language=SOURCE_LANGUAGES.get(source),
+                    ctc_logp=ctc_logp,
+                    decoder_out_lens=decoder_out_lens,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                    hidden_capture=hidden_capture,
+                    capture_layer_ids=capture_layer_ids,
+                    sample_idx=sample_idx,
+                )
+                continue
+
+            encoder_frame_count = int(encoder_out_lens[sample_idx].item())
+            captured_layers = hidden_capture.get("layers", {})
+            layer_hiddens: dict[str, dict[str, torch.Tensor]] = {}
+            for layer_id in capture_layer_ids:
+                captured_components = captured_layers.get(layer_id, {})
+                missing_components = [
+                    name for name in ("input", "mixer", "ffn", "block")
+                    if not isinstance(captured_components.get(name), torch.Tensor)
+                ]
+                if missing_components:
+                    raise RuntimeError(
+                        f"Nano layer hidden capture is incomplete for utt_id={utt_id!r} "
+                        f"layer={layer_id}: missing={missing_components}"
+                    )
+                layer_hiddens[str(layer_id)] = {
+                    name: captured_components[name][sample_idx, :encoder_frame_count, :]
+                    .detach()
+                    .cpu()
+                    .to(dtype=torch.float16)
+                    for name in ("input", "mixer", "ffn", "block")
+                }
+            hidden_record: dict[str, Any] = {
+                "format": "funasr_nano_encoder_hidden_online_v1",
+                "teacher": "FunASR-Nano-2512",
+                "utt_id": utt_id,
+                "source": source,
+                "language": SOURCE_LANGUAGES.get(source),
+                "encoder_out_lens": encoder_frame_count,
+                "encoder_layer_hiddens": layer_hiddens,
+                "encoder_layer_ids": list(capture_layer_ids),
+            }
+            if self.config.return_encoder_out:
+                hidden_record["encoder_out"] = (
+                    encoder_out[sample_idx, :encoder_frame_count, :]
+                    .detach()
+                    .cpu()
+                    .to(dtype=torch.float16)
+                )
+            if self.config.return_encoder_input:
+                encoder_input = hidden_capture.get("encoder_input")
+                if not isinstance(encoder_input, torch.Tensor):
+                    raise RuntimeError(f"Nano encoder input capture is missing for utt_id={utt_id!r}.")
+                hidden_record["encoder_input"] = (
+                    encoder_input[sample_idx, :encoder_frame_count, :]
+                    .detach()
+                    .cpu()
+                    .to(dtype=torch.float16)
+                )
+                hidden_record["encoder_input_lens"] = encoder_frame_count
+            records[utt_id] = hidden_record
+        return records
 
     def topk_records(
         self,
         utt_ids: list[str] | tuple[str, ...],
         audio_rows: list[dict[str, Any] | None] | tuple[dict[str, Any] | None, ...] | None = None,
+        *,
+        layer_ids: tuple[int, ...] | list[int] | None = None,
     ) -> dict[str, dict[str, Any]]:
         records: dict[str, dict[str, Any]] = {}
+        requested_layer_ids = tuple(int(value) for value in (layer_ids or ()))
         for index, utt_id_value in enumerate(utt_ids):
             utt_id = str(utt_id_value)
             row = None
@@ -379,5 +670,9 @@ class FunASRNanoCTCTopKOnlineTeacher:
                 row = self.audio_rows.get(utt_id)
             if row is None:
                 continue
-            records[utt_id] = self._forward_one(utt_id=utt_id, row=row)
+            records[utt_id] = self._forward_one(
+                utt_id=utt_id,
+                row=row,
+                layer_ids=requested_layer_ids,
+            )
         return records

@@ -1066,6 +1066,72 @@ def test_sensevoice_rwkv_loads_non_attention_matching_keys() -> None:
     )
 
 
+def test_sensevoice_rwkv_maps_nano_qkv_into_both_directions() -> None:
+    torch.manual_seed(2451)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=10,
+            n_embd=8,
+            encoder_output_dim=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=3,
+            vocab_size=16,
+            head_size=4,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    encoder = model.encoder.sensevoice_encoder
+    first_basis = torch.linalg.qr(torch.randn(10, 8), mode="reduced").Q.transpose(0, 1)
+    first_qkv = torch.cat(
+        [torch.randn(8, 8) @ first_basis for _ in range(3)],
+        dim=0,
+    )
+    prefixes = ("encoders0.0", "encoders.0", "tp_encoders.0")
+    source: dict[str, torch.Tensor] = {}
+    for layer_idx, prefix in enumerate(prefixes):
+        qkv = first_qkv if layer_idx == 0 else torch.randn(24, 8)
+        source[f"audio_encoder.{prefix}.self_attn.linear_q_k_v.weight"] = qkv
+        source[f"audio_encoder.{prefix}.self_attn.linear_out.weight"] = torch.randn(8, 8)
+
+    report = encoder.load_sensevoice_qkv_state_dict(source)
+
+    assert len(report["loaded"]) == 25
+    assert report["first_layer_reconstruction_errors"]["q"] < 1.0e-5
+    assert report["first_layer_reconstruction_errors"]["k"] < 1.0e-5
+    assert report["first_layer_reconstruction_errors"]["v"] < 1.0e-5
+    first_projection = encoder.layers[0].input_proj
+    assert first_projection is not None
+    for direction in (
+        encoder.layers[0].time_mixer.forward_mixer,
+        encoder.layers[0].time_mixer.backward_mixer,
+    ):
+        for mapped, expected in zip(
+            (direction.receptance.weight, direction.key.weight, direction.value.weight),
+            first_qkv.chunk(3, dim=0),
+            strict=True,
+        ):
+            reconstructed = mapped.float() @ first_projection.weight.float()
+            assert torch.allclose(reconstructed, expected, atol=2.0e-5, rtol=2.0e-5)
+
+    second_q, second_k, second_v = source[
+        "audio_encoder.encoders.0.self_attn.linear_q_k_v.weight"
+    ].chunk(3, dim=0)
+    for direction in (
+        encoder.layers[1].time_mixer.forward_mixer,
+        encoder.layers[1].time_mixer.backward_mixer,
+    ):
+        assert torch.equal(direction.receptance.weight, second_q)
+        assert torch.equal(direction.key.weight, second_k)
+        assert torch.equal(direction.value.weight, second_v)
+        assert torch.equal(
+            direction.output.weight,
+            source["audio_encoder.encoders.0.self_attn.linear_out.weight"],
+        )
+
+
 def test_sensevoice_conformer_conv_encoder_forward_shape_and_lengths() -> None:
     torch.manual_seed(246)
     model = RWKVCTCModel(

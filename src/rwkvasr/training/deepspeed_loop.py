@@ -5,9 +5,10 @@ import json
 import math
 import time
 import shutil
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import deepspeed
 import torch
@@ -302,6 +303,19 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_keep_audio_cache: bool = True
     ctc_teacher_online_device: str | None = None
     ctc_teacher_online_project_ignored_token_ids: tuple[int, ...] | list[int] = (60514,)
+    ctc_teacher_online_use_batch_features: bool = False
+    ctc_teacher_online_layer_mixer_loss_weight: float = 0.0
+    ctc_teacher_online_layer_ffn_loss_weight: float = 0.0
+    ctc_teacher_online_layer_block_loss_weight: float = 0.0
+    ctc_teacher_online_layer_normalized_mse_weight: float = 1.0
+    ctc_teacher_online_layer_cosine_weight: float = 0.25
+    ctc_teacher_online_layer_energy_mse_weight: float = 0.0
+    ctc_teacher_online_layer_log_rms_weight: float = 0.0
+    ctc_teacher_online_layer_raw_mse_weight: float = 0.0
+    ctc_teacher_online_layer_sample_count: int = 8
+    ctc_teacher_online_layer_boundary_ids: tuple[int, ...] | list[int] = (0, 49, 50, 69)
+    ctc_teacher_online_layer_frame_tolerance: int = 0
+    ctc_teacher_online_layer_input_mode: str = "stacked"
     ctc_decoder_type: str = "none"
     ctc_decoder_downsample_rate: int = 1
     ctc_decoder_dim: int | None = None
@@ -318,11 +332,13 @@ class DeepSpeedTrainConfig:
     funasr_nano_ctc_init_checkpoint_path: str | None = None
     funasr_nano_ctc_init_load_encoder: bool = False
     funasr_nano_ctc_init_load_encoder_attention: bool = True
+    funasr_nano_ctc_init_load_rwkv_encoder_from_qkv: bool = False
     funasr_nano_ctc_init_load_decoder: bool = True
     funasr_nano_ctc_init_load_head: bool = True
     funasr_nano_ctc_teacher_blank_id: int = 60514
     funasr_nano_ctc_init_blank_bias_delta: float = 0.0
     freeze_encoder: bool = False
+    freeze_encoder_except_time_mixer: bool = False
     freeze_ctc_decoder: bool = False
     freeze_ctc_head: bool = False
     direction_variant: str = "none"
@@ -347,6 +363,8 @@ class DeepSpeedTrainConfig:
     step_eval_every: int | None = None
     step_eval_samples: int | None = None
     step_eval_split: str | None = None
+    step_eval_shuffle: bool = True
+    step_eval_at_start: bool = False
     top_k_step_checkpoints: int = 3
     save_deepspeed_sharded_checkpoints: bool = True
     local_rank: int = -1
@@ -399,6 +417,7 @@ def _maybe_load_funasr_nano_ctc_init_distributed(model: RWKVCTCModel, config: De
         config.funasr_nano_ctc_init_checkpoint_path,
         load_encoder=bool(config.funasr_nano_ctc_init_load_encoder),
         load_encoder_attention=bool(config.funasr_nano_ctc_init_load_encoder_attention),
+        load_rwkv_encoder_from_qkv=bool(config.funasr_nano_ctc_init_load_rwkv_encoder_from_qkv),
         load_ctc_decoder=bool(config.funasr_nano_ctc_init_load_decoder),
         load_ctc_head=bool(config.funasr_nano_ctc_init_load_head),
         teacher_blank_id=int(config.funasr_nano_ctc_teacher_blank_id),
@@ -411,6 +430,9 @@ def _maybe_load_funasr_nano_ctc_init_distributed(model: RWKVCTCModel, config: De
         f"encoder_tensors={report['encoder_loaded']} "
         f"encoder_skipped={report['encoder_skipped']} "
         f"encoder_attention_skipped={report['encoder_attention_skipped']} "
+        f"rwkv_encoder_tensors={report['rwkv_encoder_loaded']} "
+        f"rwkv_encoder_skipped={report['rwkv_encoder_skipped']} "
+        f"rwkv_first_layer_errors={report['rwkv_encoder_first_layer_reconstruction_errors']} "
         f"bridge_tensors={report.get('ctc_bridge_loaded', 0)} "
         f"bridge_skipped={report.get('ctc_bridge_skipped', 0)} "
         f"decoder_tensors={report['ctc_decoder_loaded']} "
@@ -624,10 +646,21 @@ def _build_deepspeed_optimizer(
 
 def _apply_training_freeze(model: RWKVCTCModel, config: DeepSpeedTrainConfig) -> None:
     frozen_names: list[str] = []
+    if config.freeze_encoder and config.freeze_encoder_except_time_mixer:
+        raise ValueError("freeze_encoder and freeze_encoder_except_time_mixer are mutually exclusive.")
     if config.freeze_encoder:
         for name, parameter in model.encoder.named_parameters(prefix="encoder"):
             parameter.requires_grad_(False)
             frozen_names.append(name)
+    if config.freeze_encoder_except_time_mixer:
+        sensevoice_encoder = getattr(model.encoder, "sensevoice_encoder", None)
+        if sensevoice_encoder is None:
+            raise ValueError("freeze_encoder_except_time_mixer requires frontend_type='sensevoice_rwkv'.")
+        for name, parameter in model.encoder.named_parameters(prefix="encoder"):
+            trainable = ".time_mixer." in name or ".input_proj." in name
+            parameter.requires_grad_(trainable)
+            if not trainable:
+                frozen_names.append(name)
     if config.freeze_ctc_decoder and model.ctc_decoder is not None:
         for name, parameter in model.ctc_decoder.named_parameters(prefix="ctc_decoder"):
             parameter.requires_grad_(False)
@@ -643,6 +676,7 @@ def _apply_training_freeze(model: RWKVCTCModel, config: DeepSpeedTrainConfig) ->
         _rank_zero_log(
             "Applied parameter freeze: "
             f"freeze_encoder={bool(config.freeze_encoder)} "
+            f"freeze_encoder_except_time_mixer={bool(config.freeze_encoder_except_time_mixer)} "
             f"freeze_ctc_decoder={bool(config.freeze_ctc_decoder)} "
             f"freeze_ctc_head={bool(config.freeze_ctc_head)} "
             f"frozen_tensors={len(frozen_names)} "
@@ -819,18 +853,6 @@ def _resolve_max_steps(config: DeepSpeedTrainConfig, grad_accum: int) -> tuple[i
         global_batch = max(1, config.batch_size * grad_accum * _world_size())
         steps_per_epoch = max(1, math.ceil(num_samples / global_batch))
     else:
-        index_path = resolve_webdataset_index_path(data_path, config.webdataset_index_path)
-        index_data = load_webdataset_index(index_path)
-        validate_webdataset_index(
-            index_data,
-            split_config=StableHashSplitConfig(
-                eval_ratio=config.webdataset_eval_ratio,
-                hash_seed=config.webdataset_hash_seed,
-                split_by=config.webdataset_split_by,
-                utt_id_key=config.webdataset_utt_id_key,
-            ),
-        )
-        num_samples = index_split_sample_count(index_data, config.webdataset_split)
         bucket_manifest_path = _resolve_bucket_manifest_path(
             data_path,
             config.webdataset_bucket_manifest_path,
@@ -847,6 +869,18 @@ def _resolve_max_steps(config: DeepSpeedTrainConfig, grad_accum: int) -> tuple[i
                 drop_last=True,
             )
             return steps_per_epoch * int(config.epochs), steps_per_epoch
+        index_path = resolve_webdataset_index_path(data_path, config.webdataset_index_path)
+        index_data = load_webdataset_index(index_path)
+        validate_webdataset_index(
+            index_data,
+            split_config=StableHashSplitConfig(
+                eval_ratio=config.webdataset_eval_ratio,
+                hash_seed=config.webdataset_hash_seed,
+                split_by=config.webdataset_split_by,
+                utt_id_key=config.webdataset_utt_id_key,
+            ),
+        )
+        num_samples = index_split_sample_count(index_data, config.webdataset_split)
         global_batch = max(1, config.batch_size * grad_accum * _world_size())
         length_index_path = _resolve_in_memory_length_index_path(
             data_path,
@@ -1194,6 +1228,619 @@ def _all_reduce_mean(sum_value: float, count_value: int, *, device: torch.device
     return total_sum / total_count
 
 
+def _select_layer_hidden_ids(
+    *,
+    step: int,
+    num_layers: int,
+    sample_count: int,
+    boundary_ids: tuple[int, ...] | list[int],
+    include_boundaries: bool = False,
+) -> tuple[int, ...]:
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be positive, got {num_layers}.")
+    if sample_count <= 0:
+        raise ValueError(f"layer hidden sample_count must be positive, got {sample_count}.")
+    anchors = (
+        tuple(sorted({int(value) for value in boundary_ids if 0 <= int(value) < num_layers}))
+        if include_boundaries
+        else ()
+    )
+    target_count = min(num_layers, max(sample_count, len(anchors)))
+    remaining = [layer_id for layer_id in range(num_layers) if layer_id not in anchors]
+    extra_count = target_count - len(anchors)
+    if extra_count <= 0 or not remaining:
+        return anchors[:target_count]
+    cursor = int(step) * max(extra_count, 1) % len(remaining)
+    extras = tuple(remaining[(cursor + offset) % len(remaining)] for offset in range(extra_count))
+    return tuple(sorted((*anchors, *extras)))
+
+
+def _teacher_layer_capture_ids(
+    layer_ids: tuple[int, ...],
+    *,
+    input_mode: str,
+) -> tuple[int, ...]:
+    if input_mode == "stacked":
+        return layer_ids
+    if input_mode == "teacher_forced":
+        return tuple(sorted({0, *layer_ids}))
+    raise ValueError(
+        f"Unsupported ctc_teacher_online_layer_input_mode={input_mode!r}; "
+        "expected 'stacked' or 'teacher_forced'."
+    )
+
+
+def _first_module_tensor(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (tuple, list)) and value and isinstance(value[0], torch.Tensor):
+        return value[0]
+    raise TypeError(f"Expected tensor module output, got {type(value)!r}.")
+
+
+@contextmanager
+def _capture_student_sensevoice_layer_hiddens(
+    model: RWKVCTCModel,
+    layer_ids: tuple[int, ...],
+) -> Iterator[dict[int, dict[str, torch.Tensor]]]:
+    sensevoice_encoder = getattr(model.encoder, "sensevoice_encoder", None)
+    if sensevoice_encoder is None:
+        raise ValueError("Layer hidden distillation requires frontend_type='sensevoice_rwkv'.")
+    layers = sensevoice_encoder.layers
+    invalid = [layer_id for layer_id in layer_ids if not 0 <= int(layer_id) < len(layers)]
+    if invalid:
+        raise ValueError(f"Student encoder layer ids are out of range: {invalid}; layers={len(layers)}")
+
+    captured: dict[int, dict[str, torch.Tensor]] = {}
+    handles: list[Any] = []
+    for layer_id in layer_ids:
+        layer_capture: dict[str, torch.Tensor] = {}
+        captured[int(layer_id)] = layer_capture
+        layer = layers[int(layer_id)]
+
+        def capture_mixer(
+            _module: Any,
+            _args: tuple[Any, ...],
+            output: Any,
+            *,
+            target: dict[str, torch.Tensor] = layer_capture,
+        ) -> None:
+            target["mixer"] = _first_module_tensor(output)
+
+        def capture_ffn(
+            _module: Any,
+            _args: tuple[Any, ...],
+            output: Any,
+            *,
+            target: dict[str, torch.Tensor] = layer_capture,
+        ) -> None:
+            target["ffn"] = _first_module_tensor(output)
+
+        def capture_block(
+            _module: Any,
+            _args: tuple[Any, ...],
+            output: Any,
+            *,
+            target: dict[str, torch.Tensor] = layer_capture,
+        ) -> None:
+            target["block"] = _first_module_tensor(output)
+
+        handles.append(layer.time_mixer.register_forward_hook(capture_mixer))
+        handles.append(layer.feed_forward.register_forward_hook(capture_ffn))
+        handles.append(layer.register_forward_hook(capture_block))
+
+    try:
+        yield captured
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _teacher_forced_hidden_batch(
+    teacher_records: dict[str, dict[str, Any]],
+    utt_ids: tuple[str, ...] | list[str],
+    *,
+    layer_id: int,
+    component: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    missing_policy: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows: list[torch.Tensor | None] = []
+    feature_dim: int | None = None
+    for utt_id_value in utt_ids:
+        utt_id = str(utt_id_value)
+        record = teacher_records.get(utt_id)
+        teacher_layers = record.get("encoder_layer_hiddens") if isinstance(record, dict) else None
+        layer_components = teacher_layers.get(str(layer_id)) if isinstance(teacher_layers, dict) else None
+        value = layer_components.get(component) if isinstance(layer_components, dict) else None
+        if value is None:
+            if missing_policy == "error":
+                raise ValueError(
+                    f"Missing teacher-forced {component} for utt_id={utt_id!r} layer={layer_id}."
+                )
+            rows.append(None)
+            continue
+        tensor = torch.as_tensor(value)
+        if tensor.ndim != 2:
+            raise ValueError(
+                f"Teacher-forced {component} must be [T, D] for utt_id={utt_id!r} "
+                f"layer={layer_id}, got {tuple(tensor.shape)}."
+            )
+        current_dim = int(tensor.size(-1))
+        if feature_dim is None:
+            feature_dim = current_dim
+        elif current_dim != feature_dim:
+            raise ValueError(
+                f"Teacher-forced {component} dimension mismatch at layer={layer_id}: "
+                f"{current_dim} != {feature_dim}."
+            )
+        rows.append(tensor)
+    if feature_dim is None:
+        raise RuntimeError(f"No teacher-forced {component} tensors matched layer={layer_id}.")
+    lengths = torch.tensor(
+        [0 if row is None else int(row.size(0)) for row in rows],
+        device=device,
+        dtype=torch.long,
+    )
+    max_time = max(int(lengths.max().item()), 1)
+    batch = torch.zeros((len(rows), max_time, feature_dim), device=device, dtype=dtype)
+    for sample_idx, row in enumerate(rows):
+        if row is None or int(row.size(0)) <= 0:
+            continue
+        row_on_device = row.to(device=device, dtype=dtype)
+        batch[sample_idx, : int(row_on_device.size(0)), :] = row_on_device
+    return batch, lengths
+
+
+def _teacher_forced_student_layer_hiddens(
+    model: RWKVCTCModel,
+    teacher_records: dict[str, dict[str, Any]],
+    utt_ids: tuple[str, ...] | list[str] | None,
+    *,
+    layer_ids: tuple[int, ...],
+    missing_policy: str,
+) -> tuple[dict[int, dict[str, torch.Tensor]], torch.Tensor]:
+    if utt_ids is None:
+        raise RuntimeError("Teacher-forced layer alignment requires batch.utt_ids.")
+    sensevoice_encoder = getattr(model.encoder, "sensevoice_encoder", None)
+    if sensevoice_encoder is None:
+        raise ValueError("Teacher-forced layer alignment requires frontend_type='sensevoice_rwkv'.")
+    if not layer_ids:
+        raise ValueError("Teacher-forced layer alignment requires at least one layer id.")
+    invalid = [layer_id for layer_id in layer_ids if not 0 <= int(layer_id) < len(sensevoice_encoder.layers)]
+    if invalid:
+        raise ValueError(f"Teacher-forced student layer ids are out of range: {invalid}.")
+    parameter = next(sensevoice_encoder.parameters())
+    device = parameter.device
+    dtype = parameter.dtype
+
+    layer_zero_input, layer_zero_lengths = _teacher_forced_hidden_batch(
+        teacher_records,
+        utt_ids,
+        layer_id=0,
+        component="input",
+        device=device,
+        dtype=dtype,
+        missing_policy=missing_policy,
+    )
+    layer_zero = sensevoice_encoder.layers[0]
+    layer_zero_mixed_input = layer_zero.norm1(layer_zero_input)
+    if layer_zero.input_proj is not None:
+        layer_zero_mixed_input = layer_zero.input_proj(layer_zero_mixed_input)
+    layer_zero_mixed, v_first, _ = layer_zero.time_mixer(
+        layer_zero_mixed_input,
+        lengths=layer_zero_lengths,
+    )
+
+    outputs: dict[int, dict[str, torch.Tensor]] = {}
+    for layer_id in layer_ids:
+        layer = sensevoice_encoder.layers[int(layer_id)]
+        if int(layer_id) == 0:
+            layer_input = layer_zero_input
+            lengths = layer_zero_lengths
+            mixed = layer_zero_mixed
+        else:
+            layer_input, lengths = _teacher_forced_hidden_batch(
+                teacher_records,
+                utt_ids,
+                layer_id=int(layer_id),
+                component="input",
+                device=device,
+                dtype=dtype,
+                missing_policy=missing_policy,
+            )
+            if not torch.equal(lengths, layer_zero_lengths):
+                raise ValueError(
+                    f"Teacher-forced layer lengths differ between layer 0 and layer {layer_id}."
+                )
+            mixed_input = layer.norm1(layer_input)
+            if layer.input_proj is not None:
+                mixed_input = layer.input_proj(mixed_input)
+            mixed, _, _ = layer.time_mixer(
+                mixed_input,
+                v_first=v_first,
+                lengths=lengths,
+            )
+        post_mixer = mixed if layer.input_dim != layer.hidden_dim else layer_input + mixed
+        ffn = layer.feed_forward(layer.norm2(post_mixer))
+        outputs[int(layer_id)] = {
+            "mixer": mixed,
+            "ffn": ffn,
+            "block": post_mixer + ffn,
+        }
+    return outputs, layer_zero_lengths
+
+
+@dataclass(frozen=True)
+class _LayerHiddenDistillationResult:
+    loss: torch.Tensor
+    component_losses: dict[str, torch.Tensor]
+    layer_losses: dict[int, torch.Tensor]
+    component_energy_mse: dict[str, float]
+    component_log_rms: dict[str, float]
+    component_student_rms: dict[str, float]
+    component_teacher_rms: dict[str, float]
+    component_rms_ratio: dict[str, float]
+    component_cosine: dict[str, float]
+    layer_energy_mse: dict[int, float]
+    layer_log_rms: dict[int, float]
+    layer_student_rms: dict[int, float]
+    layer_teacher_rms: dict[int, float]
+    layer_rms_ratio: dict[int, float]
+    layer_cosine: dict[int, float]
+    matched_samples: int
+    missing_samples: int
+    events: int
+    max_frame_delta: int
+
+
+def _is_layer_hidden_only_objective(config: DeepSpeedTrainConfig) -> bool:
+    layer_enabled = any(
+        float(value) > 0.0
+        for value in (
+            config.ctc_teacher_online_layer_mixer_loss_weight,
+            config.ctc_teacher_online_layer_ffn_loss_weight,
+            config.ctc_teacher_online_layer_block_loss_weight,
+        )
+    )
+    non_layer_weights = (
+        config.ctc_loss_weight,
+        config.decoder_loss_weight,
+        config.encoder_anchor_loss_weight,
+        config.ctc_logit_anchor_loss_weight,
+        config.ctc_teacher_topk_loss_weight,
+        config.ctc_teacher_topk_blank_loss_weight,
+        config.ctc_teacher_topk_mass_loss_weight,
+        config.ctc_teacher_online_loss_weight,
+        config.ctc_teacher_online_blank_loss_weight,
+        config.ctc_teacher_online_mass_loss_weight,
+        config.ctc_teacher_online_full_loss_weight,
+        config.ctc_teacher_online_encoder_loss_weight,
+        config.ctc_teacher_online_sequence_loss_weight,
+        config.ctc_teacher_online_sequence_presence_loss_weight,
+        config.ctc_teacher_online_sequence_window_loss_weight,
+        config.ctc_teacher_online_nonblank_hard_loss_weight,
+        config.ctc_teacher_online_nonblank_margin_loss_weight,
+        config.ctc_teacher_online_nonblank_window_loss_weight,
+        config.ctc_teacher_online_nonblank_window_margin_loss_weight,
+        config.ctc_teacher_online_nonblank_window_topk_loss_weight,
+    )
+    return layer_enabled and all(float(value) <= 0.0 for value in non_layer_weights)
+
+
+def _ctc_teacher_layer_hidden_loss(
+    student_hiddens: dict[int, dict[str, torch.Tensor]],
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_records: dict[str, dict[str, Any]],
+    *,
+    layer_ids: tuple[int, ...],
+    component_weights: dict[str, float],
+    normalized_mse_weight: float,
+    cosine_weight: float,
+    energy_mse_weight: float,
+    log_rms_weight: float,
+    raw_mse_weight: float,
+    frame_tolerance: int,
+    missing_policy: str,
+) -> _LayerHiddenDistillationResult:
+    if utt_ids is None:
+        raise RuntimeError("Layer hidden distillation requires batch.utt_ids.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported missing_policy={missing_policy!r}; expected skip or error.")
+    if frame_tolerance < 0:
+        raise ValueError(f"frame_tolerance must be >= 0, got {frame_tolerance}.")
+    metric_weights = (
+        float(normalized_mse_weight),
+        float(cosine_weight),
+        float(energy_mse_weight),
+        float(log_rms_weight),
+        float(raw_mse_weight),
+    )
+    if any(value < 0.0 for value in metric_weights):
+        raise ValueError(f"Layer hidden metric weights must be non-negative, got {metric_weights}.")
+    active_components = {
+        name: float(component_weights.get(name, 0.0))
+        for name in ("mixer", "ffn", "block")
+        if float(component_weights.get(name, 0.0)) > 0.0
+    }
+    if not active_components:
+        raise ValueError("Layer hidden distillation requires at least one positive component weight.")
+
+    reference = next(
+        (
+            components[name]
+            for components in student_hiddens.values()
+            for name in active_components
+            if isinstance(components.get(name), torch.Tensor)
+        ),
+        None,
+    )
+    if reference is None:
+        raise RuntimeError("Student layer hooks did not capture any requested hidden tensors.")
+    batch_size = min(int(reference.size(0)), len(utt_ids))
+    max_student_time = int(reference.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=reference.device,
+        )
+    else:
+        clipped_lengths = student_lengths[:batch_size].to(device=reference.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_student_time,
+        )
+
+    component_sums = {name: reference.new_zeros((), dtype=torch.float32) for name in active_components}
+    component_denoms = {name: reference.new_zeros((), dtype=torch.float32) for name in active_components}
+    layer_sums = {layer_id: reference.new_zeros((), dtype=torch.float32) for layer_id in layer_ids}
+    layer_denoms = {layer_id: reference.new_zeros((), dtype=torch.float32) for layer_id in layer_ids}
+    stat_keys = ("student_sq", "teacher_sq", "elements", "energy", "log_rms", "cosine", "frames")
+    component_stats = {
+        name: {key: reference.new_zeros((), dtype=torch.float32) for key in stat_keys}
+        for name in active_components
+    }
+    layer_stats = {
+        layer_id: {key: reference.new_zeros((), dtype=torch.float32) for key in stat_keys}
+        for layer_id in layer_ids
+    }
+    matched_ids: set[str] = set()
+    missing_ids: set[str] = set()
+    events = 0
+    max_frame_delta = 0
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_records.get(utt_id)
+        if record is None:
+            missing_ids.add(utt_id)
+            if missing_policy == "error":
+                raise KeyError(f"Missing Nano layer hidden record for utt_id={utt_id!r}.")
+            continue
+        teacher_layers = record.get("encoder_layer_hiddens")
+        if not isinstance(teacher_layers, dict):
+            missing_ids.add(utt_id)
+            if missing_policy == "error":
+                raise ValueError(f"Nano record has no encoder_layer_hiddens for utt_id={utt_id!r}.")
+            continue
+        student_time = int(clipped_lengths[sample_idx].item())
+        if student_time <= 0:
+            continue
+
+        sample_had_event = False
+        for layer_id in layer_ids:
+            student_components = student_hiddens.get(layer_id)
+            teacher_components = teacher_layers.get(str(layer_id))
+            if not isinstance(student_components, dict) or not isinstance(teacher_components, dict):
+                if missing_policy == "error":
+                    raise ValueError(f"Missing layer={layer_id} hidden tensors for utt_id={utt_id!r}.")
+                continue
+            for component, component_weight in active_components.items():
+                student_hidden = student_components.get(component)
+                teacher_hidden_raw = teacher_components.get(component)
+                if not isinstance(student_hidden, torch.Tensor) or teacher_hidden_raw is None:
+                    if missing_policy == "error":
+                        raise ValueError(
+                            f"Missing {component} hidden tensor at layer={layer_id} for utt_id={utt_id!r}."
+                        )
+                    continue
+                teacher_hidden = torch.as_tensor(teacher_hidden_raw, dtype=torch.float32)
+                if teacher_hidden.ndim != 2 or int(student_hidden.size(-1)) != int(teacher_hidden.size(-1)):
+                    raise ValueError(
+                        f"Layer hidden shape mismatch for utt_id={utt_id!r} layer={layer_id} "
+                        f"component={component}: student={tuple(student_hidden.shape)} "
+                        f"teacher={tuple(teacher_hidden.shape)}"
+                    )
+                teacher_time = int(teacher_hidden.size(0))
+                frame_delta = abs(student_time - teacher_time)
+                max_frame_delta = max(max_frame_delta, frame_delta)
+                if frame_delta > frame_tolerance:
+                    raise ValueError(
+                        f"Layer hidden frame mismatch for utt_id={utt_id!r} layer={layer_id}: "
+                        f"student={student_time} teacher={teacher_time} tolerance={frame_tolerance}."
+                    )
+                aligned_time = min(student_time, teacher_time)
+                if aligned_time <= 0:
+                    continue
+                student_slice = student_hidden[sample_idx, :aligned_time, :].float()
+                teacher_slice = teacher_hidden[:aligned_time].to(device=student_slice.device)
+                frame_loss = student_slice.new_zeros((aligned_time,), dtype=torch.float32)
+                cosine = F.cosine_similarity(student_slice, teacher_slice, dim=-1, eps=1.0e-6)
+                student_power = student_slice.square().mean(dim=-1)
+                teacher_power = teacher_slice.square().mean(dim=-1)
+                diff_power = (student_slice - teacher_slice).square().mean(dim=-1)
+                energy_mse = 2.0 * diff_power / (student_power + teacher_power + 1.0e-6)
+                log_rms_delta = 0.5 * (
+                    torch.log(student_power + 1.0e-6) - torch.log(teacher_power + 1.0e-6)
+                )
+                log_rms = F.smooth_l1_loss(
+                    log_rms_delta,
+                    torch.zeros_like(log_rms_delta),
+                    reduction="none",
+                    beta=0.25,
+                )
+                if normalized_mse_weight > 0.0:
+                    student_norm = F.layer_norm(student_slice, (int(student_slice.size(-1)),))
+                    teacher_norm = F.layer_norm(teacher_slice, (int(teacher_slice.size(-1)),))
+                    frame_loss = frame_loss + F.mse_loss(
+                        student_norm,
+                        teacher_norm,
+                        reduction="none",
+                    ).mean(dim=-1) * float(normalized_mse_weight)
+                if cosine_weight > 0.0:
+                    frame_loss = frame_loss + (1.0 - cosine) * float(cosine_weight)
+                if energy_mse_weight > 0.0:
+                    frame_loss = frame_loss + energy_mse * float(energy_mse_weight)
+                if log_rms_weight > 0.0:
+                    frame_loss = frame_loss + log_rms * float(log_rms_weight)
+                if raw_mse_weight > 0.0:
+                    frame_loss = frame_loss + F.mse_loss(
+                        student_slice,
+                        teacher_slice,
+                        reduction="none",
+                    ).mean(dim=-1) * float(raw_mse_weight)
+                event_sum = frame_loss.sum()
+                event_frames = frame_loss.new_tensor(float(aligned_time))
+                component_sums[component] = component_sums[component] + event_sum
+                component_denoms[component] = component_denoms[component] + event_frames
+                layer_sums[layer_id] = layer_sums[layer_id] + event_sum * component_weight
+                layer_denoms[layer_id] = layer_denoms[layer_id] + event_frames * component_weight
+                detached_student_sq = student_slice.detach().square().sum()
+                detached_teacher_sq = teacher_slice.detach().square().sum()
+                detached_elements = student_slice.new_tensor(float(student_slice.numel()))
+                detached_energy = energy_mse.detach().sum()
+                detached_log_rms = log_rms.detach().sum()
+                detached_cosine = cosine.detach().sum()
+                detached_frames = student_slice.new_tensor(float(aligned_time))
+                component_stat = component_stats[component]
+                component_stat["student_sq"] += detached_student_sq
+                component_stat["teacher_sq"] += detached_teacher_sq
+                component_stat["elements"] += detached_elements
+                component_stat["energy"] += detached_energy
+                component_stat["log_rms"] += detached_log_rms
+                component_stat["cosine"] += detached_cosine
+                component_stat["frames"] += detached_frames
+                layer_stat = layer_stats[layer_id]
+                layer_stat["student_sq"] += detached_student_sq * component_weight
+                layer_stat["teacher_sq"] += detached_teacher_sq * component_weight
+                layer_stat["elements"] += detached_elements * component_weight
+                layer_stat["energy"] += detached_energy * component_weight
+                layer_stat["log_rms"] += detached_log_rms * component_weight
+                layer_stat["cosine"] += detached_cosine * component_weight
+                layer_stat["frames"] += detached_frames * component_weight
+                events += 1
+                sample_had_event = True
+        if sample_had_event:
+            matched_ids.add(utt_id)
+
+    if events <= 0:
+        raise RuntimeError("Layer hidden distillation produced no matched layer/component events.")
+    component_losses = {
+        name: component_sums[name] / component_denoms[name].clamp_min(1.0)
+        for name in active_components
+    }
+    layer_losses = {
+        layer_id: layer_sums[layer_id] / layer_denoms[layer_id].clamp_min(1.0)
+        for layer_id in layer_ids
+        if float(layer_denoms[layer_id].detach().item()) > 0.0
+    }
+    total = sum(
+        component_losses[name] * component_weight
+        for name, component_weight in active_components.items()
+    )
+
+    def stats_as_floats(stats: dict[Any, dict[str, torch.Tensor]]) -> dict[Any, dict[str, float]]:
+        labels = list(stats)
+        if not labels:
+            return {}
+        values = torch.stack(
+            [torch.stack([stats[label][key] for key in stat_keys]) for label in labels]
+        ).detach().cpu().tolist()
+        return {
+            label: {key: float(value) for key, value in zip(stat_keys, row, strict=True)}
+            for label, row in zip(labels, values, strict=True)
+        }
+
+    component_stats_float = stats_as_floats(component_stats)
+    layer_stats_float = stats_as_floats(layer_stats)
+
+    def rms(stat: dict[str, float], key: str) -> float:
+        return math.sqrt(max(stat[key], 0.0) / max(stat["elements"], 1.0))
+
+    component_student_rms = {
+        name: rms(stat, "student_sq") for name, stat in component_stats_float.items()
+    }
+    component_teacher_rms = {
+        name: rms(stat, "teacher_sq") for name, stat in component_stats_float.items()
+    }
+    layer_student_rms = {
+        layer_id: rms(stat, "student_sq") for layer_id, stat in layer_stats_float.items()
+    }
+    layer_teacher_rms = {
+        layer_id: rms(stat, "teacher_sq") for layer_id, stat in layer_stats_float.items()
+    }
+    return _LayerHiddenDistillationResult(
+        loss=total,
+        component_losses=component_losses,
+        layer_losses=layer_losses,
+        component_energy_mse={
+            name: stat["energy"] / max(stat["frames"], 1.0)
+            for name, stat in component_stats_float.items()
+        },
+        component_log_rms={
+            name: stat["log_rms"] / max(stat["frames"], 1.0)
+            for name, stat in component_stats_float.items()
+        },
+        component_student_rms=component_student_rms,
+        component_teacher_rms=component_teacher_rms,
+        component_rms_ratio={
+            name: component_student_rms[name] / max(component_teacher_rms[name], 1.0e-12)
+            for name in component_stats_float
+        },
+        component_cosine={
+            name: stat["cosine"] / max(stat["frames"], 1.0)
+            for name, stat in component_stats_float.items()
+        },
+        layer_energy_mse={
+            layer_id: stat["energy"] / max(stat["frames"], 1.0)
+            for layer_id, stat in layer_stats_float.items()
+            if stat["frames"] > 0.0
+        },
+        layer_log_rms={
+            layer_id: stat["log_rms"] / max(stat["frames"], 1.0)
+            for layer_id, stat in layer_stats_float.items()
+            if stat["frames"] > 0.0
+        },
+        layer_student_rms={
+            layer_id: value
+            for layer_id, value in layer_student_rms.items()
+            if layer_stats_float[layer_id]["elements"] > 0.0
+        },
+        layer_teacher_rms={
+            layer_id: value
+            for layer_id, value in layer_teacher_rms.items()
+            if layer_stats_float[layer_id]["elements"] > 0.0
+        },
+        layer_rms_ratio={
+            layer_id: layer_student_rms[layer_id] / max(layer_teacher_rms[layer_id], 1.0e-12)
+            for layer_id in layer_stats_float
+            if layer_stats_float[layer_id]["elements"] > 0.0
+        },
+        layer_cosine={
+            layer_id: stat["cosine"] / max(stat["frames"], 1.0)
+            for layer_id, stat in layer_stats_float.items()
+            if stat["frames"] > 0.0
+        },
+        matched_samples=len(matched_ids),
+        missing_samples=len(missing_ids),
+        events=events,
+        max_frame_delta=max_frame_delta,
+    )
+
+
 def _online_ctc_teacher_distillation_loss(
     *,
     config: DeepSpeedTrainConfig,
@@ -1447,38 +2094,137 @@ def _evaluate_epoch_loss(
         base = max_eval_samples // world_size
         extra = max_eval_samples % world_size
         local_eval_limit = base + (1 if rank < extra else 0)
-    for batch in loader:
+    for eval_batch_index, batch in enumerate(loader):
         remaining = None if local_eval_limit is None else local_eval_limit - local_sample_count
         if remaining is not None and remaining <= 0:
             break
         if remaining is not None and int(batch.features.size(0)) > remaining:
             batch = batch.prefix(remaining)
+        teacher_batch_features = batch.features
+        teacher_batch_feature_lengths = batch.feature_lengths
         batch = batch.to(device, feature_dtype=feature_dtype)
         if config is not None and ctc_teacher_online is not None:
             if batch.utt_ids is None:
                 raise RuntimeError("Online CTC teacher eval requires batch.utt_ids.")
-            ctc_teacher_online_records = ctc_teacher_online.topk_records(
-                batch.utt_ids,
-                batch.ctc_teacher_audio_rows,
+            layer_component_weights = {
+                "mixer": float(config.ctc_teacher_online_layer_mixer_loss_weight),
+                "ffn": float(config.ctc_teacher_online_layer_ffn_loss_weight),
+                "block": float(config.ctc_teacher_online_layer_block_loss_weight),
+            }
+            layer_hidden_enabled = any(value > 0.0 for value in layer_component_weights.values())
+            layer_hidden_only = _is_layer_hidden_only_objective(config)
+            selected_layer_ids = (
+                _select_layer_hidden_ids(
+                    step=eval_batch_index,
+                    num_layers=int(config.num_layers),
+                    sample_count=int(config.ctc_teacher_online_layer_sample_count),
+                    boundary_ids=config.ctc_teacher_online_layer_boundary_ids,
+                    include_boundaries=True,
+                )
+                if layer_hidden_enabled
+                else ()
             )
+            teacher_layer_ids = _teacher_layer_capture_ids(
+                selected_layer_ids,
+                input_mode=str(config.ctc_teacher_online_layer_input_mode),
+            )
+            if config.ctc_teacher_online_use_batch_features:
+                ctc_teacher_online_records = ctc_teacher_online.feature_records(
+                    batch.utt_ids,
+                    teacher_batch_features,
+                    teacher_batch_feature_lengths,
+                    audio_rows=batch.ctc_teacher_audio_rows,
+                    layer_ids=teacher_layer_ids,
+                    include_ctc_outputs=not layer_hidden_only,
+                )
+            else:
+                ctc_teacher_online_records = ctc_teacher_online.topk_records(
+                    batch.utt_ids,
+                    batch.ctc_teacher_audio_rows,
+                    layer_ids=teacher_layer_ids,
+                )
             mask = trainer.eval_direction_mask(mode, device=batch.features.device)
-            losses = model.joint_losses(
-                batch.features,
-                batch.feature_lengths,
-                batch.targets,
-                batch.target_lengths,
-                decoder_targets=batch.decoder_targets,
-                decoder_target_lengths=batch.decoder_target_lengths,
-                decoder_prompt_before_audio=batch.decoder_prompt_before_audio,
-                decoder_prompt_before_audio_lengths=batch.decoder_prompt_before_audio_lengths,
-                direction_mask=mask,
-            )
+            student_layer_hiddens: dict[int, dict[str, torch.Tensor]] = {}
+            if str(config.ctc_teacher_online_layer_input_mode) == "teacher_forced":
+                if not layer_hidden_only:
+                    raise ValueError("Teacher-forced layer alignment currently requires a hidden-only objective.")
+                student_layer_hiddens, encoded_lengths = _teacher_forced_student_layer_hiddens(
+                    model,
+                    ctc_teacher_online_records,
+                    batch.utt_ids,
+                    layer_ids=selected_layer_ids,
+                    missing_policy=config.ctc_teacher_topk_missing_policy,
+                )
+                reference = next(iter(student_layer_hiddens.values()))["mixer"]
+                zero_loss = reference.float().sum() * 0.0
+                losses = {
+                    "loss": zero_loss,
+                    "ctc_loss": zero_loss,
+                    "decoder_loss": zero_loss,
+                    "encoded_lengths": encoded_lengths,
+                }
+            else:
+                capture_context = (
+                    _capture_student_sensevoice_layer_hiddens(model, selected_layer_ids)
+                    if selected_layer_ids
+                    else nullcontext(student_layer_hiddens)
+                )
+                with capture_context as student_layer_hiddens:
+                    if layer_hidden_only:
+                        encoded, encoded_lengths, _ = model.encoder(
+                            batch.features,
+                            batch.feature_lengths,
+                            direction_mask=mask,
+                        )
+                        zero_loss = encoded.float().sum() * 0.0
+                        losses = {
+                            "loss": zero_loss,
+                            "ctc_loss": zero_loss,
+                            "decoder_loss": zero_loss,
+                            "encoded": encoded,
+                            "encoded_lengths": encoded_lengths,
+                        }
+                    else:
+                        losses = model.joint_losses(
+                            batch.features,
+                            batch.feature_lengths,
+                            batch.targets,
+                            batch.target_lengths,
+                            decoder_targets=batch.decoder_targets,
+                            decoder_target_lengths=batch.decoder_target_lengths,
+                            decoder_prompt_before_audio=batch.decoder_prompt_before_audio,
+                            decoder_prompt_before_audio_lengths=batch.decoder_prompt_before_audio_lengths,
+                            direction_mask=mask,
+                        )
             loss = _online_ctc_teacher_distillation_loss(
                 config=config,
                 losses=losses,
                 batch=batch,
                 ctc_teacher_online_records=ctc_teacher_online_records,
             )
+            if layer_hidden_enabled:
+                student_encoded_lengths = losses.get("encoded_lengths")
+                if student_encoded_lengths is not None and not isinstance(
+                    student_encoded_lengths,
+                    torch.Tensor,
+                ):
+                    raise RuntimeError("joint_losses returned non-tensor encoded_lengths.")
+                layer_result = _ctc_teacher_layer_hidden_loss(
+                    student_layer_hiddens,
+                    student_encoded_lengths,
+                    batch.utt_ids,
+                    ctc_teacher_online_records,
+                    layer_ids=selected_layer_ids,
+                    component_weights=layer_component_weights,
+                    normalized_mse_weight=float(config.ctc_teacher_online_layer_normalized_mse_weight),
+                    cosine_weight=float(config.ctc_teacher_online_layer_cosine_weight),
+                    energy_mse_weight=float(config.ctc_teacher_online_layer_energy_mse_weight),
+                    log_rms_weight=float(config.ctc_teacher_online_layer_log_rms_weight),
+                    raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
+                    frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
+                    missing_policy=config.ctc_teacher_topk_missing_policy,
+                )
+                loss = loss + layer_result.loss
         else:
             loss = trainer.eval_loss(batch, mode=mode)
         batch_size = int(batch.features.size(0))
@@ -3955,6 +4701,16 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     ctc_teacher_online_nonblank_window_temperature = float(
         config.ctc_teacher_online_nonblank_window_temperature
     )
+    ctc_teacher_online_layer_component_weights = {
+        "mixer": float(config.ctc_teacher_online_layer_mixer_loss_weight),
+        "ffn": float(config.ctc_teacher_online_layer_ffn_loss_weight),
+        "block": float(config.ctc_teacher_online_layer_block_loss_weight),
+    }
+    ctc_teacher_online_layer_enabled = any(
+        value > 0.0 for value in ctc_teacher_online_layer_component_weights.values()
+    )
+    ctc_teacher_online_layer_only = _is_layer_hidden_only_objective(config)
+    ctc_teacher_online_layer_input_mode = str(config.ctc_teacher_online_layer_input_mode)
     if config.allow_missing_targets and (
         float(config.ctc_loss_weight) > 0.0 or float(config.decoder_loss_weight) > 0.0
     ):
@@ -3983,6 +4739,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         and ctc_teacher_online_nonblank_window_weight <= 0.0
         and ctc_teacher_online_nonblank_window_margin_weight <= 0.0
         and ctc_teacher_online_nonblank_window_topk_weight <= 0.0
+        and not ctc_teacher_online_layer_enabled
     ):
         raise ValueError("Training objective is empty: all supervised, anchor, and teacher loss weights are zero.")
     ctc_teacher_topk_cache: dict[str, dict[str, Any]] = {}
@@ -4003,6 +4760,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         or ctc_teacher_online_nonblank_window_weight > 0.0
         or ctc_teacher_online_nonblank_window_margin_weight > 0.0
         or ctc_teacher_online_nonblank_window_topk_weight > 0.0
+        or ctc_teacher_online_layer_enabled
     ):
         if config.ctc_teacher_topk_time_map not in {"nearest", "linear"}:
             raise ValueError(
@@ -4064,6 +4822,60 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 "ctc_teacher_online_sequence_window_temperature must be >= 0, "
                 f"got {ctc_teacher_online_sequence_window_temperature!r}."
             )
+        if any(value < 0.0 for value in ctc_teacher_online_layer_component_weights.values()):
+            raise ValueError(
+                "ctc_teacher_online_layer component weights must be non-negative, "
+                f"got {ctc_teacher_online_layer_component_weights}."
+            )
+        layer_metric_weights = (
+            float(config.ctc_teacher_online_layer_normalized_mse_weight),
+            float(config.ctc_teacher_online_layer_cosine_weight),
+            float(config.ctc_teacher_online_layer_energy_mse_weight),
+            float(config.ctc_teacher_online_layer_log_rms_weight),
+            float(config.ctc_teacher_online_layer_raw_mse_weight),
+        )
+        if any(value < 0.0 for value in layer_metric_weights) or not any(
+            value > 0.0 for value in layer_metric_weights
+        ):
+            raise ValueError(
+                "Layer hidden normalized-MSE/cosine/raw-MSE weights must be non-negative with at least one positive, "
+                f"got {layer_metric_weights}."
+            )
+        if (
+            config.ctc_teacher_online_use_batch_features
+            and str(config.feature_extractor_type) != "funasr_wav_frontend"
+        ):
+            raise ValueError(
+                "ctc_teacher_online_use_batch_features requires "
+                "feature_extractor_type='funasr_wav_frontend'."
+            )
+        if ctc_teacher_online_layer_enabled:
+            if ctc_teacher_online_layer_input_mode not in {"stacked", "teacher_forced"}:
+                raise ValueError(
+                    "ctc_teacher_online_layer_input_mode must be 'stacked' or 'teacher_forced', "
+                    f"got {ctc_teacher_online_layer_input_mode!r}."
+                )
+            if int(config.ctc_teacher_online_layer_sample_count) <= 0:
+                raise ValueError("ctc_teacher_online_layer_sample_count must be positive.")
+            if int(config.ctc_teacher_online_layer_frame_tolerance) < 0:
+                raise ValueError("ctc_teacher_online_layer_frame_tolerance must be non-negative.")
+            if str(config.frontend_type) != "sensevoice_rwkv":
+                raise ValueError("Layer hidden distillation requires frontend_type='sensevoice_rwkv'.")
+            if str(config.feature_extractor_type) != "funasr_wav_frontend":
+                raise ValueError(
+                    "Nano layer hidden distillation requires feature_extractor_type='funasr_wav_frontend' "
+                    "for frame and feature parity."
+                )
+            if not bool(config.ctc_teacher_online_use_batch_features):
+                raise ValueError(
+                    "Nano layer hidden distillation requires ctc_teacher_online_use_batch_features=true."
+                )
+            if bool(config.specaugment_enabled):
+                raise ValueError("Nano layer hidden distillation requires specaugment_enabled=false.")
+            if float(config.dropout) != 0.0:
+                raise ValueError("Nano layer hidden distillation requires dropout=0 for exact sub-block parity.")
+            if ctc_teacher_online_layer_input_mode == "teacher_forced" and not ctc_teacher_online_layer_only:
+                raise ValueError("Teacher-forced layer alignment requires a hidden-only objective.")
         if (
             ctc_teacher_online_full_weight > 0.0
             and ctc_teacher_online_full_frame_filter != "all"
@@ -4111,11 +4923,16 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         or ctc_teacher_online_nonblank_window_weight > 0.0
         or ctc_teacher_online_nonblank_window_margin_weight > 0.0
         or ctc_teacher_online_nonblank_window_topk_weight > 0.0
+        or ctc_teacher_online_layer_enabled
     ):
         if config.ctc_teacher_online_model_path is None:
             raise ValueError("Online CTC teacher distillation requires ctc_teacher_online_model_path.")
         audio_index_path = config.ctc_teacher_online_audio_index_path
-        if audio_index_path is None and config.webdataset_bucket_manifest_path is None:
+        if (
+            not config.ctc_teacher_online_use_batch_features
+            and audio_index_path is None
+            and config.webdataset_bucket_manifest_path is None
+        ):
             audio_index_path = config.webdataset_length_index_path or config.manifest_path
         if audio_index_path is None and config.webdataset_bucket_manifest_path is None:
             raise ValueError(
@@ -4151,6 +4968,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 ),
                 return_full_log_probs=ctc_teacher_online_full_weight > 0.0,
                 return_encoder_out=ctc_teacher_online_encoder_weight > 0.0,
+                return_layer_hiddens=ctc_teacher_online_layer_enabled,
             )
         )
         _rank_zero_log(
@@ -4171,6 +4989,13 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"nonblank_window_topk_weight={ctc_teacher_online_nonblank_window_topk_weight:g} "
             f"nonblank_window_radius={ctc_teacher_online_nonblank_window_radius} "
             f"nonblank_window_temperature={ctc_teacher_online_nonblank_window_temperature:g} "
+            f"layer_weights={ctc_teacher_online_layer_component_weights} "
+            f"layer_metric_weights={layer_metric_weights} "
+            f"layer_sample_count={int(config.ctc_teacher_online_layer_sample_count)} "
+            f"layer_boundaries={tuple(int(value) for value in config.ctc_teacher_online_layer_boundary_ids)} "
+            f"layer_frame_tolerance={int(config.ctc_teacher_online_layer_frame_tolerance)} "
+            f"layer_input_mode={ctc_teacher_online_layer_input_mode} "
+            f"layer_hidden_only={ctc_teacher_online_layer_only} "
             f"full_temperature={ctc_teacher_online_full_temperature:g} "
             f"rows={ctc_teacher_online.num_audio_rows} "
             f"top_k={int(config.ctc_teacher_online_top_k)} "
@@ -4181,10 +5006,14 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"filter_min_nonblank={ctc_teacher_frame_filter_min_nonblank_prob:g} "
             f"missing_policy={config.ctc_teacher_topk_missing_policy} "
             f"device={online_device} "
+            f"use_batch_features={bool(config.ctc_teacher_online_use_batch_features)} "
             f"audio_index={audio_index_path if audio_index_path is not None else 'batch_inline'} "
             f"audio_cache_dir={online_audio_cache_dir} "
             f"keep_audio_cache={bool(config.ctc_teacher_online_keep_audio_cache)}"
         )
+    ctc_teacher_online_layer_coverage = {
+        layer_id: 0 for layer_id in range(int(config.num_layers))
+    }
     _rank_zero_log("DeepSpeed engine initialized. Building dataloader...")
 
     if (
@@ -4214,7 +5043,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
 
     loader, sampler = _build_train_loader(config)
     eval_loader, eval_sampler = _build_eval_loader(config)
-    step_eval_loader, step_eval_sampler = _build_eval_loader(config, shuffle_shards=True, step_subset=True)
+    step_eval_loader, step_eval_sampler = _build_eval_loader(
+        config,
+        shuffle_shards=bool(config.step_eval_shuffle),
+        step_subset=True,
+    )
     step_eval_every = _resolve_step_eval_every(config)
     _rank_zero_log("Dataloader ready. Entering training loop.")
     active_length_index_path = None
@@ -4379,6 +5212,40 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             start_step=start_step,
             description="deepspeed-train",
         )
+    if bool(config.step_eval_at_start) and start_step == 0 and step_eval_every is not None:
+        initial_eval_loss, initial_eval_count = _evaluate_epoch_loss(
+            model=engine.module,
+            loader=step_eval_loader,
+            sampler=step_eval_sampler,
+            epoch=0,
+            device=engine.device,
+            feature_dtype=feature_dtype,
+            mode=config.eval_mode,
+            max_eval_samples=int(config.step_eval_samples),
+            config=config,
+            ctc_teacher_online=ctc_teacher_online,
+        )
+        if _is_rank_zero():
+            baseline_payload = {
+                "step": 0,
+                "eval_loss": initial_eval_loss,
+                "eval_samples": initial_eval_count,
+                "shuffle": bool(config.step_eval_shuffle),
+            }
+            save_yaml(output_dir / "step_eval_baseline.yaml", baseline_payload)
+            _rank_zero_log(
+                f"Initial step eval: step=0 eval_loss={initial_eval_loss:.4f} "
+                f"eval_samples={initial_eval_count}"
+            )
+            log_wandb(
+                wandb_run,
+                {
+                    "eval/step_eval_loss": initial_eval_loss,
+                    "eval/step_eval_samples": initial_eval_count,
+                    "eval/step_eval_baseline": 1,
+                },
+                step=0,
+            )
     train_start_time = time.perf_counter()
     try:
         while step < resolved_max_steps:
@@ -4461,7 +5328,6 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 dropped_tail_samples = budgeted.dropped_tail_samples
 
                 step_start_time = time.perf_counter()
-                engine.zero_grad()
                 mask = _sample_direction_mask_distributed(
                     scheduler,
                     step=step,
@@ -4470,6 +5336,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 executed_token_stats = batch_stats
                 if engine.device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(engine.device)
+                teacher_batch_features = batch.features
+                teacher_batch_feature_lengths = batch.feature_lengths
                 batch = batch.to(engine.device, feature_dtype=feature_dtype)
                 if config.specaugment_enabled:
                     batch = replace(
@@ -4485,15 +5353,40 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     )
                 ctc_teacher_online_records: dict[str, dict[str, Any]] = {}
                 ctc_teacher_online_forward_time = 0.0
+                selected_layer_hidden_ids = (
+                    _select_layer_hidden_ids(
+                        step=step,
+                        num_layers=int(config.num_layers),
+                        sample_count=int(config.ctc_teacher_online_layer_sample_count),
+                        boundary_ids=config.ctc_teacher_online_layer_boundary_ids,
+                    )
+                    if ctc_teacher_online_layer_enabled
+                    else ()
+                )
+                teacher_layer_hidden_ids = _teacher_layer_capture_ids(
+                    selected_layer_hidden_ids,
+                    input_mode=str(config.ctc_teacher_online_layer_input_mode),
+                )
                 if ctc_teacher_online is not None:
                     if batch.utt_ids is None:
                         raise RuntimeError("Online CTC teacher distillation requires batch.utt_ids.")
                     online_teacher_start = time.perf_counter()
                     try:
-                        ctc_teacher_online_records = ctc_teacher_online.topk_records(
-                            batch.utt_ids,
-                            batch.ctc_teacher_audio_rows,
-                        )
+                        if config.ctc_teacher_online_use_batch_features:
+                            ctc_teacher_online_records = ctc_teacher_online.feature_records(
+                                batch.utt_ids,
+                                teacher_batch_features,
+                                teacher_batch_feature_lengths,
+                                audio_rows=batch.ctc_teacher_audio_rows,
+                                layer_ids=teacher_layer_hidden_ids,
+                                include_ctc_outputs=not ctc_teacher_online_layer_only,
+                            )
+                        else:
+                            ctc_teacher_online_records = ctc_teacher_online.topk_records(
+                                batch.utt_ids,
+                                batch.ctc_teacher_audio_rows,
+                                layer_ids=teacher_layer_hidden_ids,
+                            )
                     except torch.OutOfMemoryError:
                         _all_rank_log(
                             "OOM during FunASR-Nano online teacher forward "
@@ -4502,18 +5395,68 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         )
                         raise
                     ctc_teacher_online_forward_time = time.perf_counter() - online_teacher_start
+                student_layer_hiddens: dict[int, dict[str, torch.Tensor]] = {}
                 try:
-                    losses = engine.module.joint_losses(
-                        batch.features,
-                        batch.feature_lengths,
-                        batch.targets,
-                        batch.target_lengths,
-                        decoder_targets=batch.decoder_targets,
-                        decoder_target_lengths=batch.decoder_target_lengths,
-                        decoder_prompt_before_audio=batch.decoder_prompt_before_audio,
-                        decoder_prompt_before_audio_lengths=batch.decoder_prompt_before_audio_lengths,
-                        direction_mask=mask,
-                    )
+                    if str(config.ctc_teacher_online_layer_input_mode) == "teacher_forced":
+                        if not ctc_teacher_online_layer_only:
+                            raise ValueError(
+                                "Teacher-forced layer alignment currently requires a hidden-only objective."
+                            )
+                        student_layer_hiddens, encoded_lengths = (
+                            _teacher_forced_student_layer_hiddens(
+                                engine.module,
+                                ctc_teacher_online_records,
+                                batch.utt_ids,
+                                layer_ids=selected_layer_hidden_ids,
+                                missing_policy=config.ctc_teacher_topk_missing_policy,
+                            )
+                        )
+                        reference = next(iter(student_layer_hiddens.values()))["mixer"]
+                        zero_loss = reference.float().sum() * 0.0
+                        losses = {
+                            "loss": zero_loss,
+                            "ctc_loss": zero_loss,
+                            "decoder_loss": zero_loss,
+                            "encoded_lengths": encoded_lengths,
+                        }
+                    else:
+                        capture_context = (
+                            _capture_student_sensevoice_layer_hiddens(
+                                engine.module,
+                                selected_layer_hidden_ids,
+                            )
+                            if selected_layer_hidden_ids
+                            else nullcontext(student_layer_hiddens)
+                        )
+                        with capture_context as student_layer_hiddens:
+                            if ctc_teacher_online_layer_only:
+                                encoded, encoded_lengths, _ = engine.module.encoder(
+                                    batch.features,
+                                    batch.feature_lengths,
+                                    direction_mask=mask,
+                                )
+                                zero_loss = encoded.float().sum() * 0.0
+                                losses = {
+                                    "loss": zero_loss,
+                                    "ctc_loss": zero_loss,
+                                    "decoder_loss": zero_loss,
+                                    "encoded": encoded,
+                                    "encoded_lengths": encoded_lengths,
+                                }
+                            else:
+                                losses = engine.module.joint_losses(
+                                    batch.features,
+                                    batch.feature_lengths,
+                                    batch.targets,
+                                    batch.target_lengths,
+                                    decoder_targets=batch.decoder_targets,
+                                    decoder_target_lengths=batch.decoder_target_lengths,
+                                    decoder_prompt_before_audio=batch.decoder_prompt_before_audio,
+                                    decoder_prompt_before_audio_lengths=(
+                                        batch.decoder_prompt_before_audio_lengths
+                                    ),
+                                    direction_mask=mask,
+                                )
                 except torch.OutOfMemoryError:
                     _all_rank_log(
                         "OOM during joint_losses "
@@ -4554,6 +5497,25 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 ctc_teacher_online_encoder_loss_value = 0.0
                 ctc_teacher_online_encoder_matched = 0
                 ctc_teacher_online_encoder_missing = 0
+                ctc_teacher_online_layer_loss_value = 0.0
+                ctc_teacher_online_layer_component_loss_values: dict[str, float] = {}
+                ctc_teacher_online_layer_loss_values: dict[int, float] = {}
+                ctc_teacher_online_layer_component_energy_values: dict[str, float] = {}
+                ctc_teacher_online_layer_component_log_rms_values: dict[str, float] = {}
+                ctc_teacher_online_layer_component_student_rms_values: dict[str, float] = {}
+                ctc_teacher_online_layer_component_teacher_rms_values: dict[str, float] = {}
+                ctc_teacher_online_layer_component_rms_ratio_values: dict[str, float] = {}
+                ctc_teacher_online_layer_component_cosine_values: dict[str, float] = {}
+                ctc_teacher_online_layer_energy_values: dict[int, float] = {}
+                ctc_teacher_online_layer_log_rms_values: dict[int, float] = {}
+                ctc_teacher_online_layer_student_rms_values: dict[int, float] = {}
+                ctc_teacher_online_layer_teacher_rms_values: dict[int, float] = {}
+                ctc_teacher_online_layer_rms_ratio_values: dict[int, float] = {}
+                ctc_teacher_online_layer_cosine_values: dict[int, float] = {}
+                ctc_teacher_online_layer_matched = 0
+                ctc_teacher_online_layer_missing = 0
+                ctc_teacher_online_layer_events = 0
+                ctc_teacher_online_layer_max_frame_delta = 0
                 ctc_teacher_online_sequence_loss_value = 0.0
                 ctc_teacher_online_sequence_matched = 0
                 ctc_teacher_online_sequence_missing = 0
@@ -4802,6 +5764,72 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         ctc_teacher_online_encoder_loss.detach().item()
                     )
                     loss = loss + ctc_teacher_online_encoder_loss * ctc_teacher_online_encoder_weight
+                if ctc_teacher_online_layer_enabled:
+                    student_encoded_lengths = losses.get("encoded_lengths")
+                    if student_encoded_lengths is not None and not isinstance(
+                        student_encoded_lengths,
+                        torch.Tensor,
+                    ):
+                        raise RuntimeError("joint_losses returned non-tensor encoded_lengths.")
+                    layer_hidden_result = _ctc_teacher_layer_hidden_loss(
+                        student_layer_hiddens,
+                        student_encoded_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        layer_ids=selected_layer_hidden_ids,
+                        component_weights=ctc_teacher_online_layer_component_weights,
+                        normalized_mse_weight=float(
+                            config.ctc_teacher_online_layer_normalized_mse_weight
+                        ),
+                        cosine_weight=float(config.ctc_teacher_online_layer_cosine_weight),
+                        energy_mse_weight=float(config.ctc_teacher_online_layer_energy_mse_weight),
+                        log_rms_weight=float(config.ctc_teacher_online_layer_log_rms_weight),
+                        raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
+                        frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                    )
+                    ctc_teacher_online_layer_loss_value = float(
+                        layer_hidden_result.loss.detach().item()
+                    )
+                    ctc_teacher_online_layer_component_loss_values = {
+                        name: float(value.detach().item())
+                        for name, value in layer_hidden_result.component_losses.items()
+                    }
+                    ctc_teacher_online_layer_loss_values = {
+                        layer_id: float(value.detach().item())
+                        for layer_id, value in layer_hidden_result.layer_losses.items()
+                    }
+                    ctc_teacher_online_layer_component_energy_values = (
+                        layer_hidden_result.component_energy_mse
+                    )
+                    ctc_teacher_online_layer_component_log_rms_values = (
+                        layer_hidden_result.component_log_rms
+                    )
+                    ctc_teacher_online_layer_component_student_rms_values = (
+                        layer_hidden_result.component_student_rms
+                    )
+                    ctc_teacher_online_layer_component_teacher_rms_values = (
+                        layer_hidden_result.component_teacher_rms
+                    )
+                    ctc_teacher_online_layer_component_rms_ratio_values = (
+                        layer_hidden_result.component_rms_ratio
+                    )
+                    ctc_teacher_online_layer_component_cosine_values = (
+                        layer_hidden_result.component_cosine
+                    )
+                    ctc_teacher_online_layer_energy_values = layer_hidden_result.layer_energy_mse
+                    ctc_teacher_online_layer_log_rms_values = layer_hidden_result.layer_log_rms
+                    ctc_teacher_online_layer_student_rms_values = layer_hidden_result.layer_student_rms
+                    ctc_teacher_online_layer_teacher_rms_values = layer_hidden_result.layer_teacher_rms
+                    ctc_teacher_online_layer_rms_ratio_values = layer_hidden_result.layer_rms_ratio
+                    ctc_teacher_online_layer_cosine_values = layer_hidden_result.layer_cosine
+                    ctc_teacher_online_layer_matched = layer_hidden_result.matched_samples
+                    ctc_teacher_online_layer_missing = layer_hidden_result.missing_samples
+                    ctc_teacher_online_layer_events = layer_hidden_result.events
+                    ctc_teacher_online_layer_max_frame_delta = layer_hidden_result.max_frame_delta
+                    for layer_id in selected_layer_hidden_ids:
+                        ctc_teacher_online_layer_coverage[layer_id] += int(batch_stats.batch_size)
+                    loss = loss + layer_hidden_result.loss
                 if ctc_teacher_online_sequence_weight > 0.0:
                     student_logits = losses.get("logits")
                     if not isinstance(student_logits, torch.Tensor):
@@ -5117,6 +6145,21 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         f"online_ctc_encoder={ctc_teacher_online_encoder_loss_value:.4f} "
                         f"online_encoder_match={ctc_teacher_online_encoder_matched}/{batch_stats.batch_size} "
                         f"online_encoder_missing={ctc_teacher_online_encoder_missing} "
+                        f"online_layer_hidden={ctc_teacher_online_layer_loss_value:.4f} "
+                        f"online_layer_mixer={ctc_teacher_online_layer_component_loss_values.get('mixer', 0.0):.4f} "
+                        f"online_layer_ffn={ctc_teacher_online_layer_component_loss_values.get('ffn', 0.0):.4f} "
+                        f"online_layer_block={ctc_teacher_online_layer_component_loss_values.get('block', 0.0):.4f} "
+                        f"online_layer_mixer_energy={ctc_teacher_online_layer_component_energy_values.get('mixer', 0.0):.4f} "
+                        f"online_layer_mixer_log_rms={ctc_teacher_online_layer_component_log_rms_values.get('mixer', 0.0):.4f} "
+                        f"online_layer_mixer_student_rms={ctc_teacher_online_layer_component_student_rms_values.get('mixer', 0.0):.4f} "
+                        f"online_layer_mixer_teacher_rms={ctc_teacher_online_layer_component_teacher_rms_values.get('mixer', 0.0):.4f} "
+                        f"online_layer_mixer_rms_ratio={ctc_teacher_online_layer_component_rms_ratio_values.get('mixer', 0.0):.4f} "
+                        f"online_layer_mixer_cosine={ctc_teacher_online_layer_component_cosine_values.get('mixer', 0.0):.4f} "
+                        f"online_layer_match={ctc_teacher_online_layer_matched}/{batch_stats.batch_size} "
+                        f"online_layer_missing={ctc_teacher_online_layer_missing} "
+                        f"online_layer_events={ctc_teacher_online_layer_events} "
+                        f"online_layer_frame_delta={ctc_teacher_online_layer_max_frame_delta} "
+                        f"online_layer_ids={','.join(str(value) for value in selected_layer_hidden_ids) or '-'} "
                         f"online_ctc_sequence={ctc_teacher_online_sequence_loss_value:.4f} "
                         f"online_sequence_match={ctc_teacher_online_sequence_matched}/{batch_stats.batch_size} "
                         f"online_sequence_missing={ctc_teacher_online_sequence_missing} "
@@ -5181,6 +6224,61 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             "train/ctc_teacher_online_encoder_loss": ctc_teacher_online_encoder_loss_value,
                             "train/ctc_teacher_online_encoder_matched": ctc_teacher_online_encoder_matched,
                             "train/ctc_teacher_online_encoder_missing": ctc_teacher_online_encoder_missing,
+                            "train/ctc_teacher_online_layer_loss": ctc_teacher_online_layer_loss_value,
+                            "train/ctc_teacher_online_layer_mixer_loss": (
+                                ctc_teacher_online_layer_component_loss_values.get("mixer", 0.0)
+                            ),
+                            "train/ctc_teacher_online_layer_ffn_loss": (
+                                ctc_teacher_online_layer_component_loss_values.get("ffn", 0.0)
+                            ),
+                            "train/ctc_teacher_online_layer_block_loss": (
+                                ctc_teacher_online_layer_component_loss_values.get("block", 0.0)
+                            ),
+                            **{
+                                f"train/ctc_teacher_online_layer_{component}_{metric}": values.get(
+                                    component,
+                                    0.0,
+                                )
+                                for component in ctc_teacher_online_layer_component_loss_values
+                                for metric, values in (
+                                    ("energy_mse", ctc_teacher_online_layer_component_energy_values),
+                                    ("log_rms", ctc_teacher_online_layer_component_log_rms_values),
+                                    ("student_rms", ctc_teacher_online_layer_component_student_rms_values),
+                                    ("teacher_rms", ctc_teacher_online_layer_component_teacher_rms_values),
+                                    ("rms_ratio", ctc_teacher_online_layer_component_rms_ratio_values),
+                                    ("cosine", ctc_teacher_online_layer_component_cosine_values),
+                                )
+                            },
+                            "train/ctc_teacher_online_layer_matched": ctc_teacher_online_layer_matched,
+                            "train/ctc_teacher_online_layer_missing": ctc_teacher_online_layer_missing,
+                            "train/ctc_teacher_online_layer_events": ctc_teacher_online_layer_events,
+                            "train/ctc_teacher_online_layer_max_frame_delta": (
+                                ctc_teacher_online_layer_max_frame_delta
+                            ),
+                            "train/ctc_teacher_online_layer_coverage_min": min(
+                                ctc_teacher_online_layer_coverage.values(),
+                                default=0,
+                            ),
+                            "train/ctc_teacher_online_layer_coverage_max": max(
+                                ctc_teacher_online_layer_coverage.values(),
+                                default=0,
+                            ),
+                            **{
+                                f"train/ctc_teacher_online_layer_{layer_id}_loss": value
+                                for layer_id, value in ctc_teacher_online_layer_loss_values.items()
+                            },
+                            **{
+                                f"train/ctc_teacher_online_layer_{layer_id}_{metric}": values[layer_id]
+                                for metric, values in (
+                                    ("energy_mse", ctc_teacher_online_layer_energy_values),
+                                    ("log_rms", ctc_teacher_online_layer_log_rms_values),
+                                    ("student_rms", ctc_teacher_online_layer_student_rms_values),
+                                    ("teacher_rms", ctc_teacher_online_layer_teacher_rms_values),
+                                    ("rms_ratio", ctc_teacher_online_layer_rms_ratio_values),
+                                    ("cosine", ctc_teacher_online_layer_cosine_values),
+                                )
+                                for layer_id in values
+                            },
                             "train/ctc_teacher_online_sequence_loss": ctc_teacher_online_sequence_loss_value,
                             "train/ctc_teacher_online_sequence_matched": ctc_teacher_online_sequence_matched,
                             "train/ctc_teacher_online_sequence_missing": ctc_teacher_online_sequence_missing,
@@ -5296,7 +6394,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             model=engine.module,
                             loader=step_eval_loader,
                             sampler=step_eval_sampler,
-                            epoch=step,
+                            epoch=step if bool(config.step_eval_shuffle) else 0,
                             device=engine.device,
                             feature_dtype=feature_dtype,
                             mode=config.eval_mode,
