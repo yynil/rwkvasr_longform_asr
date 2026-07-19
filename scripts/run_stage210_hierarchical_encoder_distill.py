@@ -95,6 +95,21 @@ def _latest_step(output_dir: Path) -> int:
     return int(state.get("step") or 0) if isinstance(state, dict) else 0
 
 
+def _has_deepspeed_resume_state(output_dir: Path) -> bool:
+    latest_path = output_dir / "latest_checkpoint.yaml"
+    if not latest_path.is_file():
+        return False
+    state = load_yaml(latest_path)
+    if not isinstance(state, dict) or int(state.get("step") or 0) <= 0:
+        return False
+    checkpoint_dir = Path(str(state.get("deepspeed_checkpoint_dir") or ""))
+    return (
+        str(state.get("checkpoint_type") or "") == "deepspeed"
+        and bool(str(state.get("resume_tag") or ""))
+        and checkpoint_dir.is_dir()
+    )
+
+
 def _phase_config(
     *,
     phase: AlignmentPhase,
@@ -105,6 +120,7 @@ def _phase_config(
     smoke: bool,
     smoke_steps: int = 2,
     qkv_scale_mode: str = "rwkv_norm",
+    layer_sample_count: int = 8,
     eval_only: bool = False,
     skip_nano_init: bool = False,
 ) -> dict[str, Any]:
@@ -205,7 +221,7 @@ def _phase_config(
             "ctc_teacher_online_layer_energy_mse_weight": float(phase.energy_mse_weight),
             "ctc_teacher_online_layer_log_rms_weight": float(phase.log_rms_weight),
             "ctc_teacher_online_layer_raw_mse_weight": float(phase.raw_mse_weight),
-            "ctc_teacher_online_layer_sample_count": 8,
+            "ctc_teacher_online_layer_sample_count": int(layer_sample_count),
             "ctc_teacher_online_layer_boundary_ids": [0, 49, 50, 69],
             "ctc_teacher_online_layer_frame_tolerance": 0,
             "ctc_teacher_online_layer_input_mode": str(phase.input_mode),
@@ -299,6 +315,7 @@ def main() -> int:
         choices=("exact", "rwkv_norm"),
         default="rwkv_norm",
     )
+    parser.add_argument("--layer-sample-count", type=int, default=8)
     args = parser.parse_args()
     if int(args.smoke_steps) <= 0:
         parser.error("--smoke-steps must be positive")
@@ -306,6 +323,8 @@ def main() -> int:
         parser.error("--smoke and --eval-only are mutually exclusive")
     if args.skip_nano_init and args.init_checkpoint is None:
         parser.error("--skip-nano-init requires an explicit --init-checkpoint")
+    if not 1 <= int(args.layer_sample_count) <= 70:
+        parser.error("--layer-sample-count must be in [1, 70]")
 
     phase = PHASES[str(args.phase)]
     base_output_dir = args.output_dir or _default_output_dir(phase)
@@ -317,7 +336,12 @@ def main() -> int:
         output_dir = base_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     latest_step = _latest_step(output_dir)
-    resume = latest_step > 0 and not args.eval_only
+    resume = _has_deepspeed_resume_state(output_dir) and not args.eval_only
+    if latest_step > 0 and not args.eval_only and not resume:
+        raise RuntimeError(
+            f"Stage210 output has a non-resumable export checkpoint at step {latest_step}: "
+            f"{output_dir}. Use a new --output-dir; smoke runs do not save DeepSpeed optimizer shards."
+        )
 
     init_checkpoint = args.init_checkpoint
     if init_checkpoint is None and phase.name == "subblock":
@@ -340,6 +364,7 @@ def main() -> int:
         smoke=bool(args.smoke),
         smoke_steps=int(args.smoke_steps),
         qkv_scale_mode=str(args.qkv_scale_mode),
+        layer_sample_count=int(args.layer_sample_count),
         eval_only=bool(args.eval_only),
         skip_nano_init=bool(args.skip_nano_init),
     )
@@ -374,7 +399,8 @@ def main() -> int:
     )
     print(
         f"layer_weights=mixer:{phase.mixer_weight:g},ffn:{phase.ffn_weight:g},"
-        f"block:{phase.block_weight:g} lr={phase.lr:g}",
+        f"block:{phase.block_weight:g} layer_sample_count={int(args.layer_sample_count)} "
+        f"lr={phase.lr:g}",
         flush=True,
     )
     code = _run(

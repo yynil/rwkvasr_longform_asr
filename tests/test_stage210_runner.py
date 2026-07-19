@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO_ROOT))
 stage210 = importlib.import_module("scripts.run_stage210_hierarchical_encoder_distill")
 PHASES = stage210.PHASES
 _phase_config = stage210._phase_config
+_has_deepspeed_resume_state = stage210._has_deepspeed_resume_state
 
 
 def test_stage210_subblock_uses_exact_features_and_nano_initialization(tmp_path: Path) -> None:
@@ -37,6 +38,7 @@ def test_stage210_subblock_uses_exact_features_and_nano_initialization(tmp_path:
     assert config["ctc_teacher_online_use_batch_features"] is True
     assert config["ctc_teacher_online_keep_layer_hiddens_on_device"] is True
     assert config["ctc_teacher_online_layer_frame_tolerance"] == 0
+    assert config["ctc_teacher_online_layer_sample_count"] == 8
     assert config["ctc_teacher_online_layer_input_mode"] == "teacher_forced"
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(1.0)
     assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(0.25)
@@ -65,6 +67,48 @@ def test_stage210_subblock_uses_exact_features_and_nano_initialization(tmp_path:
     assert config["wandb_enabled"] is True
     assert config["deepspeed"]["gradient_accumulation_steps"] == 1
     assert "stage179a_easy" in config["webdataset_length_index_path"]
+
+
+def test_stage210_can_raise_layer_coverage_for_an_explicit_probe(tmp_path: Path) -> None:
+    config = _phase_config(
+        phase=PHASES["subblock"],
+        output_dir=tmp_path / "run",
+        init_checkpoint=tmp_path / "stage209.pt",
+        nano_checkpoint=tmp_path / "model.pt",
+        resume=False,
+        smoke=True,
+        layer_sample_count=24,
+    )
+
+    assert config["ctc_teacher_online_layer_sample_count"] == 24
+
+
+def test_stage210_does_not_treat_export_only_smoke_as_resumable(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    latest = output_dir / "latest_checkpoint.yaml"
+    latest.write_text(
+        "checkpoint_type: export\nstep: 3\ncheckpoint_path: epoch-1.pt\n",
+        encoding="utf-8",
+    )
+
+    assert _has_deepspeed_resume_state(output_dir) is False
+
+    checkpoint_dir = output_dir / "ds_checkpoints" / "step-3"
+    checkpoint_dir.mkdir(parents=True)
+    latest.write_text(
+        "\n".join(
+            [
+                "checkpoint_type: deepspeed",
+                "step: 3",
+                f"deepspeed_checkpoint_dir: {checkpoint_dir}",
+                "resume_tag: step-3",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _has_deepspeed_resume_state(output_dir) is True
 
 
 def test_stage210_block_requires_a_passing_checkpoint_without_reinitializing(tmp_path: Path) -> None:
