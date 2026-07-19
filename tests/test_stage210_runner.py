@@ -110,6 +110,32 @@ def test_stage210_resume_uses_deepspeed_state_without_reapplying_nano(tmp_path: 
     assert config["funasr_nano_ctc_init_load_rwkv_encoder_from_qkv"] is False
 
 
+def test_stage210_eval_only_can_score_trained_subblock_without_reinitializing(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "stage210a-step10000.pt"
+    config = _phase_config(
+        phase=PHASES["subblock"],
+        output_dir=tmp_path / "eval",
+        init_checkpoint=checkpoint,
+        nano_checkpoint=tmp_path / "model.pt",
+        resume=False,
+        smoke=False,
+        eval_only=True,
+        skip_nano_init=True,
+    )
+
+    assert config["max_steps"] == 0
+    assert config["epochs"] is None
+    assert config["init_checkpoint_path"] == str(checkpoint)
+    assert config["funasr_nano_ctc_init_checkpoint_path"] is None
+    assert config["funasr_nano_ctc_init_load_rwkv_encoder_from_qkv"] is False
+    assert config["funasr_nano_ctc_init_load_decoder"] is False
+    assert config["funasr_nano_ctc_init_load_head"] is False
+    assert config["step_eval_samples"] == 256
+    assert config["step_eval_at_start"] is True
+    assert config["save_deepspeed_sharded_checkpoints"] is False
+    assert config["wandb_enabled"] is False
+
+
 def test_stage210_direct_script_entrypoint_is_runnable(tmp_path: Path) -> None:
     checkpoint = tmp_path / "stage209.pt"
     nano_checkpoint = tmp_path / "model.pt"

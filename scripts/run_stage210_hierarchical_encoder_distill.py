@@ -105,7 +105,10 @@ def _phase_config(
     smoke: bool,
     smoke_steps: int = 2,
     qkv_scale_mode: str = "rwkv_norm",
+    eval_only: bool = False,
+    skip_nano_init: bool = False,
 ) -> dict[str, Any]:
+    apply_nano_init = bool(phase.apply_nano_init and not skip_nano_init)
     config = _base_config(output_dir)
     config.update(
         {
@@ -127,8 +130,8 @@ def _phase_config(
             "batch_size": TRAIN_BATCH_SIZE,
             "batch_token_budget": TRAIN_FRAME_BUDGET,
             "length_bucket_frame_budget": TRAIN_FRAME_BUDGET,
-            "max_steps": int(smoke_steps) if smoke else None,
-            "epochs": None if smoke else 1,
+            "max_steps": 0 if eval_only else (int(smoke_steps) if smoke else None),
+            "epochs": None if smoke or eval_only else 1,
             "init_checkpoint_path": None if resume else str(init_checkpoint),
             "resume_from": "latest" if resume else None,
             "resume_tag": None,
@@ -143,7 +146,7 @@ def _phase_config(
             "step_eval_shuffle": False,
             "step_eval_at_start": True,
             "top_k_step_checkpoints": 2 if smoke else 4,
-            "save_deepspeed_sharded_checkpoints": not smoke,
+            "save_deepspeed_sharded_checkpoints": not smoke and not eval_only,
             "num_workers": 2 if smoke else 8,
             "decoded_batch_prefetch": 1 if smoke else 2,
             "ctc_decoder_type": "funasr_nano_transformer",
@@ -155,16 +158,16 @@ def _phase_config(
             "ctc_decoder_dropout": 0.0,
             "ctc_decoder_attention_dropout": 0.0,
             "funasr_nano_ctc_init_checkpoint_path": (
-                str(nano_checkpoint) if phase.apply_nano_init and not resume else None
+                str(nano_checkpoint) if apply_nano_init and not resume else None
             ),
             "funasr_nano_ctc_init_load_encoder": False,
             "funasr_nano_ctc_init_load_encoder_attention": False,
             "funasr_nano_ctc_init_load_rwkv_encoder_from_qkv": bool(
-                phase.apply_nano_init and not resume
+                apply_nano_init and not resume
             ),
             "funasr_nano_ctc_init_rwkv_qkv_scale_mode": str(qkv_scale_mode),
-            "funasr_nano_ctc_init_load_decoder": bool(phase.apply_nano_init and not resume),
-            "funasr_nano_ctc_init_load_head": bool(phase.apply_nano_init and not resume),
+            "funasr_nano_ctc_init_load_decoder": bool(apply_nano_init and not resume),
+            "funasr_nano_ctc_init_load_head": bool(apply_nano_init and not resume),
             "funasr_nano_ctc_teacher_blank_id": 60514,
             "freeze_encoder": False,
             "freeze_encoder_except_time_mixer": bool(phase.freeze_encoder_except_time_mixer),
@@ -213,7 +216,7 @@ def _phase_config(
             "p_max": 0.0,
             "warmup_steps": 0,
             "ramp_steps": 0,
-            "wandb_enabled": not smoke,
+            "wandb_enabled": not smoke and not eval_only,
             "wandb_project": "rwkvasr_longform_asr_gigaspeech_wenetspeech",
             "wandb_run_name": f"{output_dir.name}_{phase.name}",
         }
@@ -227,8 +230,10 @@ def _write_config(
     config: dict[str, Any],
     *,
     smoke: bool,
+    eval_only: bool = False,
 ) -> Path:
-    target_dir = config_dir / ("smoke" if smoke else "formal")
+    mode = "eval" if eval_only else ("smoke" if smoke else "formal")
+    target_dir = config_dir / mode
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"stage210_{phase.name}.yaml"
     save_yaml(path, config)
@@ -285,6 +290,8 @@ def main() -> int:
     parser.add_argument("--nano-checkpoint", type=Path, default=NANO_CHECKPOINT)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--skip-nano-init", action="store_true")
     parser.add_argument("--smoke-steps", type=int, default=2)
     parser.add_argument("--master-port", type=int, default=29500)
     parser.add_argument(
@@ -295,13 +302,22 @@ def main() -> int:
     args = parser.parse_args()
     if int(args.smoke_steps) <= 0:
         parser.error("--smoke-steps must be positive")
+    if args.smoke and args.eval_only:
+        parser.error("--smoke and --eval-only are mutually exclusive")
+    if args.skip_nano_init and args.init_checkpoint is None:
+        parser.error("--skip-nano-init requires an explicit --init-checkpoint")
 
     phase = PHASES[str(args.phase)]
     base_output_dir = args.output_dir or _default_output_dir(phase)
-    output_dir = Path(f"{base_output_dir}_smoke") if args.smoke else base_output_dir
+    if args.smoke:
+        output_dir = Path(f"{base_output_dir}_smoke")
+    elif args.eval_only:
+        output_dir = Path(f"{base_output_dir}_eval")
+    else:
+        output_dir = base_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     latest_step = _latest_step(output_dir)
-    resume = latest_step > 0
+    resume = latest_step > 0 and not args.eval_only
 
     init_checkpoint = args.init_checkpoint
     if init_checkpoint is None and phase.name == "subblock":
@@ -312,7 +328,7 @@ def main() -> int:
         init_checkpoint = output_dir / "resume-placeholder.pt"
     if not resume and not init_checkpoint.is_file():
         raise FileNotFoundError(str(init_checkpoint))
-    if phase.apply_nano_init and not resume and not args.nano_checkpoint.is_file():
+    if phase.apply_nano_init and not args.skip_nano_init and not resume and not args.nano_checkpoint.is_file():
         raise FileNotFoundError(str(args.nano_checkpoint))
 
     config = _phase_config(
@@ -324,18 +340,34 @@ def main() -> int:
         smoke=bool(args.smoke),
         smoke_steps=int(args.smoke_steps),
         qkv_scale_mode=str(args.qkv_scale_mode),
+        eval_only=bool(args.eval_only),
+        skip_nano_init=bool(args.skip_nano_init),
     )
-    config_path = _write_config(args.config_dir, phase, config, smoke=bool(args.smoke))
-    estimated_steps = int(args.smoke_steps) if args.smoke else _split_steps(
-        EASY_SPLIT,
-        batch_size=TRAIN_BATCH_SIZE,
-        world_size=4,
-        frame_budget=TRAIN_FRAME_BUDGET,
+    config_path = _write_config(
+        args.config_dir,
+        phase,
+        config,
+        smoke=bool(args.smoke),
+        eval_only=bool(args.eval_only),
+    )
+    estimated_steps = (
+        0
+        if args.eval_only
+        else (
+            int(args.smoke_steps)
+            if args.smoke
+            else _split_steps(
+                EASY_SPLIT,
+                batch_size=TRAIN_BATCH_SIZE,
+                world_size=4,
+                frame_budget=TRAIN_FRAME_BUDGET,
+            )
+        )
     )
     print(f"phase={phase.name}", flush=True)
     print(f"output_dir={output_dir}", flush=True)
     print(f"init_checkpoint={init_checkpoint}", flush=True)
-    print(f"resume={resume} latest_step={latest_step}", flush=True)
+    print(f"resume={resume} latest_step={latest_step} eval_only={bool(args.eval_only)}", flush=True)
     print(
         f"data=easy rows=1174987 hours={EASY_SPLIT.hours:.3f} estimated_steps={estimated_steps}",
         flush=True,
@@ -354,7 +386,12 @@ def main() -> int:
     if code != 0:
         print(f"Stage210 phase failed: {phase.name} exit={code}", file=sys.stderr, flush=True)
         return code
-    if not args.dry_run:
+    if not args.dry_run and args.eval_only:
+        baseline_path = output_dir / "step_eval_baseline.yaml"
+        if not baseline_path.is_file():
+            raise RuntimeError(f"Stage210 eval-only run did not produce {baseline_path}")
+        print(f"evaluation complete: {baseline_path}", flush=True)
+    elif not args.dry_run:
         completed_step = _latest_step(output_dir)
         if completed_step < estimated_steps:
             raise RuntimeError(
