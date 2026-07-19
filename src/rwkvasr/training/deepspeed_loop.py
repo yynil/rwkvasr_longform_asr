@@ -1506,6 +1506,8 @@ class _LayerHiddenDistillationResult:
     layer_teacher_rms: dict[int, float]
     layer_rms_ratio: dict[int, float]
     layer_cosine: dict[int, float]
+    layer_frames: dict[int, float]
+    layer_elements: dict[int, float]
     matched_samples: int
     missing_samples: int
     events: int
@@ -1857,11 +1859,93 @@ def _ctc_teacher_layer_hidden_loss(
             for layer_id, stat in layer_stats_float.items()
             if stat["frames"] > 0.0
         },
+        layer_frames={
+            layer_id: stat["frames"]
+            for layer_id, stat in layer_stats_float.items()
+            if stat["frames"] > 0.0
+        },
+        layer_elements={
+            layer_id: stat["elements"]
+            for layer_id, stat in layer_stats_float.items()
+            if stat["elements"] > 0.0
+        },
         matched_samples=len(matched_ids),
         missing_samples=len(missing_ids),
         events=events,
         max_frame_delta=max_frame_delta,
     )
+
+
+_LAYER_EVAL_LOSS_SUM = 0
+_LAYER_EVAL_ENERGY_SUM = 1
+_LAYER_EVAL_LOG_RMS_SUM = 2
+_LAYER_EVAL_COSINE_SUM = 3
+_LAYER_EVAL_FRAME_WEIGHT = 4
+_LAYER_EVAL_STUDENT_SQ_SUM = 5
+_LAYER_EVAL_TEACHER_SQ_SUM = 6
+_LAYER_EVAL_ELEMENT_WEIGHT = 7
+_LAYER_EVAL_WIDTH = 8
+
+
+def _accumulate_layer_eval_metrics(
+    accumulator: torch.Tensor,
+    result: _LayerHiddenDistillationResult,
+) -> None:
+    layer_ids = tuple(result.layer_losses)
+    if not layer_ids:
+        return
+    loss_values = torch.stack(
+        [result.layer_losses[layer_id] for layer_id in layer_ids]
+    ).detach().cpu().tolist()
+    for layer_id, loss_value in zip(layer_ids, loss_values, strict=True):
+        if not 0 <= int(layer_id) < int(accumulator.size(0)):
+            raise ValueError(f"Layer eval metric id is out of range: {layer_id}")
+        frame_weight = float(result.layer_frames.get(layer_id, 0.0))
+        element_weight = float(result.layer_elements.get(layer_id, 0.0))
+        if frame_weight <= 0.0 or element_weight <= 0.0:
+            continue
+        student_rms = float(result.layer_student_rms[layer_id])
+        teacher_rms = float(result.layer_teacher_rms[layer_id])
+        row = accumulator[int(layer_id)]
+        row[_LAYER_EVAL_LOSS_SUM] += float(loss_value) * frame_weight
+        row[_LAYER_EVAL_ENERGY_SUM] += float(result.layer_energy_mse[layer_id]) * frame_weight
+        row[_LAYER_EVAL_LOG_RMS_SUM] += float(result.layer_log_rms[layer_id]) * frame_weight
+        row[_LAYER_EVAL_COSINE_SUM] += float(result.layer_cosine[layer_id]) * frame_weight
+        row[_LAYER_EVAL_FRAME_WEIGHT] += frame_weight
+        row[_LAYER_EVAL_STUDENT_SQ_SUM] += student_rms * student_rms * element_weight
+        row[_LAYER_EVAL_TEACHER_SQ_SUM] += teacher_rms * teacher_rms * element_weight
+        row[_LAYER_EVAL_ELEMENT_WEIGHT] += element_weight
+
+
+def _finalize_layer_eval_metrics(
+    accumulator: torch.Tensor,
+    *,
+    device: torch.device,
+) -> dict[int, dict[str, float]]:
+    reduced = accumulator.to(device=device, dtype=torch.float64)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    rows = reduced.cpu().tolist()
+    metrics: dict[int, dict[str, float]] = {}
+    for layer_id, row in enumerate(rows):
+        frame_weight = float(row[_LAYER_EVAL_FRAME_WEIGHT])
+        element_weight = float(row[_LAYER_EVAL_ELEMENT_WEIGHT])
+        if frame_weight <= 0.0 or element_weight <= 0.0:
+            continue
+        student_rms = math.sqrt(max(float(row[_LAYER_EVAL_STUDENT_SQ_SUM]), 0.0) / element_weight)
+        teacher_rms = math.sqrt(max(float(row[_LAYER_EVAL_TEACHER_SQ_SUM]), 0.0) / element_weight)
+        metrics[layer_id] = {
+            "loss": float(row[_LAYER_EVAL_LOSS_SUM]) / frame_weight,
+            "energy_mse": float(row[_LAYER_EVAL_ENERGY_SUM]) / frame_weight,
+            "log_rms": float(row[_LAYER_EVAL_LOG_RMS_SUM]) / frame_weight,
+            "cosine": float(row[_LAYER_EVAL_COSINE_SUM]) / frame_weight,
+            "student_rms": student_rms,
+            "teacher_rms": teacher_rms,
+            "rms_ratio": student_rms / max(teacher_rms, 1.0e-12),
+            "frame_weight": frame_weight,
+            "element_weight": element_weight,
+        }
+    return metrics
 
 
 def _online_ctc_teacher_distillation_loss(
@@ -2101,6 +2185,7 @@ def _evaluate_epoch_loss(
     max_eval_samples: int | None = None,
     config: DeepSpeedTrainConfig | None = None,
     ctc_teacher_online: FunASRNanoCTCTopKOnlineTeacher | None = None,
+    layer_metrics_output: dict[int, dict[str, float]] | None = None,
 ) -> tuple[float, int]:
     if loader is None:
         return float("nan"), 0
@@ -2110,6 +2195,11 @@ def _evaluate_epoch_loss(
     model.eval()
     local_loss_sum = 0.0
     local_sample_count = 0
+    layer_eval_accumulator = (
+        torch.zeros((int(config.num_layers), _LAYER_EVAL_WIDTH), dtype=torch.float64)
+        if layer_metrics_output is not None and config is not None
+        else None
+    )
     local_eval_limit = None
     if max_eval_samples is not None:
         world_size = _world_size()
@@ -2246,6 +2336,8 @@ def _evaluate_epoch_loss(
                     missing_policy=config.ctc_teacher_topk_missing_policy,
                 )
                 loss = loss + layer_result.loss
+                if layer_eval_accumulator is not None:
+                    _accumulate_layer_eval_metrics(layer_eval_accumulator, layer_result)
         else:
             loss = trainer.eval_loss(batch, mode=mode)
         batch_size = int(batch.features.size(0))
@@ -2258,6 +2350,11 @@ def _evaluate_epoch_loss(
         count_tensor = torch.tensor([float(local_sample_count)], device=device, dtype=torch.float64)
         dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
         global_sample_count = int(round(float(count_tensor.item())))
+    if layer_metrics_output is not None and layer_eval_accumulator is not None:
+        layer_metrics_output.clear()
+        layer_metrics_output.update(
+            _finalize_layer_eval_metrics(layer_eval_accumulator, device=device)
+        )
     return _all_reduce_mean(local_loss_sum, local_sample_count, device=device), global_sample_count
 
 
@@ -5238,6 +5335,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             description="deepspeed-train",
         )
     if bool(config.step_eval_at_start) and start_step == 0 and step_eval_every is not None:
+        initial_layer_metrics: dict[int, dict[str, float]] = {}
         initial_eval_loss, initial_eval_count = _evaluate_epoch_loss(
             model=engine.module,
             loader=step_eval_loader,
@@ -5249,6 +5347,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             max_eval_samples=int(config.step_eval_samples),
             config=config,
             ctc_teacher_online=ctc_teacher_online,
+            layer_metrics_output=initial_layer_metrics,
         )
         if _is_rank_zero():
             baseline_payload = {
@@ -5256,6 +5355,10 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 "eval_loss": initial_eval_loss,
                 "eval_samples": initial_eval_count,
                 "shuffle": bool(config.step_eval_shuffle),
+                "layer_metrics": {
+                    str(layer_id): metrics
+                    for layer_id, metrics in initial_layer_metrics.items()
+                },
             }
             save_yaml(output_dir / "step_eval_baseline.yaml", baseline_payload)
             _rank_zero_log(
@@ -5268,6 +5371,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     "eval/step_eval_loss": initial_eval_loss,
                     "eval/step_eval_samples": initial_eval_count,
                     "eval/step_eval_baseline": 1,
+                    **{
+                        f"eval/layer_{layer_id}_{metric_name}": metrics[metric_name]
+                        for layer_id, metrics in initial_layer_metrics.items()
+                        for metric_name in ("loss", "cosine", "rms_ratio")
+                    },
                 },
                 step=0,
             )
@@ -6415,6 +6523,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         save_deepspeed_sharded=bool(config.save_deepspeed_sharded_checkpoints),
                     )
                     if step_eval_every is not None and step % step_eval_every == 0:
+                        step_layer_metrics: dict[int, dict[str, float]] = {}
                         step_eval_loss, step_eval_count = _evaluate_epoch_loss(
                             model=engine.module,
                             loader=step_eval_loader,
@@ -6426,6 +6535,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             max_eval_samples=int(config.step_eval_samples),
                             config=config,
                             ctc_teacher_online=ctc_teacher_online,
+                            layer_metrics_output=step_layer_metrics,
                         )
                         step_eval_valid = step_eval_count > 0 and math.isfinite(step_eval_loss)
                         if step_eval_valid:
@@ -6436,6 +6546,22 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                 "eval_samples": step_eval_count,
                                 **saved_artifacts,
                             }
+                            if step_layer_metrics:
+                                layer_metrics_path = output_dir / f"step_eval_layers_step-{step}.yaml"
+                                if _is_rank_zero():
+                                    save_yaml(
+                                        layer_metrics_path,
+                                        {
+                                            "step": step,
+                                            "eval_loss": step_eval_loss,
+                                            "eval_samples": step_eval_count,
+                                            "layers": {
+                                                str(layer_id): metrics
+                                                for layer_id, metrics in step_layer_metrics.items()
+                                            },
+                                        },
+                                    )
+                                step_record["layer_metrics_path"] = str(layer_metrics_path)
                             step_checkpoint_history.append(step_record)
                             saved_step_records = [
                                 record
@@ -6485,6 +6611,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                         "eval/step_eval_loss": step_eval_loss,
                                         "eval/step_eval_samples": step_eval_count,
                                         "checkpoint/top_k_kept": len(best_step_checkpoints),
+                                        **{
+                                            f"eval/layer_{layer_id}_{metric_name}": metrics[metric_name]
+                                            for layer_id, metrics in step_layer_metrics.items()
+                                            for metric_name in ("loss", "cosine", "rms_ratio")
+                                        },
                                     },
                                     step=step,
                                 )

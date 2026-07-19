@@ -10,7 +10,9 @@ from rwkvasr.cli.train_ctc_deepspeed import _resolve_deepspeed_train_config, bui
 from rwkvasr.config import load_yaml
 from rwkvasr.training.deepspeed_loop import (
     DeepSpeedTrainConfig,
+    _accumulate_layer_eval_metrics,
     _ctc_teacher_layer_hidden_loss,
+    _finalize_layer_eval_metrics,
     _maybe_load_initial_model_checkpoint,
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
@@ -229,6 +231,15 @@ def test_layer_hidden_energy_mse_is_bounded_and_detects_scale_mismatch() -> None
     assert result.component_rms_ratio["mixer"] == pytest.approx(10.0, rel=1.0e-5)
     assert result.component_log_rms["mixer"] > 0.0
     assert result.component_cosine["mixer"] == pytest.approx(1.0, abs=1.0e-5)
+    accumulator = torch.zeros((2, 8), dtype=torch.float64)
+    _accumulate_layer_eval_metrics(accumulator, result)
+    _accumulate_layer_eval_metrics(accumulator, result)
+    layer_metrics = _finalize_layer_eval_metrics(accumulator, device=torch.device("cpu"))
+    assert set(layer_metrics) == {0}
+    assert layer_metrics[0]["loss"] == pytest.approx(result.layer_losses[0].item())
+    assert layer_metrics[0]["energy_mse"] == pytest.approx(result.layer_energy_mse[0])
+    assert layer_metrics[0]["cosine"] == pytest.approx(1.0, abs=1.0e-5)
+    assert layer_metrics[0]["rms_ratio"] == pytest.approx(10.0, rel=1.0e-5)
     result.loss.backward()
     assert student.grad is not None
 
