@@ -104,6 +104,7 @@ def _phase_config(
     resume: bool,
     smoke: bool,
     smoke_steps: int = 2,
+    qkv_scale_mode: str = "exact",
 ) -> dict[str, Any]:
     config = _base_config(output_dir)
     config.update(
@@ -161,6 +162,7 @@ def _phase_config(
             "funasr_nano_ctc_init_load_rwkv_encoder_from_qkv": bool(
                 phase.apply_nano_init and not resume
             ),
+            "funasr_nano_ctc_init_rwkv_qkv_scale_mode": str(qkv_scale_mode),
             "funasr_nano_ctc_init_load_decoder": bool(phase.apply_nano_init and not resume),
             "funasr_nano_ctc_init_load_head": bool(phase.apply_nano_init and not resume),
             "funasr_nano_ctc_teacher_blank_id": 60514,
@@ -285,6 +287,11 @@ def main() -> int:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--smoke-steps", type=int, default=2)
     parser.add_argument("--master-port", type=int, default=29500)
+    parser.add_argument(
+        "--qkv-scale-mode",
+        choices=("exact", "rwkv_norm"),
+        default="exact",
+    )
     args = parser.parse_args()
     if int(args.smoke_steps) <= 0:
         parser.error("--smoke-steps must be positive")
@@ -316,6 +323,7 @@ def main() -> int:
         resume=resume,
         smoke=bool(args.smoke),
         smoke_steps=int(args.smoke_steps),
+        qkv_scale_mode=str(args.qkv_scale_mode),
     )
     config_path = _write_config(args.config_dir, phase, config, smoke=bool(args.smoke))
     estimated_steps = int(args.smoke_steps) if args.smoke else _split_steps(

@@ -214,6 +214,11 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument(
+        "--funasr-nano-ctc-init-rwkv-qkv-scale-mode",
+        default=None,
+        choices=("exact", "rwkv_norm"),
+    )
     parser.add_argument("--funasr-nano-ctc-init-load-decoder", dest="funasr_nano_ctc_init_load_decoder", action="store_true", default=None)
     parser.add_argument("--no-funasr-nano-ctc-init-load-decoder", dest="funasr_nano_ctc_init_load_decoder", action="store_false")
     parser.add_argument("--funasr-nano-ctc-init-load-head", dest="funasr_nano_ctc_init_load_head", action="store_true", default=None)
@@ -449,6 +454,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "funasr_nano_ctc_init_load_encoder",
         "funasr_nano_ctc_init_load_encoder_attention",
         "funasr_nano_ctc_init_load_rwkv_encoder_from_qkv",
+        "funasr_nano_ctc_init_rwkv_qkv_scale_mode",
         "funasr_nano_ctc_init_load_decoder",
         "funasr_nano_ctc_init_load_head",
         "funasr_nano_ctc_teacher_blank_id",

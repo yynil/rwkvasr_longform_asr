@@ -48,6 +48,7 @@ def test_stage210_subblock_uses_exact_features_and_nano_initialization(tmp_path:
     assert config["ctc_teacher_online_loss_weight"] == 0.0
     assert config["funasr_nano_ctc_init_checkpoint_path"] == str(nano_checkpoint)
     assert config["funasr_nano_ctc_init_load_rwkv_encoder_from_qkv"] is True
+    assert config["funasr_nano_ctc_init_rwkv_qkv_scale_mode"] == "exact"
     assert config["funasr_nano_ctc_init_load_decoder"] is True
     assert config["funasr_nano_ctc_init_load_head"] is True
     assert config["ctc_decoder_type"] == "funasr_nano_transformer"

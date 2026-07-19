@@ -803,6 +803,7 @@ class RWKVCTCModel(nn.Module):
         load_encoder: bool = False,
         load_encoder_attention: bool = True,
         load_rwkv_encoder_from_qkv: bool = False,
+        rwkv_qkv_projection_scale_mode: str = "exact",
         teacher_blank_id: int = 60514,
         project_ignored_token_ids: tuple[int, ...] | list[int] = (60514,),
         blank_bias_delta: float = 0.0,
@@ -821,6 +822,7 @@ class RWKVCTCModel(nn.Module):
             "rwkv_encoder_loaded": 0,
             "rwkv_encoder_skipped": 0,
             "rwkv_encoder_first_layer_reconstruction_errors": {},
+            "rwkv_encoder_qkv_projection_scale_mode": str(rwkv_qkv_projection_scale_mode),
             "ctc_bridge_loaded": 0,
             "ctc_bridge_skipped": 0,
             "ctc_decoder_loaded": 0,
@@ -853,7 +855,10 @@ class RWKVCTCModel(nn.Module):
                     "frontend_type='sensevoice_rwkv' is required to initialize BiRWKV from Nano QKV weights."
                 )
             non_attention_report = sensevoice_encoder.load_sensevoice_non_attention_state_dict(state_dict)
-            qkv_report = sensevoice_encoder.load_sensevoice_qkv_state_dict(state_dict)
+            qkv_report = sensevoice_encoder.load_sensevoice_qkv_state_dict(
+                state_dict,
+                projection_scale_mode=rwkv_qkv_projection_scale_mode,
+            )
             report["rwkv_encoder_loaded"] = len(
                 set(non_attention_report["loaded"]) | set(qkv_report["loaded"])
             )
@@ -862,6 +867,9 @@ class RWKVCTCModel(nn.Module):
             )
             report["rwkv_encoder_first_layer_reconstruction_errors"] = qkv_report[
                 "first_layer_reconstruction_errors"
+            ]
+            report["rwkv_encoder_qkv_projection_scale_mode"] = qkv_report[
+                "projection_scale_mode"
             ]
         if load_ctc_decoder:
             if self.ctc_decoder is None:

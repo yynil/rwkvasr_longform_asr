@@ -1,3 +1,6 @@
+import math
+
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -1130,6 +1133,60 @@ def test_sensevoice_rwkv_maps_nano_qkv_into_both_directions() -> None:
             direction.output.weight,
             source["audio_encoder.encoders.0.self_attn.linear_out.weight"],
         )
+
+
+def test_sensevoice_rwkv_can_norm_match_nano_qkv_directions() -> None:
+    torch.manual_seed(2452)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=10,
+            n_embd=8,
+            encoder_output_dim=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=3,
+            vocab_size=16,
+            head_size=4,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    encoder = model.encoder.sensevoice_encoder
+    prefixes = ("encoders0.0", "encoders.0", "tp_encoders.0")
+    source: dict[str, torch.Tensor] = {}
+    for prefix in prefixes:
+        source[f"audio_encoder.{prefix}.self_attn.linear_q_k_v.weight"] = torch.randn(24, 10 if prefix == "encoders0.0" else 8)
+        source[f"audio_encoder.{prefix}.self_attn.linear_out.weight"] = torch.randn(8, 8)
+
+    report = encoder.load_sensevoice_qkv_state_dict(
+        source,
+        projection_scale_mode="rwkv_norm",
+    )
+
+    assert report["projection_scale_mode"] == "rwkv_norm"
+    target_rms = {
+        "receptance": 0.5 / math.sqrt(3.0 * 8.0),
+        "key": 0.05 / math.sqrt(3.0 * 8.0),
+        "value": 0.5 / math.sqrt(3.0 * 8.0),
+    }
+    for layer in encoder.layers:
+        for direction in (layer.time_mixer.forward_mixer, layer.time_mixer.backward_mixer):
+            for name, expected_rms in target_rms.items():
+                actual_rms = getattr(direction, name).weight.float().square().mean().sqrt().item()
+                assert actual_rms == pytest.approx(expected_rms, rel=1.0e-5)
+
+    second_q = source["audio_encoder.encoders.0.self_attn.linear_q_k_v.weight"].chunk(3, dim=0)[0]
+    mapped_q = encoder.layers[1].time_mixer.forward_mixer.receptance.weight
+    assert torch.nn.functional.cosine_similarity(
+        mapped_q.flatten(),
+        second_q.flatten(),
+        dim=0,
+    ).item() == pytest.approx(1.0, abs=1.0e-6)
+    assert torch.equal(
+        encoder.layers[1].time_mixer.forward_mixer.output.weight,
+        source["audio_encoder.encoders.0.self_attn.linear_out.weight"],
+    )
 
 
 def test_sensevoice_conformer_conv_encoder_forward_shape_and_lengths() -> None:

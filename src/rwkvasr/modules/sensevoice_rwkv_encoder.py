@@ -468,8 +468,20 @@ class SenseVoiceRWKVEncoder(nn.Module):
         state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
         return self.load_sensevoice_non_attention_state_dict(state_dict)
 
-    def load_sensevoice_qkv_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Any]:
+    def load_sensevoice_qkv_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        *,
+        projection_scale_mode: str = "exact",
+    ) -> dict[str, Any]:
         """Warm-start BiRWKV projections from mapped SenseVoice SANM Q/K/V weights."""
+
+        projection_scale_mode = str(projection_scale_mode).lower().strip()
+        if projection_scale_mode not in {"exact", "rwkv_norm"}:
+            raise ValueError(
+                "projection_scale_mode must be 'exact' or 'rwkv_norm', "
+                f"got {projection_scale_mode!r}."
+            )
 
         source_roots = (
             "",
@@ -497,6 +509,14 @@ class SenseVoiceRWKVEncoder(nn.Module):
             signs = basis[row_indices, max_indices].sign()
             signs = torch.where(signs == 0, torch.ones_like(signs), signs)
             return basis * signs.unsqueeze(1)
+
+        def projection_for_rwkv(source: Tensor, name: str) -> Tensor:
+            if projection_scale_mode == "exact":
+                return source
+            half_range = 0.05 if name == "key" else 0.5
+            target_rms = half_range / math.sqrt(3.0 * float(self.config.n_embd))
+            source_rms = source.float().square().mean().sqrt().clamp_min(1.0e-12)
+            return source * (target_rms / source_rms)
 
         with torch.no_grad():
             for layer_idx, layer in enumerate(self.layers):
@@ -540,15 +560,23 @@ class SenseVoiceRWKVEncoder(nn.Module):
                         reconstruction_errors[name] = float(relative_error.item())
                 else:
                     projected_weights = (q_weight, k_weight, v_weight)
+                transfer_weights = tuple(
+                    projection_for_rwkv(weight, name)
+                    for name, weight in zip(
+                        ("receptance", "key", "value"),
+                        projected_weights,
+                        strict=True,
+                    )
+                )
 
                 for direction_name, mixer in (
                     ("forward_mixer", layer.time_mixer.forward_mixer),
                     ("backward_mixer", layer.time_mixer.backward_mixer),
                 ):
                     for target_name, target, source in (
-                        ("receptance", mixer.receptance.weight, projected_weights[0]),
-                        ("key", mixer.key.weight, projected_weights[1]),
-                        ("value", mixer.value.weight, projected_weights[2]),
+                        ("receptance", mixer.receptance.weight, transfer_weights[0]),
+                        ("key", mixer.key.weight, transfer_weights[1]),
+                        ("value", mixer.value.weight, transfer_weights[2]),
                     ):
                         if tuple(target.shape) != tuple(source.shape):
                             skipped.append(f"{layer_prefix}.{direction_name}.{target_name}.weight")
@@ -581,6 +609,7 @@ class SenseVoiceRWKVEncoder(nn.Module):
             "loaded": sorted(set(loaded)),
             "skipped": sorted(set(skipped)),
             "first_layer_reconstruction_errors": reconstruction_errors,
+            "projection_scale_mode": projection_scale_mode,
         }
 
 

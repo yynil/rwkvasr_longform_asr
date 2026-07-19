@@ -335,6 +335,7 @@ class DeepSpeedTrainConfig:
     funasr_nano_ctc_init_load_encoder: bool = False
     funasr_nano_ctc_init_load_encoder_attention: bool = True
     funasr_nano_ctc_init_load_rwkv_encoder_from_qkv: bool = False
+    funasr_nano_ctc_init_rwkv_qkv_scale_mode: str = "exact"
     funasr_nano_ctc_init_load_decoder: bool = True
     funasr_nano_ctc_init_load_head: bool = True
     funasr_nano_ctc_teacher_blank_id: int = 60514
@@ -420,6 +421,7 @@ def _maybe_load_funasr_nano_ctc_init_distributed(model: RWKVCTCModel, config: De
         load_encoder=bool(config.funasr_nano_ctc_init_load_encoder),
         load_encoder_attention=bool(config.funasr_nano_ctc_init_load_encoder_attention),
         load_rwkv_encoder_from_qkv=bool(config.funasr_nano_ctc_init_load_rwkv_encoder_from_qkv),
+        rwkv_qkv_projection_scale_mode=str(config.funasr_nano_ctc_init_rwkv_qkv_scale_mode),
         load_ctc_decoder=bool(config.funasr_nano_ctc_init_load_decoder),
         load_ctc_head=bool(config.funasr_nano_ctc_init_load_head),
         teacher_blank_id=int(config.funasr_nano_ctc_teacher_blank_id),
@@ -435,6 +437,7 @@ def _maybe_load_funasr_nano_ctc_init_distributed(model: RWKVCTCModel, config: De
         f"rwkv_encoder_tensors={report['rwkv_encoder_loaded']} "
         f"rwkv_encoder_skipped={report['rwkv_encoder_skipped']} "
         f"rwkv_first_layer_errors={report['rwkv_encoder_first_layer_reconstruction_errors']} "
+        f"rwkv_qkv_scale_mode={report['rwkv_encoder_qkv_projection_scale_mode']} "
         f"bridge_tensors={report.get('ctc_bridge_loaded', 0)} "
         f"bridge_skipped={report.get('ctc_bridge_skipped', 0)} "
         f"decoder_tensors={report['ctc_decoder_loaded']} "
