@@ -3764,6 +3764,13 @@ def _ctc_teacher_full_frame_kl(
     return frame_kl * (temperature * temperature)
 
 
+def _ctc_teacher_time_index_select(value: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    return value.index_select(
+        0,
+        indices.to(device=value.device, dtype=torch.long),
+    )
+
+
 def _ctc_teacher_full_loss(
     student_logits: torch.Tensor,
     student_lengths: torch.Tensor | None,
@@ -3879,11 +3886,17 @@ def _ctc_teacher_full_loss(
                 frame_indices = torch.round(positions * float(teacher_time - 1) / float(student_time - 1)).to(
                     dtype=torch.long
                 )
-            frame_indices = frame_indices.clamp(min=0, max=teacher_time - 1).cpu()
-            selected_log_probs = teacher_full_log_probs.index_select(0, frame_indices)
+            frame_indices = frame_indices.clamp(min=0, max=teacher_time - 1)
+            selected_log_probs = _ctc_teacher_time_index_select(
+                teacher_full_log_probs,
+                frame_indices,
+            )
             if teacher_ids is not None and teacher_log_probs is not None:
-                selected_ids = teacher_ids.index_select(0, frame_indices)
-                selected_topk_log_probs = teacher_log_probs.index_select(0, frame_indices)
+                selected_ids = _ctc_teacher_time_index_select(teacher_ids, frame_indices)
+                selected_topk_log_probs = _ctc_teacher_time_index_select(
+                    teacher_log_probs,
+                    frame_indices,
+                )
                 selected_mask = _ctc_teacher_frame_filter_mask(
                     selected_ids,
                     selected_topk_log_probs,
@@ -3901,16 +3914,19 @@ def _ctc_teacher_full_loss(
             scaled = positions * float(teacher_time - 1) / float(student_time - 1)
             lo = torch.floor(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
             hi = torch.ceil(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
-            alpha = (scaled - lo.to(dtype=torch.float32)).to(dtype=torch.float32).cpu().unsqueeze(-1)
-            lo_log_probs = teacher_full_log_probs.index_select(0, lo.cpu())
-            hi_log_probs = teacher_full_log_probs.index_select(0, hi.cpu())
+            alpha = (scaled - lo.to(dtype=torch.float32)).to(
+                device=teacher_full_log_probs.device,
+                dtype=torch.float32,
+            ).unsqueeze(-1)
+            lo_log_probs = _ctc_teacher_time_index_select(teacher_full_log_probs, lo)
+            hi_log_probs = _ctc_teacher_time_index_select(teacher_full_log_probs, hi)
             selected_probs = lo_log_probs.exp() * (1.0 - alpha) + hi_log_probs.exp() * alpha
             selected_log_probs = selected_probs.log()
             if teacher_ids is not None and teacher_log_probs is not None:
-                lo_ids = teacher_ids.index_select(0, lo.cpu())
-                lo_topk_log_probs = teacher_log_probs.index_select(0, lo.cpu())
-                hi_ids = teacher_ids.index_select(0, hi.cpu())
-                hi_topk_log_probs = teacher_log_probs.index_select(0, hi.cpu())
+                lo_ids = _ctc_teacher_time_index_select(teacher_ids, lo)
+                lo_topk_log_probs = _ctc_teacher_time_index_select(teacher_log_probs, lo)
+                hi_ids = _ctc_teacher_time_index_select(teacher_ids, hi)
+                hi_topk_log_probs = _ctc_teacher_time_index_select(teacher_log_probs, hi)
                 selected_mask = _ctc_teacher_frame_filter_mask(
                     lo_ids,
                     lo_topk_log_probs,

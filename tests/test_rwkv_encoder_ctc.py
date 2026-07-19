@@ -13,6 +13,7 @@ from rwkvasr.modules import (
     build_inference_direction_mask,
 )
 from rwkvasr.training.deepspeed_loop import (
+    _ctc_teacher_full_loss,
     _ctc_teacher_hidden_loss,
     _ctc_teacher_nonblank_hard_loss,
     _ctc_teacher_nonblank_window_loss,
@@ -404,6 +405,50 @@ def test_project_ctc_teacher_full_log_probs_keeps_preprojected_blank() -> None:
     assert projected.shape == (2, 6)
     assert torch.isneginf(projected[:, 4]).all()
     assert torch.allclose(projected[:, 5], raw[:, 5])
+
+
+@pytest.mark.parametrize("time_map", ["nearest", "linear"])
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_ctc_teacher_full_loss_supports_device_resident_targets(
+    time_map: str,
+    device_type: str,
+) -> None:
+    if device_type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    device = torch.device(device_type)
+    teacher_logits = torch.randn(5, 6, device=device)
+    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1).to(dtype=torch.float16)
+    student_logits = torch.randn(1, 3, 6, device=device, requires_grad=True)
+    records = {
+        "utt-a": {
+            "full_log_probs": teacher_log_probs,
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [],
+        }
+    }
+
+    loss, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3], device=device),
+        ["utt-a"],
+        records,
+        blank_id=5,
+        time_map=time_map,
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+    )
+
+    assert loss.device == student_logits.device
+    assert torch.isfinite(loss)
+    assert matched == 1
+    assert missing == 0
+    loss.backward()
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
 
 
 def test_ctc_suppressed_token_ids_mask_logits_but_not_blank() -> None:
