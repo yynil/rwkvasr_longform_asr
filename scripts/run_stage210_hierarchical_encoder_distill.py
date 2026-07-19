@@ -80,7 +80,7 @@ PHASES: dict[str, AlignmentPhase] = {
 
 def _default_output_dir(phase: AlignmentPhase) -> Path:
     suffix = (
-        "stage209_nanoqkv_exactfrontend_easy1490h_1ep_hidden_localenergy_uniformeval_lr1e5_4x4090"
+        "stage209_nanoqkv_rwkvnorm_exactfrontend_easy1490h_1ep_hidden_localenergy_uniformeval_lr1e5_4x4090"
         if phase.name == "subblock"
         else "stage210a_easy1490h_1ep_hidden_fullblock_lr3e6_4x4090"
     )
@@ -104,7 +104,7 @@ def _phase_config(
     resume: bool,
     smoke: bool,
     smoke_steps: int = 2,
-    qkv_scale_mode: str = "exact",
+    qkv_scale_mode: str = "rwkv_norm",
 ) -> dict[str, Any]:
     config = _base_config(output_dir)
     config.update(
@@ -290,7 +290,7 @@ def main() -> int:
     parser.add_argument(
         "--qkv-scale-mode",
         choices=("exact", "rwkv_norm"),
-        default="exact",
+        default="rwkv_norm",
     )
     args = parser.parse_args()
     if int(args.smoke_steps) <= 0:
