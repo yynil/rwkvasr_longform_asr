@@ -88,14 +88,17 @@ def test_layer_hidden_sampler_keeps_boundaries_and_covers_every_layer() -> None:
     assert {0, 49, 50, 69}.issubset(boundary_selection)
 
 
-def test_fixed_eval_layer_sampler_covers_layers_uniformly() -> None:
+def test_fixed_eval_layer_sampler_covers_layers_uniformly_across_ranks() -> None:
     selections = [
         _select_eval_layer_hidden_ids(
             batch_index=batch_index,
             num_layers=70,
             sample_count=8,
+            rank=rank,
+            world_size=4,
         )
-        for batch_index in range(64)
+        for batch_index in range(16)
+        for rank in range(4)
     ]
     counts = {
         layer_id: sum(layer_id in selection for selection in selections)
@@ -106,6 +109,25 @@ def test_fixed_eval_layer_sampler_covers_layers_uniformly() -> None:
     assert set().union(*map(set, selections)) == set(range(70))
     assert min(counts.values()) >= 7
     assert max(counts.values()) <= 8
+
+
+def test_fixed_eval_layer_sampler_rejects_invalid_distributed_coordinates() -> None:
+    with pytest.raises(ValueError, match="world_size must be positive"):
+        _select_eval_layer_hidden_ids(
+            batch_index=0,
+            num_layers=70,
+            sample_count=8,
+            rank=0,
+            world_size=0,
+        )
+    with pytest.raises(ValueError, match="rank must be in"):
+        _select_eval_layer_hidden_ids(
+            batch_index=0,
+            num_layers=70,
+            sample_count=8,
+            rank=4,
+            world_size=4,
+        )
 
 
 def test_teacher_forced_layer_alignment_uses_teacher_inputs_and_layer_zero_v_first() -> None:

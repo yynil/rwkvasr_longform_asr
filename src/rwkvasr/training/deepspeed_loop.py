@@ -1265,9 +1265,16 @@ def _select_eval_layer_hidden_ids(
     batch_index: int,
     num_layers: int,
     sample_count: int,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> tuple[int, ...]:
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}.")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}.")
+    global_batch_index = int(batch_index) * int(world_size) + int(rank)
     return _select_layer_hidden_ids(
-        step=batch_index,
+        step=global_batch_index,
         num_layers=num_layers,
         sample_count=sample_count,
         boundary_ids=(),
@@ -2235,6 +2242,8 @@ def _evaluate_epoch_loss(
                     batch_index=eval_batch_index,
                     num_layers=int(config.num_layers),
                     sample_count=int(config.ctc_teacher_online_layer_sample_count),
+                    rank=_rank(),
+                    world_size=_world_size(),
                 )
                 if layer_hidden_enabled
                 else ()
