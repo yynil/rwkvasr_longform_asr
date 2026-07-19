@@ -13,6 +13,7 @@ from rwkvasr.modules import (
     build_inference_direction_mask,
 )
 from rwkvasr.training.deepspeed_loop import (
+    _CTC_FULL_EVAL_WIDTH,
     _ctc_teacher_full_loss,
     _ctc_teacher_hidden_loss,
     _ctc_teacher_nonblank_hard_loss,
@@ -20,6 +21,7 @@ from rwkvasr.training.deepspeed_loop import (
     _ctc_teacher_nonblank_window_topk_loss,
     _ctc_teacher_sequence_presence_loss,
     _ctc_teacher_sequence_window_loss,
+    _finalize_ctc_full_eval_metrics,
     _project_ctc_teacher_full_log_probs,
 )
 
@@ -449,6 +451,60 @@ def test_ctc_teacher_full_loss_supports_device_resident_targets(
     loss.backward()
     assert student_logits.grad is not None
     assert torch.isfinite(student_logits.grad).all()
+
+
+def test_ctc_teacher_full_eval_metrics_expose_blank_peak_and_collapsed_sequence_gap() -> None:
+    teacher_ids = torch.tensor([5, 1, 1, 5, 2])
+    student_ids = torch.tensor([5, 1, 5, 3, 3])
+    teacher_logits = torch.full((5, 6), -20.0)
+    student_logits = torch.full((1, 5, 6), -20.0, requires_grad=True)
+    teacher_logits.scatter_(1, teacher_ids.unsqueeze(1), 20.0)
+    with torch.no_grad():
+        student_logits.scatter_(2, student_ids.view(1, 5, 1), 20.0)
+    records = {
+        "utt-a": {
+            "full_log_probs": F.log_softmax(teacher_logits, dim=-1),
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [],
+        }
+    }
+    accumulator = torch.zeros(_CTC_FULL_EVAL_WIDTH, dtype=torch.float64)
+
+    loss, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([5]),
+        ["utt-a"],
+        records,
+        blank_id=5,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        eval_accumulator=accumulator,
+    )
+    metrics = _finalize_ctc_full_eval_metrics(accumulator, device=torch.device("cpu"))
+
+    assert torch.isfinite(loss)
+    assert matched == 1
+    assert missing == 0
+    assert metrics["full_kl"] > 0.0
+    assert metrics["selected_top1_agreement"] == pytest.approx(0.4)
+    assert metrics["all_top1_agreement"] == pytest.approx(0.4)
+    assert metrics["blank_prob_mae"] > 0.0
+    assert metrics["teacher_nonblank_rate"] == pytest.approx(0.6)
+    assert metrics["student_nonblank_rate"] == pytest.approx(0.6)
+    assert metrics["nonblank_rate_ratio"] == pytest.approx(1.0)
+    assert metrics["ctc_token_error_rate"] == pytest.approx(0.5)
+    assert metrics["collapsed_length_ratio"] == pytest.approx(1.0)
+    assert metrics["sequence_exact_rate"] == 0.0
+    assert metrics["mean_frame_delta"] == 0.0
+    assert metrics["teacher_tokens"] == 2.0
+    assert metrics["student_tokens"] == 2.0
+    assert metrics["matched_utterances"] == 1.0
+    assert metrics["missing_utterances"] == 0.0
 
 
 def test_ctc_suppressed_token_ids_mask_logits_but_not_blank() -> None:
