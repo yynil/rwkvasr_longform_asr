@@ -2199,6 +2199,7 @@ def _evaluate_epoch_loss(
     config: DeepSpeedTrainConfig | None = None,
     ctc_teacher_online: FunASRNanoCTCTopKOnlineTeacher | None = None,
     layer_metrics_output: dict[int, dict[str, float]] | None = None,
+    layer_component_metrics_output: dict[str, dict[int, dict[str, float]]] | None = None,
     logit_metrics_output: dict[str, float] | None = None,
 ) -> tuple[float, int]:
     if loader is None:
@@ -2212,6 +2213,19 @@ def _evaluate_epoch_loss(
     layer_eval_accumulator = (
         torch.zeros((int(config.num_layers), _LAYER_EVAL_WIDTH), dtype=torch.float64)
         if layer_metrics_output is not None and config is not None
+        else None
+    )
+    layer_component_eval_accumulators = (
+        {
+            component: torch.zeros((int(config.num_layers), _LAYER_EVAL_WIDTH), dtype=torch.float64)
+            for component, weight in (
+                ("mixer", float(config.ctc_teacher_online_layer_mixer_loss_weight)),
+                ("ffn", float(config.ctc_teacher_online_layer_ffn_loss_weight)),
+                ("block", float(config.ctc_teacher_online_layer_block_loss_weight)),
+            )
+            if weight > 0.0
+        }
+        if layer_component_metrics_output is not None and config is not None
         else None
     )
     full_eval_accumulator = (
@@ -2362,6 +2376,24 @@ def _evaluate_epoch_loss(
                 loss = loss + layer_result.loss
                 if layer_eval_accumulator is not None:
                     _accumulate_layer_eval_metrics(layer_eval_accumulator, layer_result)
+                if layer_component_eval_accumulators is not None:
+                    for component, accumulator in layer_component_eval_accumulators.items():
+                        component_result = _ctc_teacher_layer_hidden_loss(
+                            student_layer_hiddens,
+                            student_encoded_lengths,
+                            batch.utt_ids,
+                            ctc_teacher_online_records,
+                            layer_ids=selected_layer_ids,
+                            component_weights={component: 1.0},
+                            normalized_mse_weight=float(config.ctc_teacher_online_layer_normalized_mse_weight),
+                            cosine_weight=float(config.ctc_teacher_online_layer_cosine_weight),
+                            energy_mse_weight=float(config.ctc_teacher_online_layer_energy_mse_weight),
+                            log_rms_weight=float(config.ctc_teacher_online_layer_log_rms_weight),
+                            raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
+                            frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
+                            missing_policy=config.ctc_teacher_topk_missing_policy,
+                        )
+                        _accumulate_layer_eval_metrics(accumulator, component_result)
         else:
             loss = trainer.eval_loss(batch, mode=mode)
         batch_size = int(batch.features.size(0))
@@ -2378,6 +2410,14 @@ def _evaluate_epoch_loss(
         layer_metrics_output.clear()
         layer_metrics_output.update(
             _finalize_layer_eval_metrics(layer_eval_accumulator, device=device)
+        )
+    if layer_component_metrics_output is not None and layer_component_eval_accumulators is not None:
+        layer_component_metrics_output.clear()
+        layer_component_metrics_output.update(
+            {
+                component: _finalize_layer_eval_metrics(accumulator, device=device)
+                for component, accumulator in layer_component_eval_accumulators.items()
+            }
         )
     if logit_metrics_output is not None:
         logit_metrics_output.clear()
@@ -5593,6 +5633,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         )
     if bool(config.step_eval_at_start) and start_step == 0 and step_eval_every is not None:
         initial_layer_metrics: dict[int, dict[str, float]] = {}
+        initial_layer_component_metrics: dict[str, dict[int, dict[str, float]]] = {}
         initial_logit_metrics: dict[str, float] = {}
         initial_eval_loss, initial_eval_count = _evaluate_epoch_loss(
             model=engine.module,
@@ -5606,6 +5647,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             config=config,
             ctc_teacher_online=ctc_teacher_online,
             layer_metrics_output=initial_layer_metrics,
+            layer_component_metrics_output=initial_layer_component_metrics,
             logit_metrics_output=initial_logit_metrics,
         )
         if _is_rank_zero():
@@ -5617,6 +5659,13 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 "layer_metrics": {
                     str(layer_id): metrics
                     for layer_id, metrics in initial_layer_metrics.items()
+                },
+                "layer_component_metrics": {
+                    component: {
+                        str(layer_id): metrics
+                        for layer_id, metrics in component_metrics.items()
+                    }
+                    for component, component_metrics in initial_layer_component_metrics.items()
                 },
                 "logit_metrics": initial_logit_metrics,
             }
@@ -5634,6 +5683,12 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     **{
                         f"eval/layer_{layer_id}_{metric_name}": metrics[metric_name]
                         for layer_id, metrics in initial_layer_metrics.items()
+                        for metric_name in ("loss", "cosine", "rms_ratio")
+                    },
+                    **{
+                        f"eval/layer_{layer_id}_{component}_{metric_name}": metrics[metric_name]
+                        for component, component_metrics in initial_layer_component_metrics.items()
+                        for layer_id, metrics in component_metrics.items()
                         for metric_name in ("loss", "cosine", "rms_ratio")
                     },
                     **{
@@ -6788,6 +6843,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     )
                     if step_eval_every is not None and step % step_eval_every == 0:
                         step_layer_metrics: dict[int, dict[str, float]] = {}
+                        step_layer_component_metrics: dict[str, dict[int, dict[str, float]]] = {}
                         step_logit_metrics: dict[str, float] = {}
                         step_eval_loss, step_eval_count = _evaluate_epoch_loss(
                             model=engine.module,
@@ -6801,6 +6857,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             config=config,
                             ctc_teacher_online=ctc_teacher_online,
                             layer_metrics_output=step_layer_metrics,
+                            layer_component_metrics_output=step_layer_component_metrics,
                             logit_metrics_output=step_logit_metrics,
                         )
                         step_eval_valid = step_eval_count > 0 and math.isfinite(step_eval_loss)
@@ -6824,6 +6881,13 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                             "layers": {
                                                 str(layer_id): metrics
                                                 for layer_id, metrics in step_layer_metrics.items()
+                                            },
+                                            "layer_components": {
+                                                component: {
+                                                    str(layer_id): metrics
+                                                    for layer_id, metrics in component_metrics.items()
+                                                }
+                                                for component, component_metrics in step_layer_component_metrics.items()
                                             },
                                             "logit_metrics": step_logit_metrics,
                                         },
@@ -6881,6 +6945,12 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                         **{
                                             f"eval/layer_{layer_id}_{metric_name}": metrics[metric_name]
                                             for layer_id, metrics in step_layer_metrics.items()
+                                            for metric_name in ("loss", "cosine", "rms_ratio")
+                                        },
+                                        **{
+                                            f"eval/layer_{layer_id}_{component}_{metric_name}": metrics[metric_name]
+                                            for component, component_metrics in step_layer_component_metrics.items()
+                                            for layer_id, metrics in component_metrics.items()
                                             for metric_name in ("loss", "cosine", "rms_ratio")
                                         },
                                         **{
