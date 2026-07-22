@@ -282,6 +282,7 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_full_loss_weight: float = 0.0
     ctc_teacher_online_full_temperature: float = 1.0
     ctc_teacher_online_full_frame_filter: str | None = None
+    ctc_teacher_online_full_nonblank_weight: float = 1.0
     ctc_teacher_online_encoder_loss_weight: float = 0.0
     ctc_teacher_online_sequence_loss_weight: float = 0.0
     ctc_teacher_online_sequence_presence_loss_weight: float = 0.0
@@ -2057,6 +2058,7 @@ def _online_ctc_teacher_distillation_loss(
             frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
             missing_policy=config.ctc_teacher_topk_missing_policy,
             temperature=float(config.ctc_teacher_online_full_temperature),
+            nonblank_frame_weight=float(config.ctc_teacher_online_full_nonblank_weight),
             eval_accumulator=full_eval_accumulator,
         )
         total = total + loss_value * full_weight
@@ -4039,6 +4041,7 @@ def _ctc_teacher_full_loss(
     frame_filter_min_nonblank_prob: float,
     missing_policy: str,
     temperature: float,
+    nonblank_frame_weight: float = 1.0,
     eval_accumulator: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int, int]:
     if utt_ids is None:
@@ -4047,6 +4050,11 @@ def _ctc_teacher_full_loss(
         raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
     if missing_policy not in {"skip", "error"}:
         raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
+    if not math.isfinite(float(nonblank_frame_weight)) or float(nonblank_frame_weight) <= 0.0:
+        raise ValueError(
+            "ctc_teacher_online_full_nonblank_weight must be finite and > 0, "
+            f"got {nonblank_frame_weight!r}."
+        )
 
     batch_size = min(int(student_logits.size(0)), len(utt_ids))
     total = student_logits.new_zeros((), dtype=torch.float32)
@@ -4218,6 +4226,17 @@ def _ctc_teacher_full_loss(
             selected_log_probs,
             temperature=float(temperature),
         )
+        frame_weights = torch.ones_like(frame_loss)
+        if float(nonblank_frame_weight) != 1.0:
+            teacher_top1 = selected_log_probs.argmax(dim=-1)
+            nonblank_mask = teacher_top1.ne(int(project_blank_id))
+            for ignored_id in ignored_ids:
+                nonblank_mask = nonblank_mask & teacher_top1.ne(int(ignored_id))
+            frame_weights = torch.where(
+                nonblank_mask.to(device=frame_loss.device),
+                frame_weights.new_full((), float(nonblank_frame_weight)),
+                frame_weights,
+            )
         if eval_accumulator is not None:
             _accumulate_ctc_full_eval_metrics(
                 eval_accumulator,
@@ -4233,10 +4252,9 @@ def _ctc_teacher_full_loss(
             if not bool(selected_mask.any().item()):
                 continue
             frame_loss = frame_loss[selected_mask]
-            denom = denom + frame_loss.new_tensor(float(int(selected_mask.sum().item())))
-        else:
-            denom = denom + frame_loss.new_tensor(float(student_time))
-        total = total + frame_loss.sum()
+            frame_weights = frame_weights[selected_mask]
+        total = total + (frame_loss * frame_weights).sum()
+        denom = denom + frame_weights.sum()
 
     return total / denom.clamp_min(1.0), matched, missing
 
@@ -5083,6 +5101,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     ctc_teacher_online_mass_weight = float(config.ctc_teacher_online_mass_loss_weight)
     ctc_teacher_online_full_weight = float(config.ctc_teacher_online_full_loss_weight)
     ctc_teacher_online_full_temperature = float(config.ctc_teacher_online_full_temperature)
+    ctc_teacher_online_full_nonblank_weight = float(config.ctc_teacher_online_full_nonblank_weight)
     ctc_teacher_online_full_frame_filter = (
         ctc_teacher_frame_filter
         if config.ctc_teacher_online_full_frame_filter is None
@@ -5207,6 +5226,14 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             raise ValueError(
                 "ctc_teacher_online_full_temperature must be > 0, "
                 f"got {ctc_teacher_online_full_temperature!r}."
+            )
+        if (
+            not math.isfinite(ctc_teacher_online_full_nonblank_weight)
+            or ctc_teacher_online_full_nonblank_weight <= 0.0
+        ):
+            raise ValueError(
+                "ctc_teacher_online_full_nonblank_weight must be finite and > 0, "
+                f"got {ctc_teacher_online_full_nonblank_weight!r}."
             )
         if ctc_teacher_online_nonblank_margin < 0.0:
             raise ValueError(
@@ -5416,6 +5443,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"full_log_probs_on_device={bool(config.ctc_teacher_online_keep_full_log_probs_on_device)} "
             f"layer_hidden_only={ctc_teacher_online_layer_only} "
             f"full_temperature={ctc_teacher_online_full_temperature:g} "
+            f"full_nonblank_weight={ctc_teacher_online_full_nonblank_weight:g} "
             f"rows={ctc_teacher_online.num_audio_rows} "
             f"top_k={int(config.ctc_teacher_online_top_k)} "
             f"time_map={config.ctc_teacher_topk_time_map} "
@@ -6183,6 +6211,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
                         missing_policy=config.ctc_teacher_topk_missing_policy,
                         temperature=ctc_teacher_online_full_temperature,
+                        nonblank_frame_weight=ctc_teacher_online_full_nonblank_weight,
                     )
                     ctc_teacher_online_full_loss_value = float(ctc_teacher_online_full_loss.detach().item())
                     loss = loss + ctc_teacher_online_full_loss * ctc_teacher_online_full_weight

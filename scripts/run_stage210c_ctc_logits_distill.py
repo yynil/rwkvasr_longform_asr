@@ -217,6 +217,7 @@ def _phase_config(
             "ctc_teacher_online_mass_loss_weight": float(phase.mass_weight),
             "ctc_teacher_online_full_loss_weight": float(phase.full_weight),
             "ctc_teacher_online_full_temperature": 1.0,
+            "ctc_teacher_online_full_nonblank_weight": 1.0,
             "ctc_teacher_online_full_frame_filter": str(phase.full_frame_filter),
             "ctc_teacher_online_encoder_loss_weight": 0.0,
             "ctc_teacher_online_sequence_loss_weight": 0.0,

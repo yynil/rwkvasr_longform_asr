@@ -507,6 +507,69 @@ def test_ctc_teacher_full_eval_metrics_expose_blank_peak_and_collapsed_sequence_
     assert metrics["missing_utterances"] == 0.0
 
 
+def test_ctc_teacher_full_loss_upweights_nonblank_frames_without_masking_blank_frames() -> None:
+    teacher_ids = torch.tensor([3, 1, 3])
+    teacher_logits = torch.full((3, 4), -20.0)
+    teacher_logits.scatter_(1, teacher_ids.unsqueeze(1), 20.0)
+    student_logits = torch.tensor(
+        [[[0.0, 0.0, 0.0, 5.0], [0.0, -3.0, 0.0, 3.0], [2.0, 0.0, 0.0, 1.0]]],
+        requires_grad=True,
+    )
+    records = {
+        "utt-a": {
+            "full_log_probs": F.log_softmax(teacher_logits, dim=-1),
+            "project_blank_id": 3,
+            "teacher_blank_id": 3,
+            "project_ignored_token_ids": [],
+        }
+    }
+
+    unweighted, _, _ = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3]),
+        ["utt-a"],
+        records,
+        blank_id=3,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        nonblank_frame_weight=1.0,
+    )
+    weighted, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3]),
+        ["utt-a"],
+        records,
+        blank_id=3,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        nonblank_frame_weight=4.0,
+    )
+
+    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+    teacher_probs = teacher_log_probs.exp()
+    student_log_probs = F.log_softmax(student_logits[0], dim=-1)
+    per_frame = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
+    expected = (per_frame[0] + 4.0 * per_frame[1] + per_frame[2]) / 6.0
+
+    assert weighted.item() == pytest.approx(expected.item())
+    assert weighted.item() > unweighted.item()
+    assert matched == 1
+    assert missing == 0
+    weighted.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad[0, 0]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[0, 1]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[0, 2]).item() > 0
+
+
 def test_ctc_suppressed_token_ids_mask_logits_but_not_blank() -> None:
     model = RWKVCTCModel(
         RWKVCTCModelConfig(

@@ -42,6 +42,7 @@ def test_stage210c_nonblank_keeps_nano_output_path_frozen(tmp_path: Path) -> Non
     assert config["ctc_teacher_online_keep_full_log_probs_on_device"] is True
     assert config["ctc_teacher_online_keep_layer_hiddens_on_device"] is True
     assert config["ctc_teacher_online_full_loss_weight"] == pytest.approx(1.0)
+    assert config["ctc_teacher_online_full_nonblank_weight"] == pytest.approx(1.0)
     assert config["ctc_teacher_online_full_frame_filter"] == "nonblank_neighbors"
     assert config["ctc_teacher_online_blank_loss_weight"] > 0.0
     assert config["ctc_teacher_online_mass_loss_weight"] > 0.0

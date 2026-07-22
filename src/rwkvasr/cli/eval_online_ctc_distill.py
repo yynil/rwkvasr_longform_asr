@@ -395,6 +395,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "online_ctc_blank": float(config.ctc_teacher_online_blank_loss_weight),
             "online_ctc_mass": float(config.ctc_teacher_online_mass_loss_weight),
             "online_ctc_full": float(config.ctc_teacher_online_full_loss_weight),
+            "online_ctc_full_nonblank": float(config.ctc_teacher_online_full_nonblank_weight),
             "online_ctc_encoder": float(config.ctc_teacher_online_encoder_loss_weight),
             "online_ctc_sequence": float(config.ctc_teacher_online_sequence_loss_weight),
             "online_ctc_sequence_presence": float(config.ctc_teacher_online_sequence_presence_loss_weight),
