@@ -34,7 +34,7 @@ def _default_output_dir(phase: str) -> Path:
     suffix = "admission2k" if phase == "admission" else "all118465h_3ep"
     return DEFAULT_OUTPUT_ROOT / (
         "sensevoice_rwkv_stage210g_factorized_blank0p25_conditional1_"
-        f"hard0p25_full0p25_pathstate_{suffix}_lr2e7_wd0_4x4090"
+        f"hard0p25_nofull_pathstate_{suffix}_lr2e7_wd0_4x4090"
     )
 
 
@@ -57,6 +57,7 @@ def _config(
     )
     config.update(
         {
+            "ctc_teacher_online_full_loss_weight": 0.0,
             "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.25,
             "step_eval_cache_batches": True,
             "wandb_run_name": f"{output_dir.name}_{segment['name']}",

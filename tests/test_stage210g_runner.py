@@ -30,6 +30,7 @@ def test_stage210g_adds_blank_isolated_hard_token_target(tmp_path: Path) -> None
     assert config["save_every"] == 500
     assert config["ctc_teacher_online_conditional_nonblank_loss_weight"] == pytest.approx(1.0)
     assert config["ctc_teacher_online_conditional_nonblank_hard_loss_weight"] == pytest.approx(0.25)
+    assert config["ctc_teacher_online_full_loss_weight"] == 0.0
     assert config["ctc_teacher_online_blank_loss_weight"] == pytest.approx(0.25)
     assert config["step_eval_cache_batches"] is True
     assert config["freeze_ctc_decoder"] is True
