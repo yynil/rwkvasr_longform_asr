@@ -127,6 +127,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=("all", "nonblank", "nonblank_neighbors"),
     )
+    parser.add_argument(
+        "--ctc-teacher-online-frame-balance-mode",
+        default=None,
+        choices=("all", "teacher_top1_balanced"),
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-blank-frame-balance-mode",
+        default=None,
+        choices=("all", "teacher_top1_balanced"),
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-hidden-frame-balance-mode",
+        default=None,
+        choices=("all", "teacher_top1_balanced"),
+    )
     parser.add_argument("--ctc-teacher-online-encoder-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-decoder-hidden-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-sequence-loss-weight", default=None, type=float)
@@ -185,6 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="ctc_teacher_online_layer_boundary_ids",
         action="append",
         type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-layer-include-boundaries",
+        dest="ctc_teacher_online_layer_include_boundaries",
+        action=argparse.BooleanOptionalAction,
         default=None,
     )
     parser.add_argument("--ctc-teacher-online-layer-frame-tolerance", default=None, type=int)
@@ -429,6 +450,9 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "ctc_teacher_online_full_nonblank_weight",
         "ctc_teacher_online_full_frame_weight_mode",
         "ctc_teacher_online_full_frame_filter",
+        "ctc_teacher_online_frame_balance_mode",
+        "ctc_teacher_online_blank_frame_balance_mode",
+        "ctc_teacher_online_hidden_frame_balance_mode",
         "ctc_teacher_online_encoder_loss_weight",
         "ctc_teacher_online_decoder_hidden_loss_weight",
         "ctc_teacher_online_sequence_loss_weight",
@@ -463,6 +487,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "ctc_teacher_online_layer_raw_mse_weight",
         "ctc_teacher_online_layer_sample_count",
         "ctc_teacher_online_layer_boundary_ids",
+        "ctc_teacher_online_layer_include_boundaries",
         "ctc_teacher_online_layer_frame_tolerance",
         "ctc_teacher_online_layer_input_mode",
         "ctc_decoder_type",

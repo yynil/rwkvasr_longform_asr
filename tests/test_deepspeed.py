@@ -22,6 +22,7 @@ from rwkvasr.training.deepspeed_loop import (
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
     _prune_deepspeed_step_checkpoint_artifacts,
+    _resolve_ctc_frame_balance_mode,
     _resolve_ctc_teacher_online_device,
     _resolve_max_steps as resolve_deepspeed_max_steps,
     _save_export_checkpoints,
@@ -123,6 +124,33 @@ def test_layer_hidden_sampler_keeps_boundaries_and_covers_every_layer() -> None:
     assert all(len(selection) == 8 for selection in selections)
     assert set().union(*map(set, selections)) == set(range(70))
     assert {0, 49, 50, 69}.issubset(boundary_selection)
+
+
+def test_specific_ctc_frame_balance_mode_overrides_legacy_fallback() -> None:
+    assert _resolve_ctc_frame_balance_mode(None, "teacher_top1_balanced") == (
+        "teacher_top1_balanced"
+    )
+    assert _resolve_ctc_frame_balance_mode("all", "teacher_top1_balanced") == "all"
+    with pytest.raises(ValueError, match="frame_balance_mode"):
+        _resolve_ctc_frame_balance_mode("invalid", "all")
+
+
+def test_layer_hidden_sampler_repeats_boundaries_with_wider_cyclic_coverage() -> None:
+    boundaries = {0, 49, 50, 69}
+    selections = [
+        _select_layer_hidden_ids(
+            step=step,
+            num_layers=70,
+            sample_count=24,
+            boundary_ids=tuple(sorted(boundaries)),
+            include_boundaries=True,
+        )
+        for step in range(70)
+    ]
+
+    assert all(len(selection) == 24 for selection in selections)
+    assert all(boundaries.issubset(selection) for selection in map(set, selections))
+    assert set().union(*map(set, selections)) == set(range(70))
 
 
 def test_fixed_eval_layer_sampler_covers_layers_uniformly_across_ranks() -> None:

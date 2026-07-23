@@ -287,6 +287,8 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_full_nonblank_weight: float = 1.0
     ctc_teacher_online_full_frame_weight_mode: str = "hard_top1"
     ctc_teacher_online_frame_balance_mode: str = "all"
+    ctc_teacher_online_blank_frame_balance_mode: str | None = None
+    ctc_teacher_online_hidden_frame_balance_mode: str | None = None
     ctc_teacher_online_encoder_loss_weight: float = 0.0
     ctc_teacher_online_decoder_hidden_loss_weight: float = 0.0
     ctc_teacher_online_sequence_loss_weight: float = 0.0
@@ -322,6 +324,7 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_layer_raw_mse_weight: float = 0.0
     ctc_teacher_online_layer_sample_count: int = 8
     ctc_teacher_online_layer_boundary_ids: tuple[int, ...] | list[int] = (0, 49, 50, 69)
+    ctc_teacher_online_layer_include_boundaries: bool = False
     ctc_teacher_online_layer_frame_tolerance: int = 0
     ctc_teacher_online_layer_input_mode: str = "stacked"
     ctc_decoder_type: str = "none"
@@ -1651,6 +1654,16 @@ def _ctc_frame_group_count(frame_balance_mode: str) -> int:
     )
 
 
+def _resolve_ctc_frame_balance_mode(
+    specific_mode: str | None,
+    fallback_mode: str,
+) -> str:
+    mode = fallback_mode if specific_mode is None else specific_mode
+    normalized = str(mode or "all").strip().lower()
+    _ctc_frame_group_count(normalized)
+    return normalized
+
+
 def _ctc_teacher_top1_nonblank_mask(
     record: dict[str, Any],
     *,
@@ -2250,7 +2263,10 @@ def _online_ctc_teacher_distillation_loss(
             blank_id=int(config.blank_id),
             time_map=config.ctc_teacher_topk_time_map,
             missing_policy=config.ctc_teacher_topk_missing_policy,
-            frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
+            frame_balance_mode=_resolve_ctc_frame_balance_mode(
+                config.ctc_teacher_online_blank_frame_balance_mode,
+                config.ctc_teacher_online_frame_balance_mode,
+            ),
         )
         total = total + loss_value * blank_weight
 
@@ -2352,7 +2368,10 @@ def _online_ctc_teacher_distillation_loss(
             frame_filter=ctc_teacher_frame_filter,
             frame_filter_neighbor_radius=int(config.ctc_teacher_frame_filter_neighbor_radius),
             frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
-            frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
+            frame_balance_mode=_resolve_ctc_frame_balance_mode(
+                config.ctc_teacher_online_hidden_frame_balance_mode,
+                config.ctc_teacher_online_frame_balance_mode,
+            ),
         )
         total = total + loss_value * encoder_weight
 
@@ -2572,7 +2591,11 @@ def _evaluate_epoch_loss(
                     layer_ids=teacher_layer_ids,
                     include_ctc_outputs=(
                         not layer_hidden_only
-                        or str(config.ctc_teacher_online_frame_balance_mode) == "teacher_top1_balanced"
+                        or _resolve_ctc_frame_balance_mode(
+                            config.ctc_teacher_online_hidden_frame_balance_mode,
+                            config.ctc_teacher_online_frame_balance_mode,
+                        )
+                        == "teacher_top1_balanced"
                     ),
                 )
             else:
@@ -2670,7 +2693,10 @@ def _evaluate_epoch_loss(
                     raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                     frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                     missing_policy=config.ctc_teacher_topk_missing_policy,
-                    frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
+                    frame_balance_mode=_resolve_ctc_frame_balance_mode(
+                        config.ctc_teacher_online_hidden_frame_balance_mode,
+                        config.ctc_teacher_online_frame_balance_mode,
+                    ),
                     blank_id=int(config.blank_id),
                 )
                 decoder_hidden_weight = float(
@@ -2703,7 +2729,10 @@ def _evaluate_epoch_loss(
                     raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                     frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                     missing_policy=config.ctc_teacher_topk_missing_policy,
-                    frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
+                    frame_balance_mode=_resolve_ctc_frame_balance_mode(
+                        config.ctc_teacher_online_hidden_frame_balance_mode,
+                        config.ctc_teacher_online_frame_balance_mode,
+                    ),
                     blank_id=int(config.blank_id),
                 )
                 loss = loss + layer_result.loss
@@ -2725,7 +2754,10 @@ def _evaluate_epoch_loss(
                             raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                             frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                             missing_policy=config.ctc_teacher_topk_missing_policy,
-                            frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
+                            frame_balance_mode=_resolve_ctc_frame_balance_mode(
+                                config.ctc_teacher_online_hidden_frame_balance_mode,
+                                config.ctc_teacher_online_frame_balance_mode,
+                            ),
                             blank_id=int(config.blank_id),
                         )
                         _accumulate_layer_eval_metrics(accumulator, component_result)
@@ -6083,6 +6115,14 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     ctc_teacher_online_frame_balance_mode = str(
         config.ctc_teacher_online_frame_balance_mode
     ).strip().lower()
+    ctc_teacher_online_blank_frame_balance_mode = _resolve_ctc_frame_balance_mode(
+        config.ctc_teacher_online_blank_frame_balance_mode,
+        ctc_teacher_online_frame_balance_mode,
+    )
+    ctc_teacher_online_hidden_frame_balance_mode = _resolve_ctc_frame_balance_mode(
+        config.ctc_teacher_online_hidden_frame_balance_mode,
+        ctc_teacher_online_frame_balance_mode,
+    )
     ctc_teacher_online_full_frame_filter = (
         ctc_teacher_frame_filter
         if config.ctc_teacher_online_full_frame_filter is None
@@ -6239,6 +6279,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 f"'posterior_nonblank', got {ctc_teacher_online_full_frame_weight_mode!r}."
             )
         _ctc_frame_group_count(ctc_teacher_online_frame_balance_mode)
+        _ctc_frame_group_count(ctc_teacher_online_blank_frame_balance_mode)
+        _ctc_frame_group_count(ctc_teacher_online_hidden_frame_balance_mode)
         if ctc_teacher_online_decoder_hidden_weight < 0.0:
             raise ValueError("ctc_teacher_online_decoder_hidden_loss_weight must be non-negative.")
         if ctc_teacher_online_nonblank_margin < 0.0:
@@ -6462,6 +6504,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"layer_metric_weights={layer_metric_weights} "
             f"layer_sample_count={int(config.ctc_teacher_online_layer_sample_count)} "
             f"layer_boundaries={tuple(int(value) for value in config.ctc_teacher_online_layer_boundary_ids)} "
+            f"layer_include_boundaries={bool(config.ctc_teacher_online_layer_include_boundaries)} "
             f"layer_frame_tolerance={int(config.ctc_teacher_online_layer_frame_tolerance)} "
             f"layer_input_mode={ctc_teacher_online_layer_input_mode} "
             f"layer_hiddens_on_device={bool(config.ctc_teacher_online_keep_layer_hiddens_on_device)} "
@@ -6471,6 +6514,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"full_nonblank_weight={ctc_teacher_online_full_nonblank_weight:g} "
             f"full_frame_weight_mode={ctc_teacher_online_full_frame_weight_mode} "
             f"frame_balance_mode={ctc_teacher_online_frame_balance_mode} "
+            f"blank_frame_balance_mode={ctc_teacher_online_blank_frame_balance_mode} "
+            f"hidden_frame_balance_mode={ctc_teacher_online_hidden_frame_balance_mode} "
             f"rows={ctc_teacher_online.num_audio_rows} "
             f"top_k={int(config.ctc_teacher_online_top_k)} "
             f"time_map={config.ctc_teacher_topk_time_map} "
@@ -6891,6 +6936,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         num_layers=int(config.num_layers),
                         sample_count=int(config.ctc_teacher_online_layer_sample_count),
                         boundary_ids=config.ctc_teacher_online_layer_boundary_ids,
+                        include_boundaries=bool(
+                            config.ctc_teacher_online_layer_include_boundaries
+                        ),
                     )
                     if ctc_teacher_online_layer_enabled
                     else ()
@@ -6913,7 +6961,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                 layer_ids=teacher_layer_hidden_ids,
                                 include_ctc_outputs=(
                                     not ctc_teacher_online_layer_only
-                                    or ctc_teacher_online_frame_balance_mode == "teacher_top1_balanced"
+                                    or ctc_teacher_online_hidden_frame_balance_mode
+                                    == "teacher_top1_balanced"
                                 ),
                             )
                         else:
@@ -7238,7 +7287,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         blank_id=int(config.blank_id),
                         time_map=config.ctc_teacher_topk_time_map,
                         missing_policy=config.ctc_teacher_topk_missing_policy,
-                        frame_balance_mode=ctc_teacher_online_frame_balance_mode,
+                        frame_balance_mode=ctc_teacher_online_blank_frame_balance_mode,
                     )
                     ctc_teacher_online_blank_loss_value = float(ctc_teacher_online_blank_loss.detach().item())
                     loss = loss + ctc_teacher_online_blank_loss * ctc_teacher_online_blank_weight
@@ -7388,7 +7437,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         frame_filter=ctc_teacher_frame_filter,
                         frame_filter_neighbor_radius=ctc_teacher_frame_filter_neighbor_radius,
                         frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
-                        frame_balance_mode=ctc_teacher_online_frame_balance_mode,
+                        frame_balance_mode=ctc_teacher_online_hidden_frame_balance_mode,
                     )
                     ctc_teacher_online_encoder_loss_value = float(
                         ctc_teacher_online_encoder_loss.detach().item()
@@ -7417,7 +7466,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                         frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                         missing_policy=config.ctc_teacher_topk_missing_policy,
-                        frame_balance_mode=ctc_teacher_online_frame_balance_mode,
+                        frame_balance_mode=ctc_teacher_online_hidden_frame_balance_mode,
                         blank_id=int(config.blank_id),
                     )
                     ctc_teacher_online_decoder_hidden_loss_value = float(
@@ -7465,7 +7514,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                         frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                         missing_policy=config.ctc_teacher_topk_missing_policy,
-                        frame_balance_mode=ctc_teacher_online_frame_balance_mode,
+                        frame_balance_mode=ctc_teacher_online_hidden_frame_balance_mode,
                         blank_id=int(config.blank_id),
                     )
                     ctc_teacher_online_layer_loss_value = float(
