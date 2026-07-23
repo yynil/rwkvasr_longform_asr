@@ -1039,6 +1039,70 @@ def test_ctc_teacher_nonblank_window_loss_allows_local_emission_shift() -> None:
     assert torch.allclose(margin_loss, torch.tensor(0.0))
 
 
+def test_ctc_teacher_conditional_nonblank_window_hard_loss_isolates_blank_and_ignored() -> None:
+    student_logits = torch.zeros(1, 5, 6, requires_grad=True)
+    with torch.no_grad():
+        student_logits[0, 2, 4] = 20.0
+        student_logits[0, 2, 5] = 20.0
+        student_logits[0, 3, 2] = 5.0
+    teacher_ids = torch.tensor(
+        [
+            [5, 1],
+            [5, 1],
+            [2, 5],
+            [5, 3],
+            [5, 3],
+        ],
+        dtype=torch.long,
+    )
+    teacher_log_probs = torch.log(
+        torch.tensor(
+            [
+                [0.95, 0.05],
+                [0.90, 0.10],
+                [0.80, 0.20],
+                [0.96, 0.04],
+                [0.96, 0.04],
+            ],
+            dtype=torch.float32,
+        )
+    )
+    records = {
+        "utt-1": {
+            "topk_token_ids": teacher_ids,
+            "topk_log_probs": teacher_log_probs,
+            "project_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+
+    token_loss, _, matched, missing, events = _ctc_teacher_nonblank_window_loss(
+        student_logits,
+        torch.tensor([5]),
+        ["utt-1"],
+        records,
+        blank_id=5,
+        time_map="nearest",
+        frame_filter_min_nonblank_prob=0.5,
+        missing_policy="error",
+        margin=0.0,
+        window_radius=1,
+        temperature=0.0,
+        loss_mode="conditional_nonblank_hard",
+    )
+
+    legal_logits = student_logits[0, 3, :4].unsqueeze(0)
+    expected = F.cross_entropy(legal_logits, torch.tensor([2]))
+    assert matched == 1
+    assert missing == 0
+    assert events == 1
+    assert torch.allclose(token_loss, expected)
+    token_loss.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad[..., 4]) == 0
+    assert torch.count_nonzero(student_logits.grad[..., 5]) == 0
+
+
 def test_ctc_teacher_nonblank_window_topk_loss_uses_local_nonblank_distribution() -> None:
     student_logits = torch.zeros(1, 5, 7)
     student_logits[0, 2, 6] = 4.0

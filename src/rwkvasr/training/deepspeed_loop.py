@@ -303,6 +303,7 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_nonblank_window_loss_weight: float = 0.0
     ctc_teacher_online_nonblank_window_margin_loss_weight: float = 0.0
     ctc_teacher_online_nonblank_window_topk_loss_weight: float = 0.0
+    ctc_teacher_online_nonblank_window_loss_mode: str = "full"
     ctc_teacher_online_nonblank_window_radius: int = 2
     ctc_teacher_online_nonblank_window_temperature: float = 0.0
     ctc_teacher_online_top_k: int = 16
@@ -2456,6 +2457,7 @@ def _online_ctc_teacher_distillation_loss(
             margin=float(config.ctc_teacher_online_nonblank_margin),
             window_radius=int(config.ctc_teacher_online_nonblank_window_radius),
             temperature=float(config.ctc_teacher_online_nonblank_window_temperature),
+            loss_mode=str(config.ctc_teacher_online_nonblank_window_loss_mode),
         )
         if nonblank_window_weight > 0.0:
             total = total + window_loss * nonblank_window_weight
@@ -3355,6 +3357,7 @@ def _ctc_teacher_nonblank_window_loss(
     margin: float,
     window_radius: int,
     temperature: float,
+    loss_mode: str = "full",
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
     if utt_ids is None:
         raise RuntimeError("Online CTC teacher nonblank window distillation requires batch.utt_ids.")
@@ -3369,6 +3372,12 @@ def _ctc_teacher_nonblank_window_loss(
         raise ValueError(
             "ctc_teacher_online_nonblank_window_temperature must be >= 0, "
             f"got {float(temperature)!r}."
+        )
+    loss_mode = str(loss_mode).strip().lower()
+    if loss_mode not in {"full", "conditional_nonblank_hard"}:
+        raise ValueError(
+            "ctc_teacher_online_nonblank_window_loss_mode must be 'full' or "
+            f"'conditional_nonblank_hard', got {loss_mode!r}."
         )
 
     batch_size = min(int(student_logits.size(0)), len(utt_ids))
@@ -3450,10 +3459,32 @@ def _ctc_teacher_nonblank_window_loss(
             continue
 
         student_slice = student_logits[sample_idx, :student_time].float()
-        student_log_probs = F.log_softmax(student_slice, dim=-1)
+        student_log_probs = (
+            F.log_softmax(student_slice, dim=-1) if loss_mode == "full" else None
+        )
+        excluded_nonblank_ids = {project_blank_id}
+        excluded_nonblank_ids.update(
+            int(ignored_id) for ignored_id in ignored_ids if 0 <= int(ignored_id) < vocab_size
+        )
+        legal_nonblank_mask = torch.ones(
+            vocab_size,
+            dtype=torch.bool,
+            device=student_slice.device,
+        )
+        for excluded_id in excluded_nonblank_ids:
+            legal_nonblank_mask[excluded_id] = False
+        if loss_mode == "conditional_nonblank_hard" and len(excluded_nonblank_ids) >= vocab_size:
+            raise ValueError("Conditional nonblank window loss has no legal token ids.")
+        conditional_log_norm = (
+            torch.logsumexp(student_slice[:, legal_nonblank_mask], dim=-1)
+            if loss_mode == "conditional_nonblank_hard"
+            else None
+        )
         blank_logits = student_slice[:, project_blank_id]
         for teacher_idx in peak_indices:
             target_id = int(top1_ids[teacher_idx].item())
+            if target_id in excluded_nonblank_ids:
+                continue
             if teacher_time == 1 or student_time == 1:
                 center = 0
             else:
@@ -3464,9 +3495,14 @@ def _ctc_teacher_nonblank_window_loss(
             hi = min(student_time, center + window_radius + 1)
             if hi <= lo:
                 continue
-            token_ce = -student_log_probs[lo:hi, target_id]
-            token_total = token_total + _ctc_teacher_window_reduce(token_ce, float(temperature))
             target_logits = student_slice[lo:hi, target_id]
+            if loss_mode == "conditional_nonblank_hard":
+                assert conditional_log_norm is not None
+                token_ce = conditional_log_norm[lo:hi] - target_logits
+            else:
+                assert student_log_probs is not None
+                token_ce = -student_log_probs[lo:hi, target_id]
+            token_total = token_total + _ctc_teacher_window_reduce(token_ce, float(temperature))
             margin_values = F.relu(float(margin) + blank_logits[lo:hi] - target_logits)
             margin_total = margin_total + _ctc_teacher_window_reduce(margin_values, float(temperature))
             denom = denom + student_logits.new_tensor(1.0, dtype=torch.float32)
@@ -6104,6 +6140,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     ctc_teacher_online_nonblank_window_topk_weight = float(
         config.ctc_teacher_online_nonblank_window_topk_loss_weight
     )
+    ctc_teacher_online_nonblank_window_loss_mode = str(
+        config.ctc_teacher_online_nonblank_window_loss_mode
+    ).strip().lower()
     ctc_teacher_online_nonblank_window_radius = int(config.ctc_teacher_online_nonblank_window_radius)
     ctc_teacher_online_nonblank_window_temperature = float(
         config.ctc_teacher_online_nonblank_window_temperature
@@ -6250,6 +6289,15 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             raise ValueError(
                 "ctc_teacher_online_nonblank_window_temperature must be >= 0, "
                 f"got {ctc_teacher_online_nonblank_window_temperature!r}."
+            )
+        if ctc_teacher_online_nonblank_window_loss_mode not in {
+            "full",
+            "conditional_nonblank_hard",
+        }:
+            raise ValueError(
+                "ctc_teacher_online_nonblank_window_loss_mode must be 'full' or "
+                "'conditional_nonblank_hard', got "
+                f"{ctc_teacher_online_nonblank_window_loss_mode!r}."
             )
         if ctc_teacher_online_sequence_window_radius < 0:
             raise ValueError(
@@ -6451,6 +6499,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"nonblank_window_weight={ctc_teacher_online_nonblank_window_weight:g} "
             f"nonblank_window_margin_weight={ctc_teacher_online_nonblank_window_margin_weight:g} "
             f"nonblank_window_topk_weight={ctc_teacher_online_nonblank_window_topk_weight:g} "
+            f"nonblank_window_loss_mode={ctc_teacher_online_nonblank_window_loss_mode} "
             f"nonblank_window_radius={ctc_teacher_online_nonblank_window_radius} "
             f"nonblank_window_temperature={ctc_teacher_online_nonblank_window_temperature:g} "
             f"layer_weights={ctc_teacher_online_layer_component_weights} "
@@ -7681,6 +7730,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         margin=ctc_teacher_online_nonblank_margin,
                         window_radius=ctc_teacher_online_nonblank_window_radius,
                         temperature=ctc_teacher_online_nonblank_window_temperature,
+                        loss_mode=ctc_teacher_online_nonblank_window_loss_mode,
                     )
                     ctc_teacher_online_nonblank_window_loss_value = float(
                         ctc_teacher_online_nonblank_window_loss.detach().item()
@@ -8121,7 +8171,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         extra_state=checkpoint_extra,
                         save_deepspeed_sharded=bool(config.save_deepspeed_sharded_checkpoints),
                     )
-                    if step_eval_every is not None and step % step_eval_every == 0:
+                    if step_eval_every is not None and (
+                        step % step_eval_every == 0 or step == resolved_max_steps
+                    ):
                         step_layer_metrics: dict[int, dict[str, float]] = {}
                         step_layer_component_metrics: dict[str, dict[int, dict[str, float]]] = {}
                         step_logit_metrics: dict[str, float] = {}
