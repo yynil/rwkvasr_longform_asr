@@ -105,6 +105,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ctc-teacher-online-blank-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-mass-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-full-loss-weight", default=None, type=float)
+    parser.add_argument(
+        "--ctc-teacher-online-conditional-nonblank-loss-weight",
+        default=None,
+        type=float,
+    )
     parser.add_argument("--ctc-teacher-online-full-temperature", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-full-nonblank-weight", default=None, type=float)
     parser.add_argument(
@@ -407,6 +412,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "ctc_teacher_online_blank_loss_weight",
         "ctc_teacher_online_mass_loss_weight",
         "ctc_teacher_online_full_loss_weight",
+        "ctc_teacher_online_conditional_nonblank_loss_weight",
         "ctc_teacher_online_full_temperature",
         "ctc_teacher_online_full_nonblank_weight",
         "ctc_teacher_online_full_frame_weight_mode",

@@ -17,6 +17,7 @@ from rwkvasr.training.deepspeed_loop import (
     DeepSpeedTrainConfig,
     _build_eval_loader,
     _ctc_teacher_blank_loss,
+    _ctc_teacher_full_loss,
     _ctc_teacher_mass_loss,
     _ctc_teacher_topk_loss,
     _online_ctc_teacher_distillation_loss,
@@ -125,6 +126,7 @@ def _online_objective_enabled(config: DeepSpeedTrainConfig) -> bool:
         config.ctc_teacher_online_blank_loss_weight,
         config.ctc_teacher_online_mass_loss_weight,
         config.ctc_teacher_online_full_loss_weight,
+        config.ctc_teacher_online_conditional_nonblank_loss_weight,
         config.ctc_teacher_online_encoder_loss_weight,
         config.ctc_teacher_online_sequence_loss_weight,
         config.ctc_teacher_online_sequence_presence_loss_weight,
@@ -171,7 +173,10 @@ def _build_online_teacher(
             project_ignored_token_ids=tuple(
                 int(value) for value in config.ctc_teacher_online_project_ignored_token_ids
             ),
-            return_full_log_probs=float(config.ctc_teacher_online_full_loss_weight) > 0.0,
+            return_full_log_probs=(
+                float(config.ctc_teacher_online_full_loss_weight) > 0.0
+                or float(config.ctc_teacher_online_conditional_nonblank_loss_weight) > 0.0
+            ),
             return_encoder_out=float(config.ctc_teacher_online_encoder_loss_weight) > 0.0,
         )
     )
@@ -250,6 +255,55 @@ def _component_losses(
                 "online_ctc_mass_loss": _to_float(loss),
                 "online_ctc_mass_matched": int(matched),
                 "online_ctc_mass_missing": int(missing),
+            }
+        )
+    if float(config.ctc_teacher_online_full_loss_weight) > 0.0:
+        loss, matched, missing = _ctc_teacher_full_loss(
+            student_logits,
+            student_lengths,
+            utt_ids,
+            records,
+            blank_id=int(config.blank_id),
+            time_map=str(config.ctc_teacher_topk_time_map),
+            frame_filter=str(
+                config.ctc_teacher_online_full_frame_filter
+                or config.ctc_teacher_frame_filter
+                or "all"
+            ),
+            frame_filter_neighbor_radius=int(config.ctc_teacher_frame_filter_neighbor_radius),
+            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+            missing_policy=str(config.ctc_teacher_topk_missing_policy),
+            temperature=float(config.ctc_teacher_online_full_temperature),
+            nonblank_frame_weight=float(config.ctc_teacher_online_full_nonblank_weight),
+            frame_weight_mode=str(config.ctc_teacher_online_full_frame_weight_mode),
+        )
+        output.update(
+            {
+                "online_ctc_full_loss": _to_float(loss),
+                "online_ctc_full_matched": int(matched),
+                "online_ctc_full_missing": int(missing),
+            }
+        )
+    if float(config.ctc_teacher_online_conditional_nonblank_loss_weight) > 0.0:
+        loss, matched, missing = _ctc_teacher_full_loss(
+            student_logits,
+            student_lengths,
+            utt_ids,
+            records,
+            blank_id=int(config.blank_id),
+            time_map=str(config.ctc_teacher_topk_time_map),
+            frame_filter="all",
+            frame_filter_neighbor_radius=0,
+            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+            missing_policy=str(config.ctc_teacher_topk_missing_policy),
+            temperature=float(config.ctc_teacher_online_full_temperature),
+            loss_mode="conditional_nonblank",
+        )
+        output.update(
+            {
+                "online_ctc_conditional_nonblank_loss": _to_float(loss),
+                "online_ctc_conditional_nonblank_matched": int(matched),
+                "online_ctc_conditional_nonblank_missing": int(missing),
             }
         )
     return output
@@ -395,6 +449,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "online_ctc_blank": float(config.ctc_teacher_online_blank_loss_weight),
             "online_ctc_mass": float(config.ctc_teacher_online_mass_loss_weight),
             "online_ctc_full": float(config.ctc_teacher_online_full_loss_weight),
+            "online_ctc_conditional_nonblank": float(
+                config.ctc_teacher_online_conditional_nonblank_loss_weight
+            ),
             "online_ctc_full_nonblank": float(config.ctc_teacher_online_full_nonblank_weight),
             "online_ctc_encoder": float(config.ctc_teacher_online_encoder_loss_weight),
             "online_ctc_sequence": float(config.ctc_teacher_online_sequence_loss_weight),
