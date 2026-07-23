@@ -127,6 +127,7 @@ def _online_objective_enabled(config: DeepSpeedTrainConfig) -> bool:
         config.ctc_teacher_online_mass_loss_weight,
         config.ctc_teacher_online_full_loss_weight,
         config.ctc_teacher_online_conditional_nonblank_loss_weight,
+        config.ctc_teacher_online_conditional_nonblank_hard_loss_weight,
         config.ctc_teacher_online_encoder_loss_weight,
         config.ctc_teacher_online_sequence_loss_weight,
         config.ctc_teacher_online_sequence_presence_loss_weight,
@@ -176,6 +177,7 @@ def _build_online_teacher(
             return_full_log_probs=(
                 float(config.ctc_teacher_online_full_loss_weight) > 0.0
                 or float(config.ctc_teacher_online_conditional_nonblank_loss_weight) > 0.0
+                or float(config.ctc_teacher_online_conditional_nonblank_hard_loss_weight) > 0.0
             ),
             return_encoder_out=float(config.ctc_teacher_online_encoder_loss_weight) > 0.0,
         )
@@ -304,6 +306,28 @@ def _component_losses(
                 "online_ctc_conditional_nonblank_loss": _to_float(loss),
                 "online_ctc_conditional_nonblank_matched": int(matched),
                 "online_ctc_conditional_nonblank_missing": int(missing),
+            }
+        )
+    if float(config.ctc_teacher_online_conditional_nonblank_hard_loss_weight) > 0.0:
+        loss, matched, missing = _ctc_teacher_full_loss(
+            student_logits,
+            student_lengths,
+            utt_ids,
+            records,
+            blank_id=int(config.blank_id),
+            time_map=str(config.ctc_teacher_topk_time_map),
+            frame_filter="all",
+            frame_filter_neighbor_radius=0,
+            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+            missing_policy=str(config.ctc_teacher_topk_missing_policy),
+            temperature=1.0,
+            loss_mode="conditional_nonblank_hard",
+        )
+        output.update(
+            {
+                "online_ctc_conditional_nonblank_hard_loss": _to_float(loss),
+                "online_ctc_conditional_nonblank_hard_matched": int(matched),
+                "online_ctc_conditional_nonblank_hard_missing": int(missing),
             }
         )
     return output
@@ -451,6 +475,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "online_ctc_full": float(config.ctc_teacher_online_full_loss_weight),
             "online_ctc_conditional_nonblank": float(
                 config.ctc_teacher_online_conditional_nonblank_loss_weight
+            ),
+            "online_ctc_conditional_nonblank_hard": float(
+                config.ctc_teacher_online_conditional_nonblank_hard_loss_weight
             ),
             "online_ctc_full_nonblank": float(config.ctc_teacher_online_full_nonblank_weight),
             "online_ctc_encoder": float(config.ctc_teacher_online_encoder_loss_weight),

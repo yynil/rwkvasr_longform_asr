@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from rwkvasr.data import ASRBatch
 from rwkvasr.cli.train_ctc_deepspeed import _resolve_deepspeed_train_config, build_parser
 from rwkvasr.config import load_yaml
 from rwkvasr.training.deepspeed_loop import (
@@ -14,6 +15,7 @@ from rwkvasr.training.deepspeed_loop import (
     _ctc_teacher_layer_hidden_loss,
     _finalize_layer_eval_metrics,
     _maybe_load_initial_model_checkpoint,
+    _materialize_step_eval_batches,
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
     _prune_deepspeed_step_checkpoint_artifacts,
@@ -63,6 +65,38 @@ def test_deepspeed_loop_leaves_gradient_accumulation_to_engine() -> None:
     source = inspect.getsource(train_ctc_model_deepspeed)
 
     assert "engine.zero_grad()" not in source
+
+
+def test_materialize_step_eval_batches_replays_exact_features() -> None:
+    class ChangingLoader:
+        def __init__(self) -> None:
+            self.iteration = 0
+
+        def __iter__(self):
+            self.iteration += 1
+            value = float(self.iteration)
+            yield ASRBatch(
+                features=torch.full((3, 4, 2), value),
+                feature_lengths=torch.tensor([4, 4, 4]),
+                targets=torch.tensor([1, 2, 3]),
+                target_lengths=torch.tensor([1, 1, 1]),
+                utt_ids=["a", "b", "c"],
+            )
+
+    loader = ChangingLoader()
+    batches, samples = _materialize_step_eval_batches(
+        loader,
+        None,
+        epoch=0,
+        max_eval_samples=2,
+    )
+
+    assert samples == 2
+    assert len(batches) == 1
+    assert batches[0].utt_ids == ["a", "b"]
+    first = batches[0].features.clone()
+    assert torch.equal(first, next(iter(batches)).features)
+    assert loader.iteration == 1
 
 
 def test_layer_hidden_sampler_keeps_boundaries_and_covers_every_layer() -> None:

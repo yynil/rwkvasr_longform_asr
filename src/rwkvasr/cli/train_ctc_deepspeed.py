@@ -110,6 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=float,
     )
+    parser.add_argument(
+        "--ctc-teacher-online-conditional-nonblank-hard-loss-weight",
+        default=None,
+        type=float,
+    )
     parser.add_argument("--ctc-teacher-online-full-temperature", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-full-nonblank-weight", default=None, type=float)
     parser.add_argument(
@@ -287,6 +292,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument(
+        "--step-eval-cache-batches",
+        dest="step_eval_cache_batches",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--top-k-step-checkpoints", default=None, type=int)
     parser.add_argument(
         "--save-deepspeed-sharded-checkpoints",
@@ -413,6 +424,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "ctc_teacher_online_mass_loss_weight",
         "ctc_teacher_online_full_loss_weight",
         "ctc_teacher_online_conditional_nonblank_loss_weight",
+        "ctc_teacher_online_conditional_nonblank_hard_loss_weight",
         "ctc_teacher_online_full_temperature",
         "ctc_teacher_online_full_nonblank_weight",
         "ctc_teacher_online_full_frame_weight_mode",
@@ -505,6 +517,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "step_eval_split",
         "step_eval_shuffle",
         "step_eval_at_start",
+        "step_eval_cache_batches",
         "top_k_step_checkpoints",
         "save_deepspeed_sharded_checkpoints",
         "log_every",

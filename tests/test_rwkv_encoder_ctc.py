@@ -494,6 +494,7 @@ def test_ctc_teacher_full_eval_metrics_expose_blank_peak_and_collapsed_sequence_
     assert missing == 0
     assert metrics["full_kl"] > 0.0
     assert metrics["conditional_nonblank_kl"] > 0.0
+    assert metrics["conditional_nonblank_hard_ce"] > 0.0
     assert metrics["blank_binary_kl"] > 0.0
     assert metrics["selected_top1_agreement"] == pytest.approx(0.4)
     assert metrics["all_top1_agreement"] == pytest.approx(0.4)
@@ -675,6 +676,63 @@ def test_ctc_teacher_conditional_nonblank_loss_matches_only_teacher_active_frame
         teacher_conditional * (teacher_conditional_log - student_conditional_log)
     ).sum(dim=-1).mean()
 
+    assert loss.item() == pytest.approx(expected.item())
+    assert matched == 1
+    assert missing == 0
+    loss.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad[0, 0]).item() == 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:, :4]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:, 4]).item() == 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:, 5]).item() == 0
+
+
+def test_ctc_teacher_conditional_nonblank_hard_loss_changes_only_token_identity() -> None:
+    teacher_probs = torch.tensor(
+        [
+            [0.05, 0.05, 0.05, 0.05, 0.10, 0.70],
+            [0.05, 0.60, 0.05, 0.05, 0.05, 0.20],
+            [0.10, 0.10, 0.50, 0.05, 0.15, 0.10],
+        ]
+    )
+    student_logits = torch.tensor(
+        [
+            [
+                [0.3, -0.1, 0.2, 0.0, 2.0, 1.0],
+                [0.0, -1.0, 0.5, 0.2, 3.0, 2.0],
+                [0.4, 0.1, -0.5, 0.3, 4.0, 1.5],
+            ]
+        ],
+        requires_grad=True,
+    )
+    records = {
+        "utt-a": {
+            "full_log_probs": teacher_probs.log(),
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+
+    loss, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3]),
+        ["utt-a"],
+        records,
+        blank_id=5,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        loss_mode="conditional_nonblank_hard",
+    )
+
+    expected = F.cross_entropy(
+        student_logits[0, 1:, :4],
+        torch.tensor([1, 2]),
+    )
     assert loss.item() == pytest.approx(expected.item())
     assert matched == 1
     assert missing == 0
