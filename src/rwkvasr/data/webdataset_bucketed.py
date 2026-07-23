@@ -28,6 +28,7 @@ class WebDatasetBucketPart:
     num_samples: int
     first_shard: str | None = None
     last_shard: str | None = None
+    source_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +75,7 @@ def load_webdataset_bucket_manifest(manifest_path: str | Path) -> WebDatasetBuck
                     num_samples=int(part["num_samples"]),
                     first_shard=part.get("first_shard"),
                     last_shard=part.get("last_shard"),
+                    source_label=part.get("source_label"),
                 )
                 for part in bucket_data.get("parts", [])
             )
@@ -244,6 +246,8 @@ def _shard_source_label(shard_name: str | None) -> str:
 
 
 def _part_source_label(part: WebDatasetBucketPart) -> str:
+    if part.source_label is not None and part.source_label.strip():
+        return part.source_label.strip()
     first = _shard_source_label(part.first_shard)
     last = _shard_source_label(part.last_shard)
     if first == last:

@@ -27,6 +27,7 @@ from rwkvasr.data import (
 )
 from rwkvasr.data.webdataset_bucketed import (
     _BucketEntryStream,
+    _SourceInterleavedBucketEntryStream,
     _ThreadLocalTarReaderPool,
     WebDatasetBucket,
     WebDatasetBucketPart,
@@ -1056,6 +1057,52 @@ def test_bucket_entry_stream_closes_part_handle_between_takes(tmp_path: Path) ->
     assert [entry.key for entry in rest] == ["0000000001", "0000000002"]
     assert stream._handle is None
     assert stream.take(1) == []
+
+
+def test_source_interleaved_bucket_stream_prefers_explicit_part_labels(tmp_path: Path) -> None:
+    bucket_root = tmp_path / "webdataset_buckets"
+    bucket_root.mkdir()
+
+    def write_part(name: str, source: str) -> WebDatasetBucketPart:
+        path = bucket_root / name
+        with path.open("w", encoding="utf-8") as handle:
+            for idx in range(2):
+                key = f"{source}-{idx}"
+                handle.write(
+                    json.dumps(
+                        {
+                            "shard_name": f"/absolute/mixed-{idx}.tar",
+                            "key": key,
+                            "utt_id": key,
+                            "split": "train",
+                            "num_frames": 40,
+                            "audio_member": f"{key}.wav",
+                            "audio_format": "wav",
+                            "json_member": f"{key}.json",
+                        }
+                    )
+                    + "\n"
+                )
+        return WebDatasetBucketPart(
+            path=name,
+            num_samples=2,
+            first_shard="/absolute/mixed-0.tar",
+            last_shard="/absolute/mixed-1.tar",
+            source_label=source,
+        )
+
+    manifest_path = bucket_root / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    bucket = WebDatasetBucket(
+        split="train",
+        bucket_id=0,
+        num_samples=4,
+        parts=(write_part("source-a.jsonl", "source_a"), write_part("source-b.jsonl", "source_b")),
+    )
+    stream = _SourceInterleavedBucketEntryStream(manifest_path, bucket, epoch=0)
+
+    assert [entry.key for entry in stream.take(2)] == ["source_a-0", "source_a-1"]
+    assert [entry.key for entry in stream.take(2)] == ["source_b-0", "source_b-1"]
 
 
 def test_thread_local_tar_reader_pool_lru_closes_old_shards(tmp_path: Path) -> None:
