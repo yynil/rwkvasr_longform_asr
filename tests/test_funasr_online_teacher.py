@@ -9,6 +9,7 @@ from torch import nn
 from rwkvasr.training.funasr_online_teacher import (
     FunASRNanoCTCTopKOnlineTeacher,
     FunASROnlineCTCTeacherConfig,
+    _capture_funasr_ctc_decoder_hiddens,
     _capture_funasr_encoder_hiddens,
 )
 
@@ -47,6 +48,19 @@ class _InplaceFakeNanoEncoder(_FakeNanoEncoder):
 
 class _FakeCTCDecoder(nn.Module):
     def forward(self, x: torch.Tensor, lengths: torch.Tensor):
+        return x, lengths
+
+
+class _FakeLayeredCTCDecoder(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.linear2 = nn.Linear(dim, dim, bias=False)
+        self.blocks = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(2)])
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor):
+        x = self.linear2(x)
+        for block in self.blocks:
+            x = block(x)
         return x, lengths
 
 
@@ -98,6 +112,21 @@ def test_capture_funasr_encoder_hiddens_rejects_invalid_layer() -> None:
     with pytest.raises(ValueError, match="out of range"):
         with _capture_funasr_encoder_hiddens(encoder, (3,), capture_input=False):
             pass
+
+
+def test_capture_funasr_ctc_decoder_hiddens_collects_projection_and_blocks() -> None:
+    torch.manual_seed(2703)
+    decoder = _FakeLayeredCTCDecoder(dim=6)
+    features = torch.randn(2, 5, 6)
+    lengths = torch.tensor([5, 3], dtype=torch.long)
+
+    with _capture_funasr_ctc_decoder_hiddens(decoder, enabled=True) as captured:
+        decoder(features, lengths)
+
+    assert set(captured) == {"input", "layer_0", "layer_1"}
+    for value in captured.values():
+        assert value.shape == (2, 5, 6)
+        assert not value.requires_grad
 
 
 def test_feature_records_batches_teacher_forward_and_preserves_student_features() -> None:
@@ -169,3 +198,15 @@ def test_feature_records_batches_teacher_forward_and_preserves_student_features(
     assert full_log_probs.shape == (3, 8)
     assert full_log_probs.device == features.device
     assert full_log_probs.dtype == torch.float16
+
+    teacher.model.ctc_decoder = _FakeLayeredCTCDecoder(dim=6)
+    teacher.config = replace(
+        teacher.config,
+        return_ctc_decoder_hiddens=True,
+        keep_layer_hiddens_on_device=False,
+    )
+    decoder_records = teacher.feature_records(["utt-a", "utt-b"], features, lengths)
+    decoder_hiddens = decoder_records["utt-b"]["ctc_decoder_hiddens"]
+    assert set(decoder_hiddens) == {"input", "layer_0", "layer_1"}
+    assert decoder_hiddens["layer_1"].shape == (3, 6)
+    assert decoder_hiddens["layer_1"].dtype == torch.float16

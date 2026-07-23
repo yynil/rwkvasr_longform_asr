@@ -283,7 +283,9 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_full_temperature: float = 1.0
     ctc_teacher_online_full_frame_filter: str | None = None
     ctc_teacher_online_full_nonblank_weight: float = 1.0
+    ctc_teacher_online_full_frame_weight_mode: str = "hard_top1"
     ctc_teacher_online_encoder_loss_weight: float = 0.0
+    ctc_teacher_online_decoder_hidden_loss_weight: float = 0.0
     ctc_teacher_online_sequence_loss_weight: float = 0.0
     ctc_teacher_online_sequence_presence_loss_weight: float = 0.0
     ctc_teacher_online_sequence_window_loss_weight: float = 0.0
@@ -1364,6 +1366,48 @@ def _capture_student_sensevoice_layer_hiddens(
             handle.remove()
 
 
+@contextmanager
+def _capture_student_ctc_decoder_hiddens(
+    model: RWKVCTCModel,
+    *,
+    enabled: bool,
+) -> Iterator[dict[str, torch.Tensor]]:
+    captured: dict[str, torch.Tensor] = {}
+    if not enabled:
+        yield captured
+        return
+    ctc_decoder = getattr(model, "ctc_decoder", None)
+    if ctc_decoder is None:
+        raise ValueError("CTC decoder hidden distillation requires an enabled CTC decoder.")
+    linear2 = getattr(ctc_decoder, "linear2", None)
+    blocks = getattr(ctc_decoder, "blocks", None)
+    if linear2 is None or blocks is None:
+        raise ValueError("CTC decoder hidden capture requires linear2 and blocks modules.")
+
+    handles: list[Any] = []
+
+    def capture_input(_module: Any, _args: tuple[Any, ...], output: Any) -> None:
+        captured["input"] = _first_module_tensor(output)
+
+    handles.append(linear2.register_forward_hook(capture_input))
+    for layer_id, block in enumerate(blocks):
+        def capture_block(
+            _module: Any,
+            _args: tuple[Any, ...],
+            output: Any,
+            *,
+            key: str = f"layer_{layer_id}",
+        ) -> None:
+            captured[key] = _first_module_tensor(output)
+
+        handles.append(block.register_forward_hook(capture_block))
+    try:
+        yield captured
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
 def _teacher_forced_hidden_batch(
     teacher_records: dict[str, dict[str, Any]],
     utt_ids: tuple[str, ...] | list[str],
@@ -1548,6 +1592,7 @@ def _is_layer_hidden_only_objective(config: DeepSpeedTrainConfig) -> bool:
         config.ctc_teacher_online_mass_loss_weight,
         config.ctc_teacher_online_full_loss_weight,
         config.ctc_teacher_online_encoder_loss_weight,
+        config.ctc_teacher_online_decoder_hidden_loss_weight,
         config.ctc_teacher_online_sequence_loss_weight,
         config.ctc_teacher_online_sequence_presence_loss_weight,
         config.ctc_teacher_online_sequence_window_loss_weight,
@@ -2059,6 +2104,7 @@ def _online_ctc_teacher_distillation_loss(
             missing_policy=config.ctc_teacher_topk_missing_policy,
             temperature=float(config.ctc_teacher_online_full_temperature),
             nonblank_frame_weight=float(config.ctc_teacher_online_full_nonblank_weight),
+            frame_weight_mode=str(config.ctc_teacher_online_full_frame_weight_mode),
             eval_accumulator=full_eval_accumulator,
         )
         total = total + loss_value * full_weight
@@ -2203,6 +2249,7 @@ def _evaluate_epoch_loss(
     layer_metrics_output: dict[int, dict[str, float]] | None = None,
     layer_component_metrics_output: dict[str, dict[int, dict[str, float]]] | None = None,
     logit_metrics_output: dict[str, float] | None = None,
+    decoder_hidden_metrics_output: dict[str, float] | None = None,
 ) -> tuple[float, int]:
     if loader is None:
         return float("nan"), 0
@@ -2212,6 +2259,8 @@ def _evaluate_epoch_loss(
     model.eval()
     local_loss_sum = 0.0
     local_sample_count = 0
+    local_decoder_hidden_loss_sum = 0.0
+    local_decoder_hidden_sample_count = 0
     layer_eval_accumulator = (
         torch.zeros((int(config.num_layers), _LAYER_EVAL_WIDTH), dtype=torch.float64)
         if layer_metrics_output is not None and config is not None
@@ -2262,6 +2311,9 @@ def _evaluate_epoch_loss(
                 "block": float(config.ctc_teacher_online_layer_block_loss_weight),
             }
             layer_hidden_enabled = any(value > 0.0 for value in layer_component_weights.values())
+            decoder_hidden_enabled = (
+                float(config.ctc_teacher_online_decoder_hidden_loss_weight) > 0.0
+            )
             layer_hidden_only = _is_layer_hidden_only_objective(config)
             selected_layer_ids = (
                 _select_eval_layer_hidden_ids(
@@ -2295,6 +2347,7 @@ def _evaluate_epoch_loss(
                 )
             mask = trainer.eval_direction_mask(mode, device=batch.features.device)
             student_layer_hiddens: dict[int, dict[str, torch.Tensor]] = {}
+            student_decoder_hiddens: dict[str, torch.Tensor] = {}
             if str(config.ctc_teacher_online_layer_input_mode) == "teacher_forced":
                 if not layer_hidden_only:
                     raise ValueError("Teacher-forced layer alignment currently requires a hidden-only objective.")
@@ -2319,7 +2372,14 @@ def _evaluate_epoch_loss(
                     if selected_layer_ids
                     else nullcontext(student_layer_hiddens)
                 )
-                with capture_context as student_layer_hiddens:
+                decoder_capture_context = _capture_student_ctc_decoder_hiddens(
+                    model,
+                    enabled=decoder_hidden_enabled,
+                )
+                with (
+                    capture_context as student_layer_hiddens,
+                    decoder_capture_context as student_decoder_hiddens,
+                ):
                     if layer_hidden_only:
                         encoded, encoded_lengths, _ = model.encoder(
                             batch.features,
@@ -2353,6 +2413,37 @@ def _evaluate_epoch_loss(
                 ctc_teacher_online_records=ctc_teacher_online_records,
                 full_eval_accumulator=full_eval_accumulator,
             )
+            if decoder_hidden_enabled:
+                student_logit_lengths = losses.get("logit_lengths")
+                if student_logit_lengths is not None and not isinstance(
+                    student_logit_lengths,
+                    torch.Tensor,
+                ):
+                    raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                decoder_hidden_result = _ctc_teacher_decoder_hidden_loss(
+                    student_decoder_hiddens,
+                    student_logit_lengths,
+                    batch.utt_ids,
+                    ctc_teacher_online_records,
+                    normalized_mse_weight=float(
+                        config.ctc_teacher_online_layer_normalized_mse_weight
+                    ),
+                    cosine_weight=float(config.ctc_teacher_online_layer_cosine_weight),
+                    energy_mse_weight=float(config.ctc_teacher_online_layer_energy_mse_weight),
+                    log_rms_weight=float(config.ctc_teacher_online_layer_log_rms_weight),
+                    raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
+                    frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
+                    missing_policy=config.ctc_teacher_topk_missing_policy,
+                )
+                decoder_hidden_weight = float(
+                    config.ctc_teacher_online_decoder_hidden_loss_weight
+                )
+                loss = loss + decoder_hidden_result.loss * decoder_hidden_weight
+                batch_size = int(batch.features.size(0))
+                local_decoder_hidden_loss_sum += (
+                    float(decoder_hidden_result.loss.item()) * batch_size
+                )
+                local_decoder_hidden_sample_count += batch_size
             if layer_hidden_enabled:
                 student_encoded_lengths = losses.get("encoded_lengths")
                 if student_encoded_lengths is not None and not isinstance(
@@ -2426,6 +2517,14 @@ def _evaluate_epoch_loss(
         if full_eval_accumulator is not None:
             logit_metrics_output.update(
                 _finalize_ctc_full_eval_metrics(full_eval_accumulator, device=device)
+            )
+    if decoder_hidden_metrics_output is not None:
+        decoder_hidden_metrics_output.clear()
+        if local_decoder_hidden_sample_count > 0:
+            decoder_hidden_metrics_output["loss"] = _all_reduce_mean(
+                local_decoder_hidden_loss_sum,
+                local_decoder_hidden_sample_count,
+                device=device,
             )
     return _all_reduce_mean(local_loss_sum, local_sample_count, device=device), global_sample_count
 
@@ -3847,7 +3946,14 @@ _CTC_FULL_EVAL_SEQUENCE_EXACT = 11
 _CTC_FULL_EVAL_MATCHED_UTTERANCES = 12
 _CTC_FULL_EVAL_MISSING_UTTERANCES = 13
 _CTC_FULL_EVAL_FRAME_DELTA_SUM = 14
-_CTC_FULL_EVAL_WIDTH = 15
+_CTC_FULL_EVAL_ACTIVE_TOP1_MATCH = 15
+_CTC_FULL_EVAL_ACTIVE_FRAMES = 16
+_CTC_FULL_EVAL_NONBLANK_TO_BLANK = 17
+_CTC_FULL_EVAL_BLANK_TO_NONBLANK = 18
+_CTC_FULL_EVAL_TOKEN_INSERTIONS = 19
+_CTC_FULL_EVAL_TOKEN_DELETIONS = 20
+_CTC_FULL_EVAL_TOKEN_SUBSTITUTIONS = 21
+_CTC_FULL_EVAL_WIDTH = 22
 
 
 def _ctc_collapse_token_ids(
@@ -3867,21 +3973,60 @@ def _ctc_collapse_token_ids(
     return collapsed
 
 
-def _token_edit_distance(reference: list[int], hypothesis: list[int]) -> int:
-    if not reference:
-        return len(hypothesis)
-    if not hypothesis:
-        return len(reference)
-    previous = list(range(len(hypothesis) + 1))
+def _token_edit_counts(reference: list[int], hypothesis: list[int]) -> tuple[int, int, int]:
+    """Return insertion, deletion, and substitution counts for one optimal edit path."""
+
+    rows = len(reference) + 1
+    columns = len(hypothesis) + 1
+    costs = [[0] * columns for _ in range(rows)]
+    for ref_index in range(1, rows):
+        costs[ref_index][0] = ref_index
+    for hyp_index in range(1, columns):
+        costs[0][hyp_index] = hyp_index
     for ref_index, ref_token in enumerate(reference, start=1):
-        current = [ref_index]
         for hyp_index, hyp_token in enumerate(hypothesis, start=1):
-            substitution = previous[hyp_index - 1] + int(ref_token != hyp_token)
-            insertion = current[hyp_index - 1] + 1
-            deletion = previous[hyp_index] + 1
-            current.append(min(substitution, insertion, deletion))
-        previous = current
-    return previous[-1]
+            substitution = costs[ref_index - 1][hyp_index - 1] + int(ref_token != hyp_token)
+            insertion = costs[ref_index][hyp_index - 1] + 1
+            deletion = costs[ref_index - 1][hyp_index] + 1
+            costs[ref_index][hyp_index] = min(substitution, insertion, deletion)
+
+    insertions = 0
+    deletions = 0
+    substitutions = 0
+    ref_index = len(reference)
+    hyp_index = len(hypothesis)
+    while ref_index > 0 or hyp_index > 0:
+        if (
+            ref_index > 0
+            and hyp_index > 0
+            and reference[ref_index - 1] == hypothesis[hyp_index - 1]
+            and costs[ref_index][hyp_index] == costs[ref_index - 1][hyp_index - 1]
+        ):
+            ref_index -= 1
+            hyp_index -= 1
+            continue
+        if (
+            ref_index > 0
+            and hyp_index > 0
+            and costs[ref_index][hyp_index] == costs[ref_index - 1][hyp_index - 1] + 1
+        ):
+            substitutions += 1
+            ref_index -= 1
+            hyp_index -= 1
+            continue
+        if ref_index > 0 and costs[ref_index][hyp_index] == costs[ref_index - 1][hyp_index] + 1:
+            deletions += 1
+            ref_index -= 1
+            continue
+        if hyp_index <= 0:
+            raise RuntimeError("Invalid token edit backtrace.")
+        insertions += 1
+        hyp_index -= 1
+    return insertions, deletions, substitutions
+
+
+def _token_edit_distance(reference: list[int], hypothesis: list[int]) -> int:
+    return sum(_token_edit_counts(reference, hypothesis))
 
 
 def _accumulate_ctc_full_eval_metrics(
@@ -3928,7 +4073,13 @@ def _accumulate_ctc_full_eval_metrics(
         blank_id=int(blank_id),
         ignored_token_ids=ignored_token_ids,
     )
-    edits = _token_edit_distance(teacher_tokens, student_tokens)
+    insertions, deletions, substitutions = _token_edit_counts(teacher_tokens, student_tokens)
+    edits = insertions + deletions + substitutions
+    teacher_active = teacher_top1.ne(int(blank_id))
+    student_active = student_top1.ne(int(blank_id))
+    for ignored_id in ignored_token_ids:
+        teacher_active = teacher_active & teacher_top1.ne(int(ignored_id))
+        student_active = student_active & student_top1.ne(int(ignored_id))
 
     values = accumulator.new_zeros((_CTC_FULL_EVAL_WIDTH,), dtype=torch.float64)
     if selected_frames > 0:
@@ -3950,6 +4101,19 @@ def _accumulate_ctc_full_eval_metrics(
     values[_CTC_FULL_EVAL_SEQUENCE_EXACT] = float(teacher_tokens == student_tokens)
     values[_CTC_FULL_EVAL_MATCHED_UTTERANCES] = 1.0
     values[_CTC_FULL_EVAL_FRAME_DELTA_SUM] = float(abs(int(frame_delta)))
+    values[_CTC_FULL_EVAL_ACTIVE_TOP1_MATCH] = (
+        teacher_top1[teacher_active].eq(student_top1[teacher_active]).double().sum().cpu()
+    )
+    values[_CTC_FULL_EVAL_ACTIVE_FRAMES] = float(teacher_active.sum().item())
+    values[_CTC_FULL_EVAL_NONBLANK_TO_BLANK] = (
+        teacher_active.logical_and(~student_active).double().sum().cpu()
+    )
+    values[_CTC_FULL_EVAL_BLANK_TO_NONBLANK] = (
+        (~teacher_active).logical_and(student_active).double().sum().cpu()
+    )
+    values[_CTC_FULL_EVAL_TOKEN_INSERTIONS] = float(insertions)
+    values[_CTC_FULL_EVAL_TOKEN_DELETIONS] = float(deletions)
+    values[_CTC_FULL_EVAL_TOKEN_SUBSTITUTIONS] = float(substitutions)
     accumulator.add_(values)
 
 
@@ -3977,6 +4141,8 @@ def _finalize_ctc_full_eval_metrics(
     teacher_tokens = float(values[_CTC_FULL_EVAL_TEACHER_TOKENS])
     matched_utterances = float(values[_CTC_FULL_EVAL_MATCHED_UTTERANCES])
     teacher_nonblank = float(values[_CTC_FULL_EVAL_TEACHER_NONBLANK])
+    active_frames = float(values[_CTC_FULL_EVAL_ACTIVE_FRAMES])
+    blank_frames = float(values[_CTC_FULL_EVAL_ALL_FRAMES]) - active_frames
     return {
         "full_kl": ratio(_CTC_FULL_EVAL_KL_SUM, _CTC_FULL_EVAL_SELECTED_FRAMES),
         "selected_top1_agreement": ratio(
@@ -3984,6 +4150,11 @@ def _finalize_ctc_full_eval_metrics(
             _CTC_FULL_EVAL_SELECTED_FRAMES,
         ),
         "all_top1_agreement": ratio(_CTC_FULL_EVAL_ALL_TOP1_MATCH, _CTC_FULL_EVAL_ALL_FRAMES),
+        "active_top1_agreement": (
+            float(values[_CTC_FULL_EVAL_ACTIVE_TOP1_MATCH]) / active_frames
+            if active_frames > 0.0
+            else float("nan")
+        ),
         "blank_prob_mae": ratio(_CTC_FULL_EVAL_BLANK_ABS_SUM, _CTC_FULL_EVAL_ALL_FRAMES),
         "teacher_nonblank_rate": ratio(_CTC_FULL_EVAL_TEACHER_NONBLANK, _CTC_FULL_EVAL_ALL_FRAMES),
         "student_nonblank_rate": ratio(_CTC_FULL_EVAL_STUDENT_NONBLANK, _CTC_FULL_EVAL_ALL_FRAMES),
@@ -3992,8 +4163,33 @@ def _finalize_ctc_full_eval_metrics(
             if teacher_nonblank > 0.0
             else float("nan")
         ),
+        "teacher_nonblank_to_blank_rate": (
+            float(values[_CTC_FULL_EVAL_NONBLANK_TO_BLANK]) / active_frames
+            if active_frames > 0.0
+            else float("nan")
+        ),
+        "teacher_blank_to_nonblank_rate": (
+            float(values[_CTC_FULL_EVAL_BLANK_TO_NONBLANK]) / blank_frames
+            if blank_frames > 0.0
+            else float("nan")
+        ),
         "ctc_token_error_rate": (
             float(values[_CTC_FULL_EVAL_TOKEN_EDITS]) / teacher_tokens
+            if teacher_tokens > 0.0
+            else float("nan")
+        ),
+        "ctc_token_insertion_rate": (
+            float(values[_CTC_FULL_EVAL_TOKEN_INSERTIONS]) / teacher_tokens
+            if teacher_tokens > 0.0
+            else float("nan")
+        ),
+        "ctc_token_deletion_rate": (
+            float(values[_CTC_FULL_EVAL_TOKEN_DELETIONS]) / teacher_tokens
+            if teacher_tokens > 0.0
+            else float("nan")
+        ),
+        "ctc_token_substitution_rate": (
+            float(values[_CTC_FULL_EVAL_TOKEN_SUBSTITUTIONS]) / teacher_tokens
             if teacher_tokens > 0.0
             else float("nan")
         ),
@@ -4042,6 +4238,7 @@ def _ctc_teacher_full_loss(
     missing_policy: str,
     temperature: float,
     nonblank_frame_weight: float = 1.0,
+    frame_weight_mode: str = "hard_top1",
     eval_accumulator: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int, int]:
     if utt_ids is None:
@@ -4054,6 +4251,12 @@ def _ctc_teacher_full_loss(
         raise ValueError(
             "ctc_teacher_online_full_nonblank_weight must be finite and > 0, "
             f"got {nonblank_frame_weight!r}."
+        )
+    frame_weight_mode = str(frame_weight_mode).strip().lower()
+    if frame_weight_mode not in {"hard_top1", "posterior_nonblank"}:
+        raise ValueError(
+            "ctc_teacher_online_full_frame_weight_mode must be 'hard_top1' or "
+            f"'posterior_nonblank', got {frame_weight_mode!r}."
         )
 
     batch_size = min(int(student_logits.size(0)), len(utt_ids))
@@ -4228,15 +4431,27 @@ def _ctc_teacher_full_loss(
         )
         frame_weights = torch.ones_like(frame_loss)
         if float(nonblank_frame_weight) != 1.0:
-            teacher_top1 = selected_log_probs.argmax(dim=-1)
-            nonblank_mask = teacher_top1.ne(int(project_blank_id))
-            for ignored_id in ignored_ids:
-                nonblank_mask = nonblank_mask & teacher_top1.ne(int(ignored_id))
-            frame_weights = torch.where(
-                nonblank_mask.to(device=frame_loss.device),
-                frame_weights.new_full((), float(nonblank_frame_weight)),
-                frame_weights,
-            )
+            if frame_weight_mode == "hard_top1":
+                teacher_top1 = selected_log_probs.argmax(dim=-1)
+                nonblank_mask = teacher_top1.ne(int(project_blank_id))
+                for ignored_id in ignored_ids:
+                    nonblank_mask = nonblank_mask & teacher_top1.ne(int(ignored_id))
+                frame_weights = torch.where(
+                    nonblank_mask.to(device=frame_loss.device),
+                    frame_weights.new_full((), float(nonblank_frame_weight)),
+                    frame_weights,
+                )
+            else:
+                teacher_probs = selected_log_probs.exp()
+                nonblank_probability = 1.0 - teacher_probs[:, int(project_blank_id)]
+                for ignored_id in ignored_ids:
+                    if 0 <= int(ignored_id) < int(teacher_probs.size(-1)):
+                        nonblank_probability = nonblank_probability - teacher_probs[:, int(ignored_id)]
+                nonblank_probability = nonblank_probability.clamp(min=0.0, max=1.0)
+                frame_weights = frame_weights + nonblank_probability.to(
+                    device=frame_loss.device,
+                    dtype=frame_loss.dtype,
+                ) * (float(nonblank_frame_weight) - 1.0)
         if eval_accumulator is not None:
             _accumulate_ctc_full_eval_metrics(
                 eval_accumulator,
@@ -4422,6 +4637,179 @@ def _ctc_teacher_hidden_loss(
         denom = denom + frame_loss.new_tensor(float(frame_loss.numel()))
 
     return total / denom.clamp_min(1.0), matched, missing
+
+
+@dataclass(frozen=True)
+class _DecoderHiddenDistillationResult:
+    loss: torch.Tensor
+    state_losses: dict[str, torch.Tensor]
+    matched_samples: int
+    missing_samples: int
+    events: int
+    max_frame_delta: int
+
+
+def _ctc_teacher_decoder_hidden_loss(
+    student_hiddens: dict[str, torch.Tensor],
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_records: dict[str, dict[str, Any]],
+    *,
+    normalized_mse_weight: float,
+    cosine_weight: float,
+    energy_mse_weight: float,
+    log_rms_weight: float,
+    raw_mse_weight: float,
+    frame_tolerance: int,
+    missing_policy: str,
+) -> _DecoderHiddenDistillationResult:
+    if utt_ids is None:
+        raise RuntimeError("CTC decoder hidden distillation requires batch.utt_ids.")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError(f"Unsupported missing_policy={missing_policy!r}; expected skip or error.")
+    if frame_tolerance < 0:
+        raise ValueError(f"frame_tolerance must be >= 0, got {frame_tolerance}.")
+    metric_weights = (
+        float(normalized_mse_weight),
+        float(cosine_weight),
+        float(energy_mse_weight),
+        float(log_rms_weight),
+        float(raw_mse_weight),
+    )
+    if any(value < 0.0 for value in metric_weights) or not any(value > 0.0 for value in metric_weights):
+        raise ValueError(
+            "CTC decoder hidden distillation requires non-negative metric weights and at least one positive weight."
+        )
+    state_names = tuple(
+        sorted(student_hiddens, key=lambda name: (-1 if name == "input" else int(name.removeprefix("layer_"))))
+    )
+    if not state_names:
+        raise RuntimeError("Student CTC decoder hooks did not capture any hidden tensors.")
+    reference = student_hiddens[state_names[0]]
+    if reference.ndim != 3:
+        raise ValueError(f"Student CTC decoder hidden must be [B, T, D], got {tuple(reference.shape)}.")
+    batch_size = min(int(reference.size(0)), len(utt_ids))
+    max_student_time = int(reference.size(1))
+    if student_lengths is None:
+        clipped_lengths = torch.full(
+            (batch_size,),
+            max_student_time,
+            dtype=torch.long,
+            device=reference.device,
+        )
+    else:
+        clipped_lengths = student_lengths[:batch_size].to(
+            device=reference.device,
+            dtype=torch.long,
+        ).clamp(min=0, max=max_student_time)
+
+    total = reference.new_zeros((), dtype=torch.float32)
+    denom = reference.new_zeros((), dtype=torch.float32)
+    state_sums = {name: reference.new_zeros((), dtype=torch.float32) for name in state_names}
+    state_denoms = {name: reference.new_zeros((), dtype=torch.float32) for name in state_names}
+    matched_ids: set[str] = set()
+    missing_ids: set[str] = set()
+    events = 0
+    max_frame_delta = 0
+    student_times = tuple(int(value) for value in clipped_lengths.detach().cpu().tolist())
+
+    for sample_idx in range(batch_size):
+        utt_id = str(utt_ids[sample_idx])
+        record = teacher_records.get(utt_id)
+        teacher_hiddens = record.get("ctc_decoder_hiddens") if isinstance(record, dict) else None
+        if not isinstance(teacher_hiddens, dict):
+            missing_ids.add(utt_id)
+            if missing_policy == "error":
+                raise ValueError(f"Nano record has no ctc_decoder_hiddens for utt_id={utt_id!r}.")
+            continue
+        student_time = student_times[sample_idx]
+        if student_time <= 0:
+            continue
+        sample_had_event = False
+        for state_name in state_names:
+            student_hidden = student_hiddens[state_name]
+            teacher_hidden_raw = teacher_hiddens.get(state_name)
+            if teacher_hidden_raw is None:
+                if missing_policy == "error":
+                    raise ValueError(
+                        f"Missing Nano CTC decoder state={state_name!r} for utt_id={utt_id!r}."
+                    )
+                continue
+            teacher_hidden = torch.as_tensor(teacher_hidden_raw, dtype=torch.float32)
+            if teacher_hidden.ndim != 2 or int(teacher_hidden.size(-1)) != int(student_hidden.size(-1)):
+                raise ValueError(
+                    f"CTC decoder hidden shape mismatch for utt_id={utt_id!r} state={state_name!r}: "
+                    f"student={tuple(student_hidden.shape)} teacher={tuple(teacher_hidden.shape)}"
+                )
+            teacher_time = int(teacher_hidden.size(0))
+            frame_delta = abs(student_time - teacher_time)
+            max_frame_delta = max(max_frame_delta, frame_delta)
+            if frame_delta > frame_tolerance:
+                raise ValueError(
+                    f"CTC decoder hidden frame mismatch for utt_id={utt_id!r} state={state_name!r}: "
+                    f"student={student_time} teacher={teacher_time} tolerance={frame_tolerance}."
+                )
+            aligned_time = min(student_time, teacher_time)
+            if aligned_time <= 0:
+                continue
+            student_slice = student_hidden[sample_idx, :aligned_time, :].float()
+            teacher_slice = teacher_hidden[:aligned_time].to(device=student_slice.device)
+            frame_loss = student_slice.new_zeros((aligned_time,), dtype=torch.float32)
+            student_power = student_slice.square().mean(dim=-1)
+            teacher_power = teacher_slice.square().mean(dim=-1)
+            if normalized_mse_weight > 0.0:
+                student_norm = F.layer_norm(student_slice, (int(student_slice.size(-1)),))
+                teacher_norm = F.layer_norm(teacher_slice, (int(teacher_slice.size(-1)),))
+                frame_loss += F.mse_loss(student_norm, teacher_norm, reduction="none").mean(dim=-1) * float(
+                    normalized_mse_weight
+                )
+            if cosine_weight > 0.0:
+                frame_loss += (
+                    1.0 - F.cosine_similarity(student_slice, teacher_slice, dim=-1, eps=1.0e-6)
+                ) * float(cosine_weight)
+            if energy_mse_weight > 0.0:
+                diff_power = (student_slice - teacher_slice).square().mean(dim=-1)
+                frame_loss += (
+                    2.0 * diff_power / (student_power + teacher_power + 1.0e-6)
+                ) * float(energy_mse_weight)
+            if log_rms_weight > 0.0:
+                log_rms_delta = 0.5 * (
+                    torch.log(student_power + 1.0e-6) - torch.log(teacher_power + 1.0e-6)
+                )
+                frame_loss += F.smooth_l1_loss(
+                    log_rms_delta,
+                    torch.zeros_like(log_rms_delta),
+                    reduction="none",
+                    beta=0.25,
+                ) * float(log_rms_weight)
+            if raw_mse_weight > 0.0:
+                frame_loss += F.mse_loss(student_slice, teacher_slice, reduction="none").mean(dim=-1) * float(
+                    raw_mse_weight
+                )
+            event_sum = frame_loss.sum()
+            event_frames = frame_loss.new_tensor(float(aligned_time))
+            total = total + event_sum
+            denom = denom + event_frames
+            state_sums[state_name] = state_sums[state_name] + event_sum
+            state_denoms[state_name] = state_denoms[state_name] + event_frames
+            events += 1
+            sample_had_event = True
+        if sample_had_event:
+            matched_ids.add(utt_id)
+
+    if events <= 0:
+        raise RuntimeError("CTC decoder hidden distillation produced no matched state events.")
+    return _DecoderHiddenDistillationResult(
+        loss=total / denom.clamp_min(1.0),
+        state_losses={
+            name: state_sums[name] / state_denoms[name].clamp_min(1.0)
+            for name in state_names
+        },
+        matched_samples=len(matched_ids),
+        missing_samples=len(missing_ids),
+        events=events,
+        max_frame_delta=max_frame_delta,
+    )
 
 
 def _ctc_teacher_sequence_token_ids_from_record(
@@ -5102,12 +5490,18 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     ctc_teacher_online_full_weight = float(config.ctc_teacher_online_full_loss_weight)
     ctc_teacher_online_full_temperature = float(config.ctc_teacher_online_full_temperature)
     ctc_teacher_online_full_nonblank_weight = float(config.ctc_teacher_online_full_nonblank_weight)
+    ctc_teacher_online_full_frame_weight_mode = str(
+        config.ctc_teacher_online_full_frame_weight_mode
+    ).strip().lower()
     ctc_teacher_online_full_frame_filter = (
         ctc_teacher_frame_filter
         if config.ctc_teacher_online_full_frame_filter is None
         else str(config.ctc_teacher_online_full_frame_filter)
     )
     ctc_teacher_online_encoder_weight = float(config.ctc_teacher_online_encoder_loss_weight)
+    ctc_teacher_online_decoder_hidden_weight = float(
+        config.ctc_teacher_online_decoder_hidden_loss_weight
+    )
     ctc_teacher_online_sequence_weight = float(config.ctc_teacher_online_sequence_loss_weight)
     ctc_teacher_online_sequence_presence_weight = float(
         config.ctc_teacher_online_sequence_presence_loss_weight
@@ -5161,6 +5555,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         and ctc_teacher_online_mass_weight <= 0.0
         and ctc_teacher_online_full_weight <= 0.0
         and ctc_teacher_online_encoder_weight <= 0.0
+        and ctc_teacher_online_decoder_hidden_weight <= 0.0
         and ctc_teacher_online_sequence_weight <= 0.0
         and ctc_teacher_online_sequence_presence_weight <= 0.0
         and ctc_teacher_online_sequence_window_weight <= 0.0
@@ -5182,6 +5577,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         or ctc_teacher_online_mass_weight > 0.0
         or ctc_teacher_online_full_weight > 0.0
         or ctc_teacher_online_encoder_weight > 0.0
+        or ctc_teacher_online_decoder_hidden_weight > 0.0
         or ctc_teacher_online_sequence_weight > 0.0
         or ctc_teacher_online_sequence_presence_weight > 0.0
         or ctc_teacher_online_sequence_window_weight > 0.0
@@ -5235,6 +5631,13 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 "ctc_teacher_online_full_nonblank_weight must be finite and > 0, "
                 f"got {ctc_teacher_online_full_nonblank_weight!r}."
             )
+        if ctc_teacher_online_full_frame_weight_mode not in {"hard_top1", "posterior_nonblank"}:
+            raise ValueError(
+                "ctc_teacher_online_full_frame_weight_mode must be 'hard_top1' or "
+                f"'posterior_nonblank', got {ctc_teacher_online_full_frame_weight_mode!r}."
+            )
+        if ctc_teacher_online_decoder_hidden_weight < 0.0:
+            raise ValueError("ctc_teacher_online_decoder_hidden_loss_weight must be non-negative.")
         if ctc_teacher_online_nonblank_margin < 0.0:
             raise ValueError(
                 "ctc_teacher_online_nonblank_margin must be >= 0, "
@@ -5314,6 +5717,14 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 raise ValueError("Nano layer hidden distillation requires dropout=0 for exact sub-block parity.")
             if ctc_teacher_online_layer_input_mode == "teacher_forced" and not ctc_teacher_online_layer_only:
                 raise ValueError("Teacher-forced layer alignment requires a hidden-only objective.")
+        if ctc_teacher_online_decoder_hidden_weight > 0.0:
+            if str(config.ctc_decoder_type) != "funasr_nano_transformer":
+                raise ValueError(
+                    "Nano CTC decoder hidden distillation requires "
+                    "ctc_decoder_type='funasr_nano_transformer'."
+                )
+            if int(config.ctc_decoder_downsample_rate) != 1:
+                raise ValueError("Nano CTC decoder hidden distillation requires downsample_rate=1.")
         if (
             ctc_teacher_online_full_weight > 0.0
             and ctc_teacher_online_full_frame_filter != "all"
@@ -5353,6 +5764,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         or ctc_teacher_online_mass_weight > 0.0
         or ctc_teacher_online_full_weight > 0.0
         or ctc_teacher_online_encoder_weight > 0.0
+        or ctc_teacher_online_decoder_hidden_weight > 0.0
         or ctc_teacher_online_sequence_weight > 0.0
         or ctc_teacher_online_sequence_presence_weight > 0.0
         or ctc_teacher_online_sequence_window_weight > 0.0
@@ -5407,6 +5819,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 return_full_log_probs=ctc_teacher_online_full_weight > 0.0,
                 return_encoder_out=ctc_teacher_online_encoder_weight > 0.0,
                 return_layer_hiddens=ctc_teacher_online_layer_enabled,
+                return_ctc_decoder_hiddens=ctc_teacher_online_decoder_hidden_weight > 0.0,
                 keep_layer_hiddens_on_device=bool(
                     config.ctc_teacher_online_keep_layer_hiddens_on_device
                 ),
@@ -5420,6 +5833,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"weight={ctc_teacher_online_weight:g} blank_weight={ctc_teacher_online_blank_weight:g} "
             f"mass_weight={ctc_teacher_online_mass_weight:g} full_weight={ctc_teacher_online_full_weight:g} "
             f"encoder_weight={ctc_teacher_online_encoder_weight:g} "
+            f"decoder_hidden_weight={ctc_teacher_online_decoder_hidden_weight:g} "
             f"sequence_weight={ctc_teacher_online_sequence_weight:g} "
             f"sequence_presence_weight={ctc_teacher_online_sequence_presence_weight:g} "
             f"sequence_window_weight={ctc_teacher_online_sequence_window_weight:g} "
@@ -5444,6 +5858,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"layer_hidden_only={ctc_teacher_online_layer_only} "
             f"full_temperature={ctc_teacher_online_full_temperature:g} "
             f"full_nonblank_weight={ctc_teacher_online_full_nonblank_weight:g} "
+            f"full_frame_weight_mode={ctc_teacher_online_full_frame_weight_mode} "
             f"rows={ctc_teacher_online.num_audio_rows} "
             f"top_k={int(config.ctc_teacher_online_top_k)} "
             f"time_map={config.ctc_teacher_topk_time_map} "
@@ -5663,6 +6078,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         initial_layer_metrics: dict[int, dict[str, float]] = {}
         initial_layer_component_metrics: dict[str, dict[int, dict[str, float]]] = {}
         initial_logit_metrics: dict[str, float] = {}
+        initial_decoder_hidden_metrics: dict[str, float] = {}
         initial_eval_loss, initial_eval_count = _evaluate_epoch_loss(
             model=engine.module,
             loader=step_eval_loader,
@@ -5677,6 +6093,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             layer_metrics_output=initial_layer_metrics,
             layer_component_metrics_output=initial_layer_component_metrics,
             logit_metrics_output=initial_logit_metrics,
+            decoder_hidden_metrics_output=initial_decoder_hidden_metrics,
         )
         if _is_rank_zero():
             baseline_payload = {
@@ -5696,6 +6113,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     for component, component_metrics in initial_layer_component_metrics.items()
                 },
                 "logit_metrics": initial_logit_metrics,
+                "decoder_hidden_metrics": initial_decoder_hidden_metrics,
             }
             save_yaml(output_dir / "step_eval_baseline.yaml", baseline_payload)
             _rank_zero_log(
@@ -5722,6 +6140,10 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     **{
                         f"eval/ctc_alignment_{metric_name}": value
                         for metric_name, value in initial_logit_metrics.items()
+                    },
+                    **{
+                        f"eval/ctc_decoder_hidden_{metric_name}": value
+                        for metric_name, value in initial_decoder_hidden_metrics.items()
                     },
                 },
                 step=0,
@@ -5876,6 +6298,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         raise
                     ctc_teacher_online_forward_time = time.perf_counter() - online_teacher_start
                 student_layer_hiddens: dict[int, dict[str, torch.Tensor]] = {}
+                student_decoder_hiddens: dict[str, torch.Tensor] = {}
                 try:
                     if str(config.ctc_teacher_online_layer_input_mode) == "teacher_forced":
                         if not ctc_teacher_online_layer_only:
@@ -5908,7 +6331,14 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             if selected_layer_hidden_ids
                             else nullcontext(student_layer_hiddens)
                         )
-                        with capture_context as student_layer_hiddens:
+                        decoder_capture_context = _capture_student_ctc_decoder_hiddens(
+                            engine.module,
+                            enabled=ctc_teacher_online_decoder_hidden_weight > 0.0,
+                        )
+                        with (
+                            capture_context as student_layer_hiddens,
+                            decoder_capture_context as student_decoder_hiddens,
+                        ):
                             if ctc_teacher_online_layer_only:
                                 encoded, encoded_lengths, _ = engine.module.encoder(
                                     batch.features,
@@ -5977,6 +6407,12 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 ctc_teacher_online_encoder_loss_value = 0.0
                 ctc_teacher_online_encoder_matched = 0
                 ctc_teacher_online_encoder_missing = 0
+                ctc_teacher_online_decoder_hidden_loss_value = 0.0
+                ctc_teacher_online_decoder_hidden_state_loss_values: dict[str, float] = {}
+                ctc_teacher_online_decoder_hidden_matched = 0
+                ctc_teacher_online_decoder_hidden_missing = 0
+                ctc_teacher_online_decoder_hidden_events = 0
+                ctc_teacher_online_decoder_hidden_max_frame_delta = 0
                 ctc_teacher_online_layer_loss_value = 0.0
                 ctc_teacher_online_layer_component_loss_values: dict[str, float] = {}
                 ctc_teacher_online_layer_loss_values: dict[int, float] = {}
@@ -6212,6 +6648,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         missing_policy=config.ctc_teacher_topk_missing_policy,
                         temperature=ctc_teacher_online_full_temperature,
                         nonblank_frame_weight=ctc_teacher_online_full_nonblank_weight,
+                        frame_weight_mode=str(config.ctc_teacher_online_full_frame_weight_mode),
                     )
                     ctc_teacher_online_full_loss_value = float(ctc_teacher_online_full_loss.detach().item())
                     loss = loss + ctc_teacher_online_full_loss * ctc_teacher_online_full_weight
@@ -6245,6 +6682,52 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         ctc_teacher_online_encoder_loss.detach().item()
                     )
                     loss = loss + ctc_teacher_online_encoder_loss * ctc_teacher_online_encoder_weight
+                if ctc_teacher_online_decoder_hidden_weight > 0.0:
+                    student_logit_lengths = losses.get("logit_lengths")
+                    if student_logit_lengths is not None and not isinstance(
+                        student_logit_lengths,
+                        torch.Tensor,
+                    ):
+                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
+                    decoder_hidden_result = _ctc_teacher_decoder_hidden_loss(
+                        student_decoder_hiddens,
+                        student_logit_lengths,
+                        batch.utt_ids,
+                        ctc_teacher_online_records,
+                        normalized_mse_weight=float(
+                            config.ctc_teacher_online_layer_normalized_mse_weight
+                        ),
+                        cosine_weight=float(config.ctc_teacher_online_layer_cosine_weight),
+                        energy_mse_weight=float(
+                            config.ctc_teacher_online_layer_energy_mse_weight
+                        ),
+                        log_rms_weight=float(config.ctc_teacher_online_layer_log_rms_weight),
+                        raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
+                        frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
+                        missing_policy=config.ctc_teacher_topk_missing_policy,
+                    )
+                    ctc_teacher_online_decoder_hidden_loss_value = float(
+                        decoder_hidden_result.loss.detach().item()
+                    )
+                    ctc_teacher_online_decoder_hidden_state_loss_values = {
+                        name: float(value.detach().item())
+                        for name, value in decoder_hidden_result.state_losses.items()
+                    }
+                    ctc_teacher_online_decoder_hidden_matched = (
+                        decoder_hidden_result.matched_samples
+                    )
+                    ctc_teacher_online_decoder_hidden_missing = (
+                        decoder_hidden_result.missing_samples
+                    )
+                    ctc_teacher_online_decoder_hidden_events = decoder_hidden_result.events
+                    ctc_teacher_online_decoder_hidden_max_frame_delta = (
+                        decoder_hidden_result.max_frame_delta
+                    )
+                    loss = (
+                        loss
+                        + decoder_hidden_result.loss
+                        * ctc_teacher_online_decoder_hidden_weight
+                    )
                 if ctc_teacher_online_layer_enabled:
                     student_encoded_lengths = losses.get("encoded_lengths")
                     if student_encoded_lengths is not None and not isinstance(
@@ -6626,6 +7109,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         f"online_ctc_encoder={ctc_teacher_online_encoder_loss_value:.4f} "
                         f"online_encoder_match={ctc_teacher_online_encoder_matched}/{batch_stats.batch_size} "
                         f"online_encoder_missing={ctc_teacher_online_encoder_missing} "
+                        f"online_ctc_decoder_hidden={ctc_teacher_online_decoder_hidden_loss_value:.4f} "
+                        f"online_decoder_hidden_match={ctc_teacher_online_decoder_hidden_matched}/{batch_stats.batch_size} "
+                        f"online_decoder_hidden_missing={ctc_teacher_online_decoder_hidden_missing} "
+                        f"online_decoder_hidden_events={ctc_teacher_online_decoder_hidden_events} "
+                        f"online_decoder_hidden_frame_delta={ctc_teacher_online_decoder_hidden_max_frame_delta} "
                         f"online_layer_hidden={ctc_teacher_online_layer_loss_value:.4f} "
                         f"online_layer_mixer={ctc_teacher_online_layer_component_loss_values.get('mixer', 0.0):.4f} "
                         f"online_layer_ffn={ctc_teacher_online_layer_component_loss_values.get('ffn', 0.0):.4f} "
@@ -6705,6 +7193,27 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             "train/ctc_teacher_online_encoder_loss": ctc_teacher_online_encoder_loss_value,
                             "train/ctc_teacher_online_encoder_matched": ctc_teacher_online_encoder_matched,
                             "train/ctc_teacher_online_encoder_missing": ctc_teacher_online_encoder_missing,
+                            "train/ctc_teacher_online_decoder_hidden_loss": (
+                                ctc_teacher_online_decoder_hidden_loss_value
+                            ),
+                            "train/ctc_teacher_online_decoder_hidden_matched": (
+                                ctc_teacher_online_decoder_hidden_matched
+                            ),
+                            "train/ctc_teacher_online_decoder_hidden_missing": (
+                                ctc_teacher_online_decoder_hidden_missing
+                            ),
+                            "train/ctc_teacher_online_decoder_hidden_events": (
+                                ctc_teacher_online_decoder_hidden_events
+                            ),
+                            "train/ctc_teacher_online_decoder_hidden_max_frame_delta": (
+                                ctc_teacher_online_decoder_hidden_max_frame_delta
+                            ),
+                            **{
+                                f"train/ctc_teacher_online_decoder_hidden_{state_name}_loss": value
+                                for state_name, value in (
+                                    ctc_teacher_online_decoder_hidden_state_loss_values.items()
+                                )
+                            },
                             "train/ctc_teacher_online_layer_loss": ctc_teacher_online_layer_loss_value,
                             "train/ctc_teacher_online_layer_mixer_loss": (
                                 ctc_teacher_online_layer_component_loss_values.get("mixer", 0.0)
@@ -6874,6 +7383,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         step_layer_metrics: dict[int, dict[str, float]] = {}
                         step_layer_component_metrics: dict[str, dict[int, dict[str, float]]] = {}
                         step_logit_metrics: dict[str, float] = {}
+                        step_decoder_hidden_metrics: dict[str, float] = {}
                         step_eval_loss, step_eval_count = _evaluate_epoch_loss(
                             model=engine.module,
                             loader=step_eval_loader,
@@ -6888,6 +7398,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             layer_metrics_output=step_layer_metrics,
                             layer_component_metrics_output=step_layer_component_metrics,
                             logit_metrics_output=step_logit_metrics,
+                            decoder_hidden_metrics_output=step_decoder_hidden_metrics,
                         )
                         step_eval_valid = step_eval_count > 0 and math.isfinite(step_eval_loss)
                         if step_eval_valid:
@@ -6898,7 +7409,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                 "eval_samples": step_eval_count,
                                 **saved_artifacts,
                             }
-                            if step_layer_metrics or step_logit_metrics:
+                            if (
+                                step_layer_metrics
+                                or step_logit_metrics
+                                or step_decoder_hidden_metrics
+                            ):
                                 layer_metrics_path = output_dir / f"step_eval_layers_step-{step}.yaml"
                                 if _is_rank_zero():
                                     save_yaml(
@@ -6919,6 +7434,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                                 for component, component_metrics in step_layer_component_metrics.items()
                                             },
                                             "logit_metrics": step_logit_metrics,
+                                            "decoder_hidden_metrics": step_decoder_hidden_metrics,
                                         },
                                     )
                                 step_record["layer_metrics_path"] = str(layer_metrics_path)
@@ -6985,6 +7501,10 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                         **{
                                             f"eval/ctc_alignment_{metric_name}": value
                                             for metric_name, value in step_logit_metrics.items()
+                                        },
+                                        **{
+                                            f"eval/ctc_decoder_hidden_{metric_name}": value
+                                            for metric_name, value in step_decoder_hidden_metrics.items()
                                         },
                                     },
                                     step=step,

@@ -108,11 +108,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ctc-teacher-online-full-temperature", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-full-nonblank-weight", default=None, type=float)
     parser.add_argument(
+        "--ctc-teacher-online-full-frame-weight-mode",
+        default=None,
+        choices=("hard_top1", "posterior_nonblank"),
+    )
+    parser.add_argument(
         "--ctc-teacher-online-full-frame-filter",
         default=None,
         choices=("all", "nonblank", "nonblank_neighbors"),
     )
     parser.add_argument("--ctc-teacher-online-encoder-loss-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-decoder-hidden-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-sequence-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-sequence-presence-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-sequence-window-loss-weight", default=None, type=float)
@@ -403,8 +409,10 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "ctc_teacher_online_full_loss_weight",
         "ctc_teacher_online_full_temperature",
         "ctc_teacher_online_full_nonblank_weight",
+        "ctc_teacher_online_full_frame_weight_mode",
         "ctc_teacher_online_full_frame_filter",
         "ctc_teacher_online_encoder_loss_weight",
+        "ctc_teacher_online_decoder_hidden_loss_weight",
         "ctc_teacher_online_sequence_loss_weight",
         "ctc_teacher_online_sequence_presence_loss_weight",
         "ctc_teacher_online_sequence_window_loss_weight",
