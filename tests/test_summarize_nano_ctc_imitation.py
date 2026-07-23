@@ -33,3 +33,38 @@ def test_load_teacher_accepts_native_nano_eval_prediction_fields(tmp_path: Path)
 
     assert rows["utt-a"]["text"] == "hello world"
     assert rows["utt-a"]["tokens"] == [1, 2, 3]
+
+
+def test_accumulator_reports_token_edit_decomposition() -> None:
+    accumulator = summary.Accumulator()
+    common = {
+        "pred_text": "",
+        "teacher_text": "",
+        "language": "en",
+        "normalization": "ctc",
+        "student_blank_prob": None,
+        "teacher_blank_prob": None,
+        "student_blank_top1": None,
+        "teacher_blank_top1": None,
+    }
+    accumulator.add(
+        **common,
+        pred_tokens=[1, 4, 3, 5],
+        teacher_tokens=[1, 2, 3],
+    )
+    accumulator.add(
+        **common,
+        pred_tokens=[8],
+        teacher_tokens=[7, 8],
+    )
+
+    stats = accumulator.as_dict()
+
+    assert stats["token_insertions"] == 1
+    assert stats["token_deletions"] == 1
+    assert stats["token_substitutions"] == 1
+    assert stats["token_errors"] == 3
+    assert stats["nano_token_insertion_rate"] == 0.2
+    assert stats["nano_token_deletion_rate"] == 0.2
+    assert stats["nano_token_substitution_rate"] == 0.2
+    assert stats["nano_token_er"] == 0.6

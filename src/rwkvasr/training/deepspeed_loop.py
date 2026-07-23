@@ -39,6 +39,7 @@ from rwkvasr.data import (
     tokenizer_eos_token_id,
     validate_webdataset_index,
 )
+from rwkvasr.eval.text_metrics import edit_counts
 from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, DirectionMask, RWKVCTCModel, RWKVCTCModelConfig
 
 from .checkpoint import (
@@ -4437,55 +4438,7 @@ def _ctc_collapse_token_ids(
 
 
 def _token_edit_counts(reference: list[int], hypothesis: list[int]) -> tuple[int, int, int]:
-    """Return insertion, deletion, and substitution counts for one optimal edit path."""
-
-    rows = len(reference) + 1
-    columns = len(hypothesis) + 1
-    costs = [[0] * columns for _ in range(rows)]
-    for ref_index in range(1, rows):
-        costs[ref_index][0] = ref_index
-    for hyp_index in range(1, columns):
-        costs[0][hyp_index] = hyp_index
-    for ref_index, ref_token in enumerate(reference, start=1):
-        for hyp_index, hyp_token in enumerate(hypothesis, start=1):
-            substitution = costs[ref_index - 1][hyp_index - 1] + int(ref_token != hyp_token)
-            insertion = costs[ref_index][hyp_index - 1] + 1
-            deletion = costs[ref_index - 1][hyp_index] + 1
-            costs[ref_index][hyp_index] = min(substitution, insertion, deletion)
-
-    insertions = 0
-    deletions = 0
-    substitutions = 0
-    ref_index = len(reference)
-    hyp_index = len(hypothesis)
-    while ref_index > 0 or hyp_index > 0:
-        if (
-            ref_index > 0
-            and hyp_index > 0
-            and reference[ref_index - 1] == hypothesis[hyp_index - 1]
-            and costs[ref_index][hyp_index] == costs[ref_index - 1][hyp_index - 1]
-        ):
-            ref_index -= 1
-            hyp_index -= 1
-            continue
-        if (
-            ref_index > 0
-            and hyp_index > 0
-            and costs[ref_index][hyp_index] == costs[ref_index - 1][hyp_index - 1] + 1
-        ):
-            substitutions += 1
-            ref_index -= 1
-            hyp_index -= 1
-            continue
-        if ref_index > 0 and costs[ref_index][hyp_index] == costs[ref_index - 1][hyp_index] + 1:
-            deletions += 1
-            ref_index -= 1
-            continue
-        if hyp_index <= 0:
-            raise RuntimeError("Invalid token edit backtrace.")
-        insertions += 1
-        hyp_index -= 1
-    return insertions, deletions, substitutions
+    return edit_counts(reference, hypothesis)
 
 
 def _token_edit_distance(reference: list[int], hypothesis: list[int]) -> int:

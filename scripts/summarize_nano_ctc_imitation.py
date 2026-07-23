@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.eval.text_metrics import (
+    edit_counts,
     edit_distance,
     normalize_asr_text_for_metrics,
     tokenize_for_cer,
@@ -122,6 +123,9 @@ class Accumulator:
         self.ref_words = 0
         self.ref_chars = 0
         self.token_errors = 0
+        self.token_insertions = 0
+        self.token_deletions = 0
+        self.token_substitutions = 0
         self.ref_tokens = 0
         self.pred_tokens = 0
         self.length_ratio_sum = 0.0
@@ -166,7 +170,11 @@ class Accumulator:
         self.cer_errors += edit_distance(pred_chars, teacher_chars)
         self.ref_words += len(teacher_words)
         self.ref_chars += len(teacher_chars)
-        self.token_errors += edit_distance([str(v) for v in pred_tokens], [str(v) for v in teacher_tokens])
+        insertions, deletions, substitutions = edit_counts(teacher_tokens, pred_tokens)
+        self.token_insertions += insertions
+        self.token_deletions += deletions
+        self.token_substitutions += substitutions
+        self.token_errors += insertions + deletions + substitutions
         self.ref_tokens += len(teacher_tokens)
         self.pred_tokens += len(pred_tokens)
         self.length_ratio_sum += float(len(pred_tokens)) / float(max(1, len(teacher_tokens)))
@@ -186,6 +194,9 @@ class Accumulator:
         self.ref_words += other.ref_words
         self.ref_chars += other.ref_chars
         self.token_errors += other.token_errors
+        self.token_insertions += other.token_insertions
+        self.token_deletions += other.token_deletions
+        self.token_substitutions += other.token_substitutions
         self.ref_tokens += other.ref_tokens
         self.pred_tokens += other.pred_tokens
         self.length_ratio_sum += other.length_ratio_sum
@@ -200,11 +211,17 @@ class Accumulator:
             "nano_wer": float(self.wer_errors) / float(max(1, self.ref_words)),
             "nano_cer": float(self.cer_errors) / float(max(1, self.ref_chars)),
             "nano_token_er": float(self.token_errors) / float(max(1, self.ref_tokens)),
+            "nano_token_insertion_rate": float(self.token_insertions) / float(max(1, self.ref_tokens)),
+            "nano_token_deletion_rate": float(self.token_deletions) / float(max(1, self.ref_tokens)),
+            "nano_token_substitution_rate": float(self.token_substitutions) / float(max(1, self.ref_tokens)),
             "text_exact_rate": float(self.text_exact) / float(max(1, self.samples)),
             "token_exact_rate": float(self.token_exact) / float(max(1, self.samples)),
             "wer_errors": self.wer_errors,
             "cer_errors": self.cer_errors,
             "token_errors": self.token_errors,
+            "token_insertions": self.token_insertions,
+            "token_deletions": self.token_deletions,
+            "token_substitutions": self.token_substitutions,
             "ref_words": self.ref_words,
             "ref_chars": self.ref_chars,
             "ref_tokens": self.ref_tokens,
@@ -336,18 +353,21 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
         "",
         f"Teacher: `{summary['teacher_jsonl']}`",
         "",
-        "| candidate | samples | Nano WER | Nano CER | Nano token ER | text exact | token exact | len ratio | blank prob diff |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| candidate | samples | Nano WER | Nano CER | Nano token ER | token I | token D | token S | text exact | token exact | len ratio | blank prob diff |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for result in summary["results"]:
         stats = result["overall"]
         lines.append(
-            "| {label} | {samples} | {wer} | {cer} | {ter} | {text_exact} | {token_exact} | {length_ratio} | {blank_diff} |".format(
+            "| {label} | {samples} | {wer} | {cer} | {ter} | {insertions} | {deletions} | {substitutions} | {text_exact} | {token_exact} | {length_ratio} | {blank_diff} |".format(
                 label=result["label"],
                 samples=stats["samples"],
                 wer=_format_pct(stats["nano_wer"]),
                 cer=_format_pct(stats["nano_cer"]),
                 ter=_format_pct(stats["nano_token_er"]),
+                insertions=_format_pct(stats["nano_token_insertion_rate"]),
+                deletions=_format_pct(stats["nano_token_deletion_rate"]),
+                substitutions=_format_pct(stats["nano_token_substitution_rate"]),
                 text_exact=_format_pct(stats["text_exact_rate"]),
                 token_exact=_format_pct(stats["token_exact_rate"]),
                 length_ratio=_format_num(stats["avg_token_length_ratio"]),
@@ -357,18 +377,23 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
     lines.append("")
     lines.append("## By Source")
     lines.append("")
-    lines.append("| candidate | source | samples | Nano WER | Nano CER | Nano token ER | text exact | token exact |")
-    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    lines.append(
+        "| candidate | source | samples | Nano WER | Nano CER | Nano token ER | token I | token D | token S | text exact | token exact |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for result in summary["results"]:
         for source, stats in result["by_source"].items():
             lines.append(
-                "| {label} | {source} | {samples} | {wer} | {cer} | {ter} | {text_exact} | {token_exact} |".format(
+                "| {label} | {source} | {samples} | {wer} | {cer} | {ter} | {insertions} | {deletions} | {substitutions} | {text_exact} | {token_exact} |".format(
                     label=result["label"],
                     source=source,
                     samples=stats["samples"],
                     wer=_format_pct(stats["nano_wer"]),
                     cer=_format_pct(stats["nano_cer"]),
                     ter=_format_pct(stats["nano_token_er"]),
+                    insertions=_format_pct(stats["nano_token_insertion_rate"]),
+                    deletions=_format_pct(stats["nano_token_deletion_rate"]),
+                    substitutions=_format_pct(stats["nano_token_substitution_rate"]),
                     text_exact=_format_pct(stats["text_exact_rate"]),
                     token_exact=_format_pct(stats["token_exact_rate"]),
                 )
@@ -418,7 +443,7 @@ def main() -> None:
         )
 
     summary = {
-        "version": 1,
+        "version": 2,
         "teacher_jsonl": str(teacher_path),
         "teacher_rows": len(teacher),
         "normalization": str(args.normalization),
