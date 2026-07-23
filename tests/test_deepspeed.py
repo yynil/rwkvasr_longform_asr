@@ -12,7 +12,10 @@ from rwkvasr.config import load_yaml
 from rwkvasr.training.deepspeed_loop import (
     DeepSpeedTrainConfig,
     _accumulate_layer_eval_metrics,
+    _ctc_frame_group_mean,
+    _ctc_frame_group_sums,
     _ctc_teacher_layer_hidden_loss,
+    _ctc_teacher_top1_nonblank_mask,
     _finalize_layer_eval_metrics,
     _maybe_load_initial_model_checkpoint,
     _materialize_step_eval_batches,
@@ -255,6 +258,76 @@ def test_layer_hidden_loss_matches_identical_sampled_components() -> None:
     assert result.max_frame_delta == 0
     result.loss.backward()
     assert student_hiddens[0]["mixer"].grad is not None
+
+
+def test_teacher_top1_balanced_reduction_weights_blank_and_nonblank_equally() -> None:
+    frame_loss = torch.tensor([4.0, 1.0, 1.0, 1.0], requires_grad=True)
+    group_sums, group_denoms = _ctc_frame_group_sums(
+        frame_loss,
+        frame_balance_mode="teacher_top1_balanced",
+        teacher_nonblank_mask=torch.tensor([True, False, False, False]),
+    )
+    loss = _ctc_frame_group_mean(group_sums, group_denoms)
+
+    assert loss.item() == pytest.approx(2.5)
+    loss.backward()
+    assert frame_loss.grad is not None
+    assert frame_loss.grad.tolist() == pytest.approx([0.5, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0])
+
+
+def test_teacher_top1_nonblank_mask_excludes_blank_and_ignored_ids() -> None:
+    mask = _ctc_teacher_top1_nonblank_mask(
+        {
+            "topk_token_ids": torch.tensor([[5], [4], [2]]),
+            "topk_log_probs": torch.zeros(3, 1),
+            "project_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        },
+        target_time=5,
+        blank_id=5,
+        device=torch.device("cpu"),
+    )
+
+    assert mask is not None
+    assert mask.tolist() == [False, False, False, True, True]
+
+
+def test_layer_hidden_loss_balances_teacher_nonblank_and_blank_frames() -> None:
+    student = torch.tensor(
+        [[[2.0, 2.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]],
+        requires_grad=True,
+    )
+    result = _ctc_teacher_layer_hidden_loss(
+        {0: {"mixer": student}},
+        torch.tensor([4]),
+        ["utt-a"],
+        {
+            "utt-a": {
+                "encoder_layer_hiddens": {"0": {"mixer": torch.zeros(4, 2)}},
+                "topk_token_ids": torch.tensor([[1], [5], [5], [5]]),
+                "topk_log_probs": torch.zeros(4, 1),
+                "project_blank_id": 5,
+                "project_ignored_token_ids": [4],
+            }
+        },
+        layer_ids=(0,),
+        component_weights={"mixer": 1.0},
+        normalized_mse_weight=0.0,
+        cosine_weight=0.0,
+        energy_mse_weight=0.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=1.0,
+        frame_tolerance=0,
+        missing_policy="error",
+        frame_balance_mode="teacher_top1_balanced",
+        blank_id=5,
+    )
+
+    assert result.loss.item() == pytest.approx(2.5)
+    result.loss.backward()
+    assert student.grad is not None
+    assert torch.count_nonzero(student.grad[0, 0]).item() == 2
+    assert torch.count_nonzero(student.grad[0, 1:]).item() == 6
 
 
 def test_layer_hidden_energy_mse_is_bounded_and_detects_scale_mismatch() -> None:

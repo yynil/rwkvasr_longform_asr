@@ -85,9 +85,13 @@ def _load_teacher(
         text = row.get(teacher_text_key)
         if text is None:
             text = row.get("funasr_ctc_text")
+        if text is None:
+            text = row.get("pred_text")
         tokens = row.get(teacher_token_key)
         if tokens is None:
             tokens = row.get("funasr_ctc_token_ids")
+        if tokens is None:
+            tokens = row.get("pred_token_ids")
         source = _key(row.get("source") or row.get("source_dataset") or "unknown").lower() or "unknown"
         language = _key(row.get("language")).lower() or SOURCE_LANGUAGE.get(source)
         rows[utt_id] = {

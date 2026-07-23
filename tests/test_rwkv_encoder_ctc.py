@@ -15,6 +15,7 @@ from rwkvasr.modules import (
 from rwkvasr.training.deepspeed_loop import (
     _CTC_FULL_EVAL_WIDTH,
     _ctc_teacher_blank_frame_bce,
+    _ctc_teacher_blank_loss,
     _ctc_teacher_decoder_hidden_loss,
     _ctc_teacher_full_loss,
     _ctc_teacher_hidden_loss,
@@ -770,6 +771,57 @@ def test_ctc_teacher_blank_frame_bce_excludes_ignored_token_gradient() -> None:
     assert torch.count_nonzero(student_logits.grad[0, [0, 1, 3]]).item() == 3
 
 
+def test_ctc_teacher_blank_loss_balances_teacher_active_and_blank_frames() -> None:
+    student_logits = torch.tensor(
+        [
+            [
+                [0.1, 0.7, -0.2, 0.0, 5.0, -0.3],
+                [0.2, -0.1, 0.3, 0.0, 5.0, 0.8],
+                [0.4, -0.2, 0.1, 0.0, 5.0, 1.1],
+                [-0.2, 0.1, 0.3, 0.0, 5.0, 0.5],
+            ]
+        ],
+        requires_grad=True,
+    )
+    teacher_blank_log_probs = torch.tensor([0.2, 0.9, 0.8, 0.7]).log()
+    teacher_record = {
+        "topk_token_ids": torch.tensor([[1, 5], [5, 1], [5, 2], [5, 3]]),
+        "topk_log_probs": torch.tensor(
+            [[0.8, 0.2], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3]]
+        ).log(),
+        "blank_log_probs": teacher_blank_log_probs,
+        "project_blank_id": 5,
+        "project_ignored_token_ids": [4],
+    }
+
+    loss, matched, missing = _ctc_teacher_blank_loss(
+        student_logits,
+        torch.tensor([4]),
+        ["utt-a"],
+        {"utt-a": teacher_record},
+        blank_id=5,
+        time_map="nearest",
+        missing_policy="error",
+        frame_balance_mode="teacher_top1_balanced",
+    )
+    frame_loss = _ctc_teacher_blank_frame_bce(
+        student_logits[0],
+        teacher_blank_log_probs,
+        blank_id=5,
+        ignored_token_ids=(4,),
+    )
+    expected = 0.5 * (frame_loss[0] + frame_loss[1:].mean())
+
+    assert loss.item() == pytest.approx(expected.item())
+    assert matched == 1
+    assert missing == 0
+    loss.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad[0, 0]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[..., 4]).item() == 0
+
+
 def test_ctc_teacher_decoder_hidden_loss_aligns_all_decoder_states() -> None:
     student_hiddens = {
         "input": torch.randn(2, 4, 6, requires_grad=True),
@@ -816,6 +868,43 @@ def test_ctc_teacher_decoder_hidden_loss_aligns_all_decoder_states() -> None:
     for hidden in student_hiddens.values():
         assert hidden.grad is not None
         assert torch.isfinite(hidden.grad).all()
+
+
+def test_ctc_teacher_decoder_hidden_loss_balances_teacher_active_and_blank_frames() -> None:
+    student = torch.tensor(
+        [[[2.0, 2.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]],
+        requires_grad=True,
+    )
+    result = _ctc_teacher_decoder_hidden_loss(
+        {"input": student},
+        torch.tensor([4]),
+        ["utt-a"],
+        {
+            "utt-a": {
+                "ctc_decoder_hiddens": {"input": torch.zeros(4, 2)},
+                "topk_token_ids": torch.tensor([[1], [5], [5], [5]]),
+                "topk_log_probs": torch.zeros(4, 1),
+                "project_blank_id": 5,
+                "project_ignored_token_ids": [4],
+            }
+        },
+        normalized_mse_weight=0.0,
+        cosine_weight=0.0,
+        energy_mse_weight=0.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=1.0,
+        frame_tolerance=0,
+        missing_policy="error",
+        frame_balance_mode="teacher_top1_balanced",
+        blank_id=5,
+    )
+
+    assert result.loss.item() == pytest.approx(2.5)
+    assert result.state_losses["input"].item() == pytest.approx(2.5)
+    result.loss.backward()
+    assert student.grad is not None
+    assert torch.count_nonzero(student.grad[0, 0]).item() == 2
+    assert torch.count_nonzero(student.grad[0, 1:]).item() == 6
 
 
 def test_ctc_suppressed_token_ids_mask_logits_but_not_blank() -> None:

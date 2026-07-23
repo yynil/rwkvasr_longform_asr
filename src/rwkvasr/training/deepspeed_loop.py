@@ -286,6 +286,7 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_full_frame_filter: str | None = None
     ctc_teacher_online_full_nonblank_weight: float = 1.0
     ctc_teacher_online_full_frame_weight_mode: str = "hard_top1"
+    ctc_teacher_online_frame_balance_mode: str = "all"
     ctc_teacher_online_encoder_loss_weight: float = 0.0
     ctc_teacher_online_decoder_hidden_loss_weight: float = 0.0
     ctc_teacher_online_sequence_loss_weight: float = 0.0
@@ -1638,6 +1639,119 @@ def _is_layer_hidden_only_objective(config: DeepSpeedTrainConfig) -> bool:
     return layer_enabled and all(float(value) <= 0.0 for value in non_layer_weights)
 
 
+def _ctc_frame_group_count(frame_balance_mode: str) -> int:
+    mode = str(frame_balance_mode or "all").strip().lower()
+    if mode == "all":
+        return 1
+    if mode == "teacher_top1_balanced":
+        return 2
+    raise ValueError(
+        "ctc_teacher_online_frame_balance_mode must be 'all' or "
+        f"'teacher_top1_balanced', got {frame_balance_mode!r}."
+    )
+
+
+def _ctc_teacher_top1_nonblank_mask(
+    record: dict[str, Any],
+    *,
+    target_time: int,
+    blank_id: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
+    raw_log_probs = _ctc_teacher_topk_field(
+        record,
+        "topk_log_probs",
+        "topk_logprobs",
+        "log_probs",
+        "logprobs",
+    )
+    if raw_ids is None or raw_log_probs is None:
+        return None
+    teacher_ids = torch.as_tensor(raw_ids, dtype=torch.long)
+    teacher_log_probs = torch.as_tensor(raw_log_probs, dtype=torch.float32)
+    if teacher_ids.ndim != 2 or teacher_log_probs.ndim != 2 or teacher_ids.shape != teacher_log_probs.shape:
+        raise ValueError(
+            "CTC teacher frame balancing expects matching 2-D ids/log_probs, "
+            f"got ids={tuple(teacher_ids.shape)} log_probs={tuple(teacher_log_probs.shape)}."
+        )
+    source_time = int(teacher_ids.size(0))
+    target_time = int(target_time)
+    if target_time <= 0:
+        return torch.zeros((0,), dtype=torch.bool, device=device)
+    if source_time <= 0:
+        return torch.zeros((target_time,), dtype=torch.bool, device=device)
+    ignored_values = record.get("project_ignored_token_ids")
+    if ignored_values is None:
+        ignored_values = [60514]
+    source_mask = _ctc_teacher_frame_filter_mask(
+        teacher_ids,
+        teacher_log_probs,
+        frame_filter="nonblank",
+        blank_id=int(record.get("project_blank_id", int(blank_id))),
+        ignored_token_ids=tuple(int(value) for value in ignored_values),
+        neighbor_radius=0,
+        min_nonblank_prob=0.0,
+        device=device,
+    )
+    if source_mask is None:
+        raise RuntimeError("Teacher top-1 nonblank mask unexpectedly resolved to None.")
+    if source_time == target_time:
+        return source_mask
+    if source_time == 1 or target_time == 1:
+        indices = torch.zeros((target_time,), dtype=torch.long, device=device)
+    else:
+        positions = torch.arange(target_time, dtype=torch.float32, device=device)
+        indices = torch.round(positions * float(source_time - 1) / float(target_time - 1)).to(
+            dtype=torch.long
+        )
+    return source_mask.index_select(0, indices.clamp(min=0, max=source_time - 1))
+
+
+def _ctc_frame_group_sums(
+    frame_loss: torch.Tensor,
+    *,
+    frame_balance_mode: str,
+    teacher_nonblank_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    group_count = _ctc_frame_group_count(frame_balance_mode)
+    if group_count == 1:
+        return (
+            frame_loss.sum().reshape(1),
+            frame_loss.new_tensor([float(frame_loss.numel())], dtype=torch.float32),
+        )
+    if teacher_nonblank_mask is None:
+        raise ValueError("teacher_top1_balanced frame reduction requires Nano top-1 token ids.")
+    mask = teacher_nonblank_mask.to(device=frame_loss.device, dtype=torch.bool)
+    if tuple(mask.shape) != tuple(frame_loss.shape):
+        raise ValueError(
+            "CTC teacher frame balance mask shape mismatch: "
+            f"loss={tuple(frame_loss.shape)} mask={tuple(mask.shape)}."
+        )
+    blank_mask = ~mask
+    return (
+        torch.stack(
+            (
+                frame_loss.masked_select(mask).sum(),
+                frame_loss.masked_select(blank_mask).sum(),
+            )
+        ),
+        torch.stack(
+            (
+                mask.sum().to(device=frame_loss.device, dtype=torch.float32),
+                blank_mask.sum().to(device=frame_loss.device, dtype=torch.float32),
+            )
+        ),
+    )
+
+
+def _ctc_frame_group_mean(group_sums: torch.Tensor, group_denoms: torch.Tensor) -> torch.Tensor:
+    present = group_denoms > 0.0
+    means = group_sums / group_denoms.clamp_min(1.0)
+    weights = present.to(dtype=means.dtype)
+    return (means * weights).sum() / weights.sum().clamp_min(1.0)
+
+
 def _ctc_teacher_layer_hidden_loss(
     student_hiddens: dict[int, dict[str, torch.Tensor]],
     student_lengths: torch.Tensor | None,
@@ -1653,6 +1767,8 @@ def _ctc_teacher_layer_hidden_loss(
     raw_mse_weight: float,
     frame_tolerance: int,
     missing_policy: str,
+    frame_balance_mode: str = "all",
+    blank_id: int = 0,
 ) -> _LayerHiddenDistillationResult:
     if utt_ids is None:
         raise RuntimeError("Layer hidden distillation requires batch.utt_ids.")
@@ -1676,6 +1792,7 @@ def _ctc_teacher_layer_hidden_loss(
     }
     if not active_components:
         raise ValueError("Layer hidden distillation requires at least one positive component weight.")
+    group_count = _ctc_frame_group_count(frame_balance_mode)
 
     reference = next(
         (
@@ -1703,10 +1820,18 @@ def _ctc_teacher_layer_hidden_loss(
             max=max_student_time,
         )
 
-    component_sums = {name: reference.new_zeros((), dtype=torch.float32) for name in active_components}
-    component_denoms = {name: reference.new_zeros((), dtype=torch.float32) for name in active_components}
-    layer_sums = {layer_id: reference.new_zeros((), dtype=torch.float32) for layer_id in layer_ids}
-    layer_denoms = {layer_id: reference.new_zeros((), dtype=torch.float32) for layer_id in layer_ids}
+    component_sums = {
+        name: reference.new_zeros((group_count,), dtype=torch.float32) for name in active_components
+    }
+    component_denoms = {
+        name: reference.new_zeros((group_count,), dtype=torch.float32) for name in active_components
+    }
+    layer_sums = {
+        layer_id: reference.new_zeros((group_count,), dtype=torch.float32) for layer_id in layer_ids
+    }
+    layer_denoms = {
+        layer_id: reference.new_zeros((group_count,), dtype=torch.float32) for layer_id in layer_ids
+    }
     stat_keys = ("student_sq", "teacher_sq", "elements", "energy", "log_rms", "cosine", "frames")
     component_stats = {
         name: {key: reference.new_zeros((), dtype=torch.float32) for key in stat_keys}
@@ -1740,6 +1865,23 @@ def _ctc_teacher_layer_hidden_loss(
             continue
         student_time = student_times[sample_idx]
         if student_time <= 0:
+            continue
+        teacher_nonblank_mask = (
+            _ctc_teacher_top1_nonblank_mask(
+                record,
+                target_time=student_time,
+                blank_id=int(blank_id),
+                device=reference.device,
+            )
+            if group_count == 2
+            else None
+        )
+        if group_count == 2 and teacher_nonblank_mask is None:
+            missing_ids.add(utt_id)
+            if missing_policy == "error":
+                raise ValueError(
+                    f"Nano record has no top-1 CTC path for balanced layer loss utt_id={utt_id!r}."
+                )
             continue
 
         sample_had_event = False
@@ -1814,12 +1956,19 @@ def _ctc_teacher_layer_hidden_loss(
                         teacher_slice,
                         reduction="none",
                     ).mean(dim=-1) * float(raw_mse_weight)
-                event_sum = frame_loss.sum()
-                event_frames = frame_loss.new_tensor(float(aligned_time))
-                component_sums[component] = component_sums[component] + event_sum
-                component_denoms[component] = component_denoms[component] + event_frames
-                layer_sums[layer_id] = layer_sums[layer_id] + event_sum * component_weight
-                layer_denoms[layer_id] = layer_denoms[layer_id] + event_frames * component_weight
+                event_sums, event_denoms = _ctc_frame_group_sums(
+                    frame_loss,
+                    frame_balance_mode=frame_balance_mode,
+                    teacher_nonblank_mask=(
+                        teacher_nonblank_mask[:aligned_time]
+                        if teacher_nonblank_mask is not None
+                        else None
+                    ),
+                )
+                component_sums[component] = component_sums[component] + event_sums
+                component_denoms[component] = component_denoms[component] + event_denoms
+                layer_sums[layer_id] = layer_sums[layer_id] + event_sums * component_weight
+                layer_denoms[layer_id] = layer_denoms[layer_id] + event_denoms * component_weight
                 detached_student_sq = student_slice.detach().square().sum()
                 detached_teacher_sq = teacher_slice.detach().square().sum()
                 detached_elements = student_slice.new_tensor(float(student_slice.numel()))
@@ -1851,16 +2000,13 @@ def _ctc_teacher_layer_hidden_loss(
     if events <= 0:
         raise RuntimeError("Layer hidden distillation produced no matched layer/component events.")
     component_losses = {
-        name: component_sums[name] / component_denoms[name].clamp_min(1.0)
+        name: _ctc_frame_group_mean(component_sums[name], component_denoms[name])
         for name in active_components
     }
-    layer_denom_values = torch.stack(
-        [layer_denoms[layer_id] for layer_id in layer_ids]
-    ).detach().cpu().tolist()
     layer_losses = {
-        layer_id: layer_sums[layer_id] / layer_denoms[layer_id].clamp_min(1.0)
-        for layer_id, denom in zip(layer_ids, layer_denom_values, strict=True)
-        if float(denom) > 0.0
+        layer_id: _ctc_frame_group_mean(layer_sums[layer_id], layer_denoms[layer_id])
+        for layer_id in layer_ids
+        if float(layer_denoms[layer_id].sum().detach().item()) > 0.0
     }
     total = sum(
         component_losses[name] * component_weight
@@ -2104,6 +2250,7 @@ def _online_ctc_teacher_distillation_loss(
             blank_id=int(config.blank_id),
             time_map=config.ctc_teacher_topk_time_map,
             missing_policy=config.ctc_teacher_topk_missing_policy,
+            frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
         )
         total = total + loss_value * blank_weight
 
@@ -2205,6 +2352,7 @@ def _online_ctc_teacher_distillation_loss(
             frame_filter=ctc_teacher_frame_filter,
             frame_filter_neighbor_radius=int(config.ctc_teacher_frame_filter_neighbor_radius),
             frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
+            frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
         )
         total = total + loss_value * encoder_weight
 
@@ -2422,7 +2570,10 @@ def _evaluate_epoch_loss(
                     teacher_batch_feature_lengths,
                     audio_rows=batch.ctc_teacher_audio_rows,
                     layer_ids=teacher_layer_ids,
-                    include_ctc_outputs=not layer_hidden_only,
+                    include_ctc_outputs=(
+                        not layer_hidden_only
+                        or str(config.ctc_teacher_online_frame_balance_mode) == "teacher_top1_balanced"
+                    ),
                 )
             else:
                 ctc_teacher_online_records = ctc_teacher_online.topk_records(
@@ -2519,6 +2670,8 @@ def _evaluate_epoch_loss(
                     raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                     frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                     missing_policy=config.ctc_teacher_topk_missing_policy,
+                    frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
+                    blank_id=int(config.blank_id),
                 )
                 decoder_hidden_weight = float(
                     config.ctc_teacher_online_decoder_hidden_loss_weight
@@ -2550,6 +2703,8 @@ def _evaluate_epoch_loss(
                     raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                     frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                     missing_policy=config.ctc_teacher_topk_missing_policy,
+                    frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
+                    blank_id=int(config.blank_id),
                 )
                 loss = loss + layer_result.loss
                 if layer_eval_accumulator is not None:
@@ -2570,6 +2725,8 @@ def _evaluate_epoch_loss(
                             raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                             frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                             missing_policy=config.ctc_teacher_topk_missing_policy,
+                            frame_balance_mode=str(config.ctc_teacher_online_frame_balance_mode),
+                            blank_id=int(config.blank_id),
                         )
                         _accumulate_layer_eval_metrics(accumulator, component_result)
         else:
@@ -3691,6 +3848,7 @@ def _ctc_teacher_blank_loss(
     blank_id: int,
     time_map: str,
     missing_policy: str,
+    frame_balance_mode: str = "all",
 ) -> tuple[torch.Tensor, int, int]:
     if utt_ids is None:
         raise RuntimeError("CTC teacher blank distillation requires batch.utt_ids.")
@@ -3700,8 +3858,9 @@ def _ctc_teacher_blank_loss(
         raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
 
     batch_size = min(int(student_logits.size(0)), len(utt_ids))
-    total = student_logits.new_zeros((), dtype=torch.float32)
-    denom = student_logits.new_zeros((), dtype=torch.float32)
+    group_count = _ctc_frame_group_count(frame_balance_mode)
+    total = student_logits.new_zeros((group_count,), dtype=torch.float32)
+    denom = student_logits.new_zeros((group_count,), dtype=torch.float32)
     matched = 0
     missing = 0
     max_student_time = int(student_logits.size(1))
@@ -3768,6 +3927,23 @@ def _ctc_teacher_blank_loss(
         if teacher_time <= 0 or student_time <= 0:
             continue
 
+        teacher_nonblank_mask = (
+            _ctc_teacher_top1_nonblank_mask(
+                record,
+                target_time=student_time,
+                blank_id=int(blank_id),
+                device=student_logits.device,
+            )
+            if group_count == 2
+            else None
+        )
+        if group_count == 2 and teacher_nonblank_mask is None:
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(
+                    f"CTC teacher blank record has no top-1 path for balanced reduction utt_id={utt_id!r}"
+                )
+            continue
         matched += 1
         student_slice = student_logits[sample_idx, :student_time].float()
         if time_map == "nearest" or student_time == 1 or teacher_time == 1:
@@ -3796,10 +3972,15 @@ def _ctc_teacher_blank_loss(
             blank_id=int(blank_id),
             ignored_token_ids=ignored_ids,
         )
-        total = total + frame_loss.sum()
-        denom = denom + frame_loss.new_tensor(float(student_time))
+        event_sums, event_denoms = _ctc_frame_group_sums(
+            frame_loss,
+            frame_balance_mode=frame_balance_mode,
+            teacher_nonblank_mask=teacher_nonblank_mask,
+        )
+        total = total + event_sums
+        denom = denom + event_denoms
 
-    return total / denom.clamp_min(1.0), matched, missing
+    return _ctc_frame_group_mean(total, denom), matched, missing
 
 
 def _ctc_teacher_mass_loss(
@@ -4829,6 +5010,7 @@ def _ctc_teacher_hidden_loss(
     frame_filter: str = "all",
     frame_filter_neighbor_radius: int = 0,
     frame_filter_min_nonblank_prob: float = 0.0,
+    frame_balance_mode: str = "all",
 ) -> tuple[torch.Tensor, int, int]:
     if utt_ids is None:
         raise RuntimeError("CTC teacher hidden distillation requires batch.utt_ids.")
@@ -4838,8 +5020,9 @@ def _ctc_teacher_hidden_loss(
         raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
 
     batch_size = min(int(student_hidden.size(0)), len(utt_ids))
-    total = student_hidden.new_zeros((), dtype=torch.float32)
-    denom = student_hidden.new_zeros((), dtype=torch.float32)
+    group_count = _ctc_frame_group_count(frame_balance_mode)
+    total = student_hidden.new_zeros((group_count,), dtype=torch.float32)
+    denom = student_hidden.new_zeros((group_count,), dtype=torch.float32)
     matched = 0
     missing = 0
     max_student_time = int(student_hidden.size(1))
@@ -4889,6 +5072,24 @@ def _ctc_teacher_hidden_loss(
 
         matched += 1
         student_slice = student_hidden[sample_idx, :student_time].float()
+        selected_nonblank_mask = (
+            _ctc_teacher_top1_nonblank_mask(
+                record,
+                target_time=student_time,
+                blank_id=int(blank_id),
+                device=student_hidden.device,
+            )
+            if group_count == 2
+            else None
+        )
+        if group_count == 2 and selected_nonblank_mask is None:
+            matched -= 1
+            missing += 1
+            if missing_policy == "error":
+                raise ValueError(
+                    f"CTC teacher hidden record has no top-1 path for balanced reduction utt_id={utt_id!r}"
+                )
+            continue
         teacher_filter_mask: torch.Tensor | None = None
         if str(frame_filter or "all") != "all":
             raw_ids = _ctc_teacher_topk_field(record, "topk_token_ids", "topk_ids", "token_ids", "ids")
@@ -4975,10 +5176,17 @@ def _ctc_teacher_hidden_loss(
             if not bool(selected_frame_mask.any().item()):
                 continue
             frame_loss = frame_loss.masked_select(selected_frame_mask)
-        total = total + frame_loss.sum()
-        denom = denom + frame_loss.new_tensor(float(frame_loss.numel()))
+            if selected_nonblank_mask is not None:
+                selected_nonblank_mask = selected_nonblank_mask.masked_select(selected_frame_mask)
+        event_sums, event_denoms = _ctc_frame_group_sums(
+            frame_loss,
+            frame_balance_mode=frame_balance_mode,
+            teacher_nonblank_mask=selected_nonblank_mask,
+        )
+        total = total + event_sums
+        denom = denom + event_denoms
 
-    return total / denom.clamp_min(1.0), matched, missing
+    return _ctc_frame_group_mean(total, denom), matched, missing
 
 
 @dataclass(frozen=True)
@@ -5004,6 +5212,8 @@ def _ctc_teacher_decoder_hidden_loss(
     raw_mse_weight: float,
     frame_tolerance: int,
     missing_policy: str,
+    frame_balance_mode: str = "all",
+    blank_id: int = 0,
 ) -> _DecoderHiddenDistillationResult:
     if utt_ids is None:
         raise RuntimeError("CTC decoder hidden distillation requires batch.utt_ids.")
@@ -5027,6 +5237,7 @@ def _ctc_teacher_decoder_hidden_loss(
     )
     if not state_names:
         raise RuntimeError("Student CTC decoder hooks did not capture any hidden tensors.")
+    group_count = _ctc_frame_group_count(frame_balance_mode)
     reference = student_hiddens[state_names[0]]
     if reference.ndim != 3:
         raise ValueError(f"Student CTC decoder hidden must be [B, T, D], got {tuple(reference.shape)}.")
@@ -5045,10 +5256,14 @@ def _ctc_teacher_decoder_hidden_loss(
             dtype=torch.long,
         ).clamp(min=0, max=max_student_time)
 
-    total = reference.new_zeros((), dtype=torch.float32)
-    denom = reference.new_zeros((), dtype=torch.float32)
-    state_sums = {name: reference.new_zeros((), dtype=torch.float32) for name in state_names}
-    state_denoms = {name: reference.new_zeros((), dtype=torch.float32) for name in state_names}
+    total = reference.new_zeros((group_count,), dtype=torch.float32)
+    denom = reference.new_zeros((group_count,), dtype=torch.float32)
+    state_sums = {
+        name: reference.new_zeros((group_count,), dtype=torch.float32) for name in state_names
+    }
+    state_denoms = {
+        name: reference.new_zeros((group_count,), dtype=torch.float32) for name in state_names
+    }
     matched_ids: set[str] = set()
     missing_ids: set[str] = set()
     events = 0
@@ -5066,6 +5281,23 @@ def _ctc_teacher_decoder_hidden_loss(
             continue
         student_time = student_times[sample_idx]
         if student_time <= 0:
+            continue
+        teacher_nonblank_mask = (
+            _ctc_teacher_top1_nonblank_mask(
+                record,
+                target_time=student_time,
+                blank_id=int(blank_id),
+                device=reference.device,
+            )
+            if group_count == 2
+            else None
+        )
+        if group_count == 2 and teacher_nonblank_mask is None:
+            missing_ids.add(utt_id)
+            if missing_policy == "error":
+                raise ValueError(
+                    f"Nano record has no top-1 CTC path for balanced decoder loss utt_id={utt_id!r}."
+                )
             continue
         sample_had_event = False
         for state_name in state_names:
@@ -5128,12 +5360,19 @@ def _ctc_teacher_decoder_hidden_loss(
                 frame_loss += F.mse_loss(student_slice, teacher_slice, reduction="none").mean(dim=-1) * float(
                     raw_mse_weight
                 )
-            event_sum = frame_loss.sum()
-            event_frames = frame_loss.new_tensor(float(aligned_time))
-            total = total + event_sum
-            denom = denom + event_frames
-            state_sums[state_name] = state_sums[state_name] + event_sum
-            state_denoms[state_name] = state_denoms[state_name] + event_frames
+            event_sums, event_denoms = _ctc_frame_group_sums(
+                frame_loss,
+                frame_balance_mode=frame_balance_mode,
+                teacher_nonblank_mask=(
+                    teacher_nonblank_mask[:aligned_time]
+                    if teacher_nonblank_mask is not None
+                    else None
+                ),
+            )
+            total = total + event_sums
+            denom = denom + event_denoms
+            state_sums[state_name] = state_sums[state_name] + event_sums
+            state_denoms[state_name] = state_denoms[state_name] + event_denoms
             events += 1
             sample_had_event = True
         if sample_had_event:
@@ -5142,9 +5381,9 @@ def _ctc_teacher_decoder_hidden_loss(
     if events <= 0:
         raise RuntimeError("CTC decoder hidden distillation produced no matched state events.")
     return _DecoderHiddenDistillationResult(
-        loss=total / denom.clamp_min(1.0),
+        loss=_ctc_frame_group_mean(total, denom),
         state_losses={
-            name: state_sums[name] / state_denoms[name].clamp_min(1.0)
+            name: _ctc_frame_group_mean(state_sums[name], state_denoms[name])
             for name in state_names
         },
         matched_samples=len(matched_ids),
@@ -5841,6 +6080,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     ctc_teacher_online_full_frame_weight_mode = str(
         config.ctc_teacher_online_full_frame_weight_mode
     ).strip().lower()
+    ctc_teacher_online_frame_balance_mode = str(
+        config.ctc_teacher_online_frame_balance_mode
+    ).strip().lower()
     ctc_teacher_online_full_frame_filter = (
         ctc_teacher_frame_filter
         if config.ctc_teacher_online_full_frame_filter is None
@@ -5996,6 +6238,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 "ctc_teacher_online_full_frame_weight_mode must be 'hard_top1' or "
                 f"'posterior_nonblank', got {ctc_teacher_online_full_frame_weight_mode!r}."
             )
+        _ctc_frame_group_count(ctc_teacher_online_frame_balance_mode)
         if ctc_teacher_online_decoder_hidden_weight < 0.0:
             raise ValueError("ctc_teacher_online_decoder_hidden_loss_weight must be non-negative.")
         if ctc_teacher_online_nonblank_margin < 0.0:
@@ -6227,6 +6470,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"full_temperature={ctc_teacher_online_full_temperature:g} "
             f"full_nonblank_weight={ctc_teacher_online_full_nonblank_weight:g} "
             f"full_frame_weight_mode={ctc_teacher_online_full_frame_weight_mode} "
+            f"frame_balance_mode={ctc_teacher_online_frame_balance_mode} "
             f"rows={ctc_teacher_online.num_audio_rows} "
             f"top_k={int(config.ctc_teacher_online_top_k)} "
             f"time_map={config.ctc_teacher_topk_time_map} "
@@ -6667,7 +6911,10 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                 teacher_batch_feature_lengths,
                                 audio_rows=batch.ctc_teacher_audio_rows,
                                 layer_ids=teacher_layer_hidden_ids,
-                                include_ctc_outputs=not ctc_teacher_online_layer_only,
+                                include_ctc_outputs=(
+                                    not ctc_teacher_online_layer_only
+                                    or ctc_teacher_online_frame_balance_mode == "teacher_top1_balanced"
+                                ),
                             )
                         else:
                             ctc_teacher_online_records = ctc_teacher_online.topk_records(
@@ -6991,6 +7238,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         blank_id=int(config.blank_id),
                         time_map=config.ctc_teacher_topk_time_map,
                         missing_policy=config.ctc_teacher_topk_missing_policy,
+                        frame_balance_mode=ctc_teacher_online_frame_balance_mode,
                     )
                     ctc_teacher_online_blank_loss_value = float(ctc_teacher_online_blank_loss.detach().item())
                     loss = loss + ctc_teacher_online_blank_loss * ctc_teacher_online_blank_weight
@@ -7140,6 +7388,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         frame_filter=ctc_teacher_frame_filter,
                         frame_filter_neighbor_radius=ctc_teacher_frame_filter_neighbor_radius,
                         frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
+                        frame_balance_mode=ctc_teacher_online_frame_balance_mode,
                     )
                     ctc_teacher_online_encoder_loss_value = float(
                         ctc_teacher_online_encoder_loss.detach().item()
@@ -7168,6 +7417,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                         frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                         missing_policy=config.ctc_teacher_topk_missing_policy,
+                        frame_balance_mode=ctc_teacher_online_frame_balance_mode,
+                        blank_id=int(config.blank_id),
                     )
                     ctc_teacher_online_decoder_hidden_loss_value = float(
                         decoder_hidden_result.loss.detach().item()
@@ -7214,6 +7465,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         raw_mse_weight=float(config.ctc_teacher_online_layer_raw_mse_weight),
                         frame_tolerance=int(config.ctc_teacher_online_layer_frame_tolerance),
                         missing_policy=config.ctc_teacher_topk_missing_policy,
+                        frame_balance_mode=ctc_teacher_online_frame_balance_mode,
+                        blank_id=int(config.blank_id),
                     )
                     ctc_teacher_online_layer_loss_value = float(
                         layer_hidden_result.loss.detach().item()
