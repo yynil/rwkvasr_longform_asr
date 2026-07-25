@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.config import load_yaml, save_yaml
+from rwkvasr.data import estimate_bucket_manifest_steps, load_webdataset_bucket_manifest
 
 try:
-    from scripts.run_stage206_full_online_ctc_distill import SPLITS, _base_config, _split_steps
+    from scripts.run_stage206_full_online_ctc_distill import SPLITS, _base_config
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
-    from run_stage206_full_online_ctc_distill import SPLITS, _base_config, _split_steps
+    from run_stage206_full_online_ctc_distill import SPLITS, _base_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +88,55 @@ def _default_output_dir(phase: AlignmentPhase) -> Path:
     return Path("/tmp/rwkvasr_runs") / f"{RUN_PREFIX}_{suffix}"
 
 
+def _resolve_manifest_recorded_path(manifest_path: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return path.resolve()
+
+
+def _audit_bucket_manifest(bucket_manifest: Path) -> dict[str, Any]:
+    bucket_manifest = bucket_manifest.resolve()
+    manifest = load_webdataset_bucket_manifest(bucket_manifest)
+    root = _resolve_manifest_recorded_path(bucket_manifest, manifest.root)
+    length_index = _resolve_manifest_recorded_path(
+        bucket_manifest,
+        manifest.source_length_index_path,
+    )
+    if not root.is_dir():
+        raise FileNotFoundError(f"Stage210 WebDataset root is unavailable: {root}")
+    if not length_index.is_file():
+        raise FileNotFoundError(f"Stage210 length index is unavailable: {length_index}")
+
+    part_paths: list[Path] = []
+    source_labels: set[str] = set()
+    split_samples: dict[str, int] = {}
+    for split, buckets in manifest.splits.items():
+        split_samples[split] = sum(bucket.num_samples for bucket in buckets)
+        for bucket in buckets:
+            for part in bucket.parts:
+                part_paths.append(_resolve_manifest_recorded_path(bucket_manifest, part.path))
+                if part.source_label:
+                    source_labels.add(str(part.source_label))
+    if not part_paths:
+        raise ValueError(f"Stage210 bucket manifest has no part files: {bucket_manifest}")
+    missing_parts = [path for path in part_paths if not path.is_file()]
+    if missing_parts:
+        raise FileNotFoundError(
+            "Stage210 bucket manifest references missing part files: "
+            f"missing={len(missing_parts)}/{len(part_paths)} first={missing_parts[:3]}"
+        )
+    return {
+        "manifest": manifest,
+        "bucket_manifest": bucket_manifest,
+        "root": root,
+        "length_index": length_index,
+        "part_files": len(part_paths),
+        "source_labels": sorted(source_labels),
+        "split_samples": split_samples,
+    }
+
+
 def _latest_step(output_dir: Path) -> int:
     latest_path = output_dir / "latest_checkpoint.yaml"
     if not latest_path.is_file():
@@ -123,6 +173,11 @@ def _phase_config(
     layer_sample_count: int = 8,
     eval_only: bool = False,
     skip_nano_init: bool = False,
+    length_index_path: Path | None = None,
+    bucket_manifest_path: Path | None = None,
+    bucket_source_interleave: bool = False,
+    save_every: int | None = None,
+    teacher_model_dir: Path | None = None,
 ) -> dict[str, Any]:
     apply_nano_init = bool(phase.apply_nano_init and not skip_nano_init)
     config = _base_config(output_dir)
@@ -139,8 +194,11 @@ def _phase_config(
                 },
                 "bf16": {"enabled": True},
             },
-            "webdataset_length_index_path": str(EASY_SPLIT.length_index),
-            "webdataset_bucket_manifest_path": str(EASY_SPLIT.bucket_manifest),
+            "webdataset_length_index_path": str(length_index_path or EASY_SPLIT.length_index),
+            "webdataset_bucket_manifest_path": str(
+                bucket_manifest_path or EASY_SPLIT.bucket_manifest
+            ),
+            "bucket_source_interleave": bool(bucket_source_interleave),
             "feature_extractor_type": "funasr_wav_frontend",
             "dropout": 0.0,
             "batch_size": TRAIN_BATCH_SIZE,
@@ -154,7 +212,7 @@ def _phase_config(
             "lr": float(phase.lr),
             "weight_decay": 0.1,
             "gradient_checkpointing": False,
-            "save_every": 1 if smoke else 10_000,
+            "save_every": 1 if smoke else int(save_every or 10_000),
             "step_eval_every": 1 if smoke else 10_000,
             "step_eval_samples": 4 if smoke else 256,
             "step_eval_batch_size": 1 if smoke else 4,
@@ -178,9 +236,7 @@ def _phase_config(
             ),
             "funasr_nano_ctc_init_load_encoder": False,
             "funasr_nano_ctc_init_load_encoder_attention": False,
-            "funasr_nano_ctc_init_load_rwkv_encoder_from_qkv": bool(
-                apply_nano_init and not resume
-            ),
+            "funasr_nano_ctc_init_load_rwkv_encoder_from_qkv": bool(apply_nano_init and not resume),
             "funasr_nano_ctc_init_rwkv_qkv_scale_mode": str(qkv_scale_mode),
             "funasr_nano_ctc_init_load_decoder": bool(apply_nano_init and not resume),
             "funasr_nano_ctc_init_load_head": bool(apply_nano_init and not resume),
@@ -196,7 +252,7 @@ def _phase_config(
             "ctc_teacher_topk_loss_weight": 0.0,
             "ctc_teacher_topk_blank_loss_weight": 0.0,
             "ctc_teacher_topk_mass_loss_weight": 0.0,
-            "ctc_teacher_online_model_path": str(NANO_MODEL_DIR),
+            "ctc_teacher_online_model_path": str(teacher_model_dir or NANO_MODEL_DIR),
             "ctc_teacher_online_use_batch_features": True,
             "ctc_teacher_online_keep_layer_hiddens_on_device": True,
             "ctc_teacher_online_keep_audio_cache": False,
@@ -304,6 +360,9 @@ def main() -> int:
     parser.add_argument("--config-dir", type=Path, default=DEFAULT_CONFIG_DIR)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
     parser.add_argument("--nano-checkpoint", type=Path, default=NANO_CHECKPOINT)
+    parser.add_argument("--teacher-model-dir", type=Path, default=NANO_MODEL_DIR)
+    parser.add_argument("--bucket-manifest", type=Path, default=EASY_SPLIT.bucket_manifest)
+    parser.add_argument("--save-every", type=int, default=10_000)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--eval-only", action="store_true")
@@ -319,6 +378,8 @@ def main() -> int:
     args = parser.parse_args()
     if int(args.smoke_steps) <= 0:
         parser.error("--smoke-steps must be positive")
+    if int(args.save_every) <= 0:
+        parser.error("--save-every must be positive")
     if args.smoke and args.eval_only:
         parser.error("--smoke and --eval-only are mutually exclusive")
     if args.skip_nano_init and args.init_checkpoint is None:
@@ -347,13 +408,25 @@ def main() -> int:
     if init_checkpoint is None and phase.name == "subblock":
         init_checkpoint = STAGE209_CHECKPOINT
     if init_checkpoint is None and not resume:
-        parser.error("--phase block requires --init-checkpoint from a passing Stage210 subblock run")
+        parser.error(
+            "--phase block requires --init-checkpoint from a passing Stage210 subblock run"
+        )
     if init_checkpoint is None:
         init_checkpoint = output_dir / "resume-placeholder.pt"
     if not resume and not init_checkpoint.is_file():
         raise FileNotFoundError(str(init_checkpoint))
-    if phase.apply_nano_init and not args.skip_nano_init and not resume and not args.nano_checkpoint.is_file():
+    if (
+        phase.apply_nano_init
+        and not args.skip_nano_init
+        and not resume
+        and not args.nano_checkpoint.is_file()
+    ):
         raise FileNotFoundError(str(args.nano_checkpoint))
+    if not args.teacher_model_dir.is_dir():
+        raise FileNotFoundError(str(args.teacher_model_dir))
+
+    data_audit = _audit_bucket_manifest(args.bucket_manifest)
+    source_interleave = bool(data_audit["source_labels"])
 
     config = _phase_config(
         phase=phase,
@@ -367,6 +440,11 @@ def main() -> int:
         layer_sample_count=int(args.layer_sample_count),
         eval_only=bool(args.eval_only),
         skip_nano_init=bool(args.skip_nano_init),
+        length_index_path=data_audit["length_index"],
+        bucket_manifest_path=data_audit["bucket_manifest"],
+        bucket_source_interleave=source_interleave,
+        save_every=int(args.save_every),
+        teacher_model_dir=args.teacher_model_dir,
     )
     config_path = _write_config(
         args.config_dir,
@@ -381,11 +459,13 @@ def main() -> int:
         else (
             int(args.smoke_steps)
             if args.smoke
-            else _split_steps(
-                EASY_SPLIT,
+            else estimate_bucket_manifest_steps(
+                data_audit["manifest"],
+                split="train",
                 batch_size=TRAIN_BATCH_SIZE,
                 world_size=4,
                 frame_budget=TRAIN_FRAME_BUDGET,
+                drop_last=True,
             )
         )
     )
@@ -394,7 +474,10 @@ def main() -> int:
     print(f"init_checkpoint={init_checkpoint}", flush=True)
     print(f"resume={resume} latest_step={latest_step} eval_only={bool(args.eval_only)}", flush=True)
     print(
-        f"data=easy rows=1174987 hours={EASY_SPLIT.hours:.3f} estimated_steps={estimated_steps}",
+        f"data=easy rows={data_audit['split_samples'].get('train', 0)} "
+        f"hours={EASY_SPLIT.hours:.3f} estimated_steps={estimated_steps} "
+        f"bucket_parts={data_audit['part_files']} "
+        f"sources={','.join(data_audit['source_labels']) or 'ungrouped'}",
         flush=True,
     )
     print(

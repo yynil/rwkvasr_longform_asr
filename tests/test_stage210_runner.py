@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -83,6 +84,32 @@ def test_stage210_can_raise_layer_coverage_for_an_explicit_probe(tmp_path: Path)
     assert config["ctc_teacher_online_layer_sample_count"] == 24
 
 
+def test_stage210_recovery_can_bind_persistent_source_balanced_data(tmp_path: Path) -> None:
+    length_index = tmp_path / "webdataset_lengths.jsonl"
+    bucket_manifest = tmp_path / "source_grouped" / "manifest.json"
+    teacher_model_dir = tmp_path / "nano"
+    config = _phase_config(
+        phase=PHASES["subblock"],
+        output_dir=tmp_path / "run",
+        init_checkpoint=tmp_path / "stage179.pt",
+        nano_checkpoint=tmp_path / "model.pt",
+        resume=False,
+        smoke=False,
+        length_index_path=length_index,
+        bucket_manifest_path=bucket_manifest,
+        bucket_source_interleave=True,
+        save_every=2_000,
+        teacher_model_dir=teacher_model_dir,
+    )
+
+    assert config["webdataset_length_index_path"] == str(length_index)
+    assert config["webdataset_bucket_manifest_path"] == str(bucket_manifest)
+    assert config["bucket_source_interleave"] is True
+    assert config["save_every"] == 2_000
+    assert config["step_eval_every"] == 10_000
+    assert config["ctc_teacher_online_model_path"] == str(teacher_model_dir)
+
+
 def test_stage210_does_not_treat_export_only_smoke_as_resumable(tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
     output_dir.mkdir()
@@ -111,7 +138,9 @@ def test_stage210_does_not_treat_export_only_smoke_as_resumable(tmp_path: Path) 
     assert _has_deepspeed_resume_state(output_dir) is True
 
 
-def test_stage210_block_requires_a_passing_checkpoint_without_reinitializing(tmp_path: Path) -> None:
+def test_stage210_block_requires_a_passing_checkpoint_without_reinitializing(
+    tmp_path: Path,
+) -> None:
     checkpoint = tmp_path / "stage210a.pt"
     nano_checkpoint = tmp_path / "model.pt"
     checkpoint.touch()
@@ -154,7 +183,9 @@ def test_stage210_resume_uses_deepspeed_state_without_reapplying_nano(tmp_path: 
     assert config["funasr_nano_ctc_init_load_rwkv_encoder_from_qkv"] is False
 
 
-def test_stage210_eval_only_can_score_trained_subblock_without_reinitializing(tmp_path: Path) -> None:
+def test_stage210_eval_only_can_score_trained_subblock_without_reinitializing(
+    tmp_path: Path,
+) -> None:
     checkpoint = tmp_path / "stage210a-step10000.pt"
     config = _phase_config(
         phase=PHASES["subblock"],
@@ -183,8 +214,48 @@ def test_stage210_eval_only_can_score_trained_subblock_without_reinitializing(tm
 def test_stage210_direct_script_entrypoint_is_runnable(tmp_path: Path) -> None:
     checkpoint = tmp_path / "stage209.pt"
     nano_checkpoint = tmp_path / "model.pt"
+    teacher_model_dir = tmp_path / "nano"
+    shard_root = tmp_path / "shards"
+    bucket_dir = tmp_path / "buckets"
+    length_index = tmp_path / "webdataset_lengths.jsonl"
+    part_path = bucket_dir / "train" / "bucket_0000" / "part_000000.jsonl"
     checkpoint.touch()
     nano_checkpoint.touch()
+    teacher_model_dir.mkdir()
+    shard_root.mkdir()
+    part_path.parent.mkdir(parents=True)
+    length_index.write_text("{}\n", encoding="utf-8")
+    part_path.write_text("{}\n", encoding="utf-8")
+    manifest_path = bucket_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "root": str(shard_root),
+                "source_length_index_path": str(length_index),
+                "bucket_width": 200,
+                "entries_per_part": 100_000,
+                "splits": {
+                    "train": {
+                        "num_samples": 1,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": 1,
+                                "parts": [
+                                    {
+                                        "path": str(part_path),
+                                        "num_samples": 1,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -195,6 +266,10 @@ def test_stage210_direct_script_entrypoint_is_runnable(tmp_path: Path) -> None:
             str(checkpoint),
             "--nano-checkpoint",
             str(nano_checkpoint),
+            "--teacher-model-dir",
+            str(teacher_model_dir),
+            "--bucket-manifest",
+            str(manifest_path),
             "--output-dir",
             str(tmp_path / "run"),
             "--config-dir",
