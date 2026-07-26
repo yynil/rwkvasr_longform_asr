@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from rwkvasr.eval.stage211_gate import STAGE211_PUBLIC_BENCHMARKS, sha256_file
+from rwkvasr.config import save_yaml
+from rwkvasr.eval.stage211_gate import (
+    STAGE211_PUBLIC_BENCHMARKS,
+    sha256_file,
+    stage211_phase_train_config_contract,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -121,13 +126,11 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
     artifacts["provenance"].write_text("{}\n", encoding="utf-8")
     artifacts["nano_teacher_checkpoint"].parent.mkdir()
     artifacts["nano_teacher_checkpoint"].write_bytes(b"nano-teacher")
-    artifacts["train_config"].write_text(
-        json.dumps(
-            {"ctc_teacher_online_model_path": str(artifacts["nano_teacher_checkpoint"].parent)}
-        )
-        + "\n",
-        encoding="utf-8",
+    train_config = stage211_phase_train_config_contract("sft")
+    train_config["ctc_teacher_online_model_path"] = str(
+        artifacts["nano_teacher_checkpoint"].parent
     )
+    save_yaml(artifacts["train_config"], train_config)
     artifacts["logits_promotion_receipt"].write_text("{}\n", encoding="utf-8")
     artifacts["training_log"].write_text("complete\n", encoding="utf-8")
     torch.save({"step": 0}, artifacts["init_checkpoint"])

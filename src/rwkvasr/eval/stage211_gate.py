@@ -68,6 +68,128 @@ STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES = (
     STAGE211_AUDIO_TOTAL_ROW_EXPOSURES
     + STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
 )
+_STAGE211_COMMON_PHASE_TRAIN_CONFIG: dict[str, Any] = {
+    "weight_decay": 0.0,
+    "freeze_encoder": False,
+    "freeze_encoder_except_time_mixer": True,
+    "freeze_ctc_decoder": True,
+    "freeze_ctc_head": True,
+    "decoder_loss_weight": 0.0,
+    "funasr_nano_ctc_init_checkpoint_path": None,
+    "funasr_nano_ctc_init_load_encoder": False,
+    "funasr_nano_ctc_init_load_encoder_attention": False,
+    "funasr_nano_ctc_init_load_rwkv_encoder_from_qkv": False,
+    "funasr_nano_ctc_init_load_decoder": False,
+    "funasr_nano_ctc_init_load_head": False,
+    "ctc_teacher_frame_filter": "all",
+    "ctc_teacher_online_use_batch_features": True,
+    "ctc_teacher_online_layer_ffn_loss_weight": 0.0,
+    "ctc_teacher_online_layer_raw_mse_weight": 0.0,
+    "ctc_teacher_online_layer_normalized_mse_weight": 1.0,
+    "ctc_teacher_online_layer_cosine_weight": 0.25,
+    "ctc_teacher_online_layer_energy_mse_weight": 0.25,
+    "ctc_teacher_online_layer_log_rms_weight": 0.1,
+    "ctc_teacher_online_layer_frame_tolerance": 0,
+    "ctc_teacher_online_frame_balance_mode": "all",
+    "ctc_teacher_online_blank_frame_balance_mode": "all",
+    "ctc_teacher_online_hidden_frame_balance_mode": "all",
+    "ctc_teacher_online_loss_weight": 0.0,
+    "ctc_teacher_online_mass_loss_weight": 0.0,
+    "ctc_teacher_online_full_loss_weight": 0.0,
+    "ctc_teacher_online_sequence_presence_loss_weight": 0.0,
+    "ctc_teacher_online_sequence_window_loss_weight": 0.0,
+    "ctc_teacher_online_nonblank_hard_loss_weight": 0.0,
+    "ctc_teacher_online_nonblank_margin_loss_weight": 0.0,
+    "ctc_teacher_online_nonblank_window_margin_loss_weight": 0.0,
+    "ctc_teacher_online_nonblank_window_topk_loss_weight": 0.0,
+    "ctc_teacher_online_nonblank_window_loss_mode": "conditional_nonblank_hard",
+    "ctc_teacher_online_nonblank_window_radius": 2,
+    "ctc_teacher_online_nonblank_window_temperature": 0.2,
+    "ctc_teacher_online_project_ignored_token_ids": [60_514],
+    "ctc_teacher_online_top_k": 32,
+}
+_STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
+    "mixer": {
+        "lr": 3.0e-6,
+        "allow_missing_targets": True,
+        "ctc_loss_weight": 0.0,
+        "ctc_suppress_non_pronunciation_tokens": False,
+        "ctc_teacher_online_layer_input_mode": "teacher_forced",
+        "ctc_teacher_online_layer_mixer_loss_weight": 1.0,
+        "ctc_teacher_online_layer_block_loss_weight": 0.0,
+        "ctc_teacher_online_encoder_loss_weight": 0.0,
+        "ctc_teacher_online_decoder_hidden_loss_weight": 0.0,
+        "ctc_teacher_online_blank_loss_weight": 0.0,
+        "ctc_teacher_online_conditional_nonblank_loss_weight": 0.0,
+        "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.0,
+        "ctc_teacher_online_sequence_loss_weight": 0.0,
+        "ctc_teacher_online_nonblank_window_loss_weight": 0.0,
+        "ctc_teacher_online_layer_sample_count": 8,
+        "ctc_teacher_online_layer_boundary_ids": [],
+        "ctc_teacher_online_layer_include_boundaries": False,
+        "ctc_teacher_online_keep_full_log_probs_on_device": False,
+    },
+    "block": {
+        "lr": 2.0e-6,
+        "allow_missing_targets": True,
+        "ctc_loss_weight": 0.0,
+        "ctc_suppress_non_pronunciation_tokens": False,
+        "ctc_teacher_online_layer_input_mode": "stacked",
+        "ctc_teacher_online_layer_mixer_loss_weight": 0.25,
+        "ctc_teacher_online_layer_block_loss_weight": 1.0,
+        "ctc_teacher_online_encoder_loss_weight": 0.5,
+        "ctc_teacher_online_decoder_hidden_loss_weight": 0.5,
+        "ctc_teacher_online_blank_loss_weight": 0.0,
+        "ctc_teacher_online_conditional_nonblank_loss_weight": 0.0,
+        "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.0,
+        "ctc_teacher_online_sequence_loss_weight": 0.0,
+        "ctc_teacher_online_nonblank_window_loss_weight": 0.0,
+        "ctc_teacher_online_layer_sample_count": 8,
+        "ctc_teacher_online_layer_boundary_ids": [],
+        "ctc_teacher_online_layer_include_boundaries": False,
+        "ctc_teacher_online_keep_full_log_probs_on_device": False,
+    },
+    "logits": {
+        "lr": 3.0e-7,
+        "allow_missing_targets": True,
+        "ctc_loss_weight": 0.0,
+        "ctc_suppress_non_pronunciation_tokens": False,
+        "ctc_teacher_online_layer_input_mode": "stacked",
+        "ctc_teacher_online_layer_mixer_loss_weight": 0.1,
+        "ctc_teacher_online_layer_block_loss_weight": 0.25,
+        "ctc_teacher_online_encoder_loss_weight": 0.25,
+        "ctc_teacher_online_decoder_hidden_loss_weight": 0.25,
+        "ctc_teacher_online_blank_loss_weight": 0.25,
+        "ctc_teacher_online_conditional_nonblank_loss_weight": 1.0,
+        "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.125,
+        "ctc_teacher_online_sequence_loss_weight": 0.2,
+        "ctc_teacher_online_nonblank_window_loss_weight": 0.25,
+        "ctc_teacher_online_layer_sample_count": 12,
+        "ctc_teacher_online_layer_boundary_ids": [0, 11, 12, 17, 20, 49, 50, 69],
+        "ctc_teacher_online_layer_include_boundaries": True,
+        "ctc_teacher_online_keep_full_log_probs_on_device": True,
+    },
+    "sft": {
+        "lr": 3.0e-7,
+        "allow_missing_targets": False,
+        "ctc_loss_weight": 1.0,
+        "ctc_suppress_non_pronunciation_tokens": True,
+        "ctc_teacher_online_layer_input_mode": "stacked",
+        "ctc_teacher_online_layer_mixer_loss_weight": 0.05,
+        "ctc_teacher_online_layer_block_loss_weight": 0.1,
+        "ctc_teacher_online_encoder_loss_weight": 0.1,
+        "ctc_teacher_online_decoder_hidden_loss_weight": 0.1,
+        "ctc_teacher_online_blank_loss_weight": 0.05,
+        "ctc_teacher_online_conditional_nonblank_loss_weight": 0.1,
+        "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.0,
+        "ctc_teacher_online_sequence_loss_weight": 0.0,
+        "ctc_teacher_online_nonblank_window_loss_weight": 0.0,
+        "ctc_teacher_online_layer_sample_count": 8,
+        "ctc_teacher_online_layer_boundary_ids": [0, 11, 12, 17, 20, 49, 50, 69],
+        "ctc_teacher_online_layer_include_boundaries": True,
+        "ctc_teacher_online_keep_full_log_probs_on_device": False,
+    },
+}
 
 
 def sha256_file(path: str | Path) -> str:
@@ -77,6 +199,34 @@ def sha256_file(path: str | Path) -> str:
         while chunk := source.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def stage211_phase_train_config_contract(phase: str) -> dict[str, Any]:
+    try:
+        phase_values = _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES[phase]
+    except KeyError as error:
+        raise ValueError(f"Unsupported Stage211 phase objective: {phase!r}") from error
+    contract = {**_STAGE211_COMMON_PHASE_TRAIN_CONFIG, **phase_values}
+    return {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in contract.items()
+    }
+
+
+def validate_stage211_phase_train_config(
+    train_config: dict[str, Any],
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    contract = stage211_phase_train_config_contract(phase)
+    for key, expected in contract.items():
+        actual = train_config.get(key)
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError(
+                f"Stage211 {phase} train config {key} mismatch: "
+                f"actual={actual!r} expected={expected!r}"
+            )
+    return contract
 
 
 def resolve_stage211_nano_teacher_checkpoint(train_config: dict[str, Any]) -> Path:
@@ -356,8 +506,10 @@ def validate_stage211_full_data_coverage(
                     f"Stage211 {phase}/{difficulty} Nano teacher binding differs "
                     "from its coverage receipt."
                 )
+        train_config = load_yaml(train_config_path)
+        validate_stage211_phase_train_config(train_config, phase=phase)
         configured_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(
-            load_yaml(train_config_path)
+            train_config
         )
         if configured_teacher_checkpoint != teacher_checkpoint:
             raise ValueError(

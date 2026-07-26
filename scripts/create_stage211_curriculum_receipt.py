@@ -23,6 +23,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_WORLD_SIZE,
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
+    validate_stage211_phase_train_config,
 )
 
 
@@ -216,6 +217,7 @@ def build_receipt(
                 f"Stage211 {difficulty} train config {key} mismatch: "
                 f"actual={train_config.get(key)!r} expected={value!r}"
             )
+    validate_stage211_phase_train_config(train_config, phase=phase)
     nano_teacher_checkpoint_path = resolve_stage211_nano_teacher_checkpoint(
         train_config
     )

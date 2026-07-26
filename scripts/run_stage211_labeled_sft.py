@@ -16,6 +16,7 @@ from rwkvasr.config import load_yaml
 from rwkvasr.eval.stage211_gate import (
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
+    validate_stage211_phase_train_config,
 )
 
 try:
@@ -361,8 +362,10 @@ def _validate_completion(
         if not path.is_file() or sha256_file(path) != completion.get(sha_key):
             raise ValueError(f"Stage211D completion artifact is unavailable or changed: {path}")
     train_config_path = Path(str(completion["train_config_path"])).resolve()
+    train_config = load_yaml(train_config_path)
+    validate_stage211_phase_train_config(train_config, phase="sft")
     configured_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(
-        load_yaml(train_config_path)
+        train_config
     )
     recorded_teacher_checkpoint = Path(
         str(completion["nano_teacher_checkpoint_path"])
@@ -522,6 +525,7 @@ def run_sft(args: argparse.Namespace) -> Path | None:
                 f"Stage211D train config {key} mismatch: "
                 f"actual={train_config.get(key)!r} expected={value!r}"
             )
+    validate_stage211_phase_train_config(train_config, phase="sft")
     nano_teacher_checkpoint_path = resolve_stage211_nano_teacher_checkpoint(
         train_config
     )

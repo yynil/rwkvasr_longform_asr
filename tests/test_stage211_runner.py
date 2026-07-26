@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from rwkvasr.config import save_yaml
 from rwkvasr.eval.stage211_gate import (
     STAGE211_ALLOWED_OPERATOR_KEY_MARKERS,
     STAGE211_AUDIO_CURRICULUM,
@@ -24,6 +25,8 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_WORLD_SIZE,
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
+    stage211_phase_train_config_contract,
+    validate_stage211_phase_train_config,
 )
 
 
@@ -548,6 +551,10 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
 ) -> None:
     config = _config_for_phase(tmp_path, phase_name)
 
+    assert validate_stage211_phase_train_config(
+        config,
+        phase=phase_name,
+    ) == stage211_phase_train_config_contract(phase_name)
     expected_steps = 12_045 if phase_name == "sft" else 30_064
     expected_interval = 2_000 if phase_name == "sft" else 10_000
     assert config["max_steps"] == expected_steps
@@ -567,6 +574,19 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
         assert config["length_bucket_drop_last"] is False
         assert config["skip_oversized_samples"] is False
         assert config["webdataset_skip_decode_errors"] is False
+
+
+def test_stage211_phase_config_contract_rejects_cross_phase_objective(
+    tmp_path: Path,
+) -> None:
+    config = _config_for_phase(tmp_path, "block")
+    config["ctc_teacher_online_layer_input_mode"] = "teacher_forced"
+
+    with pytest.raises(
+        ValueError,
+        match="block train config ctc_teacher_online_layer_input_mode mismatch",
+    ):
+        validate_stage211_phase_train_config(config, phase="block")
 
 
 def test_stage211_mixer_phase_has_only_teacher_forced_mixer_objective(
@@ -954,10 +974,11 @@ def _write_valid_phase_gate(
         provenance = tmp_path / f"{difficulty}-provenance.json"
         provenance.write_text("{}\n", encoding="utf-8")
         train_config = tmp_path / f"{difficulty}-train-config.yaml"
-        train_config.write_text(
-            json.dumps({"ctc_teacher_online_model_path": str(nano_teacher_dir.resolve())}) + "\n",
-            encoding="utf-8",
+        train_config_payload = stage211_phase_train_config_contract(phase)
+        train_config_payload["ctc_teacher_online_model_path"] = str(
+            nano_teacher_dir.resolve()
         )
+        save_yaml(train_config, train_config_payload)
         completion = checkpoint if difficulty == "long" else tmp_path / f"{difficulty}.pt"
         if completion != checkpoint:
             completion.write_bytes(f"checkpoint-{index}".encode())
@@ -1209,10 +1230,11 @@ def test_stage211_phase_gate_rejects_mixed_nano_teachers(
     report = json.loads(gate_report.read_text(encoding="utf-8"))
     medium = report["full_data_coverage"]["segments"][1]
     train_config = Path(medium["train_config_path"])
-    train_config.write_text(
-        json.dumps({"ctc_teacher_online_model_path": str(alternate_dir.resolve())}) + "\n",
-        encoding="utf-8",
+    train_config_payload = stage211_phase_train_config_contract("mixer")
+    train_config_payload["ctc_teacher_online_model_path"] = str(
+        alternate_dir.resolve()
     )
+    save_yaml(train_config, train_config_payload)
     medium["train_config_sha256"] = sha256_file(train_config)
     medium["nano_teacher_checkpoint_path"] = str(alternate_checkpoint.resolve())
     medium["nano_teacher_checkpoint_sha256"] = sha256_file(alternate_checkpoint)
