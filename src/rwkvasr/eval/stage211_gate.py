@@ -178,6 +178,7 @@ def validate_stage211_full_data_coverage(
             "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
             "length_bucket_drop_last": False,
             "skip_oversized_samples": False,
+            "webdataset_skip_decode_errors": False,
         }
         if any(segment.get(key) != value for key, value in expected_fields.items()):
             raise ValueError(f"Stage211 {phase}/{difficulty} coverage is incomplete.")

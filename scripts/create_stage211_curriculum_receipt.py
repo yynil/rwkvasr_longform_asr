@@ -110,6 +110,7 @@ def build_receipt(
         "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
     }
     for key, value in expected_train_config.items():
         if train_config.get(key) != value:
@@ -134,6 +135,7 @@ def build_receipt(
         "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
         "rows": rows,
         "row_exposures": rows * STAGE211_FULL_DATA_EPOCHS,
         "tail_padding_samples_per_epoch": tail_padding_samples_per_epoch,

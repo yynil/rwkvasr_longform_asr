@@ -137,6 +137,7 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         "frame_budget": 8_000,
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
         **LABELED_EXPECTED,
         "labeled_webdataset_root": str(root),
     }

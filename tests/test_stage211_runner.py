@@ -348,6 +348,7 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
     if phase_name == "sft":
         assert config["length_bucket_drop_last"] is False
         assert config["skip_oversized_samples"] is False
+        assert config["webdataset_skip_decode_errors"] is False
 
 
 def test_stage211_mixer_phase_has_only_teacher_forced_mixer_objective(
@@ -637,6 +638,7 @@ def test_stage211_medium_config_uses_fixed_eval_split(tmp_path: Path) -> None:
     assert config["batch_token_budget"] == 24_000
     assert config["length_bucket_drop_last"] is False
     assert config["skip_oversized_samples"] is False
+    assert config["webdataset_skip_decode_errors"] is False
     assert config["length_bucket_frame_budget"] == 24_000
     assert config["deepspeed"]["train_micro_batch_size_per_gpu"] == 36
     assert config["deepspeed"]["train_batch_size"] == 144
@@ -748,6 +750,7 @@ def _write_valid_phase_gate(
             "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
             "length_bucket_drop_last": False,
             "skip_oversized_samples": False,
+            "webdataset_skip_decode_errors": False,
             "rows": expected["rows"],
             "row_exposures": expected["rows"] * STAGE211_FULL_DATA_EPOCHS,
             "tail_padding_samples_per_epoch": expected[
@@ -928,6 +931,30 @@ def test_stage211_phase_gate_rejects_mutated_coverage_receipt(
     )
 
     with pytest.raises(ValueError, match="coverage receipt SHA-256 mismatch"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_decode_skipping_coverage(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    report["full_data_coverage"]["segments"][0][
+        "webdataset_skip_decode_errors"
+    ] = True
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="coverage is incomplete"):
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",

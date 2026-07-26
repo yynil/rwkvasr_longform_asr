@@ -330,6 +330,7 @@ def _validate_completion(
         "frame_budget": 8_000,
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
         **LABELED_EXPECTED,
     }
     for key, value in expected.items():
@@ -498,6 +499,7 @@ def run_sft(args: argparse.Namespace) -> Path | None:
         "length_bucket_frame_budget": 8_000,
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
     }
     for key, value in expected_train_config.items():
         if train_config.get(key) != value:
@@ -520,6 +522,7 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             "frame_budget": 8_000,
             "length_bucket_drop_last": False,
             "skip_oversized_samples": False,
+            "webdataset_skip_decode_errors": False,
             **LABELED_EXPECTED,
             "labeled_webdataset_root": str(labeled_root),
             "bucket_manifest_path": str(bucket_manifest),

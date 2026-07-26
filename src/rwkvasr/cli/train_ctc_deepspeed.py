@@ -20,6 +20,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--webdataset-hash-seed", default=None, type=int)
     parser.add_argument("--webdataset-split-by", default=None)
     parser.add_argument("--webdataset-utt-id-key", default=None)
+    parser.add_argument(
+        "--webdataset-skip-decode-errors",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--vocab-size", default=None, type=int)
     parser.add_argument("--tokenizer-type", default=None)
@@ -372,6 +377,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "webdataset_hash_seed",
         "webdataset_split_by",
         "webdataset_utt_id_key",
+        "webdataset_skip_decode_errors",
         "output_dir",
         "vocab_size",
         "tokenizer_type",

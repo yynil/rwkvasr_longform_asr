@@ -717,6 +717,7 @@ def _config(
                 "length_bucket_drop_last": False,
                 "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
                 "skip_oversized_samples": False,
+                "webdataset_skip_decode_errors": False,
             }
         )
         deepspeed_config = dict(config["deepspeed"])
@@ -753,6 +754,7 @@ def _config(
                 "bucket_source_interleave": True,
                 "length_bucket_drop_last": False,
                 "skip_oversized_samples": False,
+                "webdataset_skip_decode_errors": False,
             }
         )
     elif audio_data_audit is not None:
@@ -910,9 +912,11 @@ def _record_or_validate_provenance(
         payload["full_data_profile"] = True
         payload["length_bucket_drop_last"] = False
         payload["skip_oversized_samples"] = False
+        payload["webdataset_skip_decode_errors"] = False
     if phase.requires_labels:
         payload["length_bucket_drop_last"] = False
         payload["skip_oversized_samples"] = False
+        payload["webdataset_skip_decode_errors"] = False
     if path.is_file():
         existing = json.loads(path.read_text(encoding="utf-8"))
         if existing != payload:
@@ -955,9 +959,11 @@ def _validate_resume_provenance(
         expected["full_data_profile"] = True
         expected["length_bucket_drop_last"] = False
         expected["skip_oversized_samples"] = False
+        expected["webdataset_skip_decode_errors"] = False
     if phase.requires_labels:
         expected["length_bucket_drop_last"] = False
         expected["skip_oversized_samples"] = False
+        expected["webdataset_skip_decode_errors"] = False
     for key, value in expected.items():
         if payload.get(key) != value:
             raise ValueError(

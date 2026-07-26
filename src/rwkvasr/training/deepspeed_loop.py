@@ -263,6 +263,7 @@ class DeepSpeedTrainConfig:
     webdataset_hash_seed: int = 0
     webdataset_split_by: str = "shard_name"
     webdataset_utt_id_key: str = "sid"
+    webdataset_skip_decode_errors: bool = True
     feature_extractor_type: str = "wenet_fbank"
     input_dim: int = 80
     n_embd: int = 512
@@ -493,6 +494,20 @@ def _validate_exact_batch_coverage(
             f"skipped_samples={budgeted.skipped_samples} "
             f"dropped_tail_samples={budgeted.dropped_tail_samples}"
         )
+
+
+def _resolve_train_webdataset_skip_decode_errors(config: DeepSpeedTrainConfig) -> bool:
+    exact_coverage = (
+        not config.length_bucket_drop_last
+        and not config.skip_oversized_samples
+    )
+    if exact_coverage and config.webdataset_skip_decode_errors:
+        raise ValueError(
+            "Exact-coverage WebDataset training requires "
+            "webdataset_skip_decode_errors=false; corrupt rows must fail the run "
+            "instead of being silently omitted."
+        )
+    return bool(config.webdataset_skip_decode_errors)
 
 
 def _maybe_load_initial_model_checkpoint(
@@ -1146,7 +1161,7 @@ def _build_train_loader(config: DeepSpeedTrainConfig) -> tuple[DataLoader, Any |
     webdataset_config = _build_webdataset_config(
         config,
         shuffle_shards=True,
-        skip_decode_errors=True,
+        skip_decode_errors=_resolve_train_webdataset_skip_decode_errors(config),
         apply_decoder_prompt_language_label_noise=True,
     )
     bucket_manifest_path = _resolve_bucket_manifest_path(

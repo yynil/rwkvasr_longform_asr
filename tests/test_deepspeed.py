@@ -27,6 +27,7 @@ from rwkvasr.training.deepspeed_loop import (
     _prune_periodic_step_checkpoint_artifacts,
     _resolve_ctc_frame_balance_mode,
     _resolve_ctc_teacher_online_device,
+    _resolve_train_webdataset_skip_decode_errors,
     _resolve_max_steps as resolve_deepspeed_max_steps,
     _save_export_checkpoints,
     _select_eval_layer_hidden_ids,
@@ -81,6 +82,7 @@ def test_exact_coverage_rejects_any_token_budget_truncation() -> None:
         deepspeed={},
         length_bucket_drop_last=False,
         skip_oversized_samples=False,
+        webdataset_skip_decode_errors=False,
     )
 
     with pytest.raises(RuntimeError, match="no executable sample"):
@@ -104,6 +106,30 @@ def test_exact_coverage_rejects_any_token_budget_truncation() -> None:
         DeepSpeedTrainConfig(output_dir="unused", deepspeed={}),
         None,
     )
+
+
+def test_exact_coverage_requires_fail_fast_webdataset_decode() -> None:
+    permissive = DeepSpeedTrainConfig(output_dir="unused", deepspeed={})
+    assert _resolve_train_webdataset_skip_decode_errors(permissive) is True
+
+    exact = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+        webdataset_skip_decode_errors=False,
+    )
+    assert _resolve_train_webdataset_skip_decode_errors(exact) is False
+
+    invalid = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+        webdataset_skip_decode_errors=True,
+    )
+    with pytest.raises(ValueError, match="webdataset_skip_decode_errors=false"):
+        _resolve_train_webdataset_skip_decode_errors(invalid)
 
 
 def test_materialize_step_eval_batches_replays_exact_features() -> None:
