@@ -41,6 +41,35 @@ def test_stage211_controllers_preserve_virtualenv_python() -> None:
     assert stage211_phase_finalizer.PYTHON == expected
 
 
+def test_stage211_public_eval_shards_large_second_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        dry_run: bool,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        assert dry_run is False
+        calls.append((command, env))
+
+    monkeypatch.setattr(stage211_phase_finalizer, "_run", fake_run)
+    stage211_phase_finalizer._run_public_eval(
+        checkpoint=tmp_path / "checkpoint.pt",
+        output_dir=tmp_path / "output",
+        manifest_dir=tmp_path / "manifests",
+        devices="0,1,2,3",
+        dry_run=False,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1] is not None
+    assert calls[0][1]["CTC_SHARD_STAGE2"] == "1"
+
+
 def test_stage211_formal_defaults_use_persistent_storage_and_local_teacher() -> None:
     output_dir = stage211._default_output_dir(stage211.PHASES["mixer"]).resolve()
 

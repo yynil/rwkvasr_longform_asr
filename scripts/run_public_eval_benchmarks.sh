@@ -36,6 +36,7 @@ CTC_TOKEN_PRUNE_TOPK="${CTC_TOKEN_PRUNE_TOPK:-16}"
 CTC_TEXT_NORMALIZATION="${CTC_TEXT_NORMALIZATION:-runtime}"
 CTC_PROGRESS_INTERVAL="${CTC_PROGRESS_INTERVAL:-500}"
 CTC_SHARD_DATASETS="${CTC_SHARD_DATASETS:-0}"
+CTC_SHARD_STAGE2="${CTC_SHARD_STAGE2:-0}"
 CTC_SHARD_COUNT="${CTC_SHARD_COUNT:-}"
 CTC_LIMIT="${CTC_LIMIT:-0}"
 
@@ -207,7 +208,7 @@ run_ctc_dataset() {
 run_ctc_dataset_sharded() {
   local dataset="$1"
   if [[ "${CTC_LIMIT}" -gt 0 ]]; then
-    echo "CTC_LIMIT is incompatible with CTC_SHARD_DATASETS; use dataset-level parallelism" >&2
+    echo "CTC_LIMIT is incompatible with sharded CTC evaluation" >&2
     exit 1
   fi
   local manifest
@@ -395,7 +396,11 @@ main() {
   log "ctc stage 1"
   run_parallel_stage ctc "${DATASETS[0]}" "${DATASETS[1]}" "${DATASETS[2]}" "${DATASETS[3]}"
   log "ctc stage 2"
-  run_parallel_stage ctc "${DATASETS[4]}"
+  if truthy "${CTC_SHARD_STAGE2}"; then
+    run_ctc_dataset_sharded "${DATASETS[4]}"
+  else
+    run_parallel_stage ctc "${DATASETS[4]}"
+  fi
   summarize
 
   local do_ar="${RUN_AR}"

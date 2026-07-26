@@ -111,6 +111,7 @@ def _run_public_eval(
         "DEVICES": devices,
         "CTC_BATCH_SIZE": "4",
         "CTC_NUM_WORKERS": "0",
+        "CTC_SHARD_STAGE2": "1",
         "CTC_LIMIT": "0",
         "RUN_AR": "0",
         "METRIC_NORMALIZATION": "ctc",
