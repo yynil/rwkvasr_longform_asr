@@ -858,7 +858,7 @@ def test_bucketed_webdataset_loader_splits_same_bucket_across_ranks(tmp_path: Pa
     assert batch1.utt_ids == ["sid-2"]
 
 
-def test_bucketed_webdataset_loader_pads_distributed_tail_without_dropping_rows(
+def test_bucketed_webdataset_loader_covers_all_rows_across_three_padded_epochs(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "bucket_loader_tail_root"
@@ -906,6 +906,7 @@ def test_bucketed_webdataset_loader_pads_distributed_tail_without_dropping_rows(
     config = WebDatasetConfig(
         shuffle_shards=False,
         split="train",
+        bucket_source_interleave=True,
         length_bucket_drop_last=False,
         length_bucket_frame_budget=80,
     )
@@ -922,10 +923,13 @@ def test_bucketed_webdataset_loader_pads_distributed_tail_without_dropping_rows(
         )
         for rank in range(2)
     ]
-    rank_ids = [[batch.utt_ids for batch in loader] for loader in loaders]
+    for epoch in range(3):
+        for loader in loaders:
+            loader.set_epoch(epoch)
+        rank_ids = [[batch.utt_ids for batch in loader] for loader in loaders]
 
-    assert rank_ids[0] == [["sid-1"], ["sid-3"]]
-    assert rank_ids[1] == [["sid-2"], ["sid-3"]]
+        assert rank_ids[0] == [["sid-1"], ["sid-3"]]
+        assert rank_ids[1] == [["sid-2"], ["sid-3"]]
 
 
 def test_bucketed_webdataset_loader_skips_corrupt_audio_when_configured(tmp_path: Path, capsys) -> None:
