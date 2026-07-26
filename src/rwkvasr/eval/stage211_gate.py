@@ -16,6 +16,7 @@ STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
 STAGE211_FULL_DATA_FRAME_BUDGET = 24_000
 STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES = 256
+STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT = "alignment_checkpoint_eval"
 STAGE211_ALLOWED_OPERATOR_KEY_MARKERS = (".time_mixer.", ".input_proj.")
 STAGE211_AUDIO_CURRICULUM: dict[str, dict[str, float | int]] = {
     "easy": {
@@ -560,6 +561,86 @@ def _validate_stage211_alignment_eval_provenance(
     return tuple(fingerprint)
 
 
+def _validate_stage211_alignment_source_report(
+    path: Path,
+    *,
+    phase: str,
+    role: str,
+    checkpoint_path: Path,
+    nano_teacher_checkpoint_sha256: str,
+) -> tuple[dict[str, Any], tuple[tuple[str, int], ...]]:
+    report = _load_json_object(
+        path,
+        label=f"Stage211 {phase} {role} alignment source report",
+    )
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT,
+        "phase": phase,
+        "role": role,
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+    }
+    if any(report.get(key) != value for key, value in expected.items()):
+        raise ValueError(
+            f"Stage211 {phase} {role} alignment source binding mismatch."
+        )
+    logical_step = int(report.get("step", -1))
+    checkpoint_step = int(report.get("checkpoint_step", -1))
+    if role == "baseline":
+        if logical_step != 0 or checkpoint_step < 0:
+            raise ValueError(
+                "Stage211 alignment baseline source has invalid step metadata."
+            )
+    else:
+        if logical_step <= 0 or checkpoint_step != logical_step:
+            raise ValueError(
+                "Stage211 alignment candidate source has invalid step metadata."
+            )
+    pair_eval_id = str(report.get("pair_eval_id") or "")
+    if (
+        len(pair_eval_id) != 64
+        or any(character not in "0123456789abcdef" for character in pair_eval_id)
+    ):
+        raise ValueError(
+            f"Stage211 {phase} {role} alignment source pair ID is invalid."
+        )
+    for prefix, label in (
+        ("train_config", "train config"),
+        ("model_config", "model config"),
+        ("nano_checkpoint", "Nano checkpoint"),
+    ):
+        _validate_bound_file(
+            report,
+            path_key=f"{prefix}_path",
+            sha256_key=f"{prefix}_sha256",
+            label=f"Stage211 {phase} {role} alignment {label}",
+        )
+    train_config = load_yaml(Path(str(report["train_config_path"])).resolve())
+    validate_stage211_phase_train_config(train_config, phase=phase)
+    if report.get("nano_checkpoint_sha256") != nano_teacher_checkpoint_sha256:
+        raise ValueError(
+            f"Stage211 {phase} {role} alignment teacher checkpoint mismatch."
+        )
+    feature_seed = report.get("feature_seed")
+    provenance = report.get("eval_provenance")
+    if (
+        feature_seed != 0
+        or not isinstance(provenance, dict)
+        or provenance.get("feature_seed") != feature_seed
+    ):
+        raise ValueError(
+            f"Stage211 {phase} {role} alignment fixed feature seed mismatch."
+        )
+    fingerprint = _validate_stage211_alignment_eval_provenance(
+        provenance,
+        label=f"{phase} {role} alignment source",
+    )
+    return report, fingerprint
+
+
 def validate_stage211_runtime_epoch_coverage(
     coverage: Any,
     *,
@@ -996,6 +1077,31 @@ def validate_stage211_phase_gate_report(
         phase=expected_phase,
         checkpoint_path=checkpoint_path,
     )
+    phase_segments = coverage.get("segments")
+    if not isinstance(phase_segments, list):
+        raise ValueError("Stage211 phase gate lacks ordered curriculum segments.")
+    easy_segment = next(
+        (
+            segment
+            for segment in phase_segments
+            if isinstance(segment, dict)
+            and str(segment.get("difficulty") or "") == "easy"
+        ),
+        None,
+    )
+    if easy_segment is None:
+        raise ValueError("Stage211 phase gate lacks the easy initialization segment.")
+    phase_init_checkpoint = Path(
+        str(easy_segment.get("init_checkpoint_path") or "")
+    ).resolve()
+    if (
+        not phase_init_checkpoint.is_file()
+        or sha256_file(phase_init_checkpoint)
+        != easy_segment.get("init_checkpoint_sha256")
+    ):
+        raise ValueError(
+            "Stage211 phase initialization checkpoint is missing or changed."
+        )
     benchmark = validate_stage211_public_benchmark(report.get("public_benchmark"))
     teacher_sha256_values = {
         str(segment.get("nano_teacher_checkpoint_sha256") or "")
@@ -1051,6 +1157,10 @@ def validate_stage211_phase_gate_report(
         "artifact": expected_alignment_artifact,
         "phase": expected_phase,
         "gate_passed": True,
+        "baseline_checkpoint_path": str(phase_init_checkpoint),
+        "baseline_checkpoint_sha256": sha256_file(
+            phase_init_checkpoint
+        ),
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": sha256_file(checkpoint_path),
     }
@@ -1061,8 +1171,9 @@ def validate_stage211_phase_gate_report(
         raise ValueError(
             f"Stage211 {expected_phase} alignment report contract mismatch."
         )
+    alignment_source_paths: dict[str, Path] = {}
     for prefix in ("baseline_report", "candidate_report"):
-        _validate_bound_file(
+        alignment_source_paths[prefix] = _validate_bound_file(
             alignment_report,
             path_key=f"{prefix}_path",
             sha256_key=f"{prefix}_sha256",
@@ -1070,6 +1181,57 @@ def validate_stage211_phase_gate_report(
                 f"Stage211 {expected_phase} alignment "
                 f"{prefix.replace('_', ' ')}"
             ),
+        )
+    baseline_source, baseline_source_fingerprint = (
+        _validate_stage211_alignment_source_report(
+            alignment_source_paths["baseline_report"],
+            phase=expected_phase,
+            role="baseline",
+            checkpoint_path=phase_init_checkpoint,
+            nano_teacher_checkpoint_sha256=nano_teacher_checkpoint_sha256,
+        )
+    )
+    candidate_source, candidate_source_fingerprint = (
+        _validate_stage211_alignment_source_report(
+            alignment_source_paths["candidate_report"],
+            phase=expected_phase,
+            role="candidate",
+            checkpoint_path=checkpoint_path,
+            nano_teacher_checkpoint_sha256=nano_teacher_checkpoint_sha256,
+        )
+    )
+    pair_shared_fields = (
+        "pair_eval_id",
+        "train_config_path",
+        "train_config_sha256",
+        "model_config_path",
+        "model_config_sha256",
+        "nano_checkpoint_path",
+        "nano_checkpoint_sha256",
+        "feature_seed",
+    )
+    if any(
+        baseline_source.get(key) != candidate_source.get(key)
+        for key in pair_shared_fields
+    ):
+        raise ValueError(
+            f"Stage211 {expected_phase} alignment sources are not one eval pair."
+        )
+    if (
+        Path(str(baseline_source.get("train_config_path") or "")).resolve()
+        != Path(str(easy_segment.get("train_config_path") or "")).resolve()
+        or baseline_source.get("train_config_sha256")
+        != easy_segment.get("train_config_sha256")
+    ):
+        raise ValueError(
+            f"Stage211 {expected_phase} alignment pair train config mismatch."
+        )
+    if baseline_source.get("eval_provenance") != candidate_source.get(
+        "eval_provenance"
+    ):
+        raise ValueError(
+            f"Stage211 {expected_phase} alignment sources use different "
+            "fixed-eval provenance."
         )
     baseline_fingerprint = _validate_stage211_alignment_eval_provenance(
         alignment_report.get("baseline_eval_provenance"),
@@ -1082,6 +1244,17 @@ def validate_stage211_phase_gate_report(
     if baseline_fingerprint != candidate_fingerprint:
         raise ValueError(
             f"Stage211 {expected_phase} alignment reports use different eval samples."
+        )
+    if (
+        baseline_source_fingerprint != baseline_fingerprint
+        or candidate_source_fingerprint != candidate_fingerprint
+        or baseline_source.get("eval_provenance")
+        != alignment_report.get("baseline_eval_provenance")
+        or candidate_source.get("eval_provenance")
+        != alignment_report.get("candidate_eval_provenance")
+    ):
+        raise ValueError(
+            f"Stage211 {expected_phase} alignment source provenance mismatch."
         )
     if expected_phase == "logits":
         baseline_feature_seed = alignment_report[

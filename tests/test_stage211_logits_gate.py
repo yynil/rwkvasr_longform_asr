@@ -105,12 +105,37 @@ def _write_report(
     manifest: Path,
     part: Path,
     metrics: dict[str, float],
+    checkpoint: Path,
     feature_seed: int = 0,
 ) -> Path:
+    role = "baseline" if step == 0 else "candidate"
+    train_config = path.parent / "pair-train.yaml"
+    model_config = path.parent / "pair-model.yaml"
+    nano_checkpoint = path.parent / "pair-nano.pt"
+    if not train_config.exists():
+        train_config.write_text("{}\n", encoding="utf-8")
+        model_config.write_text("{}\n", encoding="utf-8")
+        nano_checkpoint.write_bytes(b"nano")
     save_yaml(
         path,
         {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "alignment_checkpoint_eval",
+            "phase": "logits",
+            "role": role,
+            "pair_eval_id": "a" * 64,
             "step": step,
+            "checkpoint_step": 17 if role == "baseline" else step,
+            "checkpoint_path": str(checkpoint.resolve()),
+            "checkpoint_sha256": sha256_file(checkpoint),
+            "train_config_path": str(train_config.resolve()),
+            "train_config_sha256": sha256_file(train_config),
+            "model_config_path": str(model_config.resolve()),
+            "model_config_sha256": sha256_file(model_config),
+            "nano_checkpoint_path": str(nano_checkpoint.resolve()),
+            "nano_checkpoint_sha256": sha256_file(nano_checkpoint),
+            "feature_seed": feature_seed,
             "eval_loss": metrics["full_kl"],
             "eval_samples": 256,
             "eval_provenance": _eval_provenance(
@@ -131,8 +156,8 @@ def test_stage211_logits_gate_requires_distribution_and_decode_improvement(
     eval_part.write_text('{"utt_id": "u1"}\n', encoding="utf-8")
     baseline_manifest = tmp_path / "easy.json"
     baseline_manifest.write_text("{}\n", encoding="utf-8")
-    candidate_manifest = tmp_path / "long.json"
-    candidate_manifest.write_text("{}\n", encoding="utf-8")
+    baseline_checkpoint = tmp_path / "init.pt"
+    baseline_checkpoint.write_bytes(b"initial")
     checkpoint = tmp_path / "step-105.pt"
     checkpoint.write_bytes(b"checkpoint")
     baseline = _write_report(
@@ -141,18 +166,21 @@ def test_stage211_logits_gate_requires_distribution_and_decode_improvement(
         manifest=baseline_manifest,
         part=eval_part,
         metrics=_baseline_metrics(),
+        checkpoint=baseline_checkpoint,
     )
     candidate = _write_report(
         tmp_path / "candidate.yaml",
         step=105,
-        manifest=candidate_manifest,
+        manifest=baseline_manifest,
         part=eval_part,
         metrics=_candidate_metrics(),
+        checkpoint=checkpoint,
     )
 
     report = logits_gate.build_gate(
         baseline_report_path=baseline,
         candidate_report_path=candidate,
+        baseline_checkpoint_path=baseline_checkpoint,
         checkpoint_path=checkpoint,
     )
 
@@ -165,13 +193,15 @@ def test_stage211_logits_gate_requires_distribution_and_decode_improvement(
     weak_candidate = _write_report(
         tmp_path / "weak-candidate.yaml",
         step=105,
-        manifest=candidate_manifest,
+        manifest=baseline_manifest,
         part=eval_part,
         metrics=weak_candidate_metrics,
+        checkpoint=checkpoint,
     )
     rejected = logits_gate.build_gate(
         baseline_report_path=baseline,
         candidate_report_path=weak_candidate,
+        baseline_checkpoint_path=baseline_checkpoint,
         checkpoint_path=checkpoint,
     )
 
@@ -188,6 +218,8 @@ def test_stage211_logits_gate_requires_identical_fixed_audio(
     candidate_part.write_text('{"utt_id": "u2"}\n', encoding="utf-8")
     manifest = tmp_path / "manifest.json"
     manifest.write_text("{}\n", encoding="utf-8")
+    baseline_checkpoint = tmp_path / "init.pt"
+    baseline_checkpoint.write_bytes(b"initial")
     checkpoint = tmp_path / "step-105.pt"
     checkpoint.write_bytes(b"checkpoint")
     baseline = _write_report(
@@ -196,6 +228,7 @@ def test_stage211_logits_gate_requires_identical_fixed_audio(
         manifest=manifest,
         part=baseline_part,
         metrics=_baseline_metrics(),
+        checkpoint=baseline_checkpoint,
     )
     candidate = _write_report(
         tmp_path / "candidate.yaml",
@@ -203,12 +236,14 @@ def test_stage211_logits_gate_requires_identical_fixed_audio(
         manifest=manifest,
         part=candidate_part,
         metrics=_candidate_metrics(),
+        checkpoint=checkpoint,
     )
 
-    with pytest.raises(ValueError, match="different eval samples"):
+    with pytest.raises(ValueError, match="same fixed-eval provenance"):
         logits_gate.build_gate(
             baseline_report_path=baseline,
             candidate_report_path=candidate,
+            baseline_checkpoint_path=baseline_checkpoint,
             checkpoint_path=checkpoint,
         )
 
@@ -220,6 +255,8 @@ def test_stage211_logits_gate_requires_identical_fixed_feature_seed(
     eval_part.write_text('{"utt_id": "u1"}\n', encoding="utf-8")
     manifest = tmp_path / "manifest.json"
     manifest.write_text("{}\n", encoding="utf-8")
+    baseline_checkpoint = tmp_path / "init.pt"
+    baseline_checkpoint.write_bytes(b"initial")
     checkpoint = tmp_path / "step-105.pt"
     checkpoint.write_bytes(b"checkpoint")
     baseline = _write_report(
@@ -228,6 +265,7 @@ def test_stage211_logits_gate_requires_identical_fixed_feature_seed(
         manifest=manifest,
         part=eval_part,
         metrics=_baseline_metrics(),
+        checkpoint=baseline_checkpoint,
         feature_seed=0,
     )
     candidate = _write_report(
@@ -236,12 +274,14 @@ def test_stage211_logits_gate_requires_identical_fixed_feature_seed(
         manifest=manifest,
         part=eval_part,
         metrics=_candidate_metrics(),
+        checkpoint=checkpoint,
         feature_seed=1,
     )
 
-    with pytest.raises(ValueError, match="fixed feature seed"):
+    with pytest.raises(ValueError, match="matching fixed feature seed"):
         logits_gate.build_gate(
             baseline_report_path=baseline,
             candidate_report_path=candidate,
+            baseline_checkpoint_path=baseline_checkpoint,
             checkpoint_path=checkpoint,
         )

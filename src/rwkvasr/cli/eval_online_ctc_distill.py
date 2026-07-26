@@ -156,6 +156,14 @@ def _build_online_teacher(
     audio_index_path = config.ctc_teacher_online_audio_index_path
     if audio_index_path is None and config.webdataset_bucket_manifest_path is None:
         audio_index_path = config.webdataset_length_index_path or config.manifest_path
+    layer_hidden_enabled = any(
+        float(weight) > 0.0
+        for weight in (
+            config.ctc_teacher_online_layer_mixer_loss_weight,
+            config.ctc_teacher_online_layer_ffn_loss_weight,
+            config.ctc_teacher_online_layer_block_loss_weight,
+        )
+    )
     return FunASRNanoCTCTopKOnlineTeacher(
         FunASROnlineCTCTeacherConfig(
             model_path=str(config.ctc_teacher_online_model_path),
@@ -180,6 +188,16 @@ def _build_online_teacher(
                 or float(config.ctc_teacher_online_conditional_nonblank_hard_loss_weight) > 0.0
             ),
             return_encoder_out=float(config.ctc_teacher_online_encoder_loss_weight) > 0.0,
+            return_layer_hiddens=layer_hidden_enabled,
+            return_ctc_decoder_hiddens=(
+                float(config.ctc_teacher_online_decoder_hidden_loss_weight) > 0.0
+            ),
+            keep_layer_hiddens_on_device=bool(
+                config.ctc_teacher_online_keep_layer_hiddens_on_device
+            ),
+            keep_full_log_probs_on_device=bool(
+                config.ctc_teacher_online_keep_full_log_probs_on_device
+            ),
         )
     )
 

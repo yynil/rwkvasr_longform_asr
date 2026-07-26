@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +13,8 @@ try:
     from scripts.create_stage211_hidden_alignment_gate import (
         FIXED_EVAL_SAMPLES,
         _eval_part_fingerprint,
-        _validated_eval_provenance,
+        _pair_shared_binding,
+        _validated_pair_report,
     )
 except ModuleNotFoundError as error:
     if error.name != "scripts":
@@ -22,7 +22,8 @@ except ModuleNotFoundError as error:
     from create_stage211_hidden_alignment_gate import (
         FIXED_EVAL_SAMPLES,
         _eval_part_fingerprint,
-        _validated_eval_provenance,
+        _pair_shared_binding,
+        _validated_pair_report,
     )
 
 
@@ -103,54 +104,46 @@ def _relative_reduction(baseline: float, candidate: float) -> float:
     return (baseline - candidate) / max(abs(baseline), 1.0e-12)
 
 
-def _checkpoint_step(path: Path) -> int:
-    match = re.fullmatch(r"step-([0-9]+)\.pt", path.name)
-    if match is None:
-        raise ValueError(
-            f"Stage211 logits checkpoint must be named step-N.pt: {path}"
-        )
-    return int(match.group(1))
-
-
 def build_gate(
     *,
     baseline_report_path: Path,
     candidate_report_path: Path,
+    baseline_checkpoint_path: Path,
     checkpoint_path: Path,
 ) -> dict[str, Any]:
     baseline_report_path = baseline_report_path.expanduser().resolve()
     candidate_report_path = candidate_report_path.expanduser().resolve()
+    baseline_checkpoint_path = baseline_checkpoint_path.expanduser().resolve()
     checkpoint_path = checkpoint_path.expanduser().resolve()
-    if not checkpoint_path.is_file() or checkpoint_path.stat().st_size <= 0:
-        raise FileNotFoundError(str(checkpoint_path))
+    for path in (baseline_checkpoint_path, checkpoint_path):
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(str(path))
     baseline_report = load_yaml(baseline_report_path)
     candidate_report = load_yaml(candidate_report_path)
-    if int(baseline_report.get("step", -1)) != 0:
-        raise ValueError("Stage211 logits baseline report must be the step-0 report.")
-    candidate_step = int(candidate_report.get("step", -1))
-    if candidate_step <= 0 or candidate_step != _checkpoint_step(checkpoint_path):
-        raise ValueError(
-            "Stage211 logits candidate report step does not match the checkpoint."
-        )
 
-    baseline_provenance = _validated_eval_provenance(
+    baseline_provenance = _validated_pair_report(
         baseline_report,
-        label="logits baseline",
+        phase="logits",
+        role="baseline",
+        checkpoint_path=baseline_checkpoint_path,
     )
-    candidate_provenance = _validated_eval_provenance(
+    candidate_provenance = _validated_pair_report(
         candidate_report,
-        label="logits candidate",
+        phase="logits",
+        role="candidate",
+        checkpoint_path=checkpoint_path,
     )
-    baseline_feature_seed = baseline_provenance.get("feature_seed")
-    candidate_feature_seed = candidate_provenance.get("feature_seed")
-    if (
-        not isinstance(baseline_feature_seed, int)
-        or baseline_feature_seed < 0
-        or candidate_feature_seed != baseline_feature_seed
+    if _pair_shared_binding(baseline_report) != _pair_shared_binding(
+        candidate_report
     ):
         raise ValueError(
-            "Stage211 logits baseline/candidate reports require the same "
-            "non-negative fixed feature seed."
+            "Stage211 baseline and candidate logits reports were not produced "
+            "by the same paired evaluation."
+        )
+    if baseline_provenance != candidate_provenance:
+        raise ValueError(
+            "Stage211 baseline and candidate logits reports do not bind the "
+            "same fixed-eval provenance."
         )
     if _eval_part_fingerprint(baseline_provenance) != _eval_part_fingerprint(
         candidate_provenance
@@ -256,6 +249,8 @@ def build_gate(
         "pipeline": "stage211",
         "artifact": "logits_alignment_gate",
         "phase": "logits",
+        "baseline_checkpoint_path": str(baseline_checkpoint_path),
+        "baseline_checkpoint_sha256": sha256_file(baseline_checkpoint_path),
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "gate_passed": all(checks.values()),
@@ -299,6 +294,7 @@ def main() -> int:
     )
     parser.add_argument("--baseline-report", type=Path, required=True)
     parser.add_argument("--candidate-report", type=Path, required=True)
+    parser.add_argument("--baseline-checkpoint", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -306,6 +302,7 @@ def main() -> int:
     report = build_gate(
         baseline_report_path=args.baseline_report,
         candidate_report_path=args.candidate_report,
+        baseline_checkpoint_path=args.baseline_checkpoint,
         checkpoint_path=args.checkpoint,
     )
     output_path = args.output.expanduser().resolve()

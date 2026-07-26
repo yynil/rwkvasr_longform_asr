@@ -22,6 +22,9 @@ PUBLIC_EVAL_SCRIPT = REPO_ROOT / "scripts" / "run_public_eval_benchmarks.sh"
 COMPARE_SCRIPT = REPO_ROOT / "scripts" / "compare_public_ctc_with_nano.py"
 HIDDEN_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_hidden_alignment_gate.py"
 LOGITS_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_logits_alignment_gate.py"
+ALIGNMENT_PAIR_EVAL_SCRIPT = (
+    REPO_ROOT / "scripts" / "evaluate_stage211_alignment_pair.py"
+)
 PHASE_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_phase_gate.py"
 PROMOTION_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_promotion_receipt.py"
 DEFAULT_PUBLIC_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
@@ -181,10 +184,74 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         else (DEFAULT_EVAL_ROOT / phase).resolve()
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    _, checkpoint, receipt_paths = _resolve_curriculum(
+    coverage, checkpoint, receipt_paths = _resolve_curriculum(
         phase=phase,
         phase_root=phase_root,
     )
+    segments = coverage.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError("Stage211 phase coverage lacks segment records.")
+    easy_segment = next(
+        (
+            segment
+            for segment in segments
+            if isinstance(segment, dict)
+            and str(segment.get("difficulty") or "") == "easy"
+        ),
+        None,
+    )
+    if easy_segment is None:
+        raise ValueError("Stage211 phase coverage lacks the easy initialization segment.")
+    baseline_checkpoint = Path(
+        str(easy_segment.get("init_checkpoint_path") or "")
+    ).expanduser().resolve()
+    if (
+        not baseline_checkpoint.is_file()
+        or sha256_file(baseline_checkpoint)
+        != easy_segment.get("init_checkpoint_sha256")
+    ):
+        raise ValueError(
+            "Stage211 phase initialization checkpoint is missing or changed."
+        )
+
+    alignment_eval_dir = output_dir / "alignment_pair"
+    baseline_report = alignment_eval_dir / "baseline.json"
+    candidate_report = alignment_eval_dir / "candidate.json"
+    pair_eval_command = [
+        str(PYTHON),
+        str(ALIGNMENT_PAIR_EVAL_SCRIPT),
+        "--phase",
+        phase,
+        "--train-config",
+        str(phase_root / "easy" / "train_config.yaml"),
+        "--model-config",
+        str(phase_root / "easy" / "model_config.yaml"),
+        "--baseline-checkpoint",
+        str(baseline_checkpoint),
+        "--candidate-checkpoint",
+        str(checkpoint),
+        "--baseline-output",
+        str(baseline_report),
+        "--candidate-output",
+        str(candidate_report),
+        "--samples",
+        "256",
+        "--feature-seed",
+        "0",
+        "--batch-size",
+        str(getattr(args, "alignment_batch_size", 4)),
+        "--num-workers",
+        str(getattr(args, "alignment_num_workers", 4)),
+        "--device",
+        str(getattr(args, "alignment_device", "cuda:0")),
+    ]
+    alignment_teacher_device = getattr(args, "alignment_teacher_device", None)
+    if alignment_teacher_device is not None:
+        pair_eval_command.extend(
+            ("--teacher-device", str(alignment_teacher_device))
+        )
+    _run(pair_eval_command, dry_run=bool(args.dry_run))
+
     public_output = output_dir / "public"
     comparison_json = output_dir / "nano_comparison.json"
     comparison_md = output_dir / "nano_comparison.md"
@@ -205,11 +272,6 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     )
 
     alignment_gate_path: Path | None = None
-    baseline_report = phase_root / "easy" / "step_eval_baseline.yaml"
-    long_step = int(STAGE211_AUDIO_CURRICULUM["long"]["steps"])
-    candidate_report = (
-        phase_root / "long" / f"step_eval_layers_step-{long_step}.yaml"
-    )
     if phase in {"mixer", "block"}:
         alignment_gate_path = output_dir / "hidden_gate.json"
         _run(
@@ -222,6 +284,8 @@ def finalize_phase(args: argparse.Namespace) -> Path:
                 str(baseline_report),
                 "--candidate-report",
                 str(candidate_report),
+                "--baseline-checkpoint",
+                str(baseline_checkpoint),
                 "--checkpoint",
                 str(checkpoint),
                 "--output",
@@ -239,6 +303,8 @@ def finalize_phase(args: argparse.Namespace) -> Path:
                 str(baseline_report),
                 "--candidate-report",
                 str(candidate_report),
+                "--baseline-checkpoint",
+                str(baseline_checkpoint),
                 "--checkpoint",
                 str(checkpoint),
                 "--output",
@@ -345,6 +411,10 @@ def main() -> int:
         default=None,
     )
     parser.add_argument("--devices", default="0,1,2,3")
+    parser.add_argument("--alignment-device", default="cuda:0")
+    parser.add_argument("--alignment-teacher-device", default=None)
+    parser.add_argument("--alignment-batch-size", type=int, default=4)
+    parser.add_argument("--alignment-num-workers", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

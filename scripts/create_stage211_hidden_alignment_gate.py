@@ -2,16 +2,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from rwkvasr.config import load_yaml
-from rwkvasr.eval.stage211_gate import sha256_file
+from rwkvasr.eval.stage211_gate import (
+    STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT,
+    sha256_file,
+)
 
 
 LAYER_IDS = tuple(range(70))
 WEAK_BANDS = {"10-19": tuple(range(10, 20)), "20-29": tuple(range(20, 30))}
 FIXED_EVAL_SAMPLES = 256
+PAIR_SHARED_FIELDS = (
+    "pair_eval_id",
+    "train_config_path",
+    "train_config_sha256",
+    "model_config_path",
+    "model_config_sha256",
+    "nano_checkpoint_path",
+    "nano_checkpoint_sha256",
+    "feature_seed",
+)
 
 
 def _layer_components(report: dict[str, Any]) -> dict[str, dict[str, dict[str, float]]]:
@@ -138,28 +152,146 @@ def _eval_part_fingerprint(provenance: dict[str, Any]) -> tuple[tuple[str, int],
     return tuple((str(part["sha256"]), int(part["num_samples"])) for part in provenance["parts"])
 
 
+def _checkpoint_step_from_name(path: Path) -> int:
+    match = re.fullmatch(r"step-([0-9]+)\.pt", path.name)
+    if match is None:
+        raise ValueError(
+            f"Stage211 candidate checkpoint must be named step-N.pt: {path}"
+        )
+    return int(match.group(1))
+
+
+def _validate_bound_report_file(
+    report: dict[str, Any],
+    *,
+    path_key: str,
+    sha256_key: str,
+    label: str,
+) -> Path:
+    path = Path(str(report.get(path_key) or "")).expanduser().resolve()
+    if (
+        not path.is_file()
+        or path.stat().st_size <= 0
+        or sha256_file(path) != report.get(sha256_key)
+    ):
+        raise ValueError(f"Stage211 {label} is missing or changed: {path}")
+    return path
+
+
+def _validated_pair_report(
+    report: dict[str, Any],
+    *,
+    phase: str,
+    role: str,
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    checkpoint_path = checkpoint_path.expanduser().resolve()
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT,
+        "phase": phase,
+        "role": role,
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "eval_samples": FIXED_EVAL_SAMPLES,
+    }
+    if any(report.get(key) != value for key, value in expected.items()):
+        raise ValueError(
+            f"Stage211 {phase} {role} alignment checkpoint report binding mismatch."
+        )
+    logical_step = int(report.get("step", -1))
+    checkpoint_step = int(report.get("checkpoint_step", -1))
+    if role == "baseline":
+        if logical_step != 0 or checkpoint_step < 0:
+            raise ValueError(
+                "Stage211 alignment baseline report must use logical step 0 "
+                "and record a non-negative checkpoint step."
+            )
+    elif role == "candidate":
+        expected_step = _checkpoint_step_from_name(checkpoint_path)
+        if logical_step != expected_step or checkpoint_step != expected_step:
+            raise ValueError(
+                "Stage211 alignment candidate report/checkpoint step mismatch."
+            )
+    else:
+        raise ValueError(f"Unsupported Stage211 alignment report role: {role!r}")
+    pair_eval_id = str(report.get("pair_eval_id") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", pair_eval_id):
+        raise ValueError(
+            f"Stage211 {phase} {role} alignment report has invalid pair_eval_id."
+        )
+    for prefix, label in (
+        ("train_config", "pair train config"),
+        ("model_config", "pair model config"),
+        ("nano_checkpoint", "pair Nano checkpoint"),
+    ):
+        _validate_bound_report_file(
+            report,
+            path_key=f"{prefix}_path",
+            sha256_key=f"{prefix}_sha256",
+            label=f"{phase} {role} {label}",
+        )
+    provenance = _validated_eval_provenance(
+        report,
+        label=f"{phase} {role}",
+    )
+    feature_seed = report.get("feature_seed")
+    if (
+        feature_seed != 0
+        or provenance.get("feature_seed") != feature_seed
+    ):
+        raise ValueError(
+            f"Stage211 {phase} {role} report lacks a matching fixed feature seed."
+        )
+    return provenance
+
+
+def _pair_shared_binding(report: dict[str, Any]) -> dict[str, Any]:
+    return {key: report.get(key) for key in PAIR_SHARED_FIELDS}
+
+
 def build_gate(
     *,
     phase: str,
     baseline_report_path: Path,
     candidate_report_path: Path,
+    baseline_checkpoint_path: Path,
     checkpoint_path: Path,
 ) -> dict[str, Any]:
     baseline_report_path = baseline_report_path.resolve()
     candidate_report_path = candidate_report_path.resolve()
+    baseline_checkpoint_path = baseline_checkpoint_path.resolve()
     checkpoint_path = checkpoint_path.resolve()
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(str(checkpoint_path))
+    for path in (baseline_checkpoint_path, checkpoint_path):
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(str(path))
     baseline_report = load_yaml(baseline_report_path)
     candidate_report = load_yaml(candidate_report_path)
-    baseline_eval_provenance = _validated_eval_provenance(
+    baseline_eval_provenance = _validated_pair_report(
         baseline_report,
-        label="baseline",
+        phase=phase,
+        role="baseline",
+        checkpoint_path=baseline_checkpoint_path,
     )
-    candidate_eval_provenance = _validated_eval_provenance(
+    candidate_eval_provenance = _validated_pair_report(
         candidate_report,
-        label="candidate",
+        phase=phase,
+        role="candidate",
+        checkpoint_path=checkpoint_path,
     )
+    if _pair_shared_binding(baseline_report) != _pair_shared_binding(
+        candidate_report
+    ):
+        raise ValueError(
+            "Stage211 baseline and candidate hidden reports were not produced "
+            "by the same paired evaluation."
+        )
+    if baseline_eval_provenance != candidate_eval_provenance:
+        raise ValueError(
+            "Stage211 baseline and candidate hidden reports do not bind the "
+            "same fixed-eval provenance."
+        )
     if _eval_part_fingerprint(baseline_eval_provenance) != _eval_part_fingerprint(
         candidate_eval_provenance
     ):
@@ -203,6 +335,8 @@ def build_gate(
         "pipeline": "stage211",
         "artifact": "hidden_alignment_gate",
         "phase": phase,
+        "baseline_checkpoint_path": str(baseline_checkpoint_path),
+        "baseline_checkpoint_sha256": sha256_file(baseline_checkpoint_path),
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "gate_passed": gate_passed,
@@ -226,6 +360,7 @@ def main() -> int:
     parser.add_argument("--phase", choices=("mixer", "block"), required=True)
     parser.add_argument("--baseline-report", type=Path, required=True)
     parser.add_argument("--candidate-report", type=Path, required=True)
+    parser.add_argument("--baseline-checkpoint", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -234,6 +369,7 @@ def main() -> int:
         phase=str(args.phase),
         baseline_report_path=args.baseline_report,
         candidate_report_path=args.candidate_report,
+        baseline_checkpoint_path=args.baseline_checkpoint,
         checkpoint_path=args.checkpoint,
     )
     output_path = args.output.resolve()

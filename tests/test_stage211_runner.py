@@ -81,6 +81,8 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    baseline_checkpoint = tmp_path / "init.pt"
+    baseline_checkpoint.write_bytes(b"initial")
     checkpoint = tmp_path / "step-105.pt"
     checkpoint.write_bytes(b"checkpoint")
     receipt = tmp_path / "long-receipt.json"
@@ -89,7 +91,23 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
     monkeypatch.setattr(
         stage211_phase_finalizer,
         "_resolve_curriculum",
-        lambda **kwargs: ({}, checkpoint, [receipt]),
+        lambda **kwargs: (
+            {
+                "segments": [
+                    {
+                        "difficulty": "easy",
+                        "init_checkpoint_path": str(
+                            baseline_checkpoint.resolve()
+                        ),
+                        "init_checkpoint_sha256": sha256_file(
+                            baseline_checkpoint
+                        ),
+                    }
+                ]
+            },
+            checkpoint,
+            [receipt],
+        ),
     )
     monkeypatch.setattr(
         stage211_phase_finalizer,
@@ -133,9 +151,34 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
         if str(stage211_phase_finalizer.PHASE_GATE_SCRIPT) in command
     )
     logits_gate_path = tmp_path / "eval" / "logits_gate.json"
+    pair_command = next(
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.ALIGNMENT_PAIR_EVAL_SCRIPT)
+        in command
+    )
+    assert pair_command[
+        pair_command.index("--baseline-checkpoint") + 1
+    ] == str(baseline_checkpoint.resolve())
+    assert pair_command[pair_command.index("--feature-seed") + 1] == "0"
+    pair_baseline_report = pair_command[
+        pair_command.index("--baseline-output") + 1
+    ]
+    pair_candidate_report = pair_command[
+        pair_command.index("--candidate-output") + 1
+    ]
+    assert logits_command[
+        logits_command.index("--baseline-report") + 1
+    ] == pair_baseline_report
+    assert logits_command[
+        logits_command.index("--candidate-report") + 1
+    ] == pair_candidate_report
     assert logits_command[logits_command.index("--output") + 1] == str(
         logits_gate_path
     )
+    assert logits_command[
+        logits_command.index("--baseline-checkpoint") + 1
+    ] == str(baseline_checkpoint.resolve())
     assert phase_gate_command[
         phase_gate_command.index("--alignment-report") + 1
     ] == str(logits_gate_path)
@@ -1276,12 +1319,12 @@ def _write_valid_phase_gate(
     )
     alignment_baseline_source = tmp_path / f"{phase}-alignment-baseline.yaml"
     alignment_candidate_source = tmp_path / f"{phase}-alignment-candidate.yaml"
-    alignment_baseline_source.write_text("{}\n", encoding="utf-8")
-    alignment_candidate_source.write_text("{}\n", encoding="utf-8")
     alignment_manifest = tmp_path / f"{phase}-alignment-manifest.json"
     alignment_part = tmp_path / f"{phase}-alignment-part.jsonl"
+    alignment_model_config = tmp_path / f"{phase}-alignment-model.yaml"
     alignment_manifest.write_text("{}\n", encoding="utf-8")
     alignment_part.write_text("{}\n", encoding="utf-8")
+    alignment_model_config.write_text("{}\n", encoding="utf-8")
     alignment_provenance = {
         "schema_version": 1,
         "split": "eval",
@@ -1298,6 +1341,55 @@ def _write_valid_phase_gate(
             }
         ],
     }
+    phase_init_checkpoint = Path(segments[0]["init_checkpoint_path"])
+    alignment_train_config = Path(segments[0]["train_config_path"])
+    pair_eval_id = "a" * 64
+    shared_source = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "alignment_checkpoint_eval",
+        "phase": phase,
+        "pair_eval_id": pair_eval_id,
+        "train_config_path": str(alignment_train_config.resolve()),
+        "train_config_sha256": sha256_file(alignment_train_config),
+        "model_config_path": str(alignment_model_config.resolve()),
+        "model_config_sha256": sha256_file(alignment_model_config),
+        "nano_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
+        "nano_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
+        "feature_seed": 0,
+        "eval_samples": 256,
+        "eval_provenance": alignment_provenance,
+    }
+    alignment_baseline_source.write_text(
+        json.dumps(
+            {
+                **shared_source,
+                "role": "baseline",
+                "step": 0,
+                "checkpoint_step": 0,
+                "checkpoint_path": str(phase_init_checkpoint.resolve()),
+                "checkpoint_sha256": sha256_file(phase_init_checkpoint),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    alignment_candidate_source.write_text(
+        json.dumps(
+            {
+                **shared_source,
+                "role": "candidate",
+                "step": int(STAGE211_AUDIO_CURRICULUM["long"]["steps"]),
+                "checkpoint_step": int(
+                    STAGE211_AUDIO_CURRICULUM["long"]["steps"]
+                ),
+                "checkpoint_path": str(checkpoint.resolve()),
+                "checkpoint_sha256": sha256_file(checkpoint),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     alignment_report = tmp_path / f"{phase}-alignment.json"
     alignment_report.write_text(
         json.dumps(
@@ -1310,6 +1402,12 @@ def _write_valid_phase_gate(
                     else "hidden_alignment_gate"
                 ),
                 "phase": phase,
+                "baseline_checkpoint_path": str(
+                    phase_init_checkpoint.resolve()
+                ),
+                "baseline_checkpoint_sha256": sha256_file(
+                    phase_init_checkpoint
+                ),
                 "checkpoint_path": str(checkpoint.resolve()),
                 "checkpoint_sha256": sha256_file(checkpoint),
                 "gate_passed": True,
@@ -1598,6 +1696,15 @@ def test_stage211_logits_phase_gate_rejects_missing_fixed_feature_seed(
     alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
     alignment["baseline_eval_provenance"].pop("feature_seed")
     alignment["candidate_eval_provenance"].pop("feature_seed")
+    for prefix in ("baseline_report", "candidate_report"):
+        source_path = Path(alignment[f"{prefix}_path"])
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        source["eval_provenance"].pop("feature_seed")
+        source_path.write_text(
+            json.dumps(source) + "\n",
+            encoding="utf-8",
+        )
+        alignment[f"{prefix}_sha256"] = sha256_file(source_path)
     alignment_path.write_text(
         json.dumps(alignment) + "\n",
         encoding="utf-8",

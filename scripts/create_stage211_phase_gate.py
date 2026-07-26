@@ -278,6 +278,17 @@ def build_phase_gate(
     if public_report.get("student_checkpoint_sha256") != sha256_file(checkpoint_path):
         raise ValueError("Stage211 public comparison checkpoint SHA-256 mismatch.")
     coverage = _parse_coverage_receipts(coverage_receipt_paths, phase=phase)
+    phase_init_checkpoint = Path(
+        str(coverage[0].get("init_checkpoint_path") or "")
+    ).resolve()
+    if (
+        not phase_init_checkpoint.is_file()
+        or sha256_file(phase_init_checkpoint)
+        != coverage[0].get("init_checkpoint_sha256")
+    ):
+        raise ValueError(
+            "Stage211 phase initialization checkpoint is missing or changed."
+        )
     alignment_gate_passed = False
     alignment_record: dict[str, Any] | None = None
     if alignment_report_path is not None:
@@ -306,16 +317,50 @@ def build_phase_gate(
             raise ValueError("Stage211 alignment report checkpoint path mismatch.")
         if alignment_report.get("checkpoint_sha256") != sha256_file(checkpoint_path):
             raise ValueError("Stage211 alignment report checkpoint SHA-256 mismatch.")
+        if (
+            Path(
+                str(
+                    alignment_report.get("baseline_checkpoint_path")
+                    or ""
+                )
+            ).resolve()
+            != phase_init_checkpoint
+            or alignment_report.get("baseline_checkpoint_sha256")
+            != sha256_file(phase_init_checkpoint)
+        ):
+            raise ValueError(
+                "Stage211 alignment report baseline checkpoint mismatch."
+            )
         baseline_alignment_report_path = Path(
             str(alignment_report.get("baseline_report_path") or "")
         ).resolve()
         candidate_alignment_report_path = Path(
             str(alignment_report.get("candidate_report_path") or "")
         ).resolve()
+        baseline_alignment_source = _load_json(
+            baseline_alignment_report_path,
+            label="Stage211 alignment baseline source report",
+        )
+        if (
+            Path(
+                str(
+                    baseline_alignment_source.get("train_config_path")
+                    or ""
+                )
+            ).resolve()
+            != Path(str(coverage[0]["train_config_path"])).resolve()
+            or baseline_alignment_source.get("train_config_sha256")
+            != coverage[0]["train_config_sha256"]
+        ):
+            raise ValueError(
+                "Stage211 alignment pair does not bind the easy-segment "
+                "phase train config."
+            )
         if phase == "logits":
             rebuilt_alignment_report = build_logits_alignment_gate(
                 baseline_report_path=baseline_alignment_report_path,
                 candidate_report_path=candidate_alignment_report_path,
+                baseline_checkpoint_path=phase_init_checkpoint,
                 checkpoint_path=checkpoint_path,
             )
         else:
@@ -323,6 +368,7 @@ def build_phase_gate(
                 phase=phase,
                 baseline_report_path=baseline_alignment_report_path,
                 candidate_report_path=candidate_alignment_report_path,
+                baseline_checkpoint_path=phase_init_checkpoint,
                 checkpoint_path=checkpoint_path,
             )
         if rebuilt_alignment_report != alignment_report:
@@ -367,7 +413,6 @@ def build_phase_gate(
             baseline_public_comparison_report_path,
             label="Stage211 baseline public comparison report",
         )
-        phase_init_checkpoint = Path(str(coverage[0].get("init_checkpoint_path") or "")).resolve()
         if Path(
             str(baseline_public_report.get("student_checkpoint_path") or "")
         ).resolve() != phase_init_checkpoint or baseline_public_report.get(
