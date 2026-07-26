@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 sft_runner = importlib.import_module("scripts.run_stage211_labeled_sft")
 sft_finalizer = importlib.import_module("scripts.finalize_stage211_labeled_sft")
+stepwise_report = importlib.import_module("scripts.create_stage211_stepwise_report")
 LABELED_EXPECTED = sft_runner.LABELED_EXPECTED
 
 
@@ -194,3 +195,267 @@ def test_stage211_sft_public_gate_requires_zero_dataset_regressions() -> None:
 
     assert failed["gate_passed"] is False
     assert failed["no_dataset_regression"] is False
+
+
+def _bound_public_benchmark(
+    tmp_path: Path,
+    *,
+    stage: str,
+    error_rate: float,
+) -> dict[str, object]:
+    results = []
+    for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
+        manifest = tmp_path / f"{dataset}.manifest.jsonl"
+        nano = tmp_path / f"{dataset}.nano.jsonl"
+        student = tmp_path / f"{dataset}.{stage}.student.jsonl"
+        for path in (manifest, nano, student):
+            if not path.exists():
+                path.write_text("{}\n", encoding="utf-8")
+        results.append(
+            {
+                "dataset": dataset,
+                "language": expected["language"],
+                "metric": expected["metric"],
+                "sample_count": expected["samples"],
+                "identical_utt_coverage": True,
+                "normalized_reference_mismatch_count": 0,
+                "nano_error_rate": 0.1,
+                "student_error_rate": error_rate,
+                "absolute_gap_points": (error_rate - 0.1) * 100.0,
+                "relative_ratio": error_rate / 0.1,
+                "nano_prediction_reference_unit_ratio": 1.0,
+                "student_prediction_reference_unit_ratio": 0.95,
+                "nano_deletion_rate": 0.01,
+                "student_deletion_rate": 0.02,
+                "manifest_path": str(manifest.resolve()),
+                "manifest_sha256": sha256_file(manifest),
+                "nano_prediction_path": str(nano.resolve()),
+                "nano_prediction_sha256": sha256_file(nano),
+                "student_prediction_path": str(student.resolve()),
+                "student_prediction_sha256": sha256_file(student),
+            }
+        )
+    return {
+        "decode": "greedy_ctc",
+        "normalization": "ctc",
+        "all_datasets_complete": True,
+        "all_datasets_pass": True,
+        "results": results,
+    }
+
+
+def _write_stepwise_inputs(
+    tmp_path: Path,
+) -> tuple[dict[str, Path], dict[str, Path]]:
+    checkpoints = {
+        stage: tmp_path / f"{stage}.pt"
+        for stage in ("calibration", "mixer", "block", "logits", "sft")
+    }
+    for stage, checkpoint in checkpoints.items():
+        checkpoint.write_bytes(stage.encode())
+
+    support = {}
+    for name in (
+        "selection",
+        "calibration-comparison",
+        "calibration-metrics",
+        "sft-completion",
+        "sft-baseline",
+        "sft-comparison",
+        "logits-promotion",
+    ):
+        path = tmp_path / f"{name}.json"
+        path.write_text("{}\n", encoding="utf-8")
+        support[name] = path
+
+    calibration_receipt = tmp_path / "calibration-reuse.json"
+    calibration_receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "calibration_public_eval_reuse",
+                "complete": True,
+                "checkpoint_path": str(checkpoints["calibration"].resolve()),
+                "checkpoint_sha256": sha256_file(checkpoints["calibration"]),
+                "selection_report_path": str(support["selection"].resolve()),
+                "selection_report_sha256": sha256_file(support["selection"]),
+                "comparison_report_path": str(support["calibration-comparison"].resolve()),
+                "comparison_report_sha256": sha256_file(support["calibration-comparison"]),
+                "metrics_path": str(support["calibration-metrics"].resolve()),
+                "metrics_sha256": sha256_file(support["calibration-metrics"]),
+                "public_benchmark": _bound_public_benchmark(
+                    tmp_path,
+                    stage="calibration",
+                    error_rate=0.5,
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    reports = {"calibration": calibration_receipt}
+    previous = "calibration"
+    for index, stage in enumerate(("mixer", "block", "logits"), start=1):
+        gate = tmp_path / f"{stage}-gate.json"
+        gate.write_text(
+            json.dumps(
+                {
+                    "phase": stage,
+                    "gate_passed": True,
+                    "checkpoint_path": str(checkpoints[stage].resolve()),
+                    "checkpoint_sha256": sha256_file(checkpoints[stage]),
+                    "full_data_coverage": {
+                        "segments": [
+                            {
+                                "init_checkpoint_path": str(checkpoints[previous].resolve()),
+                                "init_checkpoint_sha256": sha256_file(checkpoints[previous]),
+                            }
+                        ]
+                    },
+                    "public_benchmark": _bound_public_benchmark(
+                        tmp_path,
+                        stage=stage,
+                        error_rate=0.5 - index * 0.1,
+                    ),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        reports[stage] = gate
+        previous = stage
+
+    sft_report = tmp_path / "sft-final.json"
+    sft_report.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "final_completion",
+                "phase": "sft",
+                "complete": True,
+                "gate_passed": True,
+                "checkpoint_path": str(checkpoints["sft"].resolve()),
+                "checkpoint_sha256": sha256_file(checkpoints["sft"]),
+                "sft_completion_path": str(support["sft-completion"].resolve()),
+                "sft_completion_sha256": sha256_file(support["sft-completion"]),
+                "baseline_public_comparison_report_path": str(support["sft-baseline"].resolve()),
+                "baseline_public_comparison_report_sha256": sha256_file(support["sft-baseline"]),
+                "public_comparison_report_path": str(support["sft-comparison"].resolve()),
+                "public_comparison_report_sha256": sha256_file(support["sft-comparison"]),
+                "logits_promotion_receipt_path": str(support["logits-promotion"].resolve()),
+                "logits_promotion_receipt_sha256": sha256_file(support["logits-promotion"]),
+                "labeled_data_coverage": {
+                    "phase": "sft",
+                    "complete": True,
+                    "init_checkpoint_path": str(checkpoints["logits"].resolve()),
+                    "init_checkpoint_sha256": sha256_file(checkpoints["logits"]),
+                },
+                "public_progress": {
+                    "gate_passed": True,
+                    "no_dataset_regression": True,
+                    "macro_improved": True,
+                    "improved_datasets": 5,
+                },
+                "public_benchmark": _bound_public_benchmark(
+                    tmp_path,
+                    stage="sft",
+                    error_rate=0.1,
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    reports["sft"] = sft_report
+    return checkpoints, reports
+
+
+def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoints, reports = _write_stepwise_inputs(tmp_path)
+
+    def validate_phase(path: Path, *, expected_phase: str, checkpoint_path: Path):
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+        assert report["phase"] == expected_phase
+        assert Path(report["checkpoint_path"]) == checkpoint_path
+        return report
+
+    monkeypatch.setattr(
+        stepwise_report,
+        "validate_stage211_phase_gate_report",
+        validate_phase,
+    )
+    output_json = tmp_path / "stepwise.json"
+    output_markdown = tmp_path / "stepwise.md"
+
+    report = stepwise_report.create_stepwise_report(
+        calibration_receipt_path=reports["calibration"],
+        mixer_gate_path=reports["mixer"],
+        block_gate_path=reports["block"],
+        logits_gate_path=reports["logits"],
+        sft_final_report_path=reports["sft"],
+        output_json=output_json,
+        output_markdown=output_markdown,
+    )
+
+    assert report["strict_stage_order"] == [
+        "calibration",
+        "mixer",
+        "block",
+        "logits",
+        "sft",
+    ]
+    assert report["checkpoint_chain_passed"] is True
+    assert len(report["checkpoint_chain"]) == 4
+    assert len(report["dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
+    assert report["stages"][-1]["checkpoint_sha256"] == sha256_file(checkpoints["sft"])
+    assert report["stages"][0]["gate_passed"] is None
+    assert report["stages"][0]["gate_status"] == "baseline"
+    assert "Layer A" in output_markdown.read_text(encoding="utf-8")
+    assert "SFT D" in output_markdown.read_text(encoding="utf-8")
+    sft_finalizer._validate_final_report(
+        reports["sft"],
+        checkpoint=checkpoints["sft"],
+    )
+
+    sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
+    sft["public_benchmark"]["all_datasets_pass"] = False
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="every-dataset Nano"):
+        stepwise_report.build_stepwise_report(
+            calibration_receipt_path=reports["calibration"],
+            mixer_gate_path=reports["mixer"],
+            block_gate_path=reports["block"],
+            logits_gate_path=reports["logits"],
+            sft_final_report_path=reports["sft"],
+        )
+    with pytest.raises(ValueError, match="every-dataset Nano"):
+        sft_finalizer._validate_final_report(
+            reports["sft"],
+            checkpoint=checkpoints["sft"],
+        )
+    sft["public_benchmark"]["all_datasets_pass"] = True
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
+
+    block = json.loads(reports["block"].read_text(encoding="utf-8"))
+    block["full_data_coverage"]["segments"][0]["init_checkpoint_path"] = str(
+        checkpoints["calibration"]
+    )
+    block["full_data_coverage"]["segments"][0]["init_checkpoint_sha256"] = sha256_file(
+        checkpoints["calibration"]
+    )
+    reports["block"].write_text(json.dumps(block) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkpoint chain mismatch"):
+        stepwise_report.build_stepwise_report(
+            calibration_receipt_path=reports["calibration"],
+            mixer_gate_path=reports["mixer"],
+            block_gate_path=reports["block"],
+            logits_gate_path=reports["logits"],
+            sft_final_report_path=reports["sft"],
+        )

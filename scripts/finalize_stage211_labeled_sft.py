@@ -13,6 +13,7 @@ from rwkvasr.eval.stage211_gate import (
 )
 
 try:
+    from scripts.create_stage211_stepwise_report import create_stepwise_report
     from scripts.create_stage211_phase_gate import _enrich_public_benchmark
     from scripts.finalize_stage211_phase import (
         DEFAULT_NANO_PREDICTION_DIR,
@@ -27,6 +28,7 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
+    from create_stage211_stepwise_report import create_stepwise_report
     from create_stage211_phase_gate import _enrich_public_benchmark
     from finalize_stage211_phase import (
         DEFAULT_NANO_PREDICTION_DIR,
@@ -134,7 +136,9 @@ def _validate_final_report(
         raise ValueError("Stage211 final report checkpoint path mismatch.")
     if report.get("checkpoint_sha256") != sha256_file(checkpoint):
         raise ValueError("Stage211 final report checkpoint SHA-256 mismatch.")
-    validate_stage211_public_benchmark(report.get("public_benchmark"))
+    benchmark = validate_stage211_public_benchmark(report.get("public_benchmark"))
+    if benchmark.get("all_datasets_pass") is not True:
+        raise ValueError("Stage211D did not pass the every-dataset Nano WER/CER gate.")
     progress = report.get("public_progress")
     if (
         not isinstance(progress, dict)
@@ -273,8 +277,24 @@ def finalize_sft(args: argparse.Namespace) -> Path:
             f"public-set regression; report={final_report_path}"
         )
     _validate_final_report(final_report_path, checkpoint=checkpoint)
+    phase_gate_root = (
+        args.phase_gate_root.expanduser().resolve()
+        if args.phase_gate_root is not None
+        else output_dir.parent
+    )
+    create_stepwise_report(
+        calibration_receipt_path=args.calibration_reuse_receipt,
+        mixer_gate_path=phase_gate_root / "mixer" / "phase_gate.json",
+        block_gate_path=phase_gate_root / "block" / "phase_gate.json",
+        logits_gate_path=phase_gate_root / "logits" / "phase_gate.json",
+        sft_final_report_path=final_report_path,
+        output_json=output_dir / "stage211_stepwise_results.json",
+        output_markdown=output_dir / "stage211_stepwise_results.md",
+    )
     print(
-        f"[stage211-sft-finalize] complete checkpoint={checkpoint} report={final_report_path}",
+        f"[stage211-sft-finalize] complete checkpoint={checkpoint} "
+        f"report={final_report_path} "
+        f"stepwise_report={output_dir / 'stage211_stepwise_results.json'}",
         flush=True,
     )
     return final_report_path
@@ -305,6 +325,18 @@ def main() -> int:
         type=Path,
         default=DEFAULT_NANO_PREDICTION_DIR,
     )
+    parser.add_argument(
+        "--calibration-reuse-receipt",
+        type=Path,
+        default=(
+            Path.home()
+            / "rwkvasr_eval"
+            / "stage211_calibration_selected_full"
+            / "public"
+            / "reuse_receipt.json"
+        ),
+    )
+    parser.add_argument("--phase-gate-root", type=Path, default=None)
     parser.add_argument("--devices", default="0,1,2,3")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
