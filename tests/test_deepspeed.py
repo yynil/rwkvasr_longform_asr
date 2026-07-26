@@ -12,6 +12,7 @@ from rwkvasr.config import load_yaml
 from rwkvasr.training.deepspeed_loop import (
     DeepSpeedTrainConfig,
     _accumulate_layer_eval_metrics,
+    _build_step_eval_provenance,
     _ctc_frame_group_mean,
     _ctc_frame_group_sums,
     _ctc_teacher_layer_hidden_loss,
@@ -610,6 +611,63 @@ def test_deepspeed_resolve_max_steps_uses_bucket_manifest_without_webdataset_ind
 
     assert steps_per_epoch == 4
     assert resolved_max_steps == 8
+
+
+def test_step_eval_provenance_binds_manifest_and_eval_parts(
+    tmp_path: Path,
+) -> None:
+    eval_part = tmp_path / "eval.jsonl"
+    eval_part.write_text('{"utt_id": "u1"}\n', encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "root": "/",
+                "source_length_index_path": str(tmp_path / "lengths.jsonl"),
+                "bucket_width": 200,
+                "entries_per_part": 100,
+                "splits": {
+                    "eval": {
+                        "num_samples": 256,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": 256,
+                                "parts": [
+                                    {
+                                        "path": str(eval_part),
+                                        "num_samples": 256,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    provenance = _build_step_eval_provenance(
+        config=DeepSpeedTrainConfig(
+            output_dir=str(tmp_path / "out"),
+            deepspeed={},
+            step_eval_split="eval",
+            step_eval_samples=256,
+        ),
+        bucket_manifest_path=manifest,
+    )
+
+    assert provenance["split"] == "eval"
+    assert provenance["requested_samples"] == 256
+    assert provenance["split_samples"] == 256
+    assert provenance["bucket_manifest_path"] == str(manifest.resolve())
+    assert len(provenance["bucket_manifest_sha256"]) == 64
+    assert len(provenance["parts"]) == 1
+    assert provenance["parts"][0]["path"] == str(eval_part.resolve())
+    assert len(provenance["parts"][0]["sha256"]) == 64
+    assert provenance["parts"][0]["num_samples"] == 256
 
 
 @pytest.mark.filterwarnings("ignore:Can't initialize NVML")

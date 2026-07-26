@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
@@ -27,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 stage211 = importlib.import_module("scripts.run_stage211_strict_chained_alignment")
 stage211_phase_gate = importlib.import_module("scripts.create_stage211_phase_gate")
+stage211_full_phase = importlib.import_module("scripts.run_stage211_full_phase_curriculum")
 
 
 def test_stage211_formal_defaults_use_persistent_storage_and_local_teacher() -> None:
@@ -64,6 +66,139 @@ def test_stage211_phase_gate_normalizes_bound_references(tmp_path: Path) -> None
     )
 
     assert manifest_records == prediction_records
+
+
+def test_stage211_public_progress_requires_macro_and_deletion_improvement() -> None:
+    baseline_results = []
+    candidate_results = []
+    for dataset in STAGE211_PUBLIC_BENCHMARKS:
+        shared = {
+            "dataset": dataset,
+            "manifest_sha256": f"manifest-{dataset}",
+            "nano_prediction_sha256": f"nano-{dataset}",
+        }
+        baseline_results.append(
+            {
+                **shared,
+                "student_error_rate": 0.8,
+                "student_deletion_rate": 0.6,
+            }
+        )
+        candidate_results.append(
+            {
+                **shared,
+                "student_error_rate": 0.7,
+                "student_deletion_rate": 0.5,
+            }
+        )
+
+    progress = stage211_phase_gate._build_public_progress(
+        baseline={"results": baseline_results},
+        candidate={"results": candidate_results},
+    )
+
+    assert progress["gate_passed"] is True
+    assert progress["improved_datasets"] == len(STAGE211_PUBLIC_BENCHMARKS)
+
+    candidate_results[0]["student_error_rate"] = 0.84
+    rejected = stage211_phase_gate._build_public_progress(
+        baseline={"results": baseline_results},
+        candidate={"results": candidate_results},
+    )
+    assert rejected["gate_passed"] is False
+    assert rejected["results"][0]["within_regression_limit"] is False
+
+
+def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
+    tmp_path: Path,
+) -> None:
+    init_checkpoint = tmp_path / "init.pt"
+    init_checkpoint.write_bytes(b"init")
+    nano_checkpoint = tmp_path / "nano.pt"
+    nano_checkpoint.write_bytes(b"nano")
+    manifests: dict[str, Path] = {}
+    for difficulty in STAGE211_AUDIO_CURRICULUM:
+        manifest = tmp_path / f"{difficulty}.json"
+        manifest.write_text("{}\n", encoding="utf-8")
+        manifests[difficulty] = manifest
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "run_stage211_full_phase_curriculum.py"),
+        "--phase",
+        "mixer",
+        "--init-checkpoint",
+        str(init_checkpoint),
+        "--nano-checkpoint",
+        str(nano_checkpoint),
+        "--output-root",
+        str(tmp_path / "runs"),
+        "--config-root",
+        str(tmp_path / "configs"),
+        "--easy-manifest",
+        str(manifests["easy"]),
+        "--dry-run",
+    ]
+    for difficulty in ("medium", "hard", "long"):
+        command.extend(("--manifest", f"{difficulty}={manifests[difficulty]}"))
+
+    result = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("[stage211-full-phase] command=") == 5
+    assert "--smoke" in result.stdout
+    for difficulty, expected in STAGE211_AUDIO_CURRICULUM.items():
+        assert f"/{difficulty}/step-{expected['steps']}.pt" in result.stdout
+
+
+def test_stage211_full_phase_smoke_audit_rejects_teacher_misses(
+    tmp_path: Path,
+) -> None:
+    phase = "mixer"
+    init_checkpoint = tmp_path / "init.pt"
+    init_checkpoint.write_bytes(b"init")
+    easy_manifest = tmp_path / "easy.json"
+    easy_manifest.write_text("{}\n", encoding="utf-8")
+    smoke_run_dir = tmp_path / "smoke"
+    log_dir = smoke_run_dir / "logs"
+    log_dir.mkdir(parents=True)
+    torch.save({"step": 2}, smoke_run_dir / "step-2.pt")
+    log_path = log_dir / "mixer_smoke_2steps.log"
+    valid_log = (
+        "[rwkvasr] Batch stats peak_reserved=20.50GiB\n"
+        "[deepspeed-train] step=2 loss=0.2000 "
+        "online_layer_missing=0 online_layer_frame_delta=0\n"
+    )
+    log_path.write_text(valid_log, encoding="utf-8")
+
+    report = stage211_full_phase._audit_smoke(
+        phase=phase,
+        smoke_run_dir=smoke_run_dir,
+        init_checkpoint=init_checkpoint,
+        easy_manifest=easy_manifest,
+        max_peak_reserved_gib=22.0,
+    )
+
+    assert report["complete"] is True
+    assert report["peak_reserved_gib"] == 20.5
+
+    log_path.write_text(
+        valid_log + "[deepspeed-train] online_layer_missing=1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="rejected condition"):
+        stage211_full_phase._audit_smoke(
+            phase=phase,
+            smoke_run_dir=smoke_run_dir,
+            init_checkpoint=init_checkpoint,
+            easy_manifest=easy_manifest,
+            max_peak_reserved_gib=22.0,
+        )
 
 
 def test_stage211_formal_rejects_volatile_output_but_smoke_allows_it(
@@ -658,6 +793,7 @@ def _write_valid_phase_gate(
                 "checkpoint_sha256": sha256_file(checkpoint),
                 "gate_passed": True,
                 "alignment_gate_passed": True,
+                "public_progress_gate_passed": True,
                 "full_data_coverage": {
                     "phase": phase,
                     "complete": True,

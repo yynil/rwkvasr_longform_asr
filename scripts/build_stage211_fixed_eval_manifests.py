@@ -6,6 +6,17 @@ import json
 from pathlib import Path
 from typing import Any, Iterator
 
+from rwkvasr.data import (
+    estimate_bucket_manifest_steps,
+    load_webdataset_bucket_manifest,
+)
+from rwkvasr.eval.stage211_gate import (
+    STAGE211_AUDIO_CURRICULUM,
+    STAGE211_FULL_DATA_BATCH_SIZE,
+    STAGE211_FULL_DATA_FRAME_BUDGET,
+    STAGE211_FULL_DATA_WORLD_SIZE,
+)
+
 
 DEFAULT_EASY_MANIFEST = (
     Path.home() / "rwkvasr_data" / "stage211_easy_source_grouped_buckets" / "manifest.json"
@@ -71,9 +82,7 @@ def build_fixed_eval(
         if len(selected_lines) >= FIXED_EVAL_SAMPLES:
             break
     if len(selected_lines) != FIXED_EVAL_SAMPLES:
-        raise ValueError(
-            f"Could not materialize {FIXED_EVAL_SAMPLES} unique fixed-eval rows."
-        )
+        raise ValueError(f"Could not materialize {FIXED_EVAL_SAMPLES} unique fixed-eval rows.")
     rendered_part = "".join(selected_lines)
     if fixed_part.is_file() and fixed_part.read_text(encoding="utf-8") != rendered_part:
         raise ValueError(f"Refusing to replace a different fixed-eval part: {fixed_part}")
@@ -116,6 +125,65 @@ def build_fixed_eval(
     return fixed_part, outputs
 
 
+def validate_fixed_eval_outputs(
+    *,
+    fixed_part: Path,
+    outputs: list[Path],
+) -> list[dict[str, int | str]]:
+    if len(outputs) != len(STAGE211_AUDIO_CURRICULUM):
+        raise ValueError("Stage211 fixed-eval builder must produce four manifests.")
+    fixed_part = fixed_part.resolve()
+    fixed_part_sha256 = _sha256(fixed_part)
+    records: list[dict[str, int | str]] = []
+    for difficulty, output in zip(
+        STAGE211_AUDIO_CURRICULUM,
+        outputs,
+        strict=True,
+    ):
+        manifest = load_webdataset_bucket_manifest(output)
+        train_rows = sum(bucket.num_samples for bucket in manifest.splits.get("train", ()))
+        eval_buckets = manifest.splits.get("eval", ())
+        eval_rows = sum(bucket.num_samples for bucket in eval_buckets)
+        steps_per_epoch = estimate_bucket_manifest_steps(
+            manifest,
+            split="train",
+            batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+            world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+            frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+            drop_last=True,
+        )
+        expected = STAGE211_AUDIO_CURRICULUM[difficulty]
+        if (
+            train_rows != int(expected["rows"])
+            or eval_rows != FIXED_EVAL_SAMPLES
+            or steps_per_epoch != int(expected["steps_per_epoch"])
+        ):
+            raise ValueError(
+                f"Stage211 {difficulty} fixed-eval manifest mismatch: "
+                f"train={train_rows}/{expected['rows']} "
+                f"eval={eval_rows}/{FIXED_EVAL_SAMPLES} "
+                f"steps={steps_per_epoch}/{expected['steps_per_epoch']}"
+            )
+        eval_parts = [
+            _resolve_recorded_path(output, part.path)
+            for bucket in eval_buckets
+            for part in bucket.parts
+        ]
+        if eval_parts != [fixed_part] or _sha256(eval_parts[0]) != fixed_part_sha256:
+            raise ValueError(f"Stage211 {difficulty} does not bind the shared fixed-eval part.")
+        records.append(
+            {
+                "difficulty": difficulty,
+                "train_rows": train_rows,
+                "eval_rows": eval_rows,
+                "steps_per_epoch": steps_per_epoch,
+                "manifest_sha256": _sha256(output),
+                "fixed_eval_sha256": fixed_part_sha256,
+            }
+        )
+    return records
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Attach one immutable 256-row hidden-eval split to Stage211 curricula."
@@ -128,13 +196,22 @@ def main() -> int:
         easy_manifest_path=args.easy_manifest,
         metadata_root=args.metadata_root,
     )
+    records = validate_fixed_eval_outputs(
+        fixed_part=fixed_part,
+        outputs=outputs,
+    )
     print(
-        f"fixed_eval_part={fixed_part} samples={FIXED_EVAL_SAMPLES} "
-        f"sha256={_sha256(fixed_part)}",
+        f"fixed_eval_part={fixed_part} samples={FIXED_EVAL_SAMPLES} sha256={_sha256(fixed_part)}",
         flush=True,
     )
-    for output in outputs:
-        print(f"manifest={output} sha256={_sha256(output)}", flush=True)
+    for output, record in zip(outputs, records, strict=True):
+        print(
+            f"manifest={output} difficulty={record['difficulty']} "
+            f"train={record['train_rows']} eval={record['eval_rows']} "
+            f"steps_per_epoch={record['steps_per_epoch']} "
+            f"sha256={record['manifest_sha256']}",
+            flush=True,
+        )
     return 0
 
 

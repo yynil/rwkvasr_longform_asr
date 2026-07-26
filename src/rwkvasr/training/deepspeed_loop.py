@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import json
 import math
@@ -103,6 +104,79 @@ def _parse_deepspeed_checkpoint_step(value: Any) -> int:
         return int(tag.removeprefix("step-"))
     except ValueError:
         return 0
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_manifest_artifact_path(manifest_path: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return path.resolve()
+
+
+def _build_step_eval_provenance(
+    *,
+    config: DeepSpeedTrainConfig,
+    bucket_manifest_path: Path | None,
+) -> dict[str, Any]:
+    split = str(config.step_eval_split)
+    requested_samples = (
+        int(config.step_eval_samples)
+        if config.step_eval_samples is not None
+        else None
+    )
+    if bucket_manifest_path is None:
+        return {
+            "schema_version": 1,
+            "split": split,
+            "requested_samples": requested_samples,
+            "bucket_manifest_path": None,
+            "bucket_manifest_sha256": None,
+            "split_samples": None,
+            "parts": [],
+        }
+
+    bucket_manifest_path = bucket_manifest_path.resolve()
+    manifest = load_webdataset_bucket_manifest(bucket_manifest_path)
+    buckets = manifest.splits.get(split, ())
+    parts: list[dict[str, Any]] = []
+    seen_paths: set[Path] = set()
+    for bucket in buckets:
+        for part in bucket.parts:
+            path = _resolve_manifest_artifact_path(
+                bucket_manifest_path,
+                part.path,
+            )
+            if path in seen_paths:
+                continue
+            if not path.is_file() or path.stat().st_size <= 0:
+                raise FileNotFoundError(
+                    f"Step-eval manifest part is missing or empty: {path}"
+                )
+            seen_paths.add(path)
+            parts.append(
+                {
+                    "path": str(path),
+                    "sha256": _sha256_file(path),
+                    "num_samples": int(part.num_samples),
+                }
+            )
+    return {
+        "schema_version": 1,
+        "split": split,
+        "requested_samples": requested_samples,
+        "bucket_manifest_path": str(bucket_manifest_path),
+        "bucket_manifest_sha256": _sha256_file(bucket_manifest_path),
+        "split_samples": sum(int(bucket.num_samples) for bucket in buckets),
+        "parts": parts,
+    }
 
 
 def _resolve_latest_deepspeed_checkpoint(
@@ -6683,6 +6757,14 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"frame_budget={frame_budget} "
             f"world_size={_world_size()}"
         )
+    step_eval_provenance = (
+        _build_step_eval_provenance(
+            config=config,
+            bucket_manifest_path=active_bucket_manifest_path,
+        )
+        if _is_rank_zero() and step_eval_every is not None
+        else None
+    )
     _rank_zero_log("The first batch can be slower because workers start up and wav->fbank decoding is done online.")
     start_step = 0
     start_epoch = 0
@@ -6834,6 +6916,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 "eval_loss": initial_eval_loss,
                 "eval_samples": initial_eval_count,
                 "shuffle": bool(config.step_eval_shuffle),
+                "eval_provenance": step_eval_provenance,
                 "layer_metrics": {
                     str(layer_id): metrics
                     for layer_id, metrics in initial_layer_metrics.items()
@@ -8272,6 +8355,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                             "step": step,
                                             "eval_loss": step_eval_loss,
                                             "eval_samples": step_eval_count,
+                                            "eval_provenance": step_eval_provenance,
                                             "layers": {
                                                 str(layer_id): metrics
                                                 for layer_id, metrics in step_layer_metrics.items()

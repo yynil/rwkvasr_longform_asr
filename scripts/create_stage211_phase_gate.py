@@ -72,17 +72,11 @@ def _jsonl_records(
             if utt_id in records:
                 raise ValueError(f"Duplicate utterance id {utt_id!r} at {path}:{line_number}")
             reference = next(
-                (
-                    str(row[key])
-                    for key in reference_keys
-                    if row.get(key) is not None
-                ),
+                (str(row[key]) for key in reference_keys if row.get(key) is not None),
                 None,
             )
             if reference is None:
-                raise ValueError(
-                    f"Missing reference text for {utt_id!r} at {path}:{line_number}"
-                )
+                raise ValueError(f"Missing reference text for {utt_id!r} at {path}:{line_number}")
             records[utt_id] = normalize_asr_text_for_metrics(
                 reference,
                 language=language,
@@ -102,9 +96,7 @@ def _enrich_public_benchmark(
     if not isinstance(raw_results, list):
         raise ValueError("Stage211 public comparison results must be a list.")
     by_dataset = {
-        str(result.get("dataset")): result
-        for result in raw_results
-        if isinstance(result, dict)
+        str(result.get("dataset")): result for result in raw_results if isinstance(result, dict)
     }
     if set(by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
         raise ValueError("Stage211 public comparison dataset set is incomplete or unexpected.")
@@ -150,8 +142,7 @@ def _enrich_public_benchmark(
                 f"student={len(student_records)} expected={expected_samples}"
             )
         reference_mismatches = sum(
-            nano_records[utt_id] != reference
-            or student_records[utt_id] != reference
+            nano_records[utt_id] != reference or student_records[utt_id] != reference
             for utt_id, reference in manifest_records.items()
         )
         if reference_mismatches:
@@ -177,6 +168,66 @@ def _enrich_public_benchmark(
     }
 
 
+def _build_public_progress(
+    *,
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    max_dataset_regression: float = 0.03,
+) -> dict[str, Any]:
+    baseline_results = {str(result["dataset"]): result for result in baseline["results"]}
+    candidate_results = {str(result["dataset"]): result for result in candidate["results"]}
+    if set(baseline_results) != set(candidate_results):
+        raise ValueError("Stage211 baseline/candidate public datasets differ.")
+    rows: list[dict[str, Any]] = []
+    for dataset in STAGE211_PUBLIC_BENCHMARKS:
+        baseline_result = baseline_results[dataset]
+        candidate_result = candidate_results[dataset]
+        for hash_key in ("manifest_sha256", "nano_prediction_sha256"):
+            if baseline_result.get(hash_key) != candidate_result.get(hash_key):
+                raise ValueError(f"Stage211 {dataset} baseline/candidate {hash_key} differs.")
+        baseline_error = float(baseline_result["student_error_rate"])
+        candidate_error = float(candidate_result["student_error_rate"])
+        baseline_deletion = float(baseline_result["student_deletion_rate"])
+        candidate_deletion = float(candidate_result["student_deletion_rate"])
+        rows.append(
+            {
+                "dataset": dataset,
+                "baseline_error_rate": baseline_error,
+                "candidate_error_rate": candidate_error,
+                "absolute_change": candidate_error - baseline_error,
+                "baseline_deletion_rate": baseline_deletion,
+                "candidate_deletion_rate": candidate_deletion,
+                "within_regression_limit": (
+                    candidate_error <= baseline_error + max_dataset_regression
+                ),
+                "improved": candidate_error < baseline_error,
+            }
+        )
+    macro_baseline_error = sum(float(row["baseline_error_rate"]) for row in rows) / len(rows)
+    macro_candidate_error = sum(float(row["candidate_error_rate"]) for row in rows) / len(rows)
+    macro_baseline_deletion = sum(float(row["baseline_deletion_rate"]) for row in rows) / len(rows)
+    macro_candidate_deletion = sum(float(row["candidate_deletion_rate"]) for row in rows) / len(
+        rows
+    )
+    gate_passed = (
+        all(bool(row["within_regression_limit"]) for row in rows)
+        and macro_candidate_error < macro_baseline_error
+        and macro_candidate_deletion < macro_baseline_deletion
+        and any(bool(row["improved"]) for row in rows)
+    )
+    return {
+        "gate_passed": gate_passed,
+        "max_dataset_regression": max_dataset_regression,
+        "macro_baseline_error_rate": macro_baseline_error,
+        "macro_candidate_error_rate": macro_candidate_error,
+        "macro_baseline_deletion_rate": macro_baseline_deletion,
+        "macro_candidate_deletion_rate": macro_candidate_deletion,
+        "improved_datasets": sum(bool(row["improved"]) for row in rows),
+        "results": rows,
+        "baseline_public_benchmark": baseline,
+    }
+
+
 def build_phase_gate(
     *,
     phase: str,
@@ -185,6 +236,7 @@ def build_phase_gate(
     manifest_dir: Path,
     coverage_receipt_paths: list[Path],
     alignment_report_path: Path | None,
+    baseline_public_comparison_report_path: Path | None = None,
 ) -> dict[str, Any]:
     checkpoint_path = checkpoint_path.resolve()
     if not checkpoint_path.is_file():
@@ -214,9 +266,7 @@ def build_phase_gate(
             raise ValueError("Stage211 alignment report does not record a passing decision.")
         if alignment_report.get("phase") != phase:
             raise ValueError("Stage211 alignment report phase mismatch.")
-        alignment_checkpoint = Path(
-            str(alignment_report.get("checkpoint_path") or "")
-        ).resolve()
+        alignment_checkpoint = Path(str(alignment_report.get("checkpoint_path") or "")).resolve()
         if alignment_checkpoint != checkpoint_path:
             raise ValueError("Stage211 alignment report checkpoint path mismatch.")
         if alignment_report.get("checkpoint_sha256") != sha256_file(checkpoint_path):
@@ -230,8 +280,43 @@ def build_phase_gate(
         raise ValueError(f"Stage211 {phase} requires an independent alignment gate report.")
 
     benchmark = _enrich_public_benchmark(public_report, manifest_dir=manifest_dir.resolve())
-    gate_passed = alignment_gate_passed and (
-        phase in {"mixer", "block"} or benchmark.get("all_datasets_pass") is True
+    public_progress: dict[str, Any] | None = None
+    baseline_public_record: dict[str, str] | None = None
+    public_progress_gate_passed = phase == "logits"
+    if phase in {"mixer", "block"}:
+        if baseline_public_comparison_report_path is None:
+            raise ValueError(f"Stage211 {phase} requires a baseline public comparison report.")
+        baseline_public_comparison_report_path = baseline_public_comparison_report_path.resolve()
+        baseline_public_report = _load_json(
+            baseline_public_comparison_report_path,
+            label="Stage211 baseline public comparison report",
+        )
+        phase_init_checkpoint = Path(str(coverage[0].get("init_checkpoint_path") or "")).resolve()
+        if Path(
+            str(baseline_public_report.get("student_checkpoint_path") or "")
+        ).resolve() != phase_init_checkpoint or baseline_public_report.get(
+            "student_checkpoint_sha256"
+        ) != sha256_file(phase_init_checkpoint):
+            raise ValueError(
+                "Stage211 baseline public report does not bind the phase initialization."
+            )
+        baseline_benchmark = _enrich_public_benchmark(
+            baseline_public_report,
+            manifest_dir=manifest_dir.resolve(),
+        )
+        public_progress = _build_public_progress(
+            baseline=baseline_benchmark,
+            candidate=benchmark,
+        )
+        public_progress_gate_passed = bool(public_progress["gate_passed"])
+        baseline_public_record = {
+            "path": str(baseline_public_comparison_report_path),
+            "sha256": sha256_file(baseline_public_comparison_report_path),
+        }
+    gate_passed = (
+        alignment_gate_passed
+        and public_progress_gate_passed
+        and (phase != "logits" or benchmark.get("all_datasets_pass") is True)
     )
     final_checkpoint_sha256 = sha256_file(checkpoint_path)
     report = {
@@ -243,7 +328,10 @@ def build_phase_gate(
         "checkpoint_sha256": final_checkpoint_sha256,
         "gate_passed": gate_passed,
         "alignment_gate_passed": alignment_gate_passed,
+        "public_progress_gate_passed": public_progress_gate_passed,
         "alignment_report": alignment_record,
+        "baseline_public_comparison_report": baseline_public_record,
+        "public_progress": public_progress,
         "full_data_coverage": {
             "phase": phase,
             "complete": True,
@@ -277,6 +365,11 @@ def main() -> int:
         required=True,
     )
     parser.add_argument("--alignment-report", type=Path, default=None)
+    parser.add_argument(
+        "--baseline-public-comparison-report",
+        type=Path,
+        default=None,
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -287,6 +380,7 @@ def main() -> int:
         manifest_dir=args.manifest_dir,
         coverage_receipt_paths=list(args.coverage_receipt),
         alignment_report_path=args.alignment_report,
+        baseline_public_comparison_report_path=(args.baseline_public_comparison_report),
     )
     output_path = args.output.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,563 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from rwkvasr.eval.stage211_gate import sha256_file
+
+try:
+    from scripts.run_stage211_strict_chained_alignment import _audit_labeled_data
+except ModuleNotFoundError as error:
+    if error.name != "scripts":
+        raise
+    from run_stage211_strict_chained_alignment import _audit_labeled_data
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PYTHON = Path(sys.executable).resolve()
+RUNNER = REPO_ROOT / "scripts" / "run_stage211_strict_chained_alignment.py"
+DEFAULT_LABELED_ROOT = Path(
+    "/media/usbhd/training_data/asr/curriculum/clean_ctc_voxbox_webdataset/"
+    "stages/easy_clean_librispeech_aishell3_ctc_norm_aligned_sensevoice_lfr6_svtok"
+)
+DEFAULT_OUTPUT_DIR = (
+    Path.home() / "rwkvasr_runs" / "stage211_full_alignment" / "stage211d_labeled_ctc_sft_1ep"
+)
+DEFAULT_CONFIG_DIR = Path.home() / "rwkvasr_configs" / "stage211_full_alignment"
+DEFAULT_NANO_CHECKPOINT = Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
+LABELED_EXPECTED = {
+    "train_samples": 283_868,
+    "eval_samples": 1_434,
+    "total_samples": 285_302,
+    "total_hours": 809.12755,
+    "ctc_tokens": 8_792_460,
+    "estimated_train_steps": 12_019,
+}
+BAD_SMOKE_PATTERNS = (
+    re.compile(r"Traceback"),
+    re.compile(r"CUDA out of memory", re.IGNORECASE),
+    re.compile(r"OutOfMemory"),
+    re.compile(r"\bloss=(?:nan|inf)\b", re.IGNORECASE),
+    re.compile(r"\bonline_[a-z0-9_]*missing=[1-9][0-9]*\b"),
+    re.compile(r"\bonline_[a-z0-9_]*frame_delta=[1-9][0-9]*\b"),
+)
+
+
+def _load_json(path: Path, *, label: str) -> dict[str, Any]:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"{label} is missing or empty: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be a JSON object: {path}")
+    return payload
+
+
+def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
+    rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    if path.is_file() and path.read_text(encoding="utf-8") != rendered:
+        raise ValueError(f"Refusing to overwrite a different Stage211D artifact: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(rendered, encoding="utf-8")
+
+
+def _latest_step(run_dir: Path) -> int:
+    latest = 0
+    for checkpoint in run_dir.glob("step-*.pt"):
+        match = re.fullmatch(r"step-([0-9]+)\.pt", checkpoint.name)
+        if match:
+            latest = max(latest, int(match.group(1)))
+    return latest
+
+
+def _checkpoint_step(path: Path) -> int:
+    payload = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+    try:
+        return int(payload.get("step", 0))
+    finally:
+        del payload
+
+
+def _validate_labeled_audit(
+    audit: dict[str, Any],
+    *,
+    labeled_root: Path,
+    length_index: Path,
+    bucket_manifest: Path,
+) -> dict[str, Any]:
+    expected_paths = {
+        "webdataset_root": str(labeled_root.resolve()),
+        "length_index_path": str(length_index.resolve()),
+        "bucket_manifest_path": str(bucket_manifest.resolve()),
+    }
+    for key, expected in expected_paths.items():
+        if audit.get(key) != expected:
+            raise ValueError(
+                f"Stage211D labeled audit {key} mismatch: "
+                f"expected={expected!r} actual={audit.get(key)!r}"
+            )
+    for key, expected in LABELED_EXPECTED.items():
+        actual = audit.get(key)
+        if key == "total_hours":
+            if not math.isfinite(float(actual)) or abs(float(actual) - float(expected)) > 1e-5:
+                raise ValueError(
+                    f"Stage211D labeled audit {key} mismatch: expected={expected} actual={actual}"
+                )
+        elif int(actual) != int(expected):
+            raise ValueError(
+                f"Stage211D labeled audit {key} mismatch: expected={expected} actual={actual}"
+            )
+    return dict(audit)
+
+
+def _resolve_chain_inputs(
+    *,
+    output_dir: Path,
+    requested_checkpoint: Path | None,
+    requested_receipt: Path | None,
+) -> tuple[Path, Path]:
+    provenance_path = output_dir / "stage211_provenance.json"
+    if provenance_path.is_file():
+        provenance = _load_json(provenance_path, label="Stage211D provenance")
+        checkpoint = Path(str(provenance.get("init_checkpoint_path") or "")).resolve()
+        receipt = Path(str(provenance.get("promotion_receipt_path") or "")).resolve()
+        if not checkpoint.is_file() or provenance.get("init_checkpoint_sha256") != sha256_file(
+            checkpoint
+        ):
+            raise ValueError("Recorded Stage211D initial checkpoint is unavailable or changed.")
+        if not receipt.is_file() or provenance.get("promotion_receipt_sha256") != sha256_file(
+            receipt
+        ):
+            raise ValueError(
+                "Recorded Stage211D logits-promotion receipt is unavailable or changed."
+            )
+        if requested_checkpoint is not None and requested_checkpoint.resolve() != checkpoint:
+            raise ValueError("Requested Stage211D initialization differs from recorded provenance.")
+        if requested_receipt is not None and requested_receipt.resolve() != receipt:
+            raise ValueError(
+                "Requested Stage211D promotion receipt differs from recorded provenance."
+            )
+        return checkpoint, receipt
+    if requested_checkpoint is None or requested_receipt is None:
+        raise ValueError(
+            "A fresh Stage211D run requires --init-checkpoint and --logits-promotion-receipt."
+        )
+    checkpoint = requested_checkpoint.expanduser().resolve()
+    receipt = requested_receipt.expanduser().resolve()
+    for label, path in (
+        ("Stage211C checkpoint", checkpoint),
+        ("Stage211C promotion receipt", receipt),
+    ):
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(f"{label} is unavailable: {path}")
+    return checkpoint, receipt
+
+
+def _runner_command(
+    *,
+    output_dir: Path,
+    config_dir: Path,
+    bucket_manifest: Path,
+    labeled_root: Path,
+    length_index: Path,
+    nano_checkpoint: Path,
+    master_port: int,
+    init_checkpoint: Path | None,
+    promotion_receipt: Path | None,
+    smoke: bool,
+    dry_run: bool,
+) -> list[str]:
+    command = [
+        str(PYTHON),
+        str(RUNNER),
+        "--phase",
+        "sft",
+        "--output-dir",
+        str(output_dir),
+        "--config-dir",
+        str(config_dir),
+        "--bucket-manifest",
+        str(bucket_manifest),
+        "--labeled-webdataset-root",
+        str(labeled_root),
+        "--labeled-length-index",
+        str(length_index),
+        "--nano-checkpoint",
+        str(nano_checkpoint),
+        "--master-port",
+        str(master_port),
+    ]
+    if init_checkpoint is not None:
+        command.extend(("--init-checkpoint", str(init_checkpoint)))
+    if promotion_receipt is not None:
+        command.extend(("--promotion-receipt", str(promotion_receipt)))
+    if smoke:
+        command.append("--smoke")
+    if dry_run:
+        command.extend(("--dry-run", "--skip-nano-weight-audit"))
+    return command
+
+
+def _run_command(command: list[str], *, dry_run: bool) -> None:
+    print(f"[stage211-sft] command={shlex.join(command)}", flush=True)
+    if not dry_run:
+        subprocess.run(command, cwd=REPO_ROOT, check=True)
+
+
+def _audit_smoke(
+    *,
+    smoke_dir: Path,
+    init_checkpoint: Path,
+    promotion_receipt: Path,
+    bucket_manifest: Path,
+    length_index: Path,
+    max_peak_reserved_gib: float,
+) -> dict[str, Any]:
+    checkpoint = smoke_dir / "step-2.pt"
+    log_path = smoke_dir / "logs" / "sft_smoke_2steps.log"
+    if not checkpoint.is_file() or _checkpoint_step(checkpoint) != 2:
+        raise ValueError("Stage211D smoke did not produce an exact step-2 checkpoint.")
+    if not log_path.is_file() or log_path.stat().st_size <= 0:
+        raise ValueError(f"Stage211D smoke log is missing: {log_path}")
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if "[deepspeed-train] step=2" not in log_text:
+        raise ValueError("Stage211D smoke did not execute two training steps.")
+    for pattern in BAD_SMOKE_PATTERNS:
+        match = pattern.search(log_text)
+        if match is not None:
+            raise ValueError(f"Stage211D smoke contains a rejected condition: {match.group(0)}")
+    peak_values = [
+        float(value)
+        for value in re.findall(
+            r"peak_reserved=([0-9]+(?:\.[0-9]+)?)GiB",
+            log_text,
+        )
+    ]
+    if not peak_values:
+        raise ValueError("Stage211D smoke lacks peak-reserved memory telemetry.")
+    peak_reserved_gib = max(peak_values)
+    if peak_reserved_gib > max_peak_reserved_gib:
+        raise ValueError(
+            f"Stage211D smoke peak memory is unsafe: "
+            f"{peak_reserved_gib:.2f} GiB > {max_peak_reserved_gib:.2f} GiB"
+        )
+    return {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "labeled_sft_smoke",
+        "phase": "sft",
+        "complete": True,
+        "init_checkpoint_path": str(init_checkpoint),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint),
+        "logits_promotion_receipt_path": str(promotion_receipt),
+        "logits_promotion_receipt_sha256": sha256_file(promotion_receipt),
+        "bucket_manifest_path": str(bucket_manifest),
+        "bucket_manifest_sha256": sha256_file(bucket_manifest),
+        "length_index_path": str(length_index),
+        "length_index_sha256": sha256_file(length_index),
+        "smoke_checkpoint_path": str(checkpoint),
+        "smoke_checkpoint_sha256": sha256_file(checkpoint),
+        "smoke_log_path": str(log_path),
+        "smoke_log_sha256": sha256_file(log_path),
+        "peak_reserved_gib": peak_reserved_gib,
+        "max_peak_reserved_gib": max_peak_reserved_gib,
+    }
+
+
+def _validate_smoke_marker(
+    marker_path: Path,
+    *,
+    init_checkpoint: Path,
+    promotion_receipt: Path,
+    bucket_manifest: Path,
+    length_index: Path,
+) -> dict[str, Any]:
+    marker = _load_json(marker_path, label="Stage211D smoke marker")
+    expected = {
+        "pipeline": "stage211",
+        "artifact": "labeled_sft_smoke",
+        "phase": "sft",
+        "complete": True,
+        "init_checkpoint_path": str(init_checkpoint),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint),
+        "logits_promotion_receipt_path": str(promotion_receipt),
+        "logits_promotion_receipt_sha256": sha256_file(promotion_receipt),
+        "bucket_manifest_path": str(bucket_manifest),
+        "bucket_manifest_sha256": sha256_file(bucket_manifest),
+        "length_index_path": str(length_index),
+        "length_index_sha256": sha256_file(length_index),
+    }
+    for key, value in expected.items():
+        if marker.get(key) != value:
+            raise ValueError(f"Stage211D smoke marker {key} mismatch.")
+    for path_key, sha_key in (
+        ("smoke_checkpoint_path", "smoke_checkpoint_sha256"),
+        ("smoke_log_path", "smoke_log_sha256"),
+    ):
+        path = Path(str(marker.get(path_key) or "")).resolve()
+        if not path.is_file() or sha256_file(path) != marker.get(sha_key):
+            raise ValueError(f"Stage211D smoke artifact is unavailable or changed: {path}")
+    return marker
+
+
+def _validate_completion(
+    completion_path: Path,
+    *,
+    checkpoint_path: Path | None = None,
+) -> tuple[dict[str, Any], Path]:
+    completion = _load_json(completion_path, label="Stage211D completion report")
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "labeled_sft_completion",
+        "phase": "sft",
+        "complete": True,
+        "epochs": 1,
+        "batch_size": 12,
+        "world_size": 4,
+        "frame_budget": 8_000,
+        **LABELED_EXPECTED,
+    }
+    for key, value in expected.items():
+        actual = completion.get(key)
+        if key == "total_hours":
+            if not math.isfinite(float(actual)) or abs(float(actual) - float(value)) > 1e-5:
+                raise ValueError(f"Stage211D completion {key} mismatch.")
+        elif actual != value:
+            raise ValueError(f"Stage211D completion {key} mismatch.")
+    for path_key, sha_key in (
+        ("bucket_manifest_path", "bucket_manifest_sha256"),
+        ("length_index_path", "length_index_sha256"),
+        ("provenance_path", "provenance_sha256"),
+        ("init_checkpoint_path", "init_checkpoint_sha256"),
+        (
+            "logits_promotion_receipt_path",
+            "logits_promotion_receipt_sha256",
+        ),
+        ("completion_checkpoint_path", "completion_checkpoint_sha256"),
+        ("training_log_path", "training_log_sha256"),
+    ):
+        path = Path(str(completion.get(path_key) or "")).resolve()
+        if not path.is_file() or sha256_file(path) != completion.get(sha_key):
+            raise ValueError(f"Stage211D completion artifact is unavailable or changed: {path}")
+    recorded_checkpoint = Path(str(completion["completion_checkpoint_path"])).resolve()
+    if checkpoint_path is not None and recorded_checkpoint != checkpoint_path.resolve():
+        raise ValueError("Stage211D completion checkpoint path mismatch.")
+    if _checkpoint_step(recorded_checkpoint) != LABELED_EXPECTED["estimated_train_steps"]:
+        raise ValueError("Stage211D completion checkpoint step mismatch.")
+    return completion, recorded_checkpoint
+
+
+def run_sft(args: argparse.Namespace) -> Path | None:
+    output_dir = args.output_dir.expanduser().resolve()
+    config_dir = args.config_dir.expanduser().resolve()
+    labeled_root = args.labeled_webdataset_root.expanduser().resolve()
+    length_index = (
+        args.labeled_length_index.expanduser().resolve()
+        if args.labeled_length_index is not None
+        else (labeled_root / "webdataset_lengths.jsonl").resolve()
+    )
+    bucket_manifest = (
+        args.bucket_manifest.expanduser().resolve()
+        if args.bucket_manifest is not None
+        else (labeled_root / "webdataset_buckets_audio_text" / "manifest.json").resolve()
+    )
+    nano_checkpoint = args.nano_checkpoint.expanduser().resolve()
+    for label, path in (
+        ("labeled root", labeled_root),
+        ("labeled length index", length_index),
+        ("labeled bucket manifest", bucket_manifest),
+        ("Nano checkpoint", nano_checkpoint),
+    ):
+        exists = path.is_dir() if label == "labeled root" else path.is_file()
+        if not exists:
+            raise FileNotFoundError(f"Stage211D {label} is unavailable: {path}")
+    audit = _validate_labeled_audit(
+        _audit_labeled_data(
+            webdataset_root=labeled_root,
+            length_index_path=length_index,
+            bucket_manifest_path=bucket_manifest,
+        ),
+        labeled_root=labeled_root,
+        length_index=length_index,
+        bucket_manifest=bucket_manifest,
+    )
+    init_checkpoint, promotion_receipt = _resolve_chain_inputs(
+        output_dir=output_dir,
+        requested_checkpoint=args.init_checkpoint,
+        requested_receipt=args.logits_promotion_receipt,
+    )
+
+    smoke_dir = Path(f"{output_dir}_smoke")
+    smoke_marker_path = output_dir.parent / f"{output_dir.name}_smoke_passed.json"
+    if smoke_marker_path.is_file() and not args.dry_run:
+        _validate_smoke_marker(
+            smoke_marker_path,
+            init_checkpoint=init_checkpoint,
+            promotion_receipt=promotion_receipt,
+            bucket_manifest=bucket_manifest,
+            length_index=length_index,
+        )
+    else:
+        smoke_latest_step = _latest_step(smoke_dir)
+        _run_command(
+            _runner_command(
+                output_dir=output_dir,
+                config_dir=config_dir,
+                bucket_manifest=bucket_manifest,
+                labeled_root=labeled_root,
+                length_index=length_index,
+                nano_checkpoint=nano_checkpoint,
+                master_port=int(args.master_port),
+                init_checkpoint=(init_checkpoint if smoke_latest_step <= 0 else None),
+                promotion_receipt=(promotion_receipt if smoke_latest_step <= 0 else None),
+                smoke=True,
+                dry_run=bool(args.dry_run),
+            ),
+            dry_run=bool(args.dry_run),
+        )
+        if not args.dry_run:
+            _write_immutable_json(
+                smoke_marker_path,
+                _audit_smoke(
+                    smoke_dir=smoke_dir,
+                    init_checkpoint=init_checkpoint,
+                    promotion_receipt=promotion_receipt,
+                    bucket_manifest=bucket_manifest,
+                    length_index=length_index,
+                    max_peak_reserved_gib=float(args.max_peak_reserved_gib),
+                ),
+            )
+    if args.smoke_only or args.dry_run:
+        return None
+
+    latest_step = _latest_step(output_dir)
+    _run_command(
+        _runner_command(
+            output_dir=output_dir,
+            config_dir=config_dir,
+            bucket_manifest=bucket_manifest,
+            labeled_root=labeled_root,
+            length_index=length_index,
+            nano_checkpoint=nano_checkpoint,
+            master_port=int(args.master_port),
+            init_checkpoint=init_checkpoint if latest_step <= 0 else None,
+            promotion_receipt=promotion_receipt if latest_step <= 0 else None,
+            smoke=False,
+            dry_run=False,
+        ),
+        dry_run=False,
+    )
+
+    completion_step = int(LABELED_EXPECTED["estimated_train_steps"])
+    completion_checkpoint = output_dir / f"step-{completion_step}.pt"
+    if (
+        not completion_checkpoint.is_file()
+        or _checkpoint_step(completion_checkpoint) != completion_step
+    ):
+        raise ValueError(
+            f"Stage211D lacks exact completion checkpoint step={completion_step}: "
+            f"{completion_checkpoint}"
+        )
+    provenance_path = output_dir / "stage211_provenance.json"
+    provenance = _load_json(provenance_path, label="Stage211D provenance")
+    if (
+        provenance.get("init_checkpoint_path") != str(init_checkpoint)
+        or provenance.get("init_checkpoint_sha256") != sha256_file(init_checkpoint)
+        or provenance.get("promotion_receipt_path") != str(promotion_receipt)
+        or provenance.get("promotion_receipt_sha256") != sha256_file(promotion_receipt)
+        or provenance.get("labeled_data_audit") != audit
+    ):
+        raise ValueError("Stage211D final provenance differs from the audited chain.")
+    training_log = output_dir / "logs" / f"sft_full_{completion_step}steps.log"
+    if not training_log.is_file() or training_log.stat().st_size <= 0:
+        raise ValueError(f"Stage211D formal training log is missing: {training_log}")
+    completion_path = output_dir / "sft_complete.json"
+    _write_immutable_json(
+        completion_path,
+        {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "labeled_sft_completion",
+            "phase": "sft",
+            "complete": True,
+            "epochs": 1,
+            "batch_size": 12,
+            "world_size": 4,
+            "frame_budget": 8_000,
+            **LABELED_EXPECTED,
+            "labeled_webdataset_root": str(labeled_root),
+            "bucket_manifest_path": str(bucket_manifest),
+            "bucket_manifest_sha256": sha256_file(bucket_manifest),
+            "length_index_path": str(length_index),
+            "length_index_sha256": sha256_file(length_index),
+            "provenance_path": str(provenance_path),
+            "provenance_sha256": sha256_file(provenance_path),
+            "init_checkpoint_path": str(init_checkpoint),
+            "init_checkpoint_sha256": sha256_file(init_checkpoint),
+            "logits_promotion_receipt_path": str(promotion_receipt),
+            "logits_promotion_receipt_sha256": sha256_file(promotion_receipt),
+            "completion_checkpoint_path": str(completion_checkpoint),
+            "completion_checkpoint_sha256": sha256_file(completion_checkpoint),
+            "training_log_path": str(training_log),
+            "training_log_sha256": sha256_file(training_log),
+        },
+    )
+    _validate_completion(completion_path, checkpoint_path=completion_checkpoint)
+    if args.final_checkpoint_path_output is not None:
+        path_output = args.final_checkpoint_path_output.expanduser().resolve()
+        path_output.parent.mkdir(parents=True, exist_ok=True)
+        rendered = str(completion_checkpoint.resolve()) + "\n"
+        if path_output.is_file() and path_output.read_text(encoding="utf-8") != rendered:
+            raise ValueError(
+                f"Refusing to overwrite a different Stage211D checkpoint path: {path_output}"
+            )
+        path_output.write_text(rendered, encoding="utf-8")
+    print(
+        f"[stage211-sft] complete checkpoint={completion_checkpoint} report={completion_path}",
+        flush=True,
+    )
+    return completion_checkpoint
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run restart-safe Stage211D labeled pronunciation-only CTC SFT from "
+            "the strictly promoted Stage211C checkpoint."
+        )
+    )
+    parser.add_argument("--init-checkpoint", type=Path, default=None)
+    parser.add_argument("--logits-promotion-receipt", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--config-dir", type=Path, default=DEFAULT_CONFIG_DIR)
+    parser.add_argument(
+        "--labeled-webdataset-root",
+        type=Path,
+        default=DEFAULT_LABELED_ROOT,
+    )
+    parser.add_argument("--labeled-length-index", type=Path, default=None)
+    parser.add_argument("--bucket-manifest", type=Path, default=None)
+    parser.add_argument("--nano-checkpoint", type=Path, default=DEFAULT_NANO_CHECKPOINT)
+    parser.add_argument("--master-port", type=int, default=29634)
+    parser.add_argument("--max-peak-reserved-gib", type=float, default=22.0)
+    parser.add_argument("--final-checkpoint-path-output", type=Path, default=None)
+    parser.add_argument("--smoke-only", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if args.max_peak_reserved_gib <= 0.0:
+        parser.error("--max-peak-reserved-gib must be positive")
+    run_sft(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

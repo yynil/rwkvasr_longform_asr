@@ -323,6 +323,10 @@ def validate_stage211_phase_gate_report(
     if expected_phase in {"mixer", "block"}:
         if report.get("alignment_gate_passed") is not True:
             raise ValueError(f"Stage211 {expected_phase} alignment gate did not pass.")
+        if report.get("public_progress_gate_passed") is not True:
+            raise ValueError(
+                f"Stage211 {expected_phase} public progress gate did not pass."
+            )
     elif expected_phase == "logits":
         if benchmark.get("all_datasets_pass") is not True:
             raise ValueError(
