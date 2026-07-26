@@ -8,6 +8,7 @@ from typing import Any, Iterator
 
 from rwkvasr.data import (
     estimate_bucket_manifest_steps,
+    estimate_bucket_manifest_tail_padding_samples,
     load_webdataset_bucket_manifest,
 )
 from rwkvasr.eval.stage211_gate import (
@@ -150,19 +151,31 @@ def validate_fixed_eval_outputs(
             batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
             world_size=STAGE211_FULL_DATA_WORLD_SIZE,
             frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
-            drop_last=True,
+            drop_last=False,
+        )
+        tail_padding_samples_per_epoch = estimate_bucket_manifest_tail_padding_samples(
+            manifest,
+            split="train",
+            batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+            world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+            frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
         )
         expected = STAGE211_AUDIO_CURRICULUM[difficulty]
         if (
             train_rows != int(expected["rows"])
             or eval_rows != FIXED_EVAL_SAMPLES
             or steps_per_epoch != int(expected["steps_per_epoch"])
+            or tail_padding_samples_per_epoch
+            != int(expected["tail_padding_samples_per_epoch"])
         ):
             raise ValueError(
                 f"Stage211 {difficulty} fixed-eval manifest mismatch: "
                 f"train={train_rows}/{expected['rows']} "
                 f"eval={eval_rows}/{FIXED_EVAL_SAMPLES} "
-                f"steps={steps_per_epoch}/{expected['steps_per_epoch']}"
+                f"steps={steps_per_epoch}/{expected['steps_per_epoch']} "
+                "tail_padding_samples_per_epoch="
+                f"{tail_padding_samples_per_epoch}/"
+                f"{expected['tail_padding_samples_per_epoch']}"
             )
         eval_parts = [
             _resolve_recorded_path(output, part.path)
@@ -177,6 +190,7 @@ def validate_fixed_eval_outputs(
                 "train_rows": train_rows,
                 "eval_rows": eval_rows,
                 "steps_per_epoch": steps_per_epoch,
+                "tail_padding_samples_per_epoch": tail_padding_samples_per_epoch,
                 "manifest_sha256": _sha256(output),
                 "fixed_eval_sha256": fixed_part_sha256,
             }
@@ -209,6 +223,7 @@ def main() -> int:
             f"manifest={output} difficulty={record['difficulty']} "
             f"train={record['train_rows']} eval={record['eval_rows']} "
             f"steps_per_epoch={record['steps_per_epoch']} "
+            f"tail_padding_samples_per_epoch={record['tail_padding_samples_per_epoch']} "
             f"sha256={record['manifest_sha256']}",
             flush=True,
         )
