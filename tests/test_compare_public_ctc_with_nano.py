@@ -65,6 +65,69 @@ def test_compare_dataset_reports_real_reference_gap_and_gate(tmp_path: Path) -> 
     assert result["gate_pass"] is False
 
 
+@pytest.mark.parametrize("dataset", ["aishell1_test", "wenetspeech_test_net"])
+def test_compare_dataset_uses_chinese_cer_and_reports_deletion(
+    tmp_path: Path,
+    dataset: str,
+) -> None:
+    nano = tmp_path / f"{dataset}.nano.jsonl"
+    student = tmp_path / f"{dataset}.student.jsonl"
+    reference = "语音识别"
+    _write_predictions(nano, rows=[("zh-1", reference, reference)])
+    _write_predictions(student, rows=[("zh-1", "语音识", reference)])
+
+    result = comparison.compare_dataset(
+        dataset=dataset,
+        nano_path=nano,
+        student_path=student,
+        normalization="ctc",
+        max_relative_ratio=1.20,
+        max_absolute_gap_points=3.0,
+    )
+
+    assert result["language"] == "zh"
+    assert result["metric"] == "cer"
+    assert result["nano_error_rate"] == 0.0
+    assert result["student_error_rate"] == pytest.approx(0.25)
+    assert result["student_deletion_rate"] == pytest.approx(0.25)
+    assert result["student_prediction_reference_unit_ratio"] == pytest.approx(0.75)
+    assert result["gate_pass"] is False
+
+
+def test_compare_dataset_normalizes_non_pronounced_chinese_units(
+    tmp_path: Path,
+) -> None:
+    nano = tmp_path / "nano.jsonl"
+    student = tmp_path / "student.jsonl"
+    _write_predictions(
+        nano,
+        rows=[
+            (
+                "zh-1",
+                "这是中文文字。说话人2：你好【音乐】世界",
+                "说话人2：你好【噪声】世界",
+            )
+        ],
+    )
+    _write_predictions(student, rows=[("zh-1", "你好世界", "你好世界")])
+
+    result = comparison.compare_dataset(
+        dataset="aishell1_test",
+        nano_path=nano,
+        student_path=student,
+        normalization="ctc",
+        max_relative_ratio=1.20,
+        max_absolute_gap_points=3.0,
+    )
+
+    assert result["normalized_reference_mismatch_count"] == 0
+    assert result["nano_error_rate"] == 0.0
+    assert result["student_error_rate"] == 0.0
+    assert result["nano_prediction_reference_unit_ratio"] == 1.0
+    assert result["student_prediction_reference_unit_ratio"] == 1.0
+    assert result["gate_pass"] is True
+
+
 def test_compare_dataset_rejects_reference_or_coverage_mismatch(tmp_path: Path) -> None:
     nano = tmp_path / "nano.jsonl"
     student = tmp_path / "student.jsonl"
@@ -83,6 +146,29 @@ def test_compare_dataset_rejects_reference_or_coverage_mismatch(tmp_path: Path) 
 
     _write_predictions(student, rows=[("utt-2", "hello", "hello world")])
     with pytest.raises(ValueError, match="prediction coverage differs"):
+        comparison.compare_dataset(
+            dataset="librispeech_test_clean",
+            nano_path=nano,
+            student_path=student,
+            normalization="ctc",
+            max_relative_ratio=1.20,
+            max_absolute_gap_points=3.0,
+        )
+
+
+def test_compare_dataset_rejects_duplicate_utterance_ids(tmp_path: Path) -> None:
+    nano = tmp_path / "nano.jsonl"
+    student = tmp_path / "student.jsonl"
+    _write_predictions(
+        nano,
+        rows=[
+            ("utt-1", "hello", "hello"),
+            ("utt-1", "hello", "hello"),
+        ],
+    )
+    _write_predictions(student, rows=[("utt-1", "hello", "hello")])
+
+    with pytest.raises(ValueError, match="Duplicate utt_id"):
         comparison.compare_dataset(
             dataset="librispeech_test_clean",
             nano_path=nano,
