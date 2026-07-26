@@ -17,6 +17,7 @@ from rwkvasr.data import (
     assign_split,
     estimate_length_bucketed_steps,
     estimate_bucket_manifest_steps,
+    estimate_bucket_manifest_tail_padding_samples,
     build_webdataset_dataloader,
     build_length_bucketed_webdataset_dataloader,
     inspect_webdataset,
@@ -855,6 +856,76 @@ def test_bucketed_webdataset_loader_splits_same_bucket_across_ranks(tmp_path: Pa
 
     assert batch0.utt_ids == ["sid-1"]
     assert batch1.utt_ids == ["sid-2"]
+
+
+def test_bucketed_webdataset_loader_pads_distributed_tail_without_dropping_rows(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "bucket_loader_tail_root"
+    root.mkdir()
+    root = _build_root(root)
+    entries = [
+        {
+            "shard_name": f"shard_{shard_id:08d}.tar",
+            "key": f"{index:010d}",
+            "utt_id": f"sid-{index}",
+            "split": "train",
+            "num_frames": 40 + index,
+            "audio_member": f"{index:010d}.wav",
+            "audio_format": "wav",
+            "json_member": f"{index:010d}.json",
+            "audio_offset": None,
+            "audio_size": None,
+            "json_offset": None,
+            "json_size": None,
+        }
+        for index, shard_id in ((1, 0), (2, 0), (3, 1))
+    ]
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[("train/bucket_0000/part_000000.jsonl", entries)],
+    )
+    manifest = load_webdataset_bucket_manifest(manifest_path)
+    assert estimate_bucket_manifest_steps(
+        manifest,
+        split="train",
+        batch_size=4,
+        world_size=2,
+        frame_budget=80,
+        drop_last=False,
+    ) == 2
+    assert estimate_bucket_manifest_tail_padding_samples(
+        manifest,
+        split="train",
+        batch_size=4,
+        world_size=2,
+        frame_budget=80,
+    ) == 1
+
+    config = WebDatasetConfig(
+        shuffle_shards=False,
+        split="train",
+        length_bucket_drop_last=False,
+        length_bucket_frame_budget=80,
+    )
+    loaders = [
+        build_bucketed_webdataset_loader(
+            root,
+            bucket_manifest_path=manifest_path,
+            tokenizer=DummyTokenizer(),
+            config=config,
+            batch_size=4,
+            num_workers=2,
+            rank=rank,
+            world_size=2,
+        )
+        for rank in range(2)
+    ]
+    rank_ids = [[batch.utt_ids for batch in loader] for loader in loaders]
+
+    assert rank_ids[0] == [["sid-1"], ["sid-3"]]
+    assert rank_ids[1] == [["sid-2"], ["sid-3"]]
 
 
 def test_bucketed_webdataset_loader_skips_corrupt_audio_when_configured(tmp_path: Path, capsys) -> None:

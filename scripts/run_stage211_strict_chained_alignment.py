@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.config import save_yaml
-from rwkvasr.data import estimate_bucket_manifest_steps, load_webdataset_bucket_manifest
+from rwkvasr.data import (
+    estimate_bucket_manifest_steps,
+    estimate_bucket_manifest_tail_padding_samples,
+    load_webdataset_bucket_manifest,
+)
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_FULL_DATA_BATCH_SIZE,
@@ -572,7 +576,14 @@ def _audit_labeled_data(
         batch_size=TRAIN_BATCH_SIZE,
         world_size=TRAIN_WORLD_SIZE,
         frame_budget=TRAIN_FRAME_BUDGET,
-        drop_last=True,
+        drop_last=False,
+    )
+    tail_padding_samples = estimate_bucket_manifest_tail_padding_samples(
+        manifest,
+        split="train",
+        batch_size=TRAIN_BATCH_SIZE,
+        world_size=TRAIN_WORLD_SIZE,
+        frame_budget=TRAIN_FRAME_BUDGET,
     )
     return {
         "webdataset_root": str(webdataset_root),
@@ -584,6 +595,9 @@ def _audit_labeled_data(
         "total_hours": total_frames / 100.0 / 3600.0,
         "ctc_tokens": total_tokens,
         "estimated_train_steps": estimated_steps,
+        "tail_padding_samples_per_epoch": tail_padding_samples,
+        "tail_padding_sample_exposures": tail_padding_samples,
+        "executed_sample_exposures": split_counts["train"] + tail_padding_samples,
     }
 
 
@@ -700,7 +714,9 @@ def _config(
             {
                 "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
                 "batch_token_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+                "length_bucket_drop_last": False,
                 "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+                "skip_oversized_samples": False,
             }
         )
         deepspeed_config = dict(config["deepspeed"])
@@ -735,6 +751,8 @@ def _config(
                 "webdataset_utt_id_key": "id",
                 "feature_extractor_type": "funasr_wav_frontend",
                 "bucket_source_interleave": True,
+                "length_bucket_drop_last": False,
+                "skip_oversized_samples": False,
             }
         )
     elif audio_data_audit is not None:
@@ -890,6 +908,11 @@ def _record_or_validate_provenance(
         )
     if full_data_profile:
         payload["full_data_profile"] = True
+        payload["length_bucket_drop_last"] = False
+        payload["skip_oversized_samples"] = False
+    if phase.requires_labels:
+        payload["length_bucket_drop_last"] = False
+        payload["skip_oversized_samples"] = False
     if path.is_file():
         existing = json.loads(path.read_text(encoding="utf-8"))
         if existing != payload:
@@ -930,6 +953,11 @@ def _validate_resume_provenance(
         expected["curriculum_difficulty"] = curriculum_difficulty
     if full_data_profile:
         expected["full_data_profile"] = True
+        expected["length_bucket_drop_last"] = False
+        expected["skip_oversized_samples"] = False
+    if phase.requires_labels:
+        expected["length_bucket_drop_last"] = False
+        expected["skip_oversized_samples"] = False
     for key, value in expected.items():
         if payload.get(key) != value:
             raise ValueError(
@@ -1066,7 +1094,7 @@ def main() -> int:
             batch_size=audit_batch_size,
             world_size=TRAIN_WORLD_SIZE,
             frame_budget=audit_frame_budget,
-            drop_last=True,
+            drop_last=not args.full_data_profile,
         )
         expected_steps_per_epoch = int(
             expected_coverage["steps_per_epoch"]
@@ -1082,6 +1110,22 @@ def main() -> int:
                 f"rows={actual_rows}/{expected_coverage['rows']} "
                 f"steps_per_epoch={actual_steps_per_epoch}/{expected_steps_per_epoch}"
             )
+        if args.full_data_profile:
+            actual_tail_padding = estimate_bucket_manifest_tail_padding_samples(
+                manifest,
+                split="train",
+                batch_size=audit_batch_size,
+                world_size=TRAIN_WORLD_SIZE,
+                frame_budget=audit_frame_budget,
+            )
+            expected_tail_padding = int(
+                expected_coverage["tail_padding_samples_per_epoch"]
+            )
+            if actual_tail_padding != expected_tail_padding:
+                raise ValueError(
+                    f"Stage211 {difficulty} manifest tail-padding mismatch: "
+                    f"actual={actual_tail_padding} expected={expected_tail_padding}"
+                )
         if difficulty != "easy" or args.full_data_profile:
             eval_rows = int(audio_data_audit["split_samples"].get("eval", 0))
             if eval_rows != FIXED_HIDDEN_EVAL_SAMPLES:

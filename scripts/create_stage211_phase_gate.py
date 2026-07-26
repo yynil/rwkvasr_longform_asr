@@ -8,10 +8,12 @@ from typing import Any
 from rwkvasr.eval import normalize_asr_text_for_metrics
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
+    STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES,
     STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
     STAGE211_AUDIO_TOTAL_HOURS,
     STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
     STAGE211_AUDIO_TOTAL_ROWS,
+    STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES,
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
@@ -339,6 +341,12 @@ def build_phase_gate(
             "total_hours": STAGE211_AUDIO_TOTAL_HOURS,
             "total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
             "total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
+            "total_tail_padding_sample_exposures": (
+                STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+            ),
+            "total_executed_sample_exposures": (
+                STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
+            ),
             "segments": coverage,
             "final_checkpoint_path": str(checkpoint_path),
             "final_checkpoint_sha256": final_checkpoint_sha256,

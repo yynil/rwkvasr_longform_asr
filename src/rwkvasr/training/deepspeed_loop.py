@@ -51,6 +51,7 @@ from .checkpoint import (
     write_latest_checkpoint_state,
 )
 from .batch_budget import (
+    BudgetedBatchResult,
     ctc_batch_token_stats,
     effective_batch_token_budget,
     effective_padded_text_token_budget,
@@ -292,6 +293,7 @@ class DeepSpeedTrainConfig:
     decoded_batch_prefetch: int = 2
     max_open_shards_per_worker: int = 8
     bucket_source_interleave: bool = False
+    length_bucket_drop_last: bool = True
     lr: float = 4e-4
     weight_decay: float = 0.1
     beta1: float = 0.9
@@ -469,6 +471,28 @@ class DeepSpeedTrainConfig:
     specaugment_time_width: int = 40
     specaugment_freq_masks: int = 2
     specaugment_freq_width: int = 15
+
+
+def _validate_exact_batch_coverage(
+    config: DeepSpeedTrainConfig,
+    budgeted: BudgetedBatchResult | None,
+) -> None:
+    exact_coverage = (
+        not config.length_bucket_drop_last
+        and not config.skip_oversized_samples
+    )
+    if not exact_coverage:
+        return
+    if budgeted is None:
+        raise RuntimeError(
+            "Exact-coverage training produced no executable sample for a candidate batch."
+        )
+    if budgeted.skipped_samples or budgeted.dropped_tail_samples:
+        raise RuntimeError(
+            "Exact-coverage training cannot truncate a candidate batch: "
+            f"skipped_samples={budgeted.skipped_samples} "
+            f"dropped_tail_samples={budgeted.dropped_tail_samples}"
+        )
 
 
 def _maybe_load_initial_model_checkpoint(
@@ -794,6 +818,7 @@ def _build_webdataset_config(
         split_by=config.webdataset_split_by,
         utt_id_key=config.webdataset_utt_id_key,
         length_index_path=config.webdataset_length_index_path,
+        length_bucket_drop_last=config.length_bucket_drop_last,
         length_bucket_frame_budget=length_bucket_frame_budget,
         decoded_batch_prefetch=config.decoded_batch_prefetch,
         max_open_shards_per_worker=config.max_open_shards_per_worker,
@@ -958,7 +983,7 @@ def _resolve_max_steps(config: DeepSpeedTrainConfig, grad_accum: int) -> tuple[i
                 batch_size=config.batch_size,
                 world_size=_world_size(),
                 frame_budget=config.length_bucket_frame_budget or config.batch_token_budget,
-                drop_last=True,
+                drop_last=config.length_bucket_drop_last,
             )
             return steps_per_epoch * int(config.epochs), steps_per_epoch
         index_path = resolve_webdataset_index_path(data_path, config.webdataset_index_path)
@@ -7018,6 +7043,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     text_tokens_per_sample_extra=text_tokens_per_sample_extra,
                     padded_text_token_budget=config.decoder_text_token_budget if use_padded_text_budget else None,
                 )
+                _validate_exact_batch_coverage(config, budgeted)
                 if budgeted is None:
                     if _is_rank_zero():
                         _rank_zero_log("Skipped a candidate batch because no sample fit inside the token budget.")

@@ -16,22 +16,31 @@ STAGE211_AUDIO_CURRICULUM: dict[str, dict[str, float | int]] = {
     "easy": {
         "rows": 1_174_987,
         "hours": 1_490.119,
-        "steps_per_epoch": 9_954,
-        "steps": 29_862,
+        "steps_per_epoch": 9_982,
+        "steps": 29_946,
+        "tail_padding_samples_per_epoch": 633,
     },
     "medium": {
         "rows": 42_247_508,
         "hours": 47_771.242,
-        "steps_per_epoch": 334_553,
-        "steps": 1_003_659,
+        "steps_per_epoch": 334_571,
+        "steps": 1_003_713,
+        "tail_padding_samples_per_epoch": 744,
     },
     "hard": {
         "rows": 18_649_326,
         "hours": 69_200.368,
-        "steps_per_epoch": 322_054,
-        "steps": 966_162,
+        "steps_per_epoch": 322_105,
+        "steps": 966_315,
+        "tail_padding_samples_per_epoch": 986,
     },
-    "long": {"rows": 404, "hours": 3.432, "steps_per_epoch": 14, "steps": 42},
+    "long": {
+        "rows": 404,
+        "hours": 3.432,
+        "steps_per_epoch": 35,
+        "steps": 105,
+        "tail_padding_samples_per_epoch": 296,
+    },
 }
 STAGE211_PUBLIC_BENCHMARKS: dict[str, dict[str, str | int]] = {
     "aishell1_test": {"language": "zh", "metric": "cer", "samples": 7_176},
@@ -47,6 +56,14 @@ STAGE211_AUDIO_TOTAL_HOURS = sum(
 STAGE211_AUDIO_TOTAL_ROW_EXPOSURES = STAGE211_AUDIO_TOTAL_ROWS * STAGE211_FULL_DATA_EPOCHS
 STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES = (
     STAGE211_AUDIO_TOTAL_HOURS * STAGE211_FULL_DATA_EPOCHS
+)
+STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES = sum(
+    int(row["tail_padding_samples_per_epoch"]) * STAGE211_FULL_DATA_EPOCHS
+    for row in STAGE211_AUDIO_CURRICULUM.values()
+)
+STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES = (
+    STAGE211_AUDIO_TOTAL_ROW_EXPOSURES
+    + STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
 )
 
 
@@ -112,6 +129,16 @@ def validate_stage211_full_data_coverage(
         != STAGE211_AUDIO_TOTAL_ROW_EXPOSURES
     ):
         raise ValueError("Stage211 full-data row-exposure total mismatch.")
+    if (
+        int(coverage.get("total_tail_padding_sample_exposures", -1))
+        != STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+    ):
+        raise ValueError("Stage211 full-data tail-padding exposure total mismatch.")
+    if (
+        int(coverage.get("total_executed_sample_exposures", -1))
+        != STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
+    ):
+        raise ValueError("Stage211 full-data executed-sample exposure total mismatch.")
     total_hour_exposures = float(
         coverage.get("total_hour_exposures", float("nan"))
     )
@@ -149,6 +176,8 @@ def validate_stage211_full_data_coverage(
             "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
             "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
             "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "length_bucket_drop_last": False,
+            "skip_oversized_samples": False,
         }
         if any(segment.get(key) != value for key, value in expected_fields.items()):
             raise ValueError(f"Stage211 {phase}/{difficulty} coverage is incomplete.")
@@ -164,6 +193,29 @@ def validate_stage211_full_data_coverage(
             raise ValueError(f"Stage211 {phase}/{difficulty} per-epoch steps mismatch.")
         if int(segment.get("steps", -1)) != int(expected["steps"]):
             raise ValueError(f"Stage211 {phase}/{difficulty} step count mismatch.")
+        tail_padding_samples_per_epoch = int(
+            expected["tail_padding_samples_per_epoch"]
+        )
+        if (
+            int(segment.get("tail_padding_samples_per_epoch", -1))
+            != tail_padding_samples_per_epoch
+        ):
+            raise ValueError(
+                f"Stage211 {phase}/{difficulty} tail-padding count mismatch."
+            )
+        if int(segment.get("tail_padding_sample_exposures", -1)) != (
+            tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
+        ):
+            raise ValueError(
+                f"Stage211 {phase}/{difficulty} tail-padding exposure mismatch."
+            )
+        if int(segment.get("executed_sample_exposures", -1)) != (
+            int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS
+            + tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
+        ):
+            raise ValueError(
+                f"Stage211 {phase}/{difficulty} executed-sample exposure mismatch."
+            )
         hours = float(segment.get("hours", float("nan")))
         if not math.isfinite(hours) or abs(hours - float(expected["hours"])) > 0.002:
             raise ValueError(f"Stage211 {phase}/{difficulty} hour count mismatch.")
@@ -185,6 +237,12 @@ def validate_stage211_full_data_coverage(
             path_key="provenance_path",
             sha256_key="provenance_sha256",
             label=f"Stage211 {phase}/{difficulty} provenance",
+        )
+        _validate_bound_file(
+            segment,
+            path_key="train_config_path",
+            sha256_key="train_config_sha256",
+            label=f"Stage211 {phase}/{difficulty} train config",
         )
         _validate_bound_file(
             segment,

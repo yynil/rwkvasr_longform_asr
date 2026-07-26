@@ -11,10 +11,12 @@ import torch
 
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
+    STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES,
     STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
     STAGE211_AUDIO_TOTAL_HOURS,
     STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
     STAGE211_AUDIO_TOTAL_ROWS,
+    STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES,
     STAGE211_FULL_DATA_BATCH_SIZE,
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_FULL_DATA_FRAME_BUDGET,
@@ -294,7 +296,7 @@ def _config_for_phase(
     smoke: bool = False,
 ) -> dict[str, object]:
     phase = stage211.PHASES[phase_name]
-    formal_steps = 12_019 if phase.requires_labels and not smoke else None
+    formal_steps = 12_045 if phase.requires_labels and not smoke else None
     segment = stage211._segments(
         phase=phase,
         smoke=smoke,
@@ -328,7 +330,7 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
 ) -> None:
     config = _config_for_phase(tmp_path, phase_name)
 
-    expected_steps = 12_019 if phase_name == "sft" else 30_064
+    expected_steps = 12_045 if phase_name == "sft" else 30_064
     expected_interval = 2_000 if phase_name == "sft" else 10_000
     assert config["max_steps"] == expected_steps
     assert config["save_every"] == stage211.FORMAL_RESUME_SAVE_INTERVAL
@@ -343,6 +345,9 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
     assert config["funasr_nano_ctc_init_checkpoint_path"] is None
     assert config["ctc_teacher_online_layer_ffn_loss_weight"] == 0.0
     assert config["step_eval_cache_batches"] is True
+    if phase_name == "sft":
+        assert config["length_bucket_drop_last"] is False
+        assert config["skip_oversized_samples"] is False
 
 
 def test_stage211_mixer_phase_has_only_teacher_forced_mixer_objective(
@@ -600,7 +605,7 @@ def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
     assert admitted.returncode == 0, admitted.stderr
     assert "difficulty=medium" in admitted.stdout
     assert "full_data_profile=true" in admitted.stdout
-    assert "target_step=1003659" in admitted.stdout
+    assert "target_step=1003713" in admitted.stdout
 
 
 def test_stage211_medium_config_uses_fixed_eval_split(tmp_path: Path) -> None:
@@ -627,9 +632,11 @@ def test_stage211_medium_config_uses_fixed_eval_split(tmp_path: Path) -> None:
         full_data_profile=True,
     )
 
-    assert config["max_steps"] == 1_003_659
+    assert config["max_steps"] == 1_003_713
     assert config["batch_size"] == 36
     assert config["batch_token_budget"] == 24_000
+    assert config["length_bucket_drop_last"] is False
+    assert config["skip_oversized_samples"] is False
     assert config["length_bucket_frame_budget"] == 24_000
     assert config["deepspeed"]["train_micro_batch_size_per_gpu"] == 36
     assert config["deepspeed"]["train_batch_size"] == 144
@@ -704,6 +711,8 @@ def test_stage211_sft_labeled_data_audit_and_epoch_estimate(tmp_path: Path) -> N
     assert audit["eval_samples"] == 1
     assert audit["ctc_tokens"] == 10
     assert audit["estimated_train_steps"] == 1
+    assert audit["tail_padding_samples_per_epoch"] == 47
+    assert audit["executed_sample_exposures"] == 48
 
 
 def _write_valid_phase_gate(
@@ -720,6 +729,8 @@ def _write_valid_phase_gate(
         manifest.write_text("{}\n", encoding="utf-8")
         provenance = tmp_path / f"{difficulty}-provenance.json"
         provenance.write_text("{}\n", encoding="utf-8")
+        train_config = tmp_path / f"{difficulty}-train-config.yaml"
+        train_config.write_text("{}\n", encoding="utf-8")
         completion = checkpoint if difficulty == "long" else tmp_path / f"{difficulty}.pt"
         if completion != checkpoint:
             completion.write_bytes(f"checkpoint-{index}".encode())
@@ -735,14 +746,32 @@ def _write_valid_phase_gate(
             "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
             "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
             "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "length_bucket_drop_last": False,
+            "skip_oversized_samples": False,
             "rows": expected["rows"],
             "row_exposures": expected["rows"] * STAGE211_FULL_DATA_EPOCHS,
+            "tail_padding_samples_per_epoch": expected[
+                "tail_padding_samples_per_epoch"
+            ],
+            "tail_padding_sample_exposures": (
+                expected["tail_padding_samples_per_epoch"]
+                * STAGE211_FULL_DATA_EPOCHS
+            ),
+            "executed_sample_exposures": (
+                (
+                    expected["rows"]
+                    + expected["tail_padding_samples_per_epoch"]
+                )
+                * STAGE211_FULL_DATA_EPOCHS
+            ),
             "hours": expected["hours"],
             "hour_exposures": expected["hours"] * STAGE211_FULL_DATA_EPOCHS,
             "steps_per_epoch": expected["steps_per_epoch"],
             "steps": expected["steps"],
             "provenance_path": str(provenance.resolve()),
             "provenance_sha256": sha256_file(provenance),
+            "train_config_path": str(train_config.resolve()),
+            "train_config_sha256": sha256_file(train_config),
             "bucket_manifest_path": str(manifest.resolve()),
             "bucket_manifest_sha256": sha256_file(manifest),
             "init_checkpoint_path": str(previous_checkpoint.resolve()),
@@ -809,6 +838,12 @@ def _write_valid_phase_gate(
                     "total_hours": STAGE211_AUDIO_TOTAL_HOURS,
                     "total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
                     "total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
+                    "total_tail_padding_sample_exposures": (
+                        STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+                    ),
+                    "total_executed_sample_exposures": (
+                        STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
+                    ),
                     "segments": segments,
                     "final_checkpoint_path": str(checkpoint.resolve()),
                     "final_checkpoint_sha256": sha256_file(checkpoint),

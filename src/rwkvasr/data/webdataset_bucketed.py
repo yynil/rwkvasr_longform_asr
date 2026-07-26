@@ -139,6 +139,27 @@ def estimate_bucket_manifest_steps(
     return max(1, total_steps)
 
 
+def estimate_bucket_manifest_tail_padding_samples(
+    manifest: WebDatasetBucketManifest,
+    *,
+    split: str,
+    batch_size: int,
+    world_size: int,
+    frame_budget: int | None,
+) -> int:
+    total_padding = 0
+    for bucket in manifest.splits.get(split, ()):
+        local_batch_size = compute_bucket_local_batch_size(
+            bucket_id=bucket.bucket_id,
+            bucket_width=manifest.bucket_width,
+            max_local_batch_size=batch_size,
+            frame_budget=frame_budget,
+        )
+        global_batch_size = max(1, local_batch_size * max(1, world_size))
+        total_padding += (-bucket.num_samples) % global_batch_size
+    return total_padding
+
+
 class _TarShardReader:
     def __init__(self, shard_path: Path):
         self.shard_path = shard_path
@@ -418,8 +439,13 @@ class BucketedWebDatasetBatchLoader:
                 if len(entries) < global_batch:
                     if self.config.length_bucket_drop_last:
                         continue
-                    if len(entries) <= self.rank * local_batch:
+                    if not entries:
                         continue
+                    original_tail = tuple(entries)
+                    entries.extend(
+                        original_tail[index % len(original_tail)]
+                        for index in range(global_batch - len(entries))
+                    )
                 local_start = self.rank * local_batch
                 local_end = min(local_start + local_batch, len(entries))
                 local_entries = entries[local_start:local_end]

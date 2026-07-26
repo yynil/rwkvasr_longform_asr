@@ -338,6 +338,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
     parser.add_argument("--batch-token-budget", default=None, type=int)
     parser.add_argument("--length-bucket-frame-budget", default=None, type=int)
+    parser.add_argument(
+        "--length-bucket-drop-last",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--target-gpu-memory-gib", default=None, type=float)
     parser.add_argument("--skip-oversized-samples", dest="skip_oversized_samples", action="store_true", default=None)
     parser.add_argument(
@@ -552,6 +557,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "gradient_checkpointing",
         "batch_token_budget",
         "length_bucket_frame_budget",
+        "length_bucket_drop_last",
         "target_gpu_memory_gib",
         "skip_oversized_samples",
         "specaugment_enabled",

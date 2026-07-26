@@ -7,7 +7,12 @@ from typing import Any
 
 import torch
 
-from rwkvasr.data import estimate_bucket_manifest_steps, load_webdataset_bucket_manifest
+from rwkvasr.config import load_yaml
+from rwkvasr.data import (
+    estimate_bucket_manifest_steps,
+    estimate_bucket_manifest_tail_padding_samples,
+    load_webdataset_bucket_manifest,
+)
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_FULL_DATA_BATCH_SIZE,
@@ -58,19 +63,31 @@ def build_receipt(
         batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
         world_size=STAGE211_FULL_DATA_WORLD_SIZE,
         frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
-        drop_last=True,
+        drop_last=False,
+    )
+    tail_padding_samples_per_epoch = estimate_bucket_manifest_tail_padding_samples(
+        manifest,
+        split="train",
+        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
     )
     steps = steps_per_epoch * STAGE211_FULL_DATA_EPOCHS
     if (
         rows != int(expected["rows"])
         or steps_per_epoch != int(expected["steps_per_epoch"])
         or steps != int(expected["steps"])
+        or tail_padding_samples_per_epoch
+        != int(expected["tail_padding_samples_per_epoch"])
     ):
         raise ValueError(
             f"Stage211 {difficulty} manifest coverage mismatch: "
             f"rows={rows}/{expected['rows']} "
             f"steps_per_epoch={steps_per_epoch}/{expected['steps_per_epoch']} "
-            f"steps={steps}/{expected['steps']}"
+            f"steps={steps}/{expected['steps']} "
+            "tail_padding_samples_per_epoch="
+            f"{tail_padding_samples_per_epoch}/"
+            f"{expected['tail_padding_samples_per_epoch']}"
         )
     checkpoint_step = _checkpoint_step(completion_checkpoint_path)
     if checkpoint_step != int(expected["steps"]):
@@ -82,6 +99,27 @@ def build_receipt(
     provenance_path = run_dir / "stage211_provenance.json"
     if not provenance_path.is_file():
         raise ValueError(f"Stage211 curriculum run lacks immutable provenance: {provenance_path}")
+    train_config_path = run_dir / "train_config.yaml"
+    if not train_config_path.is_file():
+        raise ValueError(f"Stage211 curriculum run lacks train config: {train_config_path}")
+    train_config = load_yaml(train_config_path)
+    expected_train_config = {
+        "max_steps": int(expected["steps"]),
+        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "batch_token_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+    }
+    for key, value in expected_train_config.items():
+        if train_config.get(key) != value:
+            raise ValueError(
+                f"Stage211 {difficulty} train config {key} mismatch: "
+                f"actual={train_config.get(key)!r} expected={value!r}"
+            )
+    tail_padding_sample_exposures = (
+        tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
+    )
     return {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -94,8 +132,15 @@ def build_receipt(
         "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
         "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
         "rows": rows,
         "row_exposures": rows * STAGE211_FULL_DATA_EPOCHS,
+        "tail_padding_samples_per_epoch": tail_padding_samples_per_epoch,
+        "tail_padding_sample_exposures": tail_padding_sample_exposures,
+        "executed_sample_exposures": (
+            rows * STAGE211_FULL_DATA_EPOCHS + tail_padding_sample_exposures
+        ),
         "hours": float(expected["hours"]),
         "hour_exposures": float(expected["hours"]) * STAGE211_FULL_DATA_EPOCHS,
         "steps_per_epoch": steps_per_epoch,
@@ -103,6 +148,8 @@ def build_receipt(
         "run_dir": str(run_dir),
         "provenance_path": str(provenance_path),
         "provenance_sha256": sha256_file(provenance_path),
+        "train_config_path": str(train_config_path),
+        "train_config_sha256": sha256_file(train_config_path),
         "bucket_manifest_path": str(bucket_manifest_path),
         "bucket_manifest_sha256": sha256_file(bucket_manifest_path),
         "init_checkpoint_path": str(init_checkpoint_path),

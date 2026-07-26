@@ -2,6 +2,7 @@ import json
 import inspect
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,6 +35,7 @@ from rwkvasr.training.deepspeed_loop import (
     _step_checkpoint_record_is_retained,
     _teacher_forced_student_layer_hiddens,
     _teacher_layer_capture_ids,
+    _validate_exact_batch_coverage,
     train_ctc_model_deepspeed,
 )
 from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, RWKVCTCModel, RWKVCTCModelConfig
@@ -71,6 +73,37 @@ def test_deepspeed_loop_leaves_gradient_accumulation_to_engine() -> None:
     source = inspect.getsource(train_ctc_model_deepspeed)
 
     assert "engine.zero_grad()" not in source
+
+
+def test_exact_coverage_rejects_any_token_budget_truncation() -> None:
+    strict = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+    )
+
+    with pytest.raises(RuntimeError, match="no executable sample"):
+        _validate_exact_batch_coverage(strict, None)
+    with pytest.raises(RuntimeError, match="skipped_samples=1"):
+        _validate_exact_batch_coverage(
+            strict,
+            SimpleNamespace(skipped_samples=1, dropped_tail_samples=0),
+        )
+    with pytest.raises(RuntimeError, match="dropped_tail_samples=2"):
+        _validate_exact_batch_coverage(
+            strict,
+            SimpleNamespace(skipped_samples=0, dropped_tail_samples=2),
+        )
+
+    _validate_exact_batch_coverage(
+        strict,
+        SimpleNamespace(skipped_samples=0, dropped_tail_samples=0),
+    )
+    _validate_exact_batch_coverage(
+        DeepSpeedTrainConfig(output_dir="unused", deepspeed={}),
+        None,
+    )
 
 
 def test_materialize_step_eval_batches_replays_exact_features() -> None:

@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from rwkvasr.config import load_yaml
 from rwkvasr.eval.stage211_gate import sha256_file
 
 try:
@@ -40,7 +41,10 @@ LABELED_EXPECTED = {
     "total_samples": 285_302,
     "total_hours": 809.12755,
     "ctc_tokens": 8_792_460,
-    "estimated_train_steps": 12_019,
+    "estimated_train_steps": 12_045,
+    "tail_padding_samples_per_epoch": 368,
+    "tail_padding_sample_exposures": 368,
+    "executed_sample_exposures": 284_236,
 }
 BAD_SMOKE_PATTERNS = (
     re.compile(r"Traceback"),
@@ -324,6 +328,8 @@ def _validate_completion(
         "batch_size": 12,
         "world_size": 4,
         "frame_budget": 8_000,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
         **LABELED_EXPECTED,
     }
     for key, value in expected.items():
@@ -337,6 +343,7 @@ def _validate_completion(
         ("bucket_manifest_path", "bucket_manifest_sha256"),
         ("length_index_path", "length_index_sha256"),
         ("provenance_path", "provenance_sha256"),
+        ("train_config_path", "train_config_sha256"),
         ("init_checkpoint_path", "init_checkpoint_sha256"),
         (
             "logits_promotion_receipt_path",
@@ -480,6 +487,24 @@ def run_sft(args: argparse.Namespace) -> Path | None:
     training_log = output_dir / "logs" / f"sft_full_{completion_step}steps.log"
     if not training_log.is_file() or training_log.stat().st_size <= 0:
         raise ValueError(f"Stage211D formal training log is missing: {training_log}")
+    train_config_path = output_dir / "train_config.yaml"
+    if not train_config_path.is_file():
+        raise ValueError(f"Stage211D formal train config is missing: {train_config_path}")
+    train_config = load_yaml(train_config_path)
+    expected_train_config = {
+        "max_steps": completion_step,
+        "batch_size": 12,
+        "batch_token_budget": 8_000,
+        "length_bucket_frame_budget": 8_000,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+    }
+    for key, value in expected_train_config.items():
+        if train_config.get(key) != value:
+            raise ValueError(
+                f"Stage211D train config {key} mismatch: "
+                f"actual={train_config.get(key)!r} expected={value!r}"
+            )
     completion_path = output_dir / "sft_complete.json"
     _write_immutable_json(
         completion_path,
@@ -493,6 +518,8 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             "batch_size": 12,
             "world_size": 4,
             "frame_budget": 8_000,
+            "length_bucket_drop_last": False,
+            "skip_oversized_samples": False,
             **LABELED_EXPECTED,
             "labeled_webdataset_root": str(labeled_root),
             "bucket_manifest_path": str(bucket_manifest),
@@ -501,6 +528,8 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             "length_index_sha256": sha256_file(length_index),
             "provenance_path": str(provenance_path),
             "provenance_sha256": sha256_file(provenance_path),
+            "train_config_path": str(train_config_path),
+            "train_config_sha256": sha256_file(train_config_path),
             "init_checkpoint_path": str(init_checkpoint),
             "init_checkpoint_sha256": sha256_file(init_checkpoint),
             "logits_promotion_receipt_path": str(promotion_receipt),

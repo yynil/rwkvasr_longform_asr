@@ -13,10 +13,12 @@ import torch
 
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
+    STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES,
     STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
     STAGE211_AUDIO_TOTAL_HOURS,
     STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
     STAGE211_AUDIO_TOTAL_ROWS,
+    STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES,
     sha256_file,
     validate_stage211_full_data_coverage,
 )
@@ -539,6 +541,12 @@ def run_phase(args: argparse.Namespace) -> Path | None:
         "total_hours": STAGE211_AUDIO_TOTAL_HOURS,
         "total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
         "total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
+        "total_tail_padding_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+        ),
+        "total_executed_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
+        ),
         "segments": receipts,
         "final_checkpoint_path": str(final_checkpoint),
         "final_checkpoint_sha256": sha256_file(final_checkpoint),

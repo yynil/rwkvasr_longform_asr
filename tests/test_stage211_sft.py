@@ -108,12 +108,16 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         "bucket_manifest": manifest,
         "length_index": length_index,
         "provenance": tmp_path / "provenance.json",
+        "train_config": tmp_path / "train_config.yaml",
         "init_checkpoint": tmp_path / "init.pt",
         "logits_promotion_receipt": tmp_path / "receipt.json",
-        "completion_checkpoint": tmp_path / "step-12019.pt",
+        "completion_checkpoint": (
+            tmp_path / f"step-{LABELED_EXPECTED['estimated_train_steps']}.pt"
+        ),
         "training_log": tmp_path / "train.log",
     }
     artifacts["provenance"].write_text("{}\n", encoding="utf-8")
+    artifacts["train_config"].write_text("{}\n", encoding="utf-8")
     artifacts["logits_promotion_receipt"].write_text("{}\n", encoding="utf-8")
     artifacts["training_log"].write_text("complete\n", encoding="utf-8")
     torch.save({"step": 0}, artifacts["init_checkpoint"])
@@ -131,6 +135,8 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         "batch_size": 12,
         "world_size": 4,
         "frame_budget": 8_000,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
         **LABELED_EXPECTED,
         "labeled_webdataset_root": str(root),
     }
