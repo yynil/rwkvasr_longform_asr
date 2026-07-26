@@ -13,11 +13,17 @@ from typing import Any
 
 from rwkvasr.config import save_yaml
 from rwkvasr.data import estimate_bucket_manifest_steps, load_webdataset_bucket_manifest
+from rwkvasr.eval.stage211_gate import (
+    STAGE211_AUDIO_CURRICULUM,
+    STAGE211_FULL_DATA_BATCH_SIZE,
+    STAGE211_FULL_DATA_FRAME_BUDGET,
+    STAGE211_FULL_DATA_WORLD_SIZE,
+    validate_stage211_phase_gate_report,
+)
 
 try:
     from scripts.run_stage210n_full_easy_spike_tolerant_distill import (
         EVAL_INTERVAL,
-        FULL_EASY_STEPS,
         _config as _stage210n_config,
         _latest_step,
         _run,
@@ -28,7 +34,6 @@ except ModuleNotFoundError as error:
         raise
     from run_stage210n_full_easy_spike_tolerant_distill import (
         EVAL_INTERVAL,
-        FULL_EASY_STEPS,
         _config as _stage210n_config,
         _latest_step,
         _run,
@@ -48,11 +53,19 @@ DEFAULT_STAGE211_OUTPUT_ROOT = Path(
 VOLATILE_OUTPUT_ROOTS = tuple(Path(path).resolve() for path in ("/tmp", "/var/tmp", "/dev/shm"))
 HARD_LAYER_IDS = (0, 11, 12, 17, 20, 49, 50, 69)
 PHASE_SEQUENCE = ("mixer", "block", "logits", "sft")
+CURRICULUM_SEQUENCE = tuple(STAGE211_AUDIO_CURRICULUM)
 PROMOTION_RECEIPT_SCHEMA_VERSION = 1
 TRAIN_BATCH_SIZE = 12
-TRAIN_WORLD_SIZE = 4
+TRAIN_WORLD_SIZE = STAGE211_FULL_DATA_WORLD_SIZE
 TRAIN_FRAME_BUDGET = 8_000
 FORMAL_RESUME_SAVE_INTERVAL = 2_000
+FIXED_HIDDEN_EVAL_SAMPLES = 256
+LEGACY_CURRICULUM_STEPS = {
+    "easy": 30_064,
+    "medium": 1_010_185,
+    "hard": 1_045_385,
+    "long": 86,
+}
 
 
 @dataclass(frozen=True)
@@ -209,6 +222,8 @@ def _segments(
     phase: AlignmentPhase,
     smoke: bool,
     formal_steps: int | None = None,
+    difficulty: str = "easy",
+    full_data_profile: bool = False,
 ) -> list[dict[str, Any]]:
     source = _stage210n_segments(smoke=bool(smoke))[0]
     if smoke:
@@ -218,13 +233,23 @@ def _segments(
             raise ValueError("Stage211 SFT requires the estimated full labeled-epoch step count.")
         target_step = int(formal_steps)
     else:
-        target_step = FULL_EASY_STEPS
+        target_step = int(
+            STAGE211_AUDIO_CURRICULUM[difficulty]["steps"]
+            if full_data_profile
+            else LEGACY_CURRICULUM_STEPS[difficulty]
+        )
+    formal_name = (
+        f"{phase.name}_full_{target_step}steps"
+        if difficulty == "easy"
+        else f"{phase.name}_{difficulty}_full_{target_step}steps"
+    )
     return [
         {
             **source,
             "name": (
-                f"{phase.name}_smoke_2steps" if smoke else f"{phase.name}_full_{target_step}steps"
+                f"{phase.name}_smoke_2steps" if smoke else formal_name
             ),
+            "difficulty": difficulty,
             "split_steps": target_step,
             "target_step": target_step,
         }
@@ -260,6 +285,11 @@ def _build_promotion_receipt(
         raise FileNotFoundError(str(checkpoint_path))
     if not gate_report_path.is_file() or gate_report_path.stat().st_size <= 0:
         raise ValueError(f"Stage211 promotion gate report is missing or empty: {gate_report_path}")
+    validate_stage211_phase_gate_report(
+        gate_report_path,
+        expected_phase=source_phase,
+        checkpoint_path=checkpoint_path,
+    )
     return {
         "schema_version": PROMOTION_RECEIPT_SCHEMA_VERSION,
         "pipeline": "stage211",
@@ -324,6 +354,63 @@ def _validate_promotion_receipt(
         )
     if receipt.get("gate_report_sha256") != _sha256_file(gate_report_path):
         raise ValueError("Stage211 promotion receipt gate-report SHA-256 mismatch.")
+    validate_stage211_phase_gate_report(
+        gate_report_path,
+        expected_phase=str(expected_source),
+        checkpoint_path=checkpoint_path,
+    )
+    return {
+        **receipt,
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": _sha256_file(receipt_path),
+    }
+
+
+def _validate_curriculum_receipt(
+    *,
+    receipt_path: Path,
+    phase: str,
+    target_difficulty: str,
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    receipt_path = receipt_path.resolve()
+    if not receipt_path.is_file():
+        raise FileNotFoundError(str(receipt_path))
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(f"Invalid Stage211 curriculum receipt: {receipt_path}") from error
+    if not isinstance(receipt, dict):
+        raise ValueError("Stage211 curriculum receipt must be a JSON object.")
+    target_index = CURRICULUM_SEQUENCE.index(target_difficulty)
+    if target_index <= 0:
+        raise ValueError("Stage211 easy curriculum does not accept a predecessor receipt.")
+    expected_difficulty = CURRICULUM_SEQUENCE[target_index - 1]
+    expected_fields = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "curriculum_coverage",
+        "phase": phase,
+        "difficulty": expected_difficulty,
+        "complete": True,
+    }
+    for key, expected in expected_fields.items():
+        if receipt.get(key) != expected:
+            raise ValueError(
+                f"Stage211 curriculum receipt {key} mismatch: "
+                f"expected={expected!r} actual={receipt.get(key)!r}"
+            )
+    checkpoint_path = checkpoint_path.resolve()
+    recorded_checkpoint = Path(
+        str(receipt.get("completion_checkpoint_path") or "")
+    ).resolve()
+    if recorded_checkpoint != checkpoint_path:
+        raise ValueError(
+            "Stage211 curriculum receipt checkpoint path mismatch: "
+            f"expected={checkpoint_path} actual={recorded_checkpoint}"
+        )
+    if receipt.get("completion_checkpoint_sha256") != _sha256_file(checkpoint_path):
+        raise ValueError("Stage211 curriculum receipt checkpoint SHA-256 mismatch.")
     return {
         **receipt,
         "receipt_path": str(receipt_path),
@@ -532,6 +619,7 @@ def _config(
     labeled_webdataset_root: Path | None = None,
     labeled_length_index: Path | None = None,
     audio_data_audit: dict[str, Any] | None = None,
+    full_data_profile: bool = False,
 ) -> dict[str, Any]:
     config = _stage210n_config(
         segment=segment,
@@ -553,8 +641,9 @@ def _config(
             "save_every": save_interval,
             "step_eval_every": eval_interval,
             "top_k_step_checkpoints": (
-                1 if smoke else max(1, math.ceil(target_step / eval_interval))
+                1 if smoke else min(8, max(1, math.ceil(target_step / eval_interval)))
             ),
+            "periodic_checkpoint_keep_last": None if smoke else 2,
             "freeze_encoder": False,
             "freeze_encoder_except_time_mixer": True,
             "freeze_ctc_decoder": True,
@@ -595,11 +684,40 @@ def _config(
             "ctc_teacher_online_nonblank_window_loss_mode": ("conditional_nonblank_hard"),
             "ctc_teacher_online_nonblank_window_radius": 2,
             "ctc_teacher_online_nonblank_window_temperature": 0.20,
-            "step_eval_split": "eval" if phase.requires_labels else "train",
+            "step_eval_split": (
+                "eval"
+                if phase.requires_labels
+                or full_data_profile
+                or str(segment.get("difficulty") or "easy") != "easy"
+                else "train"
+            ),
             "step_eval_cache_batches": True,
             "wandb_run_name": f"{output_dir.name}_{segment['name']}",
         }
     )
+    if full_data_profile:
+        config.update(
+            {
+                "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+                "batch_token_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+                "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            }
+        )
+        deepspeed_config = dict(config["deepspeed"])
+        gradient_accumulation = int(
+            deepspeed_config.get("gradient_accumulation_steps", 1)
+        )
+        deepspeed_config.update(
+            {
+                "train_micro_batch_size_per_gpu": STAGE211_FULL_DATA_BATCH_SIZE,
+                "train_batch_size": (
+                    STAGE211_FULL_DATA_BATCH_SIZE
+                    * TRAIN_WORLD_SIZE
+                    * gradient_accumulation
+                ),
+            }
+        )
+        config["deepspeed"] = deepspeed_config
     if phase.requires_labels:
         if labeled_webdataset_root is None or labeled_length_index is None:
             raise ValueError(
@@ -715,7 +833,11 @@ def _write_config(
     config_dir: Path,
     smoke: bool,
 ) -> Path:
-    formal_name = "labeled_sft" if phase.requires_labels else "full_easy"
+    formal_name = (
+        "labeled_sft"
+        if phase.requires_labels
+        else f"full_{str(segment.get('difficulty') or 'easy')}"
+    )
     target_dir = config_dir / phase.name / ("smoke" if smoke else formal_name)
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"stage211_{segment['name']}.yaml"
@@ -730,6 +852,9 @@ def _record_or_validate_provenance(
     bucket_manifest: Path,
     init_checkpoint: Path,
     promotion_receipt: dict[str, Any] | None,
+    curriculum_difficulty: str | None,
+    curriculum_receipt: dict[str, Any] | None,
+    full_data_profile: bool,
     labeled_data_audit: dict[str, Any] | None,
     audio_data_audit: dict[str, Any] | None,
 ) -> Path:
@@ -751,6 +876,20 @@ def _record_or_validate_provenance(
         "labeled_data_audit": labeled_data_audit,
         "audio_data_audit": audio_data_audit,
     }
+    if curriculum_difficulty is not None:
+        payload["curriculum_difficulty"] = curriculum_difficulty
+        payload["curriculum_receipt_path"] = (
+            curriculum_receipt.get("receipt_path")
+            if curriculum_receipt is not None
+            else None
+        )
+        payload["curriculum_receipt_sha256"] = (
+            curriculum_receipt.get("receipt_sha256")
+            if curriculum_receipt is not None
+            else None
+        )
+    if full_data_profile:
+        payload["full_data_profile"] = True
     if path.is_file():
         existing = json.loads(path.read_text(encoding="utf-8"))
         if existing != payload:
@@ -772,6 +911,8 @@ def _validate_resume_provenance(
     bucket_manifest: Path,
     labeled_data_audit: dict[str, Any] | None,
     audio_data_audit: dict[str, Any] | None,
+    curriculum_difficulty: str | None,
+    full_data_profile: bool,
 ) -> dict[str, Any]:
     path = output_dir / "stage211_provenance.json"
     if not path.is_file():
@@ -785,17 +926,49 @@ def _validate_resume_provenance(
         "labeled_data_audit": labeled_data_audit,
         "audio_data_audit": audio_data_audit,
     }
+    if curriculum_difficulty is not None:
+        expected["curriculum_difficulty"] = curriculum_difficulty
+    if full_data_profile:
+        expected["full_data_profile"] = True
     for key, value in expected.items():
         if payload.get(key) != value:
             raise ValueError(
                 f"Stage211 resume provenance {key} mismatch: "
                 f"expected={value!r} actual={payload.get(key)!r}"
             )
+    curriculum_receipt_path_value = payload.get("curriculum_receipt_path")
+    curriculum_receipt_sha256 = payload.get("curriculum_receipt_sha256")
+    is_curriculum_continuation = (
+        curriculum_difficulty is not None and curriculum_difficulty != "easy"
+    )
+    if is_curriculum_continuation:
+        curriculum_receipt_path = Path(
+            str(curriculum_receipt_path_value or "")
+        ).resolve()
+        if (
+            not curriculum_receipt_path.is_file()
+            or _sha256_file(curriculum_receipt_path) != curriculum_receipt_sha256
+        ):
+            raise ValueError(
+                "Stage211 resume curriculum-receipt provenance is missing or changed."
+            )
+    elif (
+        curriculum_receipt_path_value is not None
+        or curriculum_receipt_sha256 is not None
+    ):
+        raise ValueError("Stage211 easy/SFT provenance must not contain a curriculum receipt.")
+
     receipt_path_value = payload.get("promotion_receipt_path")
     receipt_sha256 = payload.get("promotion_receipt_sha256")
-    if _preceding_phase(phase.name) is None:
+    requires_promotion = (
+        _preceding_phase(phase.name) is not None and not is_curriculum_continuation
+    )
+    if not requires_promotion:
         if receipt_path_value is not None or receipt_sha256 is not None:
-            raise ValueError("Stage211 mixer provenance must not contain a promotion receipt.")
+            raise ValueError(
+                "Stage211 mixer/curriculum-continuation provenance must not contain "
+                "a phase-promotion receipt."
+            )
     else:
         receipt_path = Path(str(receipt_path_value or "")).resolve()
         if not receipt_path.is_file() or _sha256_file(receipt_path) != receipt_sha256:
@@ -814,6 +987,9 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--config-dir", type=Path, default=DEFAULT_CONFIG_DIR)
     parser.add_argument("--bucket-manifest", type=Path, default=None)
+    parser.add_argument("--difficulty", choices=CURRICULUM_SEQUENCE, default=None)
+    parser.add_argument("--curriculum-receipt", type=Path, default=None)
+    parser.add_argument("--full-data-profile", action="store_true")
     parser.add_argument("--labeled-webdataset-root", type=Path, default=None)
     parser.add_argument("--labeled-length-index", type=Path, default=None)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
@@ -830,6 +1006,18 @@ def main() -> int:
     args = parser.parse_args()
 
     phase = PHASES[str(args.phase)]
+    if phase.requires_labels:
+        if (
+            args.difficulty is not None
+            or args.curriculum_receipt is not None
+            or args.full_data_profile
+        ):
+            parser.error("Stage211 SFT does not accept audio curriculum arguments")
+        difficulty = "easy"
+    else:
+        difficulty = str(args.difficulty or "easy")
+        if args.full_data_profile and args.difficulty is None:
+            parser.error("--full-data-profile requires an explicit --difficulty")
     if args.skip_nano_weight_audit and not args.dry_run:
         parser.error("--skip-nano-weight-audit is allowed only with --dry-run")
     bucket_manifest = args.bucket_manifest
@@ -859,6 +1047,48 @@ def main() -> int:
         parser.error("labeled data arguments are valid only for --phase sft")
     elif not args.dry_run:
         audio_data_audit = _audit_audio_bucket_storage(bucket_manifest)
+        manifest = load_webdataset_bucket_manifest(bucket_manifest)
+        expected_coverage = STAGE211_AUDIO_CURRICULUM[difficulty]
+        actual_rows = int(audio_data_audit["split_samples"].get("train", 0))
+        audit_batch_size = (
+            STAGE211_FULL_DATA_BATCH_SIZE
+            if args.full_data_profile
+            else TRAIN_BATCH_SIZE
+        )
+        audit_frame_budget = (
+            STAGE211_FULL_DATA_FRAME_BUDGET
+            if args.full_data_profile
+            else TRAIN_FRAME_BUDGET
+        )
+        actual_steps_per_epoch = estimate_bucket_manifest_steps(
+            manifest,
+            split="train",
+            batch_size=audit_batch_size,
+            world_size=TRAIN_WORLD_SIZE,
+            frame_budget=audit_frame_budget,
+            drop_last=True,
+        )
+        expected_steps_per_epoch = int(
+            expected_coverage["steps_per_epoch"]
+            if args.full_data_profile
+            else LEGACY_CURRICULUM_STEPS[difficulty]
+        )
+        if (
+            actual_rows != int(expected_coverage["rows"])
+            or actual_steps_per_epoch != expected_steps_per_epoch
+        ):
+            raise ValueError(
+                f"Stage211 {difficulty} manifest coverage mismatch: "
+                f"rows={actual_rows}/{expected_coverage['rows']} "
+                f"steps_per_epoch={actual_steps_per_epoch}/{expected_steps_per_epoch}"
+            )
+        if difficulty != "easy" or args.full_data_profile:
+            eval_rows = int(audio_data_audit["split_samples"].get("eval", 0))
+            if eval_rows != FIXED_HIDDEN_EVAL_SAMPLES:
+                raise ValueError(
+                    f"Stage211 {difficulty} manifest must bind the fixed hidden-eval split: "
+                    f"actual={eval_rows} expected={FIXED_HIDDEN_EVAL_SAMPLES}"
+                )
 
     base_output_dir = args.output_dir or _default_output_dir(phase)
     output_dir = Path(f"{base_output_dir}_smoke") if args.smoke else base_output_dir
@@ -871,6 +1101,7 @@ def main() -> int:
     latest_step = _latest_step(output_dir)
     init_checkpoint = args.init_checkpoint
     promotion_receipt: dict[str, Any] | None = None
+    curriculum_receipt: dict[str, Any] | None = None
     if latest_step <= 0:
         if init_checkpoint is None:
             if phase.name == "mixer":
@@ -884,27 +1115,54 @@ def main() -> int:
             )
         if not init_checkpoint.is_file():
             raise FileNotFoundError(str(init_checkpoint))
-        preceding_phase = _preceding_phase(phase.name)
-        if preceding_phase is None:
-            if args.promotion_receipt is not None:
-                parser.error("Stage211 mixer phase does not accept a promotion receipt")
-        else:
-            if args.promotion_receipt is None:
+        is_curriculum_continuation = not phase.requires_labels and difficulty != "easy"
+        if is_curriculum_continuation:
+            if args.curriculum_receipt is None:
                 parser.error(
-                    f"a fresh Stage211 {phase.name} run requires a passing promotion "
-                    f"receipt from Stage211 {preceding_phase}"
+                    f"a fresh Stage211 {phase.name}/{difficulty} run requires the "
+                    "preceding curriculum coverage receipt"
                 )
-            promotion_receipt = _validate_promotion_receipt(
-                receipt_path=args.promotion_receipt,
-                target_phase=phase.name,
+            if args.promotion_receipt is not None:
+                parser.error(
+                    "a Stage211 curriculum continuation does not accept a phase-promotion receipt"
+                )
+            curriculum_receipt = _validate_curriculum_receipt(
+                receipt_path=args.curriculum_receipt,
+                phase=phase.name,
+                target_difficulty=difficulty,
                 checkpoint_path=init_checkpoint,
             )
-            print(
-                "promotion_receipt="
-                f"{promotion_receipt['source_phase']}->{promotion_receipt['target_phase']} "
-                f"sha256={promotion_receipt['receipt_sha256']}",
-                flush=True,
-            )
+            if args.full_data_profile and curriculum_receipt.get(
+                "full_data_profile"
+            ) is not True:
+                raise ValueError(
+                    "Stage211 full-data curriculum continuation requires a "
+                    "full-data predecessor receipt."
+                )
+        else:
+            if args.curriculum_receipt is not None:
+                parser.error("Stage211 easy/SFT does not accept a curriculum receipt")
+            preceding_phase = _preceding_phase(phase.name)
+            if preceding_phase is None:
+                if args.promotion_receipt is not None:
+                    parser.error("Stage211 mixer phase does not accept a promotion receipt")
+            else:
+                if args.promotion_receipt is None:
+                    parser.error(
+                        f"a fresh Stage211 {phase.name} run requires a passing promotion "
+                        f"receipt from Stage211 {preceding_phase}"
+                    )
+                promotion_receipt = _validate_promotion_receipt(
+                    receipt_path=args.promotion_receipt,
+                    target_phase=phase.name,
+                    checkpoint_path=init_checkpoint,
+                )
+                print(
+                    "promotion_receipt="
+                    f"{promotion_receipt['source_phase']}->{promotion_receipt['target_phase']} "
+                    f"sha256={promotion_receipt['receipt_sha256']}",
+                    flush=True,
+                )
         if not args.skip_nano_weight_audit:
             if not args.nano_checkpoint.is_file():
                 raise FileNotFoundError(str(args.nano_checkpoint))
@@ -923,15 +1181,22 @@ def main() -> int:
                 bucket_manifest=bucket_manifest,
                 init_checkpoint=init_checkpoint,
                 promotion_receipt=promotion_receipt,
+                curriculum_difficulty=args.difficulty,
+                curriculum_receipt=curriculum_receipt,
+                full_data_profile=bool(args.full_data_profile),
                 labeled_data_audit=labeled_data_audit,
                 audio_data_audit=audio_data_audit,
             )
             print(f"provenance={provenance_path}", flush=True)
     else:
-        if init_checkpoint is not None or args.promotion_receipt is not None:
+        if (
+            init_checkpoint is not None
+            or args.promotion_receipt is not None
+            or args.curriculum_receipt is not None
+        ):
             parser.error(
                 "a Stage211 resume must use its recorded initialization and cannot "
-                "accept --init-checkpoint or --promotion-receipt"
+                "accept checkpoint or receipt arguments"
             )
         _validate_resume_provenance(
             output_dir=output_dir,
@@ -939,6 +1204,8 @@ def main() -> int:
             bucket_manifest=bucket_manifest,
             labeled_data_audit=labeled_data_audit,
             audio_data_audit=audio_data_audit,
+            curriculum_difficulty=args.difficulty,
+            full_data_profile=bool(args.full_data_profile),
         )
     if init_checkpoint is None:
         init_checkpoint = output_dir / "resume-placeholder.pt"
@@ -946,6 +1213,9 @@ def main() -> int:
     print(f"phase={phase.name}", flush=True)
     print(f"output_dir={output_dir}", flush=True)
     print(f"bucket_manifest={bucket_manifest}", flush=True)
+    if not phase.requires_labels:
+        print(f"difficulty={difficulty}", flush=True)
+        print(f"full_data_profile={str(bool(args.full_data_profile)).lower()}", flush=True)
     if labeled_data_audit is not None:
         print(
             "labeled_data_audit="
@@ -970,6 +1240,8 @@ def main() -> int:
         phase=phase,
         smoke=bool(args.smoke),
         formal_steps=formal_steps,
+        difficulty=difficulty,
+        full_data_profile=bool(args.full_data_profile),
     ):
         target_step = int(segment["target_step"])
         print(
@@ -992,6 +1264,7 @@ def main() -> int:
             labeled_webdataset_root=args.labeled_webdataset_root,
             labeled_length_index=args.labeled_length_index,
             audio_data_audit=audio_data_audit,
+            full_data_profile=bool(args.full_data_profile),
         )
         config_path = _write_config(
             phase=phase,

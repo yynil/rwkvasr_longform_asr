@@ -102,3 +102,29 @@ def test_build_report_requires_all_public_datasets(tmp_path: Path) -> None:
             max_relative_ratio=1.20,
             max_absolute_gap_points=3.0,
         )
+
+
+def test_build_report_binds_student_checkpoint_when_requested(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "student.pt"
+    checkpoint.write_bytes(b"student checkpoint")
+    nano_predictions: dict[str, Path] = {}
+    student_dir = tmp_path / "student"
+    for dataset in comparison.DATASETS:
+        nano = tmp_path / "nano" / f"{dataset}.jsonl"
+        student = student_dir / f"{dataset}.ctc.jsonl"
+        rows = [("utt-1", "hello", "hello")]
+        _write_predictions(nano, rows=rows)
+        _write_predictions(student, rows=rows)
+        nano_predictions[dataset] = nano
+
+    report = comparison.build_report(
+        student_prediction_dir=student_dir,
+        nano_predictions=nano_predictions,
+        normalization="ctc",
+        max_relative_ratio=1.20,
+        max_absolute_gap_points=3.0,
+        student_checkpoint=checkpoint,
+    )
+
+    assert report["student_checkpoint_path"] == str(checkpoint.resolve())
+    assert len(report["student_checkpoint_sha256"]) == 64

@@ -1,7 +1,13 @@
 from pathlib import Path
 
 from rwkvasr.data import normalize_asr_text
-from rwkvasr.eval import compute_text_error_stats, compare_prediction_text_sets, tokenize_for_cer, tokenize_for_wer
+from rwkvasr.eval import (
+    compare_prediction_text_sets,
+    compute_text_error_decomposition,
+    compute_text_error_stats,
+    tokenize_for_cer,
+    tokenize_for_wer,
+)
 
 
 def _write_jsonl(path: Path, lines: list[dict[str, str]]) -> Path:
@@ -92,6 +98,34 @@ def test_compute_text_error_stats(tmp_path: Path) -> None:
     assert stats["sample_count"] == 2
     assert stats["avg_wer"] == 1.0 / 6.0
     assert abs(stats["avg_cer"] - (1.0 / 6.0)) < 1e-9
+
+
+def test_compute_text_error_decomposition_reports_deletions_and_length(
+    tmp_path: Path,
+) -> None:
+    path = _write_jsonl(
+        tmp_path / "preds.jsonl",
+        [
+            {
+                "utt_id": "u1",
+                "pred_text": "one three extra",
+                "ref_text": "one two three four",
+            }
+        ],
+    )
+
+    decomposition = compute_text_error_decomposition(
+        path,
+        language="en",
+        normalization="none",
+        metric="wer",
+    )
+
+    assert decomposition["reference_units"] == 4
+    assert decomposition["prediction_units"] == 3
+    assert decomposition["prediction_reference_unit_ratio"] == 0.75
+    assert decomposition["deletions"] + decomposition["substitutions"] == 2
+    assert decomposition["error_rate"] == 0.5
 
 
 def test_text_error_stats_ignore_punctuation(tmp_path: Path) -> None:

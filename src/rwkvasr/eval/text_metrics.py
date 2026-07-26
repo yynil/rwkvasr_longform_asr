@@ -255,6 +255,61 @@ def compute_text_error_stats(
     }
 
 
+def compute_text_error_decomposition(
+    path: Path,
+    *,
+    language: str | None = None,
+    normalization: str = "ctc",
+    metric: str,
+    strip_language_confirmation: bool = True,
+) -> dict[str, Any]:
+    if metric not in {"wer", "cer"}:
+        raise ValueError("metric must be either 'wer' or 'cer'.")
+    records = _load_normalized_records(
+        path,
+        language=language,
+        normalization=normalization,
+        strip_language_confirmation=strip_language_confirmation,
+    )
+    if not records:
+        return {}
+
+    insertions = 0
+    deletions = 0
+    substitutions = 0
+    reference_units = 0
+    prediction_units = 0
+    tokenizer = tokenize_for_wer if metric == "wer" else tokenize_for_cer
+    for prediction, reference in records.values():
+        prediction_tokens = tokenizer(prediction)
+        reference_tokens = tokenizer(reference)
+        sample_insertions, sample_deletions, sample_substitutions = edit_counts(
+            reference_tokens,
+            prediction_tokens,
+        )
+        insertions += sample_insertions
+        deletions += sample_deletions
+        substitutions += sample_substitutions
+        reference_units += len(reference_tokens)
+        prediction_units += len(prediction_tokens)
+
+    denominator = max(1, reference_units)
+    return {
+        "sample_count": len(records),
+        "metric": metric,
+        "reference_units": reference_units,
+        "prediction_units": prediction_units,
+        "prediction_reference_unit_ratio": prediction_units / denominator,
+        "insertions": insertions,
+        "deletions": deletions,
+        "substitutions": substitutions,
+        "insertion_rate": insertions / denominator,
+        "deletion_rate": deletions / denominator,
+        "substitution_rate": substitutions / denominator,
+        "error_rate": (insertions + deletions + substitutions) / denominator,
+    }
+
+
 def compare_prediction_text_sets(
     baseline_jsonl: Path,
     candidate_jsonl: Path,

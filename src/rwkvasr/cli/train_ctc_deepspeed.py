@@ -278,6 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", default=None, type=int)
     parser.add_argument("--epochs", default=None, type=int)
     parser.add_argument("--save-every", default=None, type=int)
+    parser.add_argument("--periodic-checkpoint-keep-last", default=None, type=int)
     parser.add_argument("--num-workers", default=None, type=int)
     parser.add_argument("--decoded-batch-prefetch", default=None, type=int)
     parser.add_argument("--max-open-shards-per-worker", default=None, type=int)
@@ -544,6 +545,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "step_eval_at_start",
         "step_eval_cache_batches",
         "top_k_step_checkpoints",
+        "periodic_checkpoint_keep_last",
         "save_deepspeed_sharded_checkpoints",
         "log_every",
         "local_rank",

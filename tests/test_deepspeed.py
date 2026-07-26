@@ -22,6 +22,7 @@ from rwkvasr.training.deepspeed_loop import (
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
     _prune_deepspeed_step_checkpoint_artifacts,
+    _prune_periodic_step_checkpoint_artifacts,
     _resolve_ctc_frame_balance_mode,
     _resolve_ctc_teacher_online_device,
     _resolve_max_steps as resolve_deepspeed_max_steps,
@@ -915,6 +916,29 @@ def test_prune_deepspeed_step_checkpoint_artifacts_ignores_missing_paths(tmp_pat
     assert not removed_dir.exists()
     assert kept_file.exists()
     assert kept_dir.exists()
+
+
+def test_prune_periodic_step_checkpoints_keeps_latest_and_ranked(tmp_path: Path) -> None:
+    for step in (2_000, 4_000, 6_000, 8_000, 10_000):
+        (tmp_path / f"step-{step}.pt").write_text(str(step), encoding="utf-8")
+        checkpoint_dir = tmp_path / "ds_checkpoints" / f"step-{step}"
+        checkpoint_dir.mkdir(parents=True)
+        (checkpoint_dir / "meta.txt").write_text(str(step), encoding="utf-8")
+
+    removed = _prune_periodic_step_checkpoint_artifacts(
+        output_dir=tmp_path,
+        current_step=10_000,
+        keep_last=2,
+        protected_records=[{"step": 4_000}],
+    )
+
+    assert removed == [2_000, 6_000]
+    for step in (4_000, 8_000, 10_000):
+        assert (tmp_path / f"step-{step}.pt").is_file()
+        assert (tmp_path / "ds_checkpoints" / f"step-{step}").is_dir()
+    for step in removed:
+        assert not (tmp_path / f"step-{step}.pt").exists()
+        assert not (tmp_path / "ds_checkpoints" / f"step-{step}").exists()
 
 
 def test_step_checkpoint_record_is_retained_matches_by_file_or_dir() -> None:

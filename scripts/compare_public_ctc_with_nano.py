@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 from rwkvasr.eval import (
     compare_prediction_text_sets,
+    compute_text_error_decomposition,
     compute_text_error_stats,
     normalize_asr_text_for_metrics,
 )
@@ -142,6 +144,18 @@ def compare_dataset(
         normalization=normalization,
         metric=metric,
     )
+    nano_decomposition = compute_text_error_decomposition(
+        nano_path,
+        language=language,
+        normalization=normalization,
+        metric=metric,
+    )
+    student_decomposition = compute_text_error_decomposition(
+        student_path,
+        language=language,
+        normalization=normalization,
+        metric=metric,
+    )
     absolute_gate_pass = absolute_gap_points <= max_absolute_gap_points
     relative_gate_pass = relative_ratio <= max_relative_ratio
     return {
@@ -163,6 +177,18 @@ def compare_dataset(
         "absolute_gate_pass": absolute_gate_pass,
         "relative_gate_pass": relative_gate_pass,
         "gate_pass": absolute_gate_pass and relative_gate_pass,
+        "nano_prediction_reference_unit_ratio": float(
+            nano_decomposition["prediction_reference_unit_ratio"]
+        ),
+        "student_prediction_reference_unit_ratio": float(
+            student_decomposition["prediction_reference_unit_ratio"]
+        ),
+        "nano_insertion_rate": float(nano_decomposition["insertion_rate"]),
+        "student_insertion_rate": float(student_decomposition["insertion_rate"]),
+        "nano_deletion_rate": float(nano_decomposition["deletion_rate"]),
+        "student_deletion_rate": float(student_decomposition["deletion_rate"]),
+        "nano_substitution_rate": float(nano_decomposition["substitution_rate"]),
+        "student_substitution_rate": float(student_decomposition["substitution_rate"]),
         "changed_prediction_count": int(comparison["changed_prediction_count"]),
         "student_improved_count": int(comparison["improved_count"]),
         "student_worsened_count": int(comparison["worsened_count"]),
@@ -179,6 +205,7 @@ def build_report(
     normalization: str,
     max_relative_ratio: float,
     max_absolute_gap_points: float,
+    student_checkpoint: Path | None = None,
 ) -> dict[str, Any]:
     missing = sorted(set(DATASETS) - set(nano_predictions))
     extra = sorted(set(nano_predictions) - set(DATASETS))
@@ -207,7 +234,7 @@ def build_report(
                 max_absolute_gap_points=max_absolute_gap_points,
             )
         )
-    return {
+    report = {
         "version": 1,
         "systems": {
             "baseline": "FunASR-Nano-2512 direct CTC",
@@ -223,6 +250,17 @@ def build_report(
         "all_datasets_pass": all(bool(row["gate_pass"]) for row in results),
         "results": results,
     }
+    if student_checkpoint is not None:
+        student_checkpoint = student_checkpoint.resolve()
+        if not student_checkpoint.is_file():
+            raise FileNotFoundError(f"Student checkpoint missing: {student_checkpoint}")
+        digest = hashlib.sha256()
+        with student_checkpoint.open("rb") as source:
+            while chunk := source.read(8 * 1024 * 1024):
+                digest.update(chunk)
+        report["student_checkpoint_path"] = str(student_checkpoint)
+        report["student_checkpoint_sha256"] = digest.hexdigest()
+    return report
 
 
 def _parse_nano_predictions(values: list[str]) -> dict[str, Path]:
@@ -301,6 +339,7 @@ def main() -> None:
     parser.add_argument("--normalization", default="ctc")
     parser.add_argument("--max-relative-ratio", type=float, default=1.20)
     parser.add_argument("--max-absolute-gap-points", type=float, default=3.0)
+    parser.add_argument("--student-checkpoint", type=Path, default=None)
     args = parser.parse_args()
 
     report = build_report(
@@ -309,6 +348,7 @@ def main() -> None:
         normalization=args.normalization,
         max_relative_ratio=args.max_relative_ratio,
         max_absolute_gap_points=args.max_absolute_gap_points,
+        student_checkpoint=args.student_checkpoint,
     )
     output_json = Path(args.output_json)
     output_md = Path(args.output_md)

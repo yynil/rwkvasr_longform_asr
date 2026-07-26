@@ -381,6 +381,7 @@ class DeepSpeedTrainConfig:
     step_eval_at_start: bool = False
     step_eval_cache_batches: bool = False
     top_k_step_checkpoints: int = 3
+    periodic_checkpoint_keep_last: int | None = None
     save_deepspeed_sharded_checkpoints: bool = True
     local_rank: int = -1
     log_every: int = 10
@@ -5789,6 +5790,56 @@ def _prune_deepspeed_step_checkpoint_artifacts(
                 pass
 
 
+def _prune_periodic_step_checkpoint_artifacts(
+    *,
+    output_dir: Path,
+    current_step: int,
+    keep_last: int,
+    protected_records: list[dict[str, Any]],
+) -> list[int]:
+    if keep_last <= 0:
+        raise ValueError("periodic_checkpoint_keep_last must be positive.")
+
+    artifacts: dict[int, dict[str, Path]] = {}
+    for export_path in output_dir.glob("step-*.pt"):
+        raw_step = export_path.stem.removeprefix("step-")
+        if raw_step.isdigit():
+            artifacts.setdefault(int(raw_step), {})["export"] = export_path
+    ds_root = output_dir / "ds_checkpoints"
+    if ds_root.is_dir():
+        for checkpoint_dir in ds_root.glob("step-*"):
+            raw_step = checkpoint_dir.name.removeprefix("step-")
+            if raw_step.isdigit() and checkpoint_dir.is_dir():
+                artifacts.setdefault(int(raw_step), {})["deepspeed"] = checkpoint_dir
+
+    protected_steps = {
+        int(record["step"])
+        for record in protected_records
+        if int(record.get("step", 0)) > 0
+    }
+    protected_steps.add(int(current_step))
+    protected_steps.update(sorted(artifacts, reverse=True)[:keep_last])
+
+    removed_steps: list[int] = []
+    for step, paths in artifacts.items():
+        if step in protected_steps:
+            continue
+        export_path = paths.get("export")
+        if export_path is not None:
+            try:
+                export_path.unlink()
+            except FileNotFoundError:
+                pass
+        checkpoint_dir = paths.get("deepspeed")
+        if checkpoint_dir is not None:
+            try:
+                shutil.rmtree(checkpoint_dir)
+            except FileNotFoundError:
+                pass
+        removed_steps.append(step)
+    return sorted(removed_steps)
+
+
 def _step_checkpoint_record_is_retained(
     *,
     record: dict[str, Any],
@@ -5936,6 +5987,11 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     zero_stage = int(ds_config.get("zero_optimization", {}).get("stage", 0))
     if not bool(config.save_deepspeed_sharded_checkpoints) and zero_stage >= 3:
         raise ValueError("save_deepspeed_sharded_checkpoints=False is only supported for ZeRO stage < 3.")
+    if (
+        config.periodic_checkpoint_keep_last is not None
+        and int(config.periodic_checkpoint_keep_last) <= 0
+    ):
+        raise ValueError("periodic_checkpoint_keep_last must be positive when provided.")
     grad_accum = int(ds_config["gradient_accumulation_steps"])
     local_rank, device = _init_deepspeed_runtime(config)
     _rank_zero_log(
@@ -8317,6 +8373,24 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                 },
                                 step=step,
                             )
+                    _maybe_barrier()
+                    if (
+                        _is_rank_zero()
+                        and config.periodic_checkpoint_keep_last is not None
+                    ):
+                        removed_steps = _prune_periodic_step_checkpoint_artifacts(
+                            output_dir=output_dir,
+                            current_step=step,
+                            keep_last=int(config.periodic_checkpoint_keep_last),
+                            protected_records=best_step_checkpoints,
+                        )
+                        if removed_steps:
+                            _rank_zero_log(
+                                "Pruned rolling periodic checkpoints: "
+                                f"steps={removed_steps} "
+                                f"keep_last={int(config.periodic_checkpoint_keep_last)}"
+                            )
+                    _maybe_barrier()
             if not processed_any_batch and epoch_batch_offset > 0:
                 _all_rank_log(
                     f"No candidate batch available after resuming offset={epoch_batch_offset} for epoch={epoch}; "

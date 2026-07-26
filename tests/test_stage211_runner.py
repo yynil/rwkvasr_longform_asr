@@ -8,10 +8,25 @@ from pathlib import Path
 
 import pytest
 
+from rwkvasr.eval.stage211_gate import (
+    STAGE211_AUDIO_CURRICULUM,
+    STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
+    STAGE211_AUDIO_TOTAL_HOURS,
+    STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
+    STAGE211_AUDIO_TOTAL_ROWS,
+    STAGE211_FULL_DATA_BATCH_SIZE,
+    STAGE211_FULL_DATA_EPOCHS,
+    STAGE211_FULL_DATA_FRAME_BUDGET,
+    STAGE211_FULL_DATA_WORLD_SIZE,
+    STAGE211_PUBLIC_BENCHMARKS,
+    sha256_file,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 stage211 = importlib.import_module("scripts.run_stage211_strict_chained_alignment")
+stage211_phase_gate = importlib.import_module("scripts.create_stage211_phase_gate")
 
 
 def test_stage211_formal_defaults_use_persistent_storage_and_local_teacher() -> None:
@@ -23,6 +38,32 @@ def test_stage211_formal_defaults_use_persistent_storage_and_local_teacher() -> 
     assert output_dir.is_relative_to(Path.home() / "rwkvasr_runs")
     assert stage211.NANO_CHECKPOINT == (REPO_ROOT / "assets" / "fun-asr-nano-2512" / "model.pt")
     assert stage211.NANO_CHECKPOINT.is_file()
+
+
+def test_stage211_phase_gate_normalizes_bound_references(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps({"utt_id": "utt-1", "text": "HELLO, WORLD!"}) + "\n",
+        encoding="utf-8",
+    )
+    prediction = tmp_path / "prediction.jsonl"
+    prediction.write_text(
+        json.dumps({"utt_id": "utt-1", "ref_text": "hello world"}) + "\n",
+        encoding="utf-8",
+    )
+
+    manifest_records = stage211_phase_gate._jsonl_records(
+        manifest,
+        language="en",
+        reference_keys=("text",),
+    )
+    prediction_records = stage211_phase_gate._jsonl_records(
+        prediction,
+        language="en",
+        reference_keys=("ref_text",),
+    )
+
+    assert manifest_records == prediction_records
 
 
 def test_stage211_formal_rejects_volatile_output_but_smoke_allows_it(
@@ -150,6 +191,7 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
     assert config["save_every"] == stage211.FORMAL_RESUME_SAVE_INTERVAL
     assert config["step_eval_every"] == expected_interval
     assert config["top_k_step_checkpoints"] == (7 if phase_name == "sft" else 4)
+    assert config["periodic_checkpoint_keep_last"] == 2
     assert config["weight_decay"] == 0.0
     assert config["freeze_encoder"] is False
     assert config["freeze_encoder_except_time_mixer"] is True
@@ -350,6 +392,109 @@ def test_stage211_mixer_entrypoint_dry_run_is_runnable(tmp_path: Path) -> None:
     assert "target_step=30064" in result.stdout
 
 
+def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "easy-complete.pt"
+    checkpoint.write_bytes(b"easy")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "run_stage211_strict_chained_alignment.py"),
+        "--phase",
+        "mixer",
+        "--difficulty",
+        "medium",
+        "--full-data-profile",
+        "--dry-run",
+        "--skip-nano-weight-audit",
+        "--init-checkpoint",
+        str(checkpoint),
+        "--bucket-manifest",
+        str(manifest),
+        "--output-dir",
+        str(tmp_path / "run"),
+        "--config-dir",
+        str(tmp_path / "config"),
+    ]
+    missing = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert missing.returncode != 0
+    assert "preceding curriculum coverage receipt" in missing.stderr
+
+    receipt = tmp_path / "easy-coverage.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "curriculum_coverage",
+                "phase": "mixer",
+                "difficulty": "easy",
+                "complete": True,
+                "full_data_profile": True,
+                "completion_checkpoint_path": str(checkpoint.resolve()),
+                "completion_checkpoint_sha256": sha256_file(checkpoint),
+            }
+        ),
+        encoding="utf-8",
+    )
+    admitted = subprocess.run(
+        [*command, "--curriculum-receipt", str(receipt)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert admitted.returncode == 0, admitted.stderr
+    assert "difficulty=medium" in admitted.stdout
+    assert "full_data_profile=true" in admitted.stdout
+    assert "target_step=1003659" in admitted.stdout
+
+
+def test_stage211_medium_config_uses_fixed_eval_split(tmp_path: Path) -> None:
+    phase = stage211.PHASES["mixer"]
+    segment = stage211._segments(
+        phase=phase,
+        smoke=False,
+        difficulty="medium",
+        full_data_profile=True,
+    )[0]
+    checkpoint = tmp_path / "selected.pt"
+    checkpoint.touch()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+
+    config = stage211._config(
+        phase=phase,
+        segment=segment,
+        output_dir=tmp_path / "run",
+        init_checkpoint=checkpoint,
+        bucket_manifest=manifest,
+        resume=False,
+        smoke=False,
+        full_data_profile=True,
+    )
+
+    assert config["max_steps"] == 1_003_659
+    assert config["batch_size"] == 36
+    assert config["batch_token_budget"] == 24_000
+    assert config["length_bucket_frame_budget"] == 24_000
+    assert config["deepspeed"]["train_micro_batch_size_per_gpu"] == 36
+    assert config["deepspeed"]["train_batch_size"] == 144
+    assert config["step_eval_split"] == "eval"
+    assert config["top_k_step_checkpoints"] == 8
+    assert config["periodic_checkpoint_keep_last"] == 2
+
+
 def _write_minimal_labeled_data(tmp_path: Path) -> tuple[Path, Path, Path]:
     webdataset_root = tmp_path / "webdataset"
     webdataset_root.mkdir()
@@ -418,13 +563,137 @@ def test_stage211_sft_labeled_data_audit_and_epoch_estimate(tmp_path: Path) -> N
     assert audit["estimated_train_steps"] == 1
 
 
+def _write_valid_phase_gate(
+    tmp_path: Path,
+    *,
+    phase: str,
+    checkpoint: Path,
+) -> Path:
+    segments = []
+    previous_checkpoint = tmp_path / "phase-init.pt"
+    previous_checkpoint.write_bytes(b"phase-init")
+    for index, (difficulty, expected) in enumerate(STAGE211_AUDIO_CURRICULUM.items()):
+        manifest = tmp_path / f"{difficulty}-manifest.json"
+        manifest.write_text("{}\n", encoding="utf-8")
+        provenance = tmp_path / f"{difficulty}-provenance.json"
+        provenance.write_text("{}\n", encoding="utf-8")
+        completion = checkpoint if difficulty == "long" else tmp_path / f"{difficulty}.pt"
+        if completion != checkpoint:
+            completion.write_bytes(f"checkpoint-{index}".encode())
+        segment = {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "curriculum_coverage",
+            "phase": phase,
+            "difficulty": difficulty,
+            "complete": True,
+            "full_data_profile": True,
+            "epochs": STAGE211_FULL_DATA_EPOCHS,
+            "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+            "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+            "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "rows": expected["rows"],
+            "row_exposures": expected["rows"] * STAGE211_FULL_DATA_EPOCHS,
+            "hours": expected["hours"],
+            "hour_exposures": expected["hours"] * STAGE211_FULL_DATA_EPOCHS,
+            "steps_per_epoch": expected["steps_per_epoch"],
+            "steps": expected["steps"],
+            "provenance_path": str(provenance.resolve()),
+            "provenance_sha256": sha256_file(provenance),
+            "bucket_manifest_path": str(manifest.resolve()),
+            "bucket_manifest_sha256": sha256_file(manifest),
+            "init_checkpoint_path": str(previous_checkpoint.resolve()),
+            "init_checkpoint_sha256": sha256_file(previous_checkpoint),
+            "completion_checkpoint_path": str(completion.resolve()),
+            "completion_checkpoint_sha256": sha256_file(completion),
+        }
+        receipt = tmp_path / f"{difficulty}-receipt.json"
+        receipt.write_text(json.dumps(segment) + "\n", encoding="utf-8")
+        segment["receipt_path"] = str(receipt.resolve())
+        segment["receipt_sha256"] = sha256_file(receipt)
+        segments.append(segment)
+        previous_checkpoint = completion
+
+    public_results = []
+    for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
+        manifest = tmp_path / f"{dataset}.jsonl"
+        nano = tmp_path / f"{dataset}.nano.jsonl"
+        student = tmp_path / f"{dataset}.student.jsonl"
+        for path in (manifest, nano, student):
+            path.write_text("{}\n", encoding="utf-8")
+        public_results.append(
+            {
+                "dataset": dataset,
+                "language": expected["language"],
+                "metric": expected["metric"],
+                "sample_count": expected["samples"],
+                "identical_utt_coverage": True,
+                "normalized_reference_mismatch_count": 0,
+                "nano_error_rate": 0.1,
+                "student_error_rate": 0.11,
+                "absolute_gap_points": 1.0,
+                "relative_ratio": 1.1,
+                "nano_prediction_reference_unit_ratio": 1.0,
+                "student_prediction_reference_unit_ratio": 0.99,
+                "nano_deletion_rate": 0.01,
+                "student_deletion_rate": 0.02,
+                "manifest_path": str(manifest.resolve()),
+                "manifest_sha256": sha256_file(manifest),
+                "nano_prediction_path": str(nano.resolve()),
+                "nano_prediction_sha256": sha256_file(nano),
+                "student_prediction_path": str(student.resolve()),
+                "student_prediction_sha256": sha256_file(student),
+            }
+        )
+
+    gate_report = tmp_path / "mixer_gate.json"
+    gate_report.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "phase_gate",
+                "phase": phase,
+                "checkpoint_path": str(checkpoint.resolve()),
+                "checkpoint_sha256": sha256_file(checkpoint),
+                "gate_passed": True,
+                "alignment_gate_passed": True,
+                "full_data_coverage": {
+                    "phase": phase,
+                    "complete": True,
+                    "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
+                    "total_hours": STAGE211_AUDIO_TOTAL_HOURS,
+                    "total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
+                    "total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
+                    "segments": segments,
+                    "final_checkpoint_path": str(checkpoint.resolve()),
+                    "final_checkpoint_sha256": sha256_file(checkpoint),
+                },
+                "public_benchmark": {
+                    "decode": "greedy_ctc",
+                    "normalization": "ctc",
+                    "all_datasets_complete": True,
+                    "all_datasets_pass": True,
+                    "results": public_results,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return gate_report
+
+
 def test_stage211_promotion_receipt_binds_checkpoint_and_gate_hashes(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "step-30064.pt"
     checkpoint.write_bytes(b"checkpoint")
-    gate_report = tmp_path / "mixer_gate.json"
-    gate_report.write_text('{"passed": true}\n', encoding="utf-8")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
     receipt_path = tmp_path / "mixer_to_block.json"
     receipt = stage211._build_promotion_receipt(
         source_phase="mixer",
@@ -446,5 +715,42 @@ def test_stage211_promotion_receipt_binds_checkpoint_and_gate_hashes(
         stage211._validate_promotion_receipt(
             receipt_path=receipt_path,
             target_phase="block",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_promotion_rejects_unverified_gate_file(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "step-30064.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = tmp_path / "mixer_gate.json"
+    gate_report.write_text('{"passed": true}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema_version mismatch"):
+        stage211._build_promotion_receipt(
+            source_phase="mixer",
+            checkpoint_path=checkpoint,
+            gate_report_path=gate_report,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_coverage_receipt(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    (tmp_path / "easy-receipt.json").write_text(
+        '{"mutated": true}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="coverage receipt SHA-256 mismatch"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
             checkpoint_path=checkpoint,
         )
