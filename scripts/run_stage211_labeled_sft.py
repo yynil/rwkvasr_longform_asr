@@ -17,6 +17,10 @@ from rwkvasr.eval.stage211_gate import (
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
     validate_stage211_phase_train_config,
+    validate_stage211_runtime_epoch_coverage,
+)
+from rwkvasr.eval.stage211_runtime import (
+    audit_stage211_runtime_epoch_coverage,
 )
 
 try:
@@ -344,6 +348,12 @@ def _validate_completion(
                 raise ValueError(f"Stage211D completion {key} mismatch.")
         elif actual != value:
             raise ValueError(f"Stage211D completion {key} mismatch.")
+    validate_stage211_runtime_epoch_coverage(
+        completion.get("runtime_epoch_coverage"),
+        epochs=1,
+        steps_per_epoch=int(LABELED_EXPECTED["estimated_train_steps"]),
+        label="sft",
+    )
     for path_key, sha_key in (
         ("bucket_manifest_path", "bucket_manifest_sha256"),
         ("length_index_path", "length_index_sha256"),
@@ -529,6 +539,11 @@ def run_sft(args: argparse.Namespace) -> Path | None:
     nano_teacher_checkpoint_path = resolve_stage211_nano_teacher_checkpoint(
         train_config
     )
+    runtime_epoch_coverage = audit_stage211_runtime_epoch_coverage(
+        run_dir=output_dir,
+        epochs=1,
+        steps_per_epoch=completion_step,
+    )
     completion_path = output_dir / "sft_complete.json"
     _write_immutable_json(
         completion_path,
@@ -567,6 +582,7 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             "completion_checkpoint_sha256": sha256_file(completion_checkpoint),
             "training_log_path": str(training_log),
             "training_log_sha256": sha256_file(training_log),
+            "runtime_epoch_coverage": runtime_epoch_coverage,
         },
     )
     _validate_completion(completion_path, checkpoint_path=completion_checkpoint)

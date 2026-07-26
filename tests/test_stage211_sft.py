@@ -138,6 +138,21 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         {"step": LABELED_EXPECTED["estimated_train_steps"]},
         artifacts["completion_checkpoint"],
     )
+    epoch_checkpoint = tmp_path / "epoch-1.pt"
+    torch.save(
+        {
+            "model": {},
+            "step": LABELED_EXPECTED["estimated_train_steps"],
+            "extra": {
+                "epoch": 1,
+                "epoch_batch_offset": 0,
+                "completed_epoch_batch_count": LABELED_EXPECTED[
+                    "estimated_train_steps"
+                ],
+            },
+        },
+        epoch_checkpoint,
+    )
     completion = {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -153,6 +168,27 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         "webdataset_skip_decode_errors": False,
         **LABELED_EXPECTED,
         "labeled_webdataset_root": str(root),
+        "runtime_epoch_coverage": {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "runtime_epoch_coverage",
+            "complete": True,
+            "epochs": 1,
+            "steps_per_epoch": LABELED_EXPECTED["estimated_train_steps"],
+            "total_steps": LABELED_EXPECTED["estimated_train_steps"],
+            "records": [
+                {
+                    "epoch": 1,
+                    "step": LABELED_EXPECTED["estimated_train_steps"],
+                    "epoch_batch_offset": 0,
+                    "completed_epoch_batch_count": LABELED_EXPECTED[
+                        "estimated_train_steps"
+                    ],
+                    "checkpoint_path": str(epoch_checkpoint),
+                    "checkpoint_sha256": sha256_file(epoch_checkpoint),
+                }
+            ],
+        },
     }
     for name, path in artifacts.items():
         completion[f"{name}_path"] = str(path)
@@ -167,6 +203,23 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
 
     assert loaded == completion
     assert checkpoint == artifacts["completion_checkpoint"].resolve()
+
+    completion["runtime_epoch_coverage"]["records"][0][
+        "completed_epoch_batch_count"
+    ] -= 1
+    completion_path.write_text(
+        json.dumps(completion, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="runtime epoch 1 completion mismatch"):
+        sft_runner._validate_completion(completion_path)
+    completion["runtime_epoch_coverage"]["records"][0][
+        "completed_epoch_batch_count"
+    ] += 1
+    completion_path.write_text(
+        json.dumps(completion, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
     artifacts["nano_teacher_checkpoint"].write_bytes(b"changed")
     with pytest.raises(ValueError, match="artifact is unavailable or changed"):

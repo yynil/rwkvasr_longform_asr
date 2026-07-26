@@ -25,6 +25,9 @@ from rwkvasr.eval.stage211_gate import (
     sha256_file,
     validate_stage211_phase_train_config,
 )
+from rwkvasr.eval.stage211_runtime import (
+    audit_stage211_runtime_epoch_coverage,
+)
 
 
 def _checkpoint_step(path: Path) -> int:
@@ -228,6 +231,11 @@ def build_receipt(
         init_checkpoint_path=init_checkpoint_path,
         completion_checkpoint_path=completion_checkpoint_path,
     )
+    runtime_epoch_coverage = audit_stage211_runtime_epoch_coverage(
+        run_dir=run_dir,
+        epochs=STAGE211_FULL_DATA_EPOCHS,
+        steps_per_epoch=steps_per_epoch,
+    )
     return {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -270,6 +278,7 @@ def build_receipt(
         "completion_checkpoint_path": str(completion_checkpoint_path),
         "completion_checkpoint_sha256": sha256_file(completion_checkpoint_path),
         "parameter_delta_audit": parameter_delta_audit,
+        "runtime_epoch_coverage": runtime_epoch_coverage,
     }
 
 

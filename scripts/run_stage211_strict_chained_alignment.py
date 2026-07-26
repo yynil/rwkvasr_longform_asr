@@ -20,9 +20,11 @@ from rwkvasr.data import (
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_FULL_DATA_BATCH_SIZE,
+    STAGE211_FULL_DATA_EPOCHS,
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
     validate_stage211_phase_gate_report,
+    validate_stage211_runtime_epoch_coverage,
 )
 
 try:
@@ -479,6 +481,14 @@ def _validate_curriculum_receipt(
         )
     if receipt.get("completion_checkpoint_sha256") != _sha256_file(checkpoint_path):
         raise ValueError("Stage211 curriculum receipt checkpoint SHA-256 mismatch.")
+    validate_stage211_runtime_epoch_coverage(
+        receipt.get("runtime_epoch_coverage"),
+        epochs=STAGE211_FULL_DATA_EPOCHS,
+        steps_per_epoch=int(
+            STAGE211_AUDIO_CURRICULUM[expected_difficulty]["steps_per_epoch"]
+        ),
+        label=f"{phase}/{expected_difficulty}",
+    )
     recorded_teacher_sha256 = str(
         receipt.get("nano_teacher_checkpoint_sha256") or ""
     )

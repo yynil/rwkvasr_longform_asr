@@ -10,6 +10,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 stage211_receipt = importlib.import_module("scripts.create_stage211_curriculum_receipt")
 audit_stage211_checkpoint_delta = stage211_receipt.audit_stage211_checkpoint_delta
+audit_stage211_runtime_epoch_coverage = (
+    stage211_receipt.audit_stage211_runtime_epoch_coverage
+)
 resolve_stage211_nano_teacher_checkpoint = stage211_receipt.resolve_stage211_nano_teacher_checkpoint
 
 
@@ -49,6 +52,63 @@ def test_resolve_stage211_nano_teacher_checkpoint_rejects_missing_path(
     with pytest.raises(ValueError, match="missing or empty"):
         resolve_stage211_nano_teacher_checkpoint(
             {"ctc_teacher_online_model_path": str(tmp_path / "missing")}
+        )
+
+
+def _write_epoch_checkpoint(
+    path: Path,
+    *,
+    epoch: int,
+    step: int,
+    completed_epoch_batch_count: int,
+) -> None:
+    torch.save(
+        {
+            "model": {},
+            "step": step,
+            "extra": {
+                "epoch": epoch,
+                "epoch_batch_offset": 0,
+                "completed_epoch_batch_count": completed_epoch_batch_count,
+            },
+        },
+        path,
+    )
+
+
+def test_runtime_epoch_coverage_binds_each_natural_epoch(tmp_path: Path) -> None:
+    for epoch in range(1, 4):
+        _write_epoch_checkpoint(
+            tmp_path / f"epoch-{epoch}.pt",
+            epoch=epoch,
+            step=epoch * 4,
+            completed_epoch_batch_count=4,
+        )
+
+    coverage = audit_stage211_runtime_epoch_coverage(
+        run_dir=tmp_path,
+        epochs=3,
+        steps_per_epoch=4,
+    )
+
+    assert coverage["complete"] is True
+    assert coverage["total_steps"] == 12
+    assert [record["step"] for record in coverage["records"]] == [4, 8, 12]
+
+
+def test_runtime_epoch_coverage_rejects_partial_epoch(tmp_path: Path) -> None:
+    _write_epoch_checkpoint(
+        tmp_path / "epoch-1.pt",
+        epoch=1,
+        step=4,
+        completed_epoch_batch_count=3,
+    )
+
+    with pytest.raises(ValueError, match="runtime epoch 1 completion mismatch"):
+        audit_stage211_runtime_epoch_coverage(
+            run_dir=tmp_path,
+            epochs=1,
+            steps_per_epoch=4,
         )
 
 

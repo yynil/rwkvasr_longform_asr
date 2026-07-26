@@ -278,6 +278,60 @@ def _validate_bound_file(
     return path
 
 
+def validate_stage211_runtime_epoch_coverage(
+    coverage: Any,
+    *,
+    epochs: int,
+    steps_per_epoch: int,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(coverage, dict):
+        raise ValueError(f"Stage211 {label} lacks runtime epoch coverage.")
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "runtime_epoch_coverage",
+        "complete": True,
+        "epochs": int(epochs),
+        "steps_per_epoch": int(steps_per_epoch),
+        "total_steps": int(epochs) * int(steps_per_epoch),
+    }
+    if any(coverage.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"Stage211 {label} runtime epoch coverage is incomplete.")
+    records = coverage.get("records")
+    if not isinstance(records, list) or len(records) != int(epochs):
+        raise ValueError(
+            f"Stage211 {label} runtime epoch coverage record count mismatch."
+        )
+    by_epoch = {
+        int(record.get("epoch", -1)): record
+        for record in records
+        if isinstance(record, dict)
+    }
+    if set(by_epoch) != set(range(1, int(epochs) + 1)):
+        raise ValueError(
+            f"Stage211 {label} runtime epoch coverage epoch set mismatch."
+        )
+    for epoch in range(1, int(epochs) + 1):
+        record = by_epoch[epoch]
+        if (
+            int(record.get("step", -1)) != epoch * int(steps_per_epoch)
+            or int(record.get("epoch_batch_offset", -1)) != 0
+            or int(record.get("completed_epoch_batch_count", -1))
+            != int(steps_per_epoch)
+        ):
+            raise ValueError(
+                f"Stage211 {label} runtime epoch {epoch} completion mismatch."
+            )
+        _validate_bound_file(
+            record,
+            path_key="checkpoint_path",
+            sha256_key="checkpoint_sha256",
+            label=f"Stage211 {label} epoch {epoch} checkpoint",
+        )
+    return dict(coverage)
+
+
 def _validate_parameter_delta_audit(
     segment: dict[str, Any],
     *,
@@ -409,6 +463,12 @@ def validate_stage211_full_data_coverage(
             phase=phase,
             difficulty=difficulty,
         )
+        validate_stage211_runtime_epoch_coverage(
+            segment.get("runtime_epoch_coverage"),
+            epochs=STAGE211_FULL_DATA_EPOCHS,
+            steps_per_epoch=int(expected["steps_per_epoch"]),
+            label=f"{phase}/{difficulty}",
+        )
         if int(segment.get("rows", -1)) != int(expected["rows"]):
             raise ValueError(f"Stage211 {phase}/{difficulty} row count mismatch.")
         if int(segment.get("row_exposures", -1)) != (
@@ -464,6 +524,13 @@ def validate_stage211_full_data_coverage(
             receipt_path,
             label=f"Stage211 {phase}/{difficulty} coverage receipt",
         )
+        if segment.get("runtime_epoch_coverage") != receipt.get(
+            "runtime_epoch_coverage"
+        ):
+            raise ValueError(
+                f"Stage211 {phase}/{difficulty} runtime epoch coverage differs "
+                "from its coverage receipt."
+            )
         _validate_bound_file(
             segment,
             path_key="provenance_path",

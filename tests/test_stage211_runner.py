@@ -779,6 +779,39 @@ def test_stage211_mixer_entrypoint_dry_run_is_runnable(tmp_path: Path) -> None:
     assert "target_step=30064" in result.stdout
 
 
+def _write_runtime_epoch_coverage(
+    tmp_path: Path,
+    *,
+    prefix: str,
+    epochs: int,
+    steps_per_epoch: int,
+) -> dict[str, object]:
+    records = []
+    for epoch in range(1, epochs + 1):
+        checkpoint = tmp_path / f"{prefix}-epoch-{epoch}.pt"
+        checkpoint.write_bytes(f"{prefix}-{epoch}".encode())
+        records.append(
+            {
+                "epoch": epoch,
+                "step": epoch * steps_per_epoch,
+                "epoch_batch_offset": 0,
+                "completed_epoch_batch_count": steps_per_epoch,
+                "checkpoint_path": str(checkpoint.resolve()),
+                "checkpoint_sha256": sha256_file(checkpoint),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "runtime_epoch_coverage",
+        "complete": True,
+        "epochs": epochs,
+        "steps_per_epoch": steps_per_epoch,
+        "total_steps": epochs * steps_per_epoch,
+        "records": records,
+    }
+
+
 def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
     tmp_path: Path,
 ) -> None:
@@ -833,15 +866,25 @@ def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
                 "difficulty": "easy",
                 "complete": True,
                 "full_data_profile": True,
-                    "completion_checkpoint_path": str(checkpoint.resolve()),
-                    "completion_checkpoint_sha256": sha256_file(checkpoint),
-                    "nano_teacher_checkpoint_path": str(
-                        nano_checkpoint.resolve()
+                "completion_checkpoint_path": str(checkpoint.resolve()),
+                "completion_checkpoint_sha256": sha256_file(checkpoint),
+                "nano_teacher_checkpoint_path": str(
+                    nano_checkpoint.resolve()
+                ),
+                "nano_teacher_checkpoint_sha256": sha256_file(
+                    nano_checkpoint
+                ),
+                "runtime_epoch_coverage": _write_runtime_epoch_coverage(
+                    tmp_path,
+                    prefix="medium-admission-easy",
+                    epochs=STAGE211_FULL_DATA_EPOCHS,
+                    steps_per_epoch=int(
+                        STAGE211_AUDIO_CURRICULUM["easy"][
+                            "steps_per_epoch"
+                        ]
                     ),
-                    "nano_teacher_checkpoint_sha256": sha256_file(
-                        nano_checkpoint
-                    ),
-                }
+                ),
+            }
         ),
         encoding="utf-8",
     )
@@ -994,6 +1037,12 @@ def _write_valid_phase_gate(
         completion = checkpoint if difficulty == "long" else tmp_path / f"{difficulty}.pt"
         if completion != checkpoint:
             completion.write_bytes(f"checkpoint-{index}".encode())
+        runtime_epoch_coverage = _write_runtime_epoch_coverage(
+            tmp_path,
+            prefix=f"{phase}-{difficulty}",
+            epochs=STAGE211_FULL_DATA_EPOCHS,
+            steps_per_epoch=int(expected["steps_per_epoch"]),
+        )
         segment = {
             "schema_version": 1,
             "pipeline": "stage211",
@@ -1035,6 +1084,7 @@ def _write_valid_phase_gate(
             "init_checkpoint_sha256": sha256_file(previous_checkpoint),
             "completion_checkpoint_path": str(completion.resolve()),
             "completion_checkpoint_sha256": sha256_file(completion),
+            "runtime_epoch_coverage": runtime_epoch_coverage,
             "parameter_delta_audit": {
                 "schema_version": 1,
                 "policy": "stage211_timemixer_and_input_projection_only",
@@ -1345,6 +1395,30 @@ def test_stage211_phase_gate_rejects_decode_skipping_coverage(
     gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="coverage is incomplete"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_partial_runtime_epoch(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    report["full_data_coverage"]["segments"][0]["runtime_epoch_coverage"][
+        "records"
+    ][0]["completed_epoch_batch_count"] -= 1
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime epoch 1 completion mismatch"):
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",
