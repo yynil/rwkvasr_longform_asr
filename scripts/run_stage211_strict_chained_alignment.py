@@ -273,6 +273,48 @@ def _preceding_phase(phase_name: str) -> str | None:
     return None if index == 0 else PHASE_SEQUENCE[index - 1]
 
 
+def _phase_gate_nano_teacher_sha256(gate_report: dict[str, Any]) -> str:
+    coverage = gate_report.get("full_data_coverage")
+    if not isinstance(coverage, dict):
+        raise ValueError("Stage211 phase gate lacks full-data teacher coverage.")
+    segments = coverage.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError("Stage211 phase gate lacks curriculum teacher records.")
+    teacher_sha256_values = {
+        str(segment.get("nano_teacher_checkpoint_sha256") or "")
+        for segment in segments
+        if isinstance(segment, dict)
+    }
+    if (
+        len(teacher_sha256_values) != 1
+        or len(next(iter(teacher_sha256_values), "")) != 64
+    ):
+        raise ValueError(
+            "Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256."
+        )
+    return next(iter(teacher_sha256_values))
+
+
+def _validate_target_nano_teacher_checkpoint(
+    *,
+    recorded_sha256: str,
+    nano_checkpoint_path: Path,
+    label: str,
+) -> Path:
+    nano_checkpoint_path = nano_checkpoint_path.expanduser().resolve()
+    if not nano_checkpoint_path.is_file() or nano_checkpoint_path.stat().st_size <= 0:
+        raise ValueError(
+            f"Stage211 {label} Nano teacher checkpoint is missing or empty: "
+            f"{nano_checkpoint_path}"
+        )
+    if _sha256_file(nano_checkpoint_path) != recorded_sha256:
+        raise ValueError(
+            f"Stage211 {label} Nano teacher checkpoint SHA-256 differs from "
+            "the preceding stage."
+        )
+    return nano_checkpoint_path
+
+
 def _build_promotion_receipt(
     *,
     source_phase: str,
@@ -289,10 +331,13 @@ def _build_promotion_receipt(
         raise FileNotFoundError(str(checkpoint_path))
     if not gate_report_path.is_file() or gate_report_path.stat().st_size <= 0:
         raise ValueError(f"Stage211 promotion gate report is missing or empty: {gate_report_path}")
-    validate_stage211_phase_gate_report(
+    gate_report = validate_stage211_phase_gate_report(
         gate_report_path,
         expected_phase=source_phase,
         checkpoint_path=checkpoint_path,
+    )
+    nano_teacher_checkpoint_sha256 = _phase_gate_nano_teacher_sha256(
+        gate_report
     )
     return {
         "schema_version": PROMOTION_RECEIPT_SCHEMA_VERSION,
@@ -303,6 +348,7 @@ def _build_promotion_receipt(
         "checkpoint_sha256": _sha256_file(checkpoint_path),
         "gate_report_path": str(gate_report_path),
         "gate_report_sha256": _sha256_file(gate_report_path),
+        "nano_teacher_checkpoint_sha256": nano_teacher_checkpoint_sha256,
         "gate_passed": True,
         "created_at_utc": datetime.now(UTC).isoformat(),
     }
@@ -313,6 +359,7 @@ def _validate_promotion_receipt(
     receipt_path: Path,
     target_phase: str,
     checkpoint_path: Path,
+    nano_checkpoint_path: Path | None = None,
 ) -> dict[str, Any]:
     receipt_path = receipt_path.resolve()
     if not receipt_path.is_file():
@@ -358,11 +405,27 @@ def _validate_promotion_receipt(
         )
     if receipt.get("gate_report_sha256") != _sha256_file(gate_report_path):
         raise ValueError("Stage211 promotion receipt gate-report SHA-256 mismatch.")
-    validate_stage211_phase_gate_report(
+    gate_report = validate_stage211_phase_gate_report(
         gate_report_path,
         expected_phase=str(expected_source),
         checkpoint_path=checkpoint_path,
     )
+    nano_teacher_checkpoint_sha256 = _phase_gate_nano_teacher_sha256(
+        gate_report
+    )
+    if (
+        receipt.get("nano_teacher_checkpoint_sha256")
+        != nano_teacher_checkpoint_sha256
+    ):
+        raise ValueError(
+            "Stage211 promotion receipt Nano teacher checkpoint SHA-256 mismatch."
+        )
+    if nano_checkpoint_path is not None:
+        _validate_target_nano_teacher_checkpoint(
+            recorded_sha256=nano_teacher_checkpoint_sha256,
+            nano_checkpoint_path=nano_checkpoint_path,
+            label=f"{expected_source}->{target_phase}",
+        )
     return {
         **receipt,
         "receipt_path": str(receipt_path),
@@ -376,6 +439,7 @@ def _validate_curriculum_receipt(
     phase: str,
     target_difficulty: str,
     checkpoint_path: Path,
+    nano_checkpoint_path: Path | None = None,
 ) -> dict[str, Any]:
     receipt_path = receipt_path.resolve()
     if not receipt_path.is_file():
@@ -415,6 +479,28 @@ def _validate_curriculum_receipt(
         )
     if receipt.get("completion_checkpoint_sha256") != _sha256_file(checkpoint_path):
         raise ValueError("Stage211 curriculum receipt checkpoint SHA-256 mismatch.")
+    recorded_teacher_sha256 = str(
+        receipt.get("nano_teacher_checkpoint_sha256") or ""
+    )
+    recorded_teacher_path = Path(
+        str(receipt.get("nano_teacher_checkpoint_path") or "")
+    ).resolve()
+    if (
+        len(recorded_teacher_sha256) != 64
+        or not recorded_teacher_path.is_file()
+        or recorded_teacher_path.stat().st_size <= 0
+        or _sha256_file(recorded_teacher_path) != recorded_teacher_sha256
+    ):
+        raise ValueError(
+            "Stage211 curriculum receipt Nano teacher checkpoint is unavailable "
+            "or changed."
+        )
+    if nano_checkpoint_path is not None:
+        _validate_target_nano_teacher_checkpoint(
+            recorded_sha256=recorded_teacher_sha256,
+            nano_checkpoint_path=nano_checkpoint_path,
+            label=f"{phase}/{expected_difficulty}->{target_difficulty}",
+        )
     return {
         **receipt,
         "receipt_path": str(receipt_path),
@@ -1185,6 +1271,7 @@ def main() -> int:
                 phase=phase.name,
                 target_difficulty=difficulty,
                 checkpoint_path=init_checkpoint,
+                nano_checkpoint_path=args.nano_checkpoint,
             )
             if args.full_data_profile and curriculum_receipt.get(
                 "full_data_profile"
@@ -1210,6 +1297,7 @@ def main() -> int:
                     receipt_path=args.promotion_receipt,
                     target_phase=phase.name,
                     checkpoint_path=init_checkpoint,
+                    nano_checkpoint_path=args.nano_checkpoint,
                 )
                 print(
                     "promotion_receipt="

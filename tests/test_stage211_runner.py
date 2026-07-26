@@ -784,6 +784,10 @@ def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
 ) -> None:
     checkpoint = tmp_path / "easy-complete.pt"
     checkpoint.write_bytes(b"easy")
+    nano_dir = tmp_path / "nano"
+    nano_dir.mkdir()
+    nano_checkpoint = nano_dir / "model.pt"
+    nano_checkpoint.write_bytes(b"nano")
     manifest = tmp_path / "manifest.json"
     manifest.write_text("{}", encoding="utf-8")
     command = [
@@ -800,6 +804,8 @@ def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
         str(checkpoint),
         "--bucket-manifest",
         str(manifest),
+        "--nano-checkpoint",
+        str(nano_checkpoint),
         "--output-dir",
         str(tmp_path / "run"),
         "--config-dir",
@@ -827,9 +833,15 @@ def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
                 "difficulty": "easy",
                 "complete": True,
                 "full_data_profile": True,
-                "completion_checkpoint_path": str(checkpoint.resolve()),
-                "completion_checkpoint_sha256": sha256_file(checkpoint),
-            }
+                    "completion_checkpoint_path": str(checkpoint.resolve()),
+                    "completion_checkpoint_sha256": sha256_file(checkpoint),
+                    "nano_teacher_checkpoint_path": str(
+                        nano_checkpoint.resolve()
+                    ),
+                    "nano_teacher_checkpoint_sha256": sha256_file(
+                        nano_checkpoint
+                    ),
+                }
         ),
         encoding="utf-8",
     )
@@ -1138,14 +1150,37 @@ def test_stage211_promotion_receipt_binds_checkpoint_and_gate_hashes(
         gate_report_path=gate_report,
     )
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    gate_payload = json.loads(gate_report.read_text(encoding="utf-8"))
+    nano_checkpoint = Path(
+        gate_payload["full_data_coverage"]["segments"][0][
+            "nano_teacher_checkpoint_path"
+        ]
+    )
+    assert receipt["nano_teacher_checkpoint_sha256"] == sha256_file(
+        nano_checkpoint
+    )
 
     validated = stage211._validate_promotion_receipt(
         receipt_path=receipt_path,
         target_phase="block",
         checkpoint_path=checkpoint,
+        nano_checkpoint_path=nano_checkpoint,
     )
     assert validated["source_phase"] == "mixer"
     assert validated["target_phase"] == "block"
+
+    alternate_nano = tmp_path / "alternate-nano.pt"
+    alternate_nano.write_bytes(b"different-nano")
+    with pytest.raises(
+        ValueError,
+        match="Nano teacher checkpoint SHA-256 differs from the preceding stage",
+    ):
+        stage211._validate_promotion_receipt(
+            receipt_path=receipt_path,
+            target_phase="block",
+            checkpoint_path=checkpoint,
+            nano_checkpoint_path=alternate_nano,
+        )
 
     checkpoint.write_bytes(b"changed")
     with pytest.raises(ValueError, match="checkpoint SHA-256 mismatch"):
@@ -1153,6 +1188,46 @@ def test_stage211_promotion_receipt_binds_checkpoint_and_gate_hashes(
             receipt_path=receipt_path,
             target_phase="block",
             checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_curriculum_receipt_requires_teacher_continuity(
+    tmp_path: Path,
+) -> None:
+    final_checkpoint = tmp_path / "step-final.pt"
+    final_checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=final_checkpoint,
+    )
+    gate_payload = json.loads(gate_report.read_text(encoding="utf-8"))
+    easy = gate_payload["full_data_coverage"]["segments"][0]
+    receipt_path = Path(easy["receipt_path"])
+    checkpoint = Path(easy["completion_checkpoint_path"])
+    nano_checkpoint = Path(easy["nano_teacher_checkpoint_path"])
+
+    receipt = stage211._validate_curriculum_receipt(
+        receipt_path=receipt_path,
+        phase="mixer",
+        target_difficulty="medium",
+        checkpoint_path=checkpoint,
+        nano_checkpoint_path=nano_checkpoint,
+    )
+
+    assert receipt["difficulty"] == "easy"
+    alternate_nano = tmp_path / "alternate-curriculum-nano.pt"
+    alternate_nano.write_bytes(b"different-nano")
+    with pytest.raises(
+        ValueError,
+        match="Nano teacher checkpoint SHA-256 differs from the preceding stage",
+    ):
+        stage211._validate_curriculum_receipt(
+            receipt_path=receipt_path,
+            phase="mixer",
+            target_difficulty="medium",
+            checkpoint_path=checkpoint,
+            nano_checkpoint_path=alternate_nano,
         )
 
 
