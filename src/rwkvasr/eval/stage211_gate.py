@@ -69,6 +69,12 @@ STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES = (
     + STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
 )
 _STAGE211_COMMON_PHASE_TRAIN_CONFIG: dict[str, Any] = {
+    "vocab_size": 60_515,
+    "blank_id": 60_515,
+    "tokenizer_type": "sensevoice_tiktoken",
+    "tokenizer_model_path": "assets/fun-asr-nano-2512/multilingual.tiktoken",
+    "tokenizer_append_eos": False,
+    "text_normalization": "ctc",
     "weight_decay": 0.0,
     "freeze_encoder": False,
     "freeze_encoder_except_time_mixer": True,
@@ -107,6 +113,7 @@ _STAGE211_COMMON_PHASE_TRAIN_CONFIG: dict[str, Any] = {
     "ctc_teacher_online_nonblank_window_temperature": 0.2,
     "ctc_teacher_online_project_ignored_token_ids": [60_514],
     "ctc_teacher_online_top_k": 32,
+    "funasr_nano_ctc_teacher_blank_id": 60_514,
 }
 _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
     "mixer": {
