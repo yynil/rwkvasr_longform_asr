@@ -18,6 +18,10 @@ sft_finalizer = importlib.import_module("scripts.finalize_stage211_labeled_sft")
 LABELED_EXPECTED = sft_runner.LABELED_EXPECTED
 
 
+def test_stage211_sft_controller_preserves_virtualenv_python() -> None:
+    assert sft_runner.PYTHON == Path(sys.executable)
+
+
 def _labeled_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     root = tmp_path / "labeled"
     root.mkdir()

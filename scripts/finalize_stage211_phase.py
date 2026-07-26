@@ -17,7 +17,7 @@ from rwkvasr.eval.stage211_gate import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path(sys.executable).resolve()
+PYTHON = Path(sys.executable)
 PUBLIC_EVAL_SCRIPT = REPO_ROOT / "scripts" / "run_public_eval_benchmarks.sh"
 COMPARE_SCRIPT = REPO_ROOT / "scripts" / "compare_public_ctc_with_nano.py"
 HIDDEN_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_hidden_alignment_gate.py"

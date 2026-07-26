@@ -23,7 +23,7 @@ except ModuleNotFoundError as error:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path(sys.executable).resolve()
+PYTHON = Path(sys.executable)
 RUNNER = REPO_ROOT / "scripts" / "run_stage211_strict_chained_alignment.py"
 DEFAULT_LABELED_ROOT = Path(
     "/media/usbhd/training_data/asr/curriculum/clean_ctc_voxbox_webdataset/"

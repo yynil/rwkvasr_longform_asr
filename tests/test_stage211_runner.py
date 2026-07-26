@@ -29,6 +29,14 @@ sys.path.insert(0, str(REPO_ROOT))
 stage211 = importlib.import_module("scripts.run_stage211_strict_chained_alignment")
 stage211_phase_gate = importlib.import_module("scripts.create_stage211_phase_gate")
 stage211_full_phase = importlib.import_module("scripts.run_stage211_full_phase_curriculum")
+stage211_phase_finalizer = importlib.import_module("scripts.finalize_stage211_phase")
+
+
+def test_stage211_controllers_preserve_virtualenv_python() -> None:
+    expected = Path(sys.executable)
+
+    assert stage211_full_phase.PYTHON == expected
+    assert stage211_phase_finalizer.PYTHON == expected
 
 
 def test_stage211_formal_defaults_use_persistent_storage_and_local_teacher() -> None:
