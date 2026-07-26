@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="${STAGE211_REPO_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 
 CALIBRATION_SESSION="${CALIBRATION_SESSION:-rwkvasr_stage211a_recovery_formal}"
 METADATA_SESSION="${METADATA_SESSION:-rwkvasr_stage211_metadata_copy}"
@@ -24,9 +24,18 @@ MASTER_PORT="${MASTER_PORT:-29631}"
 PHASE_GATE_ROOT="${PHASE_GATE_ROOT:-${HOME}/rwkvasr_eval/stage211_phase_gates}"
 LABELED_ROOT="${LABELED_ROOT:-/media/usbhd/training_data/asr/curriculum/clean_ctc_voxbox_webdataset/stages/easy_clean_librispeech_aishell3_ctc_norm_aligned_sensevoice_lfr6_svtok}"
 SFT_OUTPUT_DIR="${SFT_OUTPUT_DIR:-${FULL_OUTPUT_ROOT}/stage211d_labeled_ctc_sft_1ep}"
+REUSE_COMPLETED_CALIBRATION_EVAL="${REUSE_COMPLETED_CALIBRATION_EVAL:-0}"
+CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${CALIBRATION_EVAL_DIR}/public/reuse_receipt.json}"
 
 log() {
   printf '[stage211-abcd-bootstrap] %(%Y-%m-%d %H:%M:%S)T %s\n' -1 "$*"
+}
+
+truthy() {
+  case "$1" in
+    1|true|True|TRUE|yes|Yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 wait_for_session() {
@@ -124,6 +133,18 @@ evaluate_calibration_checkpoint() {
     --max-relative-ratio 1.20 \
     --max-absolute-gap-points 3.0
   log "calibration public comparison=${output}/nano_comparison.md"
+}
+
+validate_completed_calibration_eval() {
+  local output="${CALIBRATION_EVAL_DIR}/public"
+  log "validating completed calibration public evaluation for reuse"
+  uv run python "${REPO_ROOT}/scripts/validate_stage211_calibration_eval.py" \
+    --selection-report "${SELECTION_JSON}" \
+    --comparison-report "${output}/nano_comparison.json" \
+    --metrics "${output}/metrics.json" \
+    --manifest-dir "${PUBLIC_MANIFEST_DIR}" \
+    --output "${CALIBRATION_REUSE_RECEIPT}"
+  log "calibration public reuse receipt=${CALIBRATION_REUSE_RECEIPT}"
 }
 
 run_full_mixer_phase() {
@@ -244,7 +265,11 @@ main() {
   validate_nano_predictions
   wait_for_session "${CALIBRATION_SESSION}" "Stage211A calibration"
   select_calibration_checkpoint
-  evaluate_calibration_checkpoint
+  if truthy "${REUSE_COMPLETED_CALIBRATION_EVAL}"; then
+    validate_completed_calibration_eval
+  else
+    evaluate_calibration_checkpoint
+  fi
   run_full_mixer_phase
   run_full_block_phase
   run_full_logits_phase

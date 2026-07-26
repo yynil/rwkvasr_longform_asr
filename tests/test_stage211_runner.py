@@ -32,6 +32,7 @@ stage211 = importlib.import_module("scripts.run_stage211_strict_chained_alignmen
 stage211_phase_gate = importlib.import_module("scripts.create_stage211_phase_gate")
 stage211_full_phase = importlib.import_module("scripts.run_stage211_full_phase_curriculum")
 stage211_phase_finalizer = importlib.import_module("scripts.finalize_stage211_phase")
+stage211_calibration_eval = importlib.import_module("scripts.validate_stage211_calibration_eval")
 
 
 def test_stage211_controllers_preserve_virtualenv_python() -> None:
@@ -68,6 +69,126 @@ def test_stage211_public_eval_shards_large_second_stage(
     assert len(calls) == 1
     assert calls[0][1] is not None
     assert calls[0][1]["CTC_SHARD_STAGE2"] == "1"
+
+
+def test_stage211_calibration_eval_reuse_binds_checkpoint_and_complete_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "step-30000.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    checkpoint_sha256 = sha256_file(checkpoint)
+    selection_path = tmp_path / "checkpoint_selection.json"
+    selection_path.write_text(
+        json.dumps(
+            {
+                "pipeline": "stage211",
+                "artifact": "calibration_checkpoint_selection",
+                "required_completion_step": 30_064,
+                "selected": {
+                    "checkpoint_path": str(checkpoint),
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "eligible": True,
+                    "loss_improved_layers": 70,
+                    "cosine_improved_layers": 70,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    comparison_path = tmp_path / "nano_comparison.json"
+    comparison = {
+        "decode": "greedy_ctc",
+        "normalization": "ctc",
+        "student_checkpoint_path": str(checkpoint),
+        "student_checkpoint_sha256": checkpoint_sha256,
+    }
+    comparison_path.write_text(json.dumps(comparison), encoding="utf-8")
+    benchmark_results = []
+    metric_results = []
+    for index, (dataset, expected) in enumerate(STAGE211_PUBLIC_BENCHMARKS.items()):
+        wer = 0.1 + index * 0.01
+        cer = 0.2 + index * 0.01
+        benchmark_results.append(
+            {
+                "dataset": dataset,
+                "sample_count": expected["samples"],
+                "student_wer": wer,
+                "student_cer": cer,
+            }
+        )
+        metric_results.append(
+            {
+                "dataset": dataset,
+                "branch": "ctc",
+                "samples": expected["samples"],
+                "wer": wer,
+                "cer": cer,
+            }
+        )
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(
+        json.dumps({"results": metric_results}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        stage211_calibration_eval,
+        "_enrich_public_benchmark",
+        lambda report, *, manifest_dir: {
+            **report,
+            "all_datasets_complete": True,
+            "results": benchmark_results,
+        },
+    )
+
+    receipt = stage211_calibration_eval.build_reuse_receipt(
+        selection_report_path=selection_path,
+        comparison_report_path=comparison_path,
+        metrics_path=metrics_path,
+        manifest_dir=tmp_path,
+    )
+
+    assert receipt["complete"] is True
+    assert receipt["checkpoint_path"] == str(checkpoint)
+    assert receipt["checkpoint_sha256"] == checkpoint_sha256
+    assert receipt["public_benchmark"]["all_datasets_complete"] is True
+
+    comparison["student_checkpoint_sha256"] = "0" * 64
+    comparison_path.write_text(json.dumps(comparison), encoding="utf-8")
+    with pytest.raises(ValueError, match="comparison checkpoint SHA-256 mismatch"):
+        stage211_calibration_eval.build_reuse_receipt(
+            selection_report_path=selection_path,
+            comparison_report_path=comparison_path,
+            metrics_path=metrics_path,
+            manifest_dir=tmp_path,
+        )
+
+
+def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
+    script = (REPO_ROOT / "scripts" / "start_stage211_abcd_after_calibration.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "STAGE211_REPO_ROOT" in script
+    assert "REUSE_COMPLETED_CALIBRATION_EVAL" in script
+    assert "validate_stage211_calibration_eval.py" in script
+
+
+def test_stage211_calibration_eval_validator_cli_loads() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "validate_stage211_calibration_eval.py"),
+            "--help",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--selection-report" in result.stdout
 
 
 def test_stage211_formal_defaults_use_persistent_storage_and_local_teacher() -> None:
@@ -782,18 +903,12 @@ def _write_valid_phase_gate(
             "webdataset_skip_decode_errors": False,
             "rows": expected["rows"],
             "row_exposures": expected["rows"] * STAGE211_FULL_DATA_EPOCHS,
-            "tail_padding_samples_per_epoch": expected[
-                "tail_padding_samples_per_epoch"
-            ],
+            "tail_padding_samples_per_epoch": expected["tail_padding_samples_per_epoch"],
             "tail_padding_sample_exposures": (
-                expected["tail_padding_samples_per_epoch"]
-                * STAGE211_FULL_DATA_EPOCHS
+                expected["tail_padding_samples_per_epoch"] * STAGE211_FULL_DATA_EPOCHS
             ),
             "executed_sample_exposures": (
-                (
-                    expected["rows"]
-                    + expected["tail_padding_samples_per_epoch"]
-                )
+                (expected["rows"] + expected["tail_padding_samples_per_epoch"])
                 * STAGE211_FULL_DATA_EPOCHS
             ),
             "hours": expected["hours"],
@@ -978,9 +1093,7 @@ def test_stage211_phase_gate_rejects_decode_skipping_coverage(
         checkpoint=checkpoint,
     )
     report = json.loads(gate_report.read_text(encoding="utf-8"))
-    report["full_data_coverage"]["segments"][0][
-        "webdataset_skip_decode_errors"
-    ] = True
+    report["full_data_coverage"]["segments"][0]["webdataset_skip_decode_errors"] = True
     gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="coverage is incomplete"):
