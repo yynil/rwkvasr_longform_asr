@@ -125,7 +125,7 @@ def _resolve_manifest_artifact_path(manifest_path: Path, value: str) -> Path:
 def _build_step_eval_provenance(
     *,
     config: DeepSpeedTrainConfig,
-    bucket_manifest_path: Path | None,
+    bucket_manifest_path: str | Path | None,
 ) -> dict[str, Any]:
     split = str(config.step_eval_split)
     requested_samples = (
@@ -144,7 +144,7 @@ def _build_step_eval_provenance(
             "parts": [],
         }
 
-    bucket_manifest_path = bucket_manifest_path.resolve()
+    bucket_manifest_path = Path(bucket_manifest_path).expanduser().resolve()
     manifest = load_webdataset_bucket_manifest(bucket_manifest_path)
     buckets = manifest.splits.get(split, ())
     parts: list[dict[str, Any]] = []

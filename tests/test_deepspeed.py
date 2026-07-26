@@ -728,6 +728,17 @@ def test_step_eval_provenance_binds_manifest_and_eval_parts(
     assert len(provenance["parts"][0]["sha256"]) == 64
     assert provenance["parts"][0]["num_samples"] == 256
 
+    provenance_from_config_string = _build_step_eval_provenance(
+        config=DeepSpeedTrainConfig(
+            output_dir=str(tmp_path / "out"),
+            deepspeed={},
+            step_eval_split="eval",
+            step_eval_samples=256,
+        ),
+        bucket_manifest_path=str(manifest),
+    )
+    assert provenance_from_config_string == provenance
+
 
 @pytest.mark.filterwarnings("ignore:Can't initialize NVML")
 def test_train_ctc_model_deepspeed_smoke_single_process(tmp_path: Path) -> None:
