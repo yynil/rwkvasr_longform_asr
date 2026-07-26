@@ -250,6 +250,7 @@ run_labeled_sft_phase() {
   uv run python "${REPO_ROOT}/scripts/finalize_stage211_labeled_sft.py" \
     --run-dir "${SFT_OUTPUT_DIR}" \
     --output-dir "${PHASE_GATE_ROOT}/sft" \
+    --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
     --baseline-public-comparison-report "${PHASE_GATE_ROOT}/logits/nano_comparison.json" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \

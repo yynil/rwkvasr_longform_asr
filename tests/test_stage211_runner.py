@@ -173,6 +173,29 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert "STAGE211_REPO_ROOT" in script
     assert "REUSE_COMPLETED_CALIBRATION_EVAL" in script
     assert "validate_stage211_calibration_eval.py" in script
+    assert (
+        '--baseline-public-comparison-report '
+        '"${CALIBRATION_EVAL_DIR}/public/nano_comparison.json"' in script
+    )
+    assert (
+        '--baseline-public-comparison-report '
+        '"${PHASE_GATE_ROOT}/mixer/nano_comparison.json"' in script
+    )
+    assert (
+        '--baseline-public-comparison-report '
+        '"${PHASE_GATE_ROOT}/logits/nano_comparison.json"' in script
+    )
+    assert '--calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}"' in script
+
+    main_body = script[script.index("main() {") :]
+    phase_calls = (
+        "run_full_mixer_phase",
+        "run_full_block_phase",
+        "run_full_logits_phase",
+        "run_labeled_sft_phase",
+    )
+    phase_offsets = [main_body.index(call) for call in phase_calls]
+    assert phase_offsets == sorted(phase_offsets)
 
 
 def test_stage211_calibration_eval_validator_cli_loads() -> None:
