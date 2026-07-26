@@ -169,6 +169,11 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     phase_root = args.phase_root.expanduser().resolve()
     manifest_dir = args.public_manifest_dir.expanduser().resolve()
     nano_prediction_dir = args.nano_prediction_dir.expanduser().resolve()
+    nano_public_baseline_receipt = (
+        args.nano_public_baseline_receipt.expanduser().resolve()
+        if args.nano_public_baseline_receipt is not None
+        else (nano_prediction_dir.parent / "provenance_receipt.json").resolve()
+    )
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
@@ -234,6 +239,8 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         str(comparison_json),
         "--manifest-dir",
         str(manifest_dir),
+        "--nano-public-baseline-receipt",
+        str(nano_public_baseline_receipt),
         "--output",
         str(phase_gate_path),
     ]
@@ -304,6 +311,11 @@ def main() -> int:
         "--nano-prediction-dir",
         type=Path,
         default=DEFAULT_NANO_PREDICTION_DIR,
+    )
+    parser.add_argument(
+        "--nano-public-baseline-receipt",
+        type=Path,
+        default=None,
     )
     parser.add_argument(
         "--baseline-public-comparison-report",

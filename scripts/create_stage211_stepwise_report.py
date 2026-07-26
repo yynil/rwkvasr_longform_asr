@@ -8,6 +8,7 @@ from typing import Any
 from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
+    validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
     validate_stage211_public_benchmark,
 )
@@ -178,6 +179,22 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
         raise ValueError(
             "Stage211 SFT Nano teacher differs from the logits promotion receipt."
         )
+    baseline_receipt = validate_stage211_nano_public_baseline_receipt(
+        Path(str(report.get("nano_public_baseline_receipt_path") or "")),
+        expected_receipt_sha256=str(
+            report.get("nano_public_baseline_receipt_sha256") or ""
+        ),
+        expected_nano_checkpoint_sha256=str(
+            report.get("nano_teacher_checkpoint_sha256") or ""
+        ),
+        public_benchmark=benchmark,
+    )
+    if report.get("nano_public_baseline_checkpoint_sha256") != baseline_receipt.get(
+        "nano_checkpoint_sha256"
+    ):
+        raise ValueError(
+            "Stage211 SFT Nano public-baseline checkpoint binding mismatch."
+        )
     return report, checkpoint
 
 
@@ -219,6 +236,14 @@ def _phase_nano_teacher_sha256(report: dict[str, Any]) -> str:
             "Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256."
         )
     return next(iter(values))
+
+
+def _nano_public_baseline_binding(report: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(report.get("nano_public_baseline_receipt_path") or ""),
+        str(report.get("nano_public_baseline_receipt_sha256") or ""),
+        str(report.get("nano_public_baseline_checkpoint_sha256") or ""),
+    )
 
 
 def _sft_initial_checkpoint(report: dict[str, Any]) -> tuple[Path, str]:
@@ -324,6 +349,32 @@ def build_stepwise_report(
             "Stage211 A/B/C/D Nano teacher checkpoint SHA-256 chain mismatch."
         )
     nano_teacher_checkpoint_sha256 = next(iter(unique_teacher_sha256))
+    baseline_bindings = {
+        _nano_public_baseline_binding(phase_reports[phase])
+        for phase in ("mixer", "block", "logits")
+    }
+    baseline_bindings.add(_nano_public_baseline_binding(sft))
+    if len(baseline_bindings) != 1:
+        raise ValueError(
+            "Stage211 A/B/C/D Nano public-baseline provenance chain mismatch."
+        )
+    (
+        nano_public_baseline_receipt_path,
+        nano_public_baseline_receipt_sha256,
+        nano_public_baseline_checkpoint_sha256,
+    ) = next(iter(baseline_bindings))
+    baseline_receipt = validate_stage211_nano_public_baseline_receipt(
+        nano_public_baseline_receipt_path,
+        expected_receipt_sha256=nano_public_baseline_receipt_sha256,
+        expected_nano_checkpoint_sha256=nano_teacher_checkpoint_sha256,
+    )
+    if (
+        nano_public_baseline_checkpoint_sha256
+        != baseline_receipt["nano_checkpoint_sha256"]
+    ):
+        raise ValueError(
+            "Stage211 Nano public-baseline checkpoint binding mismatch."
+        )
 
     checkpoints = {
         "calibration": calibration_checkpoint,
@@ -447,6 +498,14 @@ def build_stepwise_report(
         "checkpoint_chain_passed": True,
         "nano_teacher_chain_passed": True,
         "nano_teacher_checkpoint_sha256": nano_teacher_checkpoint_sha256,
+        "nano_public_baseline_provenance_passed": True,
+        "nano_public_baseline_receipt_path": nano_public_baseline_receipt_path,
+        "nano_public_baseline_receipt_sha256": (
+            nano_public_baseline_receipt_sha256
+        ),
+        "nano_public_baseline_checkpoint_sha256": (
+            nano_public_baseline_checkpoint_sha256
+        ),
         "total_public_eval_samples_per_stage": sum(
             int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
         ),
@@ -464,6 +523,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         "Logits (C) -> Labeled CTC SFT (D)",
         "",
         f"Nano teacher SHA-256: `{report['nano_teacher_checkpoint_sha256']}`",
+        "",
+        "Nano public baseline provenance: "
+        f"`{report['nano_public_baseline_receipt_sha256']}`",
         "",
         "| Dataset | Metric | Samples | Nano | Calibration | Layer A | Block B | "
         "Logits C | SFT D | Final gap |",

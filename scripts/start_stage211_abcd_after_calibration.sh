@@ -14,6 +14,7 @@ METADATA_ROOT="${METADATA_ROOT:-${HOME}/rwkvasr_data/stage211_full_curriculum}"
 EASY_MANIFEST="${EASY_MANIFEST:-${HOME}/rwkvasr_data/stage211_easy_source_grouped_buckets/manifest.json}"
 PUBLIC_MANIFEST_DIR="${PUBLIC_MANIFEST_DIR:-${REPO_ROOT}/artifacts/eval_benchmarks/manifests}"
 NANO_EVAL_DIR="${NANO_EVAL_DIR:-${HOME}/rwkvasr_eval/stage211_public_full/nano_2512}"
+NANO_BASELINE_RECEIPT="${NANO_BASELINE_RECEIPT:-${NANO_EVAL_DIR}/provenance_receipt.json}"
 CALIBRATION_EVAL_DIR="${CALIBRATION_EVAL_DIR:-${HOME}/rwkvasr_eval/stage211_calibration_selected_full}"
 SELECTION_JSON="${SELECTION_JSON:-${CALIBRATION_EVAL_DIR}/checkpoint_selection.json}"
 SELECTED_PATH_FILE="${SELECTED_PATH_FILE:-${CALIBRATION_EVAL_DIR}/selected_checkpoint.txt}"
@@ -76,6 +77,12 @@ validate_nano_predictions() {
     echo "Nano full metrics are missing: ${NANO_EVAL_DIR}/metrics.json" >&2
     exit 1
   fi
+  uv run python "${REPO_ROOT}/scripts/create_stage211_nano_baseline_receipt.py" \
+    --nano-checkpoint "${NANO_CHECKPOINT}" \
+    --report-dir "${NANO_EVAL_DIR}/reports" \
+    --prediction-dir "${NANO_EVAL_DIR}/predictions" \
+    --manifest-dir "${PUBLIC_MANIFEST_DIR}" \
+    --output "${NANO_BASELINE_RECEIPT}"
 }
 
 build_fixed_manifests() {

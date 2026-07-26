@@ -7,6 +7,7 @@ from typing import Any
 
 from rwkvasr.eval import normalize_asr_text_for_metrics
 from rwkvasr.eval.stage211_gate import (
+    DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES,
     STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
@@ -17,6 +18,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
+    validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
 )
 
@@ -239,6 +241,9 @@ def build_phase_gate(
     coverage_receipt_paths: list[Path],
     alignment_report_path: Path | None,
     baseline_public_comparison_report_path: Path | None = None,
+    nano_public_baseline_receipt_path: Path = (
+        DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT
+    ),
 ) -> dict[str, Any]:
     checkpoint_path = checkpoint_path.resolve()
     if not checkpoint_path.is_file():
@@ -282,6 +287,23 @@ def build_phase_gate(
         raise ValueError(f"Stage211 {phase} requires an independent alignment gate report.")
 
     benchmark = _enrich_public_benchmark(public_report, manifest_dir=manifest_dir.resolve())
+    teacher_sha256_values = {
+        str(segment.get("nano_teacher_checkpoint_sha256") or "")
+        for segment in coverage
+    }
+    if len(teacher_sha256_values) != 1:
+        raise ValueError(
+            "Stage211 phase coverage does not bind one Nano teacher checkpoint SHA-256."
+        )
+    nano_teacher_checkpoint_sha256 = next(iter(teacher_sha256_values))
+    nano_public_baseline_receipt_path = (
+        nano_public_baseline_receipt_path.expanduser().resolve()
+    )
+    nano_public_baseline = validate_stage211_nano_public_baseline_receipt(
+        nano_public_baseline_receipt_path,
+        expected_nano_checkpoint_sha256=nano_teacher_checkpoint_sha256,
+        public_benchmark=benchmark,
+    )
     public_progress: dict[str, Any] | None = None
     baseline_public_record: dict[str, str] | None = None
     public_progress_gate_passed = phase == "logits"
@@ -353,6 +375,15 @@ def build_phase_gate(
         },
         "public_comparison_report_path": str(public_comparison_report_path),
         "public_comparison_report_sha256": sha256_file(public_comparison_report_path),
+        "nano_public_baseline_receipt_path": str(
+            nano_public_baseline_receipt_path
+        ),
+        "nano_public_baseline_receipt_sha256": sha256_file(
+            nano_public_baseline_receipt_path
+        ),
+        "nano_public_baseline_checkpoint_sha256": nano_public_baseline[
+            "nano_checkpoint_sha256"
+        ],
         "public_benchmark": benchmark,
     }
     return report
@@ -378,6 +409,11 @@ def main() -> int:
         type=Path,
         default=None,
     )
+    parser.add_argument(
+        "--nano-public-baseline-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -389,6 +425,7 @@ def main() -> int:
         coverage_receipt_paths=list(args.coverage_receipt),
         alignment_report_path=args.alignment_report,
         baseline_public_comparison_report_path=(args.baseline_public_comparison_report),
+        nano_public_baseline_receipt_path=args.nano_public_baseline_receipt,
     )
     output_path = args.output.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)

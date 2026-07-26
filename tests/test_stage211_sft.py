@@ -313,6 +313,76 @@ def _bound_public_benchmark(
     }
 
 
+def _write_nano_baseline_receipt(
+    tmp_path: Path,
+    *,
+    nano_checkpoint: Path,
+    benchmark: dict[str, object],
+) -> Path:
+    results = []
+    for raw_result in benchmark["results"]:
+        result = dict(raw_result)
+        dataset = str(result["dataset"])
+        report = tmp_path / f"{dataset}.nano-report.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "system": "FunASR-Nano-2512 direct CTC",
+                    "model_path": str(nano_checkpoint.parent.resolve()),
+                    "manifest_path": result["manifest_path"],
+                    "predictions_path": result["nano_prediction_path"],
+                    "language": result["language"],
+                    "normalization": "ctc",
+                    "decode": "greedy_ctc",
+                    "requested_limit": None,
+                    "sample_count": result["sample_count"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        results.append(
+            {
+                "dataset": dataset,
+                "language": result["language"],
+                "metric": result["metric"],
+                "sample_count": result["sample_count"],
+                "identical_utt_coverage": True,
+                "normalized_reference_mismatch_count": 0,
+                "report_embeds_checkpoint_sha256": False,
+                "report_path": str(report.resolve()),
+                "report_sha256": sha256_file(report),
+                "manifest_path": result["manifest_path"],
+                "manifest_sha256": result["manifest_sha256"],
+                "nano_prediction_path": result["nano_prediction_path"],
+                "nano_prediction_sha256": result["nano_prediction_sha256"],
+            }
+        )
+    receipt = tmp_path / "nano-baseline-receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "nano_public_baseline_provenance",
+                "complete": True,
+                "provenance_mode": "legacy_report_attestation",
+                "nano_checkpoint_path": str(nano_checkpoint.resolve()),
+                "nano_checkpoint_sha256": sha256_file(nano_checkpoint),
+                "total_samples": sum(
+                    int(expected["samples"])
+                    for expected in STAGE211_PUBLIC_BENCHMARKS.values()
+                ),
+                "results": results,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return receipt
+
+
 def _write_stepwise_inputs(
     tmp_path: Path,
 ) -> tuple[dict[str, Path], dict[str, Path]]:
@@ -342,6 +412,26 @@ def _write_stepwise_inputs(
         path.write_text("{}\n", encoding="utf-8")
         support[name] = path
 
+    calibration_benchmark = _bound_public_benchmark(
+        tmp_path,
+        stage="calibration",
+        error_rate=0.5,
+    )
+    nano_baseline_receipt = _write_nano_baseline_receipt(
+        tmp_path,
+        nano_checkpoint=nano_teacher_checkpoint,
+        benchmark=calibration_benchmark,
+    )
+    nano_baseline_binding = {
+        "nano_public_baseline_receipt_path": str(
+            nano_baseline_receipt.resolve()
+        ),
+        "nano_public_baseline_receipt_sha256": sha256_file(
+            nano_baseline_receipt
+        ),
+        "nano_public_baseline_checkpoint_sha256": nano_teacher_sha256,
+    }
+
     calibration_receipt = tmp_path / "calibration-reuse.json"
     calibration_receipt.write_text(
         json.dumps(
@@ -358,11 +448,7 @@ def _write_stepwise_inputs(
                 "comparison_report_sha256": sha256_file(support["calibration-comparison"]),
                 "metrics_path": str(support["calibration-metrics"].resolve()),
                 "metrics_sha256": sha256_file(support["calibration-metrics"]),
-                "public_benchmark": _bound_public_benchmark(
-                    tmp_path,
-                    stage="calibration",
-                    error_rate=0.5,
-                ),
+                "public_benchmark": calibration_benchmark,
             }
         )
         + "\n",
@@ -380,6 +466,7 @@ def _write_stepwise_inputs(
                     "gate_passed": True,
                     "checkpoint_path": str(checkpoints[stage].resolve()),
                     "checkpoint_sha256": sha256_file(checkpoints[stage]),
+                    **nano_baseline_binding,
                     "full_data_coverage": {
                         "segments": [
                             {
@@ -446,6 +533,7 @@ def _write_stepwise_inputs(
                     nano_teacher_checkpoint.resolve()
                 ),
                 "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
+                **nano_baseline_binding,
                 "labeled_data_coverage": {
                     "phase": "sft",
                     "complete": True,
@@ -525,6 +613,29 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         reports["sft"],
         checkpoint=checkpoints["sft"],
     )
+    assert report["nano_public_baseline_provenance_passed"] is True
+    assert report["nano_public_baseline_checkpoint_sha256"] == report[
+        "nano_teacher_checkpoint_sha256"
+    ]
+
+    block = json.loads(reports["block"].read_text(encoding="utf-8"))
+    original_baseline_sha256 = block[
+        "nano_public_baseline_checkpoint_sha256"
+    ]
+    block["nano_public_baseline_checkpoint_sha256"] = "e" * 64
+    reports["block"].write_text(json.dumps(block) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="public-baseline provenance chain mismatch"):
+        stepwise_report.build_stepwise_report(
+            calibration_receipt_path=reports["calibration"],
+            mixer_gate_path=reports["mixer"],
+            block_gate_path=reports["block"],
+            logits_gate_path=reports["logits"],
+            sft_final_report_path=reports["sft"],
+        )
+    block["nano_public_baseline_checkpoint_sha256"] = (
+        original_baseline_sha256
+    )
+    reports["block"].write_text(json.dumps(block) + "\n", encoding="utf-8")
 
     sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
     sft["public_benchmark"]["all_datasets_pass"] = False

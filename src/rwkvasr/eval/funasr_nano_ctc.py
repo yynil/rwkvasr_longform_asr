@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import time
@@ -95,6 +96,22 @@ def _prediction_ids(path: Path) -> set[str]:
     return ids
 
 
+def _resolve_model_checkpoint(model_path: str) -> Path:
+    resolved = Path(model_path).expanduser().resolve()
+    checkpoint = resolved if resolved.name == "model.pt" else resolved / "model.pt"
+    if not checkpoint.is_file() or checkpoint.stat().st_size <= 0:
+        raise ValueError(f"FunASR-Nano model.pt is missing or empty: {checkpoint}")
+    return checkpoint
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def evaluate_funasr_nano_ctc_manifest(
     config: FunASRNanoCTCManifestEvalConfig,
     *,
@@ -108,6 +125,8 @@ def evaluate_funasr_nano_ctc_manifest(
     manifest_path = Path(config.manifest_path)
     rows = _read_manifest_rows(manifest_path, limit=config.limit)
     teacher_source = _teacher_source_for_language(config.language)
+    model_checkpoint_path = _resolve_model_checkpoint(config.model_path)
+    model_checkpoint_sha256 = _sha256_file(model_checkpoint_path)
     if teacher is None:
         teacher = FunASRNanoCTCTopKOnlineTeacher(
             FunASROnlineCTCTeacherConfig(
@@ -223,6 +242,8 @@ def evaluate_funasr_nano_ctc_manifest(
         "version": 1,
         "system": "FunASR-Nano-2512 direct CTC",
         "model_path": str(config.model_path),
+        "model_checkpoint_path": str(model_checkpoint_path),
+        "model_checkpoint_sha256": model_checkpoint_sha256,
         "manifest_path": str(manifest_path),
         "predictions_path": str(predictions_path),
         "language": config.language,

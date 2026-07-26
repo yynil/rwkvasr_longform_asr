@@ -26,6 +26,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
     stage211_phase_train_config_contract,
+    validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_train_config,
 )
 
@@ -189,6 +190,8 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
         '"${PHASE_GATE_ROOT}/logits/nano_comparison.json"' in script
     )
     assert '--calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}"' in script
+    assert "create_stage211_nano_baseline_receipt.py" in script
+    assert '--output "${NANO_BASELINE_RECEIPT}"' in script
 
     main_body = script[script.index("main() {") :]
     phase_calls = (
@@ -225,8 +228,15 @@ def test_stage211_formal_defaults_use_persistent_storage_and_local_teacher() -> 
     assert not output_dir.is_relative_to(Path("/var/tmp"))
     assert not output_dir.is_relative_to(Path("/dev/shm"))
     assert output_dir.is_relative_to(Path.home() / "rwkvasr_runs")
-    assert stage211.NANO_CHECKPOINT == (REPO_ROOT / "assets" / "fun-asr-nano-2512" / "model.pt")
-    assert stage211.NANO_CHECKPOINT.is_file()
+    assert stage211.NANO_CHECKPOINT == (
+        Path.home()
+        / "models"
+        / "Fun-ASR-Nano-2512-modelscope"
+        / "model.pt"
+    )
+    assert stage211.NANO_CHECKPOINT != (
+        REPO_ROOT / "assets" / "fun-asr-nano-2512" / "model.pt"
+    )
 
 
 def test_stage211_phase_gate_normalizes_bound_references(tmp_path: Path) -> None:
@@ -1138,6 +1148,67 @@ def _write_valid_phase_gate(
             }
         )
 
+    baseline_results = []
+    for result in public_results:
+        dataset = str(result["dataset"])
+        report = tmp_path / f"{dataset}.nano-report.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "system": "FunASR-Nano-2512 direct CTC",
+                    "model_path": str(nano_teacher_dir.resolve()),
+                    "manifest_path": result["manifest_path"],
+                    "predictions_path": result["nano_prediction_path"],
+                    "language": result["language"],
+                    "normalization": "ctc",
+                    "decode": "greedy_ctc",
+                    "requested_limit": None,
+                    "sample_count": result["sample_count"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        baseline_results.append(
+            {
+                "dataset": dataset,
+                "language": result["language"],
+                "metric": result["metric"],
+                "sample_count": result["sample_count"],
+                "identical_utt_coverage": True,
+                "normalized_reference_mismatch_count": 0,
+                "report_embeds_checkpoint_sha256": False,
+                "report_path": str(report.resolve()),
+                "report_sha256": sha256_file(report),
+                "manifest_path": result["manifest_path"],
+                "manifest_sha256": result["manifest_sha256"],
+                "nano_prediction_path": result["nano_prediction_path"],
+                "nano_prediction_sha256": result["nano_prediction_sha256"],
+            }
+        )
+    baseline_receipt = tmp_path / "nano-baseline-receipt.json"
+    baseline_receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "nano_public_baseline_provenance",
+                "complete": True,
+                "provenance_mode": "legacy_report_attestation",
+                "nano_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
+                "nano_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
+                "total_samples": sum(
+                    int(expected["samples"])
+                    for expected in STAGE211_PUBLIC_BENCHMARKS.values()
+                ),
+                "results": baseline_results,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     gate_report = tmp_path / "mixer_gate.json"
     gate_report.write_text(
         json.dumps(
@@ -1151,6 +1222,15 @@ def _write_valid_phase_gate(
                 "gate_passed": True,
                 "alignment_gate_passed": True,
                 "public_progress_gate_passed": True,
+                "nano_public_baseline_receipt_path": str(
+                    baseline_receipt.resolve()
+                ),
+                "nano_public_baseline_receipt_sha256": sha256_file(
+                    baseline_receipt
+                ),
+                "nano_public_baseline_checkpoint_sha256": sha256_file(
+                    nano_teacher_checkpoint
+                ),
                 "full_data_coverage": {
                     "phase": phase,
                     "complete": True,
@@ -1331,6 +1411,102 @@ def test_stage211_phase_gate_rejects_mutated_nano_teacher(
     (tmp_path / "nano-teacher" / "model.pt").write_bytes(b"changed")
 
     with pytest.raises(ValueError, match="Nano teacher checkpoint SHA-256 mismatch"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_nano_baseline_receipt_rejects_mutated_inference_report(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    receipt_path = Path(gate["nano_public_baseline_receipt_path"])
+    receipt = validate_stage211_nano_public_baseline_receipt(receipt_path)
+    report_path = Path(receipt["results"][0]["report_path"])
+    inference_report = json.loads(report_path.read_text(encoding="utf-8"))
+    inference_report["decode"] = "beam_search"
+    report_path.write_text(json.dumps(inference_report) + "\n", encoding="utf-8")
+    receipt["results"][0]["report_sha256"] = sha256_file(report_path)
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="inference report contract mismatch"):
+        validate_stage211_nano_public_baseline_receipt(receipt_path)
+
+
+def test_stage211_phase_gate_rejects_nano_baseline_prediction_substitution(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    replacement = tmp_path / "replacement-nano.jsonl"
+    replacement.write_text("{}\n", encoding="utf-8")
+    result = report["public_benchmark"]["results"][0]
+    result["nano_prediction_path"] = str(replacement.resolve())
+    result["nano_prediction_sha256"] = sha256_file(replacement)
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="public-baseline provenance receipt"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_public_baseline_from_other_nano(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    receipt_path = Path(gate["nano_public_baseline_receipt_path"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    alternate_dir = tmp_path / "alternate-public-nano"
+    alternate_dir.mkdir()
+    alternate_checkpoint = alternate_dir / "model.pt"
+    alternate_checkpoint.write_bytes(b"alternate-public-nano")
+    receipt["nano_checkpoint_path"] = str(alternate_checkpoint.resolve())
+    receipt["nano_checkpoint_sha256"] = sha256_file(alternate_checkpoint)
+    for result in receipt["results"]:
+        report_path = Path(result["report_path"])
+        inference_report = json.loads(report_path.read_text(encoding="utf-8"))
+        inference_report["model_path"] = str(alternate_dir.resolve())
+        report_path.write_text(
+            json.dumps(inference_report) + "\n",
+            encoding="utf-8",
+        )
+        result["report_sha256"] = sha256_file(report_path)
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    gate["nano_public_baseline_receipt_sha256"] = sha256_file(receipt_path)
+    gate["nano_public_baseline_checkpoint_sha256"] = sha256_file(
+        alternate_checkpoint
+    )
+    gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="public baseline and online teacher checkpoint SHA-256 differ",
+    ):
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",

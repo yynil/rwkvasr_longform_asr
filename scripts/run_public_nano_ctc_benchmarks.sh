@@ -120,6 +120,16 @@ main() {
     --output-json "${OUTPUT_DIR}/metrics.json" \
     --output-md "${OUTPUT_DIR}/metrics.md" \
     --normalization "${NORMALIZATION}"
+  local nano_checkpoint="${MODEL_PATH}"
+  if [[ -d "${nano_checkpoint}" ]]; then
+    nano_checkpoint="${nano_checkpoint}/model.pt"
+  fi
+  "${PYTHON_BIN}" "${REPO_ROOT}/scripts/create_stage211_nano_baseline_receipt.py" \
+    --nano-checkpoint "${nano_checkpoint}" \
+    --report-dir "${REPORT_DIR}" \
+    --prediction-dir "${PREDICTION_DIR}" \
+    --manifest-dir "${MANIFEST_DIR}" \
+    --output "${OUTPUT_DIR}/provenance_receipt.json"
   printf '[nano-public-eval] complete output_dir=%s\n' "${OUTPUT_DIR}"
 }
 

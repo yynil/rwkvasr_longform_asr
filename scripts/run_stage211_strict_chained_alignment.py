@@ -49,7 +49,17 @@ except ModuleNotFoundError as error:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_DIR = REPO_ROOT / "configs" / "generated" / "stage211_strict_chained_alignment"
-NANO_CHECKPOINT = REPO_ROOT / "assets" / "fun-asr-nano-2512" / "model.pt"
+NANO_CHECKPOINT = Path(
+    os.environ.get(
+        "RWKVASR_NANO_CHECKPOINT",
+        str(
+            Path.home()
+            / "models"
+            / "Fun-ASR-Nano-2512-modelscope"
+            / "model.pt"
+        ),
+    )
+)
 DEFAULT_STAGE211_OUTPUT_ROOT = Path(
     os.environ.get(
         "RWKVASR_STAGE211_OUTPUT_ROOT",

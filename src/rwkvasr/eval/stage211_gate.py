@@ -10,6 +10,7 @@ from rwkvasr.config import load_yaml
 
 
 STAGE211_PHASE_GATE_SCHEMA_VERSION = 1
+STAGE211_NANO_PUBLIC_BASELINE_SCHEMA_VERSION = 1
 STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
@@ -52,6 +53,13 @@ STAGE211_PUBLIC_BENCHMARKS: dict[str, dict[str, str | int]] = {
     "commonvoice_en_test": {"language": "en", "metric": "wer", "samples": 16_396},
     "wenetspeech_test_net": {"language": "zh", "metric": "cer", "samples": 24_774},
 }
+DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT = (
+    Path.home()
+    / "rwkvasr_eval"
+    / "stage211_public_full"
+    / "nano_2512"
+    / "provenance_receipt.json"
+)
 STAGE211_AUDIO_TOTAL_ROWS = sum(int(row["rows"]) for row in STAGE211_AUDIO_CURRICULUM.values())
 STAGE211_AUDIO_TOTAL_HOURS = sum(
     float(row["hours"]) for row in STAGE211_AUDIO_CURRICULUM.values()
@@ -276,6 +284,230 @@ def _validate_bound_file(
     if len(expected_sha256) != 64 or sha256_file(path) != expected_sha256:
         raise ValueError(f"{label} SHA-256 mismatch: {path}")
     return path
+
+
+def _report_nano_checkpoint_path(report: dict[str, Any]) -> Path:
+    checkpoint_value = report.get("model_checkpoint_path")
+    if checkpoint_value is not None and str(checkpoint_value).strip():
+        return Path(str(checkpoint_value)).expanduser().resolve()
+    model_value = report.get("model_path")
+    if model_value is None or not str(model_value).strip():
+        raise ValueError("Stage211 Nano inference report lacks model_path.")
+    model_path = Path(str(model_value)).expanduser().resolve()
+    return model_path if model_path.name == "model.pt" else model_path / "model.pt"
+
+
+def validate_stage211_nano_public_baseline_receipt(
+    receipt_path: str | Path,
+    *,
+    expected_receipt_sha256: str | None = None,
+    expected_nano_checkpoint_sha256: str | None = None,
+    public_benchmark: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    receipt_path = Path(receipt_path).expanduser().resolve()
+    receipt = _load_json_object(
+        receipt_path,
+        label="Stage211 Nano public-baseline provenance receipt",
+    )
+    if expected_receipt_sha256 is not None and (
+        len(expected_receipt_sha256) != 64
+        or sha256_file(receipt_path) != expected_receipt_sha256
+    ):
+        raise ValueError(
+            f"Stage211 Nano public-baseline receipt SHA-256 mismatch: {receipt_path}"
+        )
+    expected_fields = {
+        "schema_version": STAGE211_NANO_PUBLIC_BASELINE_SCHEMA_VERSION,
+        "pipeline": "stage211",
+        "artifact": "nano_public_baseline_provenance",
+        "complete": True,
+    }
+    if any(receipt.get(key) != value for key, value in expected_fields.items()):
+        raise ValueError("Stage211 Nano public-baseline provenance receipt is invalid.")
+    provenance_mode = receipt.get("provenance_mode")
+    if provenance_mode not in {
+        "embedded_checkpoint_sha256",
+        "legacy_report_attestation",
+    }:
+        raise ValueError("Stage211 Nano public-baseline provenance mode is invalid.")
+
+    nano_checkpoint = _validate_bound_file(
+        receipt,
+        path_key="nano_checkpoint_path",
+        sha256_key="nano_checkpoint_sha256",
+        label="Stage211 Nano public-baseline checkpoint",
+    )
+    if nano_checkpoint.name != "model.pt":
+        raise ValueError("Stage211 Nano public-baseline checkpoint must be model.pt.")
+    nano_checkpoint_sha256 = str(receipt["nano_checkpoint_sha256"])
+    if (
+        expected_nano_checkpoint_sha256 is not None
+        and nano_checkpoint_sha256 != expected_nano_checkpoint_sha256
+    ):
+        raise ValueError(
+            "Stage211 Nano public baseline and online teacher checkpoint SHA-256 differ."
+        )
+    expected_total_samples = sum(
+        int(expected["samples"])
+        for expected in STAGE211_PUBLIC_BENCHMARKS.values()
+    )
+    if int(receipt.get("total_samples", -1)) != expected_total_samples:
+        raise ValueError("Stage211 Nano public-baseline sample total mismatch.")
+
+    raw_results = receipt.get("results")
+    if not isinstance(raw_results, list):
+        raise ValueError("Stage211 Nano public-baseline results must be a list.")
+    by_dataset = {
+        str(result.get("dataset")): result
+        for result in raw_results
+        if isinstance(result, dict)
+    }
+    if set(by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
+        raise ValueError(
+            "Stage211 Nano public-baseline dataset set is incomplete or unexpected."
+        )
+
+    embedded_checkpoint_reports = 0
+    for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
+        result = by_dataset[dataset]
+        expected_result = {
+            "language": expected["language"],
+            "metric": expected["metric"],
+            "sample_count": expected["samples"],
+            "identical_utt_coverage": True,
+            "normalized_reference_mismatch_count": 0,
+        }
+        if any(result.get(key) != value for key, value in expected_result.items()):
+            raise ValueError(
+                f"Stage211 Nano public-baseline metadata mismatch for {dataset}."
+            )
+        report_path = _validate_bound_file(
+            result,
+            path_key="report_path",
+            sha256_key="report_sha256",
+            label=f"Stage211 {dataset} Nano inference report",
+        )
+        manifest_path = _validate_bound_file(
+            result,
+            path_key="manifest_path",
+            sha256_key="manifest_sha256",
+            label=f"Stage211 {dataset} public manifest",
+        )
+        prediction_path = _validate_bound_file(
+            result,
+            path_key="nano_prediction_path",
+            sha256_key="nano_prediction_sha256",
+            label=f"Stage211 {dataset} Nano prediction",
+        )
+        inference_report = _load_json_object(
+            report_path,
+            label=f"Stage211 {dataset} Nano inference report",
+        )
+        expected_report_fields = {
+            "version": 1,
+            "system": "FunASR-Nano-2512 direct CTC",
+            "language": expected["language"],
+            "normalization": "ctc",
+            "decode": "greedy_ctc",
+            "requested_limit": None,
+            "sample_count": expected["samples"],
+        }
+        if any(
+            inference_report.get(key) != value
+            for key, value in expected_report_fields.items()
+        ):
+            raise ValueError(
+                f"Stage211 {dataset} Nano inference report contract mismatch."
+            )
+        if Path(str(inference_report.get("manifest_path") or "")).resolve() != manifest_path:
+            raise ValueError(
+                f"Stage211 {dataset} Nano inference report manifest path mismatch."
+            )
+        if (
+            Path(str(inference_report.get("predictions_path") or "")).resolve()
+            != prediction_path
+        ):
+            raise ValueError(
+                f"Stage211 {dataset} Nano inference report prediction path mismatch."
+            )
+        if _report_nano_checkpoint_path(inference_report) != nano_checkpoint:
+            raise ValueError(
+                f"Stage211 {dataset} Nano inference report model path mismatch."
+            )
+        embedded_path = inference_report.get("model_checkpoint_path")
+        embedded_sha256 = inference_report.get("model_checkpoint_sha256")
+        report_embeds_checkpoint = (
+            embedded_path is not None and embedded_sha256 is not None
+        )
+        if (
+            result.get("report_embeds_checkpoint_sha256")
+            is not report_embeds_checkpoint
+        ):
+            raise ValueError(
+                f"Stage211 {dataset} Nano inference report identity flag mismatch."
+            )
+        if embedded_path is not None or embedded_sha256 is not None:
+            if (
+                Path(str(embedded_path or "")).expanduser().resolve()
+                != nano_checkpoint
+                or embedded_sha256 != nano_checkpoint_sha256
+            ):
+                raise ValueError(
+                    f"Stage211 {dataset} Nano inference report checkpoint identity mismatch."
+                )
+            embedded_checkpoint_reports += 1
+
+    if embedded_checkpoint_reports not in {
+        0,
+        len(STAGE211_PUBLIC_BENCHMARKS),
+    }:
+        raise ValueError(
+            "Stage211 Nano public baseline mixes legacy and embedded checkpoint identity."
+        )
+    if (
+        provenance_mode == "embedded_checkpoint_sha256"
+        and embedded_checkpoint_reports != len(STAGE211_PUBLIC_BENCHMARKS)
+    ):
+        raise ValueError(
+            "Stage211 Nano public baseline lacks embedded checkpoint identity."
+        )
+    if (
+        provenance_mode == "legacy_report_attestation"
+        and embedded_checkpoint_reports == len(STAGE211_PUBLIC_BENCHMARKS)
+    ):
+        raise ValueError(
+            "Stage211 Nano public baseline incorrectly uses legacy provenance mode."
+        )
+
+    if public_benchmark is not None:
+        benchmark_results = public_benchmark.get("results")
+        if not isinstance(benchmark_results, list):
+            raise ValueError("Stage211 public benchmark results must be a list.")
+        benchmark_by_dataset = {
+            str(result.get("dataset")): result
+            for result in benchmark_results
+            if isinstance(result, dict)
+        }
+        if set(benchmark_by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
+            raise ValueError(
+                "Stage211 public benchmark dataset set is incomplete or unexpected."
+            )
+        for dataset in STAGE211_PUBLIC_BENCHMARKS:
+            provenance = by_dataset[dataset]
+            benchmark = benchmark_by_dataset[dataset]
+            for prefix in ("manifest", "nano_prediction"):
+                path_key = f"{prefix}_path"
+                sha256_key = f"{prefix}_sha256"
+                if (
+                    Path(str(benchmark.get(path_key) or "")).resolve()
+                    != Path(str(provenance.get(path_key) or "")).resolve()
+                    or benchmark.get(sha256_key) != provenance.get(sha256_key)
+                ):
+                    raise ValueError(
+                        f"Stage211 {dataset} {prefix} differs from the Nano "
+                        "public-baseline provenance receipt."
+                    )
+    return receipt
 
 
 def validate_stage211_runtime_epoch_coverage(
@@ -709,12 +941,42 @@ def validate_stage211_phase_gate_report(
     if str(report.get("checkpoint_sha256") or "") != sha256_file(checkpoint_path):
         raise ValueError("Stage211 phase gate checkpoint SHA-256 mismatch.")
 
-    validate_stage211_full_data_coverage(
+    coverage = validate_stage211_full_data_coverage(
         report.get("full_data_coverage"),
         phase=expected_phase,
         checkpoint_path=checkpoint_path,
     )
     benchmark = validate_stage211_public_benchmark(report.get("public_benchmark"))
+    teacher_sha256_values = {
+        str(segment.get("nano_teacher_checkpoint_sha256") or "")
+        for segment in coverage["segments"]
+        if isinstance(segment, dict)
+    }
+    if len(teacher_sha256_values) != 1:
+        raise ValueError(
+            "Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256."
+        )
+    nano_teacher_checkpoint_sha256 = next(iter(teacher_sha256_values))
+    baseline_receipt_path = _validate_bound_file(
+        report,
+        path_key="nano_public_baseline_receipt_path",
+        sha256_key="nano_public_baseline_receipt_sha256",
+        label="Stage211 Nano public-baseline provenance receipt",
+    )
+    baseline_receipt = validate_stage211_nano_public_baseline_receipt(
+        baseline_receipt_path,
+        expected_receipt_sha256=str(
+            report["nano_public_baseline_receipt_sha256"]
+        ),
+        expected_nano_checkpoint_sha256=nano_teacher_checkpoint_sha256,
+        public_benchmark=benchmark,
+    )
+    if report.get("nano_public_baseline_checkpoint_sha256") != baseline_receipt.get(
+        "nano_checkpoint_sha256"
+    ):
+        raise ValueError(
+            "Stage211 phase gate Nano public-baseline checkpoint binding mismatch."
+        )
     if expected_phase in {"mixer", "block"}:
         if report.get("alignment_gate_passed") is not True:
             raise ValueError(f"Stage211 {expected_phase} alignment gate did not pass.")

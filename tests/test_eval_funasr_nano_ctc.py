@@ -40,6 +40,10 @@ class _FakeTeacher:
 
 
 def test_evaluate_funasr_nano_ctc_manifest_writes_normalized_report(tmp_path: Path) -> None:
+    model_dir = tmp_path / "nano"
+    model_dir.mkdir()
+    model_checkpoint = model_dir / "model.pt"
+    model_checkpoint.write_bytes(b"nano-checkpoint")
     manifest = tmp_path / "manifest.jsonl"
     rows = [
         {"utt_id": "u1", "audio_filepath": "one.wav", "text": "HELLO WORLD"},
@@ -56,7 +60,7 @@ def test_evaluate_funasr_nano_ctc_manifest_writes_normalized_report(tmp_path: Pa
     report = evaluate_funasr_nano_ctc_manifest(
         FunASRNanoCTCManifestEvalConfig(
             manifest_path=str(manifest),
-            model_path="unused",
+            model_path=str(model_dir),
             predictions_path=str(predictions),
             report_path=str(report_path),
             language="en",
@@ -68,6 +72,8 @@ def test_evaluate_funasr_nano_ctc_manifest_writes_normalized_report(tmp_path: Pa
     assert teacher.sources == ["librispeech", "librispeech"]
     assert predictions.read_text(encoding="utf-8").count("\n") == 2
     assert report["sample_count"] == 2
+    assert report["model_checkpoint_path"] == str(model_checkpoint.resolve())
+    assert len(report["model_checkpoint_sha256"]) == 64
     assert report["metrics"]["avg_wer"] == 0.25
     assert report["diagnostics"]["pred_ref_unit_ratio"] == 0.75
     assert report["diagnostics"]["mean_blank_top1_ratio"] == 0.5

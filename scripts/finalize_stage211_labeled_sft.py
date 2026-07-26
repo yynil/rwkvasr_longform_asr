@@ -9,6 +9,7 @@ from typing import Any
 from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
+    validate_stage211_nano_public_baseline_receipt,
     validate_stage211_public_benchmark,
 )
 
@@ -166,6 +167,10 @@ def _validate_final_report(
             "nano_teacher_checkpoint_path",
             "nano_teacher_checkpoint_sha256",
         ),
+        (
+            "nano_public_baseline_receipt_path",
+            "nano_public_baseline_receipt_sha256",
+        ),
     ):
         artifact = Path(str(report.get(path_key) or "")).resolve()
         if not artifact.is_file() or sha256_file(artifact) != report.get(sha_key):
@@ -193,6 +198,22 @@ def _validate_final_report(
     ):
         raise ValueError(
             "Stage211 final report Nano teacher differs from the logits promotion."
+        )
+    baseline_receipt = validate_stage211_nano_public_baseline_receipt(
+        Path(str(report["nano_public_baseline_receipt_path"])),
+        expected_receipt_sha256=str(
+            report["nano_public_baseline_receipt_sha256"]
+        ),
+        expected_nano_checkpoint_sha256=str(
+            report["nano_teacher_checkpoint_sha256"]
+        ),
+        public_benchmark=benchmark,
+    )
+    if report.get("nano_public_baseline_checkpoint_sha256") != baseline_receipt.get(
+        "nano_checkpoint_sha256"
+    ):
+        raise ValueError(
+            "Stage211 final report Nano public-baseline checkpoint binding mismatch."
         )
     return report
 
@@ -269,6 +290,18 @@ def finalize_sft(args: argparse.Namespace) -> Path:
         candidate_report,
         manifest_dir=manifest_dir,
     )
+    nano_public_baseline_receipt_path = (
+        args.nano_public_baseline_receipt.expanduser().resolve()
+        if args.nano_public_baseline_receipt is not None
+        else (nano_prediction_dir.parent / "provenance_receipt.json").resolve()
+    )
+    nano_public_baseline = validate_stage211_nano_public_baseline_receipt(
+        nano_public_baseline_receipt_path,
+        expected_nano_checkpoint_sha256=str(
+            completion["nano_teacher_checkpoint_sha256"]
+        ),
+        public_benchmark=candidate_benchmark,
+    )
     progress = _build_sft_public_progress(
         baseline=baseline_benchmark,
         candidate=candidate_benchmark,
@@ -295,6 +328,15 @@ def finalize_sft(args: argparse.Namespace) -> Path:
         "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint),
         "nano_teacher_checkpoint_sha256": completion[
             "nano_teacher_checkpoint_sha256"
+        ],
+        "nano_public_baseline_receipt_path": str(
+            nano_public_baseline_receipt_path
+        ),
+        "nano_public_baseline_receipt_sha256": sha256_file(
+            nano_public_baseline_receipt_path
+        ),
+        "nano_public_baseline_checkpoint_sha256": nano_public_baseline[
+            "nano_checkpoint_sha256"
         ],
         "baseline_public_comparison_report_path": str(baseline_report_path),
         "baseline_public_comparison_report_sha256": sha256_file(baseline_report_path),
@@ -358,6 +400,11 @@ def main() -> int:
         "--nano-prediction-dir",
         type=Path,
         default=DEFAULT_NANO_PREDICTION_DIR,
+    )
+    parser.add_argument(
+        "--nano-public-baseline-receipt",
+        type=Path,
+        default=None,
     )
     parser.add_argument(
         "--calibration-reuse-receipt",
