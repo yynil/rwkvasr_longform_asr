@@ -150,6 +150,34 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
             sha_key=sha_key,
             label=f"Stage211 SFT {label}",
         )
+    _validate_bound_file(
+        report,
+        path_key="nano_teacher_checkpoint_path",
+        sha_key="nano_teacher_checkpoint_sha256",
+        label="Stage211 SFT Nano teacher checkpoint",
+    )
+    completion = _load_json(
+        Path(str(report["sft_completion_path"])),
+        label="Stage211 SFT completion report",
+    )
+    for key in (
+        "nano_teacher_checkpoint_path",
+        "nano_teacher_checkpoint_sha256",
+    ):
+        if completion.get(key) != report.get(key):
+            raise ValueError(
+                f"Stage211 SFT {key} differs from its completion report."
+            )
+    promotion = _load_json(
+        Path(str(report["logits_promotion_receipt_path"])),
+        label="Stage211 logits promotion receipt",
+    )
+    if promotion.get("nano_teacher_checkpoint_sha256") != report.get(
+        "nano_teacher_checkpoint_sha256"
+    ):
+        raise ValueError(
+            "Stage211 SFT Nano teacher differs from the logits promotion receipt."
+        )
     return report, checkpoint
 
 
@@ -174,6 +202,23 @@ def _phase_initial_checkpoint(report: dict[str, Any]) -> tuple[Path, str]:
         Path(str(first.get("init_checkpoint_path") or "")).resolve(),
         str(first.get("init_checkpoint_sha256") or ""),
     )
+
+
+def _phase_nano_teacher_sha256(report: dict[str, Any]) -> str:
+    coverage = report["full_data_coverage"]
+    segments = coverage.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise ValueError("Stage211 phase gate lacks Nano teacher coverage.")
+    values = {
+        str(segment.get("nano_teacher_checkpoint_sha256") or "")
+        for segment in segments
+        if isinstance(segment, dict)
+    }
+    if len(values) != 1 or len(next(iter(values), "")) != 64:
+        raise ValueError(
+            "Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256."
+        )
+    return next(iter(values))
 
 
 def _sft_initial_checkpoint(report: dict[str, Any]) -> tuple[Path, str]:
@@ -215,6 +260,7 @@ def _stage_record(
     benchmark: dict[str, Any],
     data_coverage: dict[str, Any] | None,
     gate_passed: bool | None,
+    nano_teacher_checkpoint_sha256: str | None,
 ) -> dict[str, Any]:
     return {
         "stage": stage,
@@ -225,6 +271,7 @@ def _stage_record(
         "source_report_sha256": sha256_file(source_report),
         "gate_passed": gate_passed,
         "gate_status": "baseline" if gate_passed is None else "pass",
+        "nano_teacher_checkpoint_sha256": nano_teacher_checkpoint_sha256,
         "data_coverage": data_coverage,
         "public_benchmark": benchmark,
     }
@@ -261,6 +308,22 @@ def build_stepwise_report(
         )
         phase_checkpoints[phase] = checkpoint
     sft, sft_checkpoint = _validate_sft_report(sft_final_report_path)
+    teacher_sha256_by_stage = {
+        phase: _phase_nano_teacher_sha256(phase_reports[phase])
+        for phase in ("mixer", "block", "logits")
+    }
+    teacher_sha256_by_stage["sft"] = str(
+        sft.get("nano_teacher_checkpoint_sha256") or ""
+    )
+    unique_teacher_sha256 = set(teacher_sha256_by_stage.values())
+    if (
+        len(unique_teacher_sha256) != 1
+        or len(next(iter(unique_teacher_sha256), "")) != 64
+    ):
+        raise ValueError(
+            "Stage211 A/B/C/D Nano teacher checkpoint SHA-256 chain mismatch."
+        )
+    nano_teacher_checkpoint_sha256 = next(iter(unique_teacher_sha256))
 
     checkpoints = {
         "calibration": calibration_checkpoint,
@@ -346,6 +409,7 @@ def build_stepwise_report(
             benchmark=benchmarks["calibration"],
             data_coverage=None,
             gate_passed=None,
+            nano_teacher_checkpoint_sha256=None,
         ),
         *[
             _stage_record(
@@ -359,6 +423,7 @@ def build_stepwise_report(
                 benchmark=benchmarks[phase],
                 data_coverage=phase_reports[phase]["full_data_coverage"],
                 gate_passed=True,
+                nano_teacher_checkpoint_sha256=teacher_sha256_by_stage[phase],
             )
             for phase in ("mixer", "block", "logits")
         ],
@@ -369,6 +434,7 @@ def build_stepwise_report(
             benchmark=benchmarks["sft"],
             data_coverage=sft["labeled_data_coverage"],
             gate_passed=True,
+            nano_teacher_checkpoint_sha256=teacher_sha256_by_stage["sft"],
         ),
     ]
     return {
@@ -379,6 +445,8 @@ def build_stepwise_report(
         "gate_passed": True,
         "strict_stage_order": list(STAGE_ORDER),
         "checkpoint_chain_passed": True,
+        "nano_teacher_chain_passed": True,
+        "nano_teacher_checkpoint_sha256": nano_teacher_checkpoint_sha256,
         "total_public_eval_samples_per_stage": sum(
             int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
         ),
@@ -394,6 +462,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "Strict order: Calibration -> Layer/Mixer (A) -> Block (B) -> "
         "Logits (C) -> Labeled CTC SFT (D)",
+        "",
+        f"Nano teacher SHA-256: `{report['nano_teacher_checkpoint_sha256']}`",
         "",
         "| Dataset | Metric | Samples | Nano | Calibration | Layer A | Block B | "
         "Logits C | SFT D | Final gap |",

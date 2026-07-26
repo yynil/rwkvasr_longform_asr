@@ -162,12 +162,38 @@ def _validate_final_report(
             "logits_promotion_receipt_path",
             "logits_promotion_receipt_sha256",
         ),
+        (
+            "nano_teacher_checkpoint_path",
+            "nano_teacher_checkpoint_sha256",
+        ),
     ):
         artifact = Path(str(report.get(path_key) or "")).resolve()
         if not artifact.is_file() or sha256_file(artifact) != report.get(sha_key):
             raise ValueError(
                 f"Stage211 final report artifact is unavailable or changed: {artifact}"
             )
+    completion = _load_json(
+        Path(str(report["sft_completion_path"])).resolve(),
+        label="Stage211 SFT completion",
+    )
+    for key in (
+        "nano_teacher_checkpoint_path",
+        "nano_teacher_checkpoint_sha256",
+    ):
+        if report.get(key) != completion.get(key):
+            raise ValueError(
+                f"Stage211 final report {key} differs from SFT completion."
+            )
+    promotion_receipt = _load_json(
+        Path(str(report["logits_promotion_receipt_path"])).resolve(),
+        label="Stage211 logits promotion receipt",
+    )
+    if promotion_receipt.get("nano_teacher_checkpoint_sha256") != report.get(
+        "nano_teacher_checkpoint_sha256"
+    ):
+        raise ValueError(
+            "Stage211 final report Nano teacher differs from the logits promotion."
+        )
     return report
 
 
@@ -180,11 +206,15 @@ def finalize_sft(args: argparse.Namespace) -> Path:
     )
     completion, checkpoint = _validate_completion(completion_path)
     init_checkpoint = Path(str(completion["init_checkpoint_path"])).resolve()
+    nano_teacher_checkpoint = Path(
+        str(completion["nano_teacher_checkpoint_path"])
+    ).resolve()
     promotion_receipt_path = Path(str(completion["logits_promotion_receipt_path"])).resolve()
     promotion_receipt = _validate_promotion_receipt(
         receipt_path=promotion_receipt_path,
         target_phase="sft",
         checkpoint_path=init_checkpoint,
+        nano_checkpoint_path=nano_teacher_checkpoint,
     )
 
     output_dir = args.output_dir.expanduser().resolve()
@@ -262,6 +292,10 @@ def finalize_sft(args: argparse.Namespace) -> Path:
         "logits_promotion_receipt_sha256": sha256_file(promotion_receipt_path),
         "logits_phase_gate_path": promotion_receipt["gate_report_path"],
         "logits_phase_gate_sha256": promotion_receipt["gate_report_sha256"],
+        "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint),
+        "nano_teacher_checkpoint_sha256": completion[
+            "nano_teacher_checkpoint_sha256"
+        ],
         "baseline_public_comparison_report_path": str(baseline_report_path),
         "baseline_public_comparison_report_sha256": sha256_file(baseline_report_path),
         "public_comparison_report_path": str(comparison_json),

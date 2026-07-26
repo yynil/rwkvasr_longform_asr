@@ -263,6 +263,11 @@ def _bound_public_benchmark(
 def _write_stepwise_inputs(
     tmp_path: Path,
 ) -> tuple[dict[str, Path], dict[str, Path]]:
+    nano_teacher_dir = tmp_path / "nano-teacher"
+    nano_teacher_dir.mkdir()
+    nano_teacher_checkpoint = nano_teacher_dir / "model.pt"
+    nano_teacher_checkpoint.write_bytes(b"nano-teacher")
+    nano_teacher_sha256 = sha256_file(nano_teacher_checkpoint)
     checkpoints = {
         stage: tmp_path / f"{stage}.pt"
         for stage in ("calibration", "mixer", "block", "logits", "sft")
@@ -327,6 +332,7 @@ def _write_stepwise_inputs(
                             {
                                 "init_checkpoint_path": str(checkpoints[previous].resolve()),
                                 "init_checkpoint_sha256": sha256_file(checkpoints[previous]),
+                                "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
                             }
                         ]
                     },
@@ -342,6 +348,26 @@ def _write_stepwise_inputs(
         )
         reports[stage] = gate
         previous = stage
+
+    support["sft-completion"].write_text(
+        json.dumps(
+            {
+                "nano_teacher_checkpoint_path": str(
+                    nano_teacher_checkpoint.resolve()
+                ),
+                "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    support["logits-promotion"].write_text(
+        json.dumps(
+            {"nano_teacher_checkpoint_sha256": nano_teacher_sha256}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     sft_report = tmp_path / "sft-final.json"
     sft_report.write_text(
@@ -363,6 +389,10 @@ def _write_stepwise_inputs(
                 "public_comparison_report_sha256": sha256_file(support["sft-comparison"]),
                 "logits_promotion_receipt_path": str(support["logits-promotion"].resolve()),
                 "logits_promotion_receipt_sha256": sha256_file(support["logits-promotion"]),
+                "nano_teacher_checkpoint_path": str(
+                    nano_teacher_checkpoint.resolve()
+                ),
+                "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
                 "labeled_data_coverage": {
                     "phase": "sft",
                     "complete": True,
@@ -427,6 +457,10 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "sft",
     ]
     assert report["checkpoint_chain_passed"] is True
+    assert report["nano_teacher_chain_passed"] is True
+    assert report["nano_teacher_checkpoint_sha256"] == sha256_file(
+        tmp_path / "nano-teacher" / "model.pt"
+    )
     assert len(report["checkpoint_chain"]) == 4
     assert len(report["dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert report["stages"][-1]["checkpoint_sha256"] == sha256_file(checkpoints["sft"])
@@ -459,6 +493,24 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
 
     block = json.loads(reports["block"].read_text(encoding="utf-8"))
+    original_teacher_sha256 = block["full_data_coverage"]["segments"][0][
+        "nano_teacher_checkpoint_sha256"
+    ]
+    block["full_data_coverage"]["segments"][0][
+        "nano_teacher_checkpoint_sha256"
+    ] = "f" * 64
+    reports["block"].write_text(json.dumps(block) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Nano teacher checkpoint SHA-256 chain mismatch"):
+        stepwise_report.build_stepwise_report(
+            calibration_receipt_path=reports["calibration"],
+            mixer_gate_path=reports["mixer"],
+            block_gate_path=reports["block"],
+            logits_gate_path=reports["logits"],
+            sft_final_report_path=reports["sft"],
+        )
+    block["full_data_coverage"]["segments"][0][
+        "nano_teacher_checkpoint_sha256"
+    ] = original_teacher_sha256
     block["full_data_coverage"]["segments"][0]["init_checkpoint_path"] = str(
         checkpoints["calibration"]
     )
