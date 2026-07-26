@@ -515,6 +515,32 @@ def _config_for_phase(
     )
 
 
+def test_stage211_config_uses_explicit_nano_checkpoint_parent(tmp_path: Path) -> None:
+    phase = stage211.PHASES["mixer"]
+    segment = stage211._segments(phase=phase, smoke=False)[0]
+    checkpoint = tmp_path / "selected.pt"
+    checkpoint.touch()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    nano_dir = tmp_path / "persistent-nano"
+    nano_dir.mkdir()
+    nano_checkpoint = nano_dir / "model.pt"
+    nano_checkpoint.touch()
+
+    config = stage211._config(
+        phase=phase,
+        segment=segment,
+        output_dir=tmp_path / "mixer",
+        init_checkpoint=checkpoint,
+        bucket_manifest=manifest,
+        resume=False,
+        smoke=False,
+        nano_checkpoint=nano_checkpoint,
+    )
+
+    assert config["ctc_teacher_online_model_path"] == str(nano_dir.resolve())
+
+
 @pytest.mark.parametrize("phase_name", tuple(stage211.PHASES))
 def test_stage211_freezes_nano_non_attention_path_in_every_phase(
     tmp_path: Path,

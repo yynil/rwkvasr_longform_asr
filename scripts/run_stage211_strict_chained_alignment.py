@@ -630,6 +630,7 @@ def _config(
     bucket_manifest: Path,
     resume: bool,
     smoke: bool,
+    nano_checkpoint: Path = NANO_CHECKPOINT,
     labeled_webdataset_root: Path | None = None,
     labeled_length_index: Path | None = None,
     audio_data_audit: dict[str, Any] | None = None,
@@ -666,6 +667,9 @@ def _config(
             "ctc_loss_weight": float(phase.ctc_weight),
             "decoder_loss_weight": 0.0,
             "ctc_suppress_non_pronunciation_tokens": bool(phase.requires_labels),
+            "ctc_teacher_online_model_path": str(
+                nano_checkpoint.expanduser().resolve().parent
+            ),
             "funasr_nano_ctc_init_checkpoint_path": None,
             "funasr_nano_ctc_init_load_encoder": False,
             "funasr_nano_ctc_init_load_encoder_attention": False,
@@ -1311,6 +1315,7 @@ def main() -> int:
             bucket_manifest=bucket_manifest,
             resume=latest_step > 0,
             smoke=bool(args.smoke),
+            nano_checkpoint=args.nano_checkpoint,
             labeled_webdataset_root=args.labeled_webdataset_root,
             labeled_length_index=args.labeled_length_index,
             audio_data_audit=audio_data_audit,
