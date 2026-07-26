@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from rwkvasr.eval.stage211_gate import (
+    STAGE211_ALLOWED_OPERATOR_KEY_MARKERS,
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES,
     STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
@@ -943,6 +944,19 @@ def _write_valid_phase_gate(
             "init_checkpoint_sha256": sha256_file(previous_checkpoint),
             "completion_checkpoint_path": str(completion.resolve()),
             "completion_checkpoint_sha256": sha256_file(completion),
+            "parameter_delta_audit": {
+                "schema_version": 1,
+                "policy": "stage211_timemixer_and_input_projection_only",
+                "complete": True,
+                "allowed_key_markers": list(STAGE211_ALLOWED_OPERATOR_KEY_MARKERS),
+                "initial_tensor_count": 4,
+                "completion_tensor_count": 4,
+                "allowed_changed_tensors": 1,
+                "allowed_changed_numel": 1,
+                "allowed_unchanged_tensors": 1,
+                "frozen_unchanged_tensors": 2,
+                "forbidden_changed_tensors": 0,
+            },
         }
         receipt = tmp_path / f"{difficulty}-receipt.json"
         receipt.write_text(json.dumps(segment) + "\n", encoding="utf-8")
@@ -1115,6 +1129,30 @@ def test_stage211_phase_gate_rejects_decode_skipping_coverage(
     gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="coverage is incomplete"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_frozen_path_change(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    report["full_data_coverage"]["segments"][0]["parameter_delta_audit"][
+        "forbidden_changed_tensors"
+    ] = 1
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="parameter-delta audit is invalid"):
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",

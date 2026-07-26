@@ -12,6 +12,7 @@ STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
 STAGE211_FULL_DATA_FRAME_BUDGET = 24_000
+STAGE211_ALLOWED_OPERATOR_KEY_MARKERS = (".time_mixer.", ".input_proj.")
 STAGE211_AUDIO_CURRICULUM: dict[str, dict[str, float | int]] = {
     "easy": {
         "rows": 1_174_987,
@@ -104,6 +105,53 @@ def _validate_bound_file(
     return path
 
 
+def _validate_parameter_delta_audit(
+    segment: dict[str, Any],
+    *,
+    phase: str,
+    difficulty: str,
+) -> None:
+    audit = segment.get("parameter_delta_audit")
+    if not isinstance(audit, dict):
+        raise ValueError(
+            f"Stage211 {phase}/{difficulty} lacks a checkpoint parameter-delta audit."
+        )
+    expected = {
+        "schema_version": 1,
+        "policy": "stage211_timemixer_and_input_projection_only",
+        "complete": True,
+        "allowed_key_markers": list(STAGE211_ALLOWED_OPERATOR_KEY_MARKERS),
+        "forbidden_changed_tensors": 0,
+    }
+    if any(audit.get(key) != value for key, value in expected.items()):
+        raise ValueError(
+            f"Stage211 {phase}/{difficulty} checkpoint parameter-delta audit is invalid."
+        )
+    initial_tensor_count = int(audit.get("initial_tensor_count", -1))
+    completion_tensor_count = int(audit.get("completion_tensor_count", -1))
+    allowed_changed_tensors = int(audit.get("allowed_changed_tensors", -1))
+    allowed_changed_numel = int(audit.get("allowed_changed_numel", -1))
+    allowed_unchanged_tensors = int(audit.get("allowed_unchanged_tensors", -1))
+    frozen_unchanged_tensors = int(audit.get("frozen_unchanged_tensors", -1))
+    if (
+        initial_tensor_count <= 0
+        or completion_tensor_count != initial_tensor_count
+        or allowed_changed_tensors <= 0
+        or allowed_changed_numel <= 0
+        or allowed_unchanged_tensors < 0
+        or frozen_unchanged_tensors <= 0
+        or (
+            allowed_changed_tensors
+            + allowed_unchanged_tensors
+            + frozen_unchanged_tensors
+            != initial_tensor_count
+        )
+    ):
+        raise ValueError(
+            f"Stage211 {phase}/{difficulty} checkpoint parameter-delta counts are invalid."
+        )
+
+
 def validate_stage211_full_data_coverage(
     coverage: Any,
     *,
@@ -182,6 +230,11 @@ def validate_stage211_full_data_coverage(
         }
         if any(segment.get(key) != value for key, value in expected_fields.items()):
             raise ValueError(f"Stage211 {phase}/{difficulty} coverage is incomplete.")
+        _validate_parameter_delta_audit(
+            segment,
+            phase=phase,
+            difficulty=difficulty,
+        )
         if int(segment.get("rows", -1)) != int(expected["rows"]):
             raise ValueError(f"Stage211 {phase}/{difficulty} row count mismatch.")
         if int(segment.get("row_exposures", -1)) != (

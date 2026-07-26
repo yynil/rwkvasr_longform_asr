@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from rwkvasr.data import (
     load_webdataset_bucket_manifest,
 )
 from rwkvasr.eval.stage211_gate import (
+    STAGE211_ALLOWED_OPERATOR_KEY_MARKERS,
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_FULL_DATA_BATCH_SIZE,
     STAGE211_FULL_DATA_EPOCHS,
@@ -29,6 +31,96 @@ def _checkpoint_step(path: Path) -> int:
         return int(payload.get("step", 0))
     finally:
         del payload
+
+
+def audit_stage211_checkpoint_delta(
+    *,
+    init_checkpoint_path: Path,
+    completion_checkpoint_path: Path,
+) -> dict[str, Any]:
+    init_payload = torch.load(
+        init_checkpoint_path,
+        map_location="cpu",
+        mmap=True,
+        weights_only=True,
+    )
+    completion_payload = torch.load(
+        completion_checkpoint_path,
+        map_location="cpu",
+        mmap=True,
+        weights_only=True,
+    )
+    try:
+        init_state = init_payload.get("model", init_payload)
+        completion_state = completion_payload.get("model", completion_payload)
+        if not isinstance(init_state, dict) or not isinstance(completion_state, dict):
+            raise ValueError("Stage211 checkpoint delta audit requires model state dictionaries.")
+
+        init_keys = set(init_state)
+        completion_keys = set(completion_state)
+        if init_keys != completion_keys:
+            missing = sorted(init_keys - completion_keys)
+            unexpected = sorted(completion_keys - init_keys)
+            raise ValueError(
+                "Stage211 checkpoint delta tensor keys changed: "
+                f"missing={len(missing)} unexpected={len(unexpected)} "
+                f"first_missing={missing[:3]} first_unexpected={unexpected[:3]}"
+            )
+
+        allowed_changed: list[str] = []
+        forbidden_changed: list[str] = []
+        allowed_unchanged = 0
+        frozen_unchanged = 0
+        allowed_changed_numel = 0
+        for key in sorted(init_keys):
+            initial = init_state[key]
+            completion = completion_state[key]
+            if not isinstance(initial, torch.Tensor) or not isinstance(completion, torch.Tensor):
+                raise ValueError(f"Stage211 checkpoint model entry is not a tensor: {key}")
+            if initial.shape != completion.shape or initial.dtype != completion.dtype:
+                raise ValueError(
+                    "Stage211 checkpoint delta tensor metadata changed: "
+                    f"{key} shape={tuple(initial.shape)}/{tuple(completion.shape)} "
+                    f"dtype={initial.dtype}/{completion.dtype}"
+                )
+            is_allowed = any(marker in key for marker in STAGE211_ALLOWED_OPERATOR_KEY_MARKERS)
+            if torch.equal(initial, completion):
+                if is_allowed:
+                    allowed_unchanged += 1
+                else:
+                    frozen_unchanged += 1
+                continue
+            if is_allowed:
+                allowed_changed.append(key)
+                allowed_changed_numel += int(completion.numel())
+            else:
+                forbidden_changed.append(key)
+
+        if forbidden_changed:
+            raise ValueError(
+                "Stage211 frozen parameter path changed: "
+                f"count={len(forbidden_changed)} first={forbidden_changed[:8]}"
+            )
+        if not allowed_changed:
+            raise ValueError(
+                "Stage211 completion checkpoint changed no TimeMixer/input-projection tensors."
+            )
+        return {
+            "schema_version": 1,
+            "policy": "stage211_timemixer_and_input_projection_only",
+            "complete": True,
+            "allowed_key_markers": list(STAGE211_ALLOWED_OPERATOR_KEY_MARKERS),
+            "initial_tensor_count": len(init_keys),
+            "completion_tensor_count": len(completion_keys),
+            "allowed_changed_tensors": len(allowed_changed),
+            "allowed_changed_numel": allowed_changed_numel,
+            "allowed_unchanged_tensors": allowed_unchanged,
+            "frozen_unchanged_tensors": frozen_unchanged,
+            "forbidden_changed_tensors": 0,
+        }
+    finally:
+        del init_payload, completion_payload
+        gc.collect()
 
 
 def build_receipt(
@@ -111,6 +203,11 @@ def build_receipt(
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
+        "freeze_encoder": False,
+        "freeze_encoder_except_time_mixer": True,
+        "freeze_ctc_decoder": True,
+        "freeze_ctc_head": True,
+        "weight_decay": 0.0,
     }
     for key, value in expected_train_config.items():
         if train_config.get(key) != value:
@@ -120,6 +217,10 @@ def build_receipt(
             )
     tail_padding_sample_exposures = (
         tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
+    )
+    parameter_delta_audit = audit_stage211_checkpoint_delta(
+        init_checkpoint_path=init_checkpoint_path,
+        completion_checkpoint_path=completion_checkpoint_path,
     )
     return {
         "schema_version": 1,
@@ -158,6 +259,7 @@ def build_receipt(
         "init_checkpoint_sha256": sha256_file(init_checkpoint_path),
         "completion_checkpoint_path": str(completion_checkpoint_path),
         "completion_checkpoint_sha256": sha256_file(completion_checkpoint_path),
+        "parameter_delta_audit": parameter_delta_audit,
     }
 
 
