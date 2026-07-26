@@ -262,6 +262,10 @@ def _audit_smoke(
     if not log_path.is_file() or log_path.stat().st_size <= 0:
         raise ValueError(f"Stage211 {phase} smoke log is missing: {log_path}")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    attempt_marker = "[rwkvasr] Distributed init complete."
+    latest_attempt_start = log_text.rfind(attempt_marker)
+    if latest_attempt_start >= 0:
+        log_text = log_text[latest_attempt_start:]
     if "[deepspeed-train] step=2" not in log_text:
         raise ValueError(f"Stage211 {phase} smoke did not execute two training steps.")
     for pattern in BAD_SMOKE_PATTERNS:

@@ -348,7 +348,25 @@ def test_stage211_full_phase_smoke_audit_rejects_teacher_misses(
     assert report["peak_reserved_gib"] == 20.5
 
     log_path.write_text(
-        valid_log + "[deepspeed-train] online_layer_missing=1\n",
+        "Traceback from an older failed attempt\n"
+        "[rwkvasr] Distributed init complete. world_size=4\n"
+        + valid_log,
+        encoding="utf-8",
+    )
+    retried_report = stage211_full_phase._audit_smoke(
+        phase=phase,
+        smoke_run_dir=smoke_run_dir,
+        init_checkpoint=init_checkpoint,
+        easy_manifest=easy_manifest,
+        max_peak_reserved_gib=22.0,
+    )
+    assert retried_report["complete"] is True
+    assert retried_report["peak_reserved_gib"] == 20.5
+
+    log_path.write_text(
+        "[rwkvasr] Distributed init complete. world_size=4\n"
+        + valid_log
+        + "[deepspeed-train] online_layer_missing=1\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="rejected condition"):
