@@ -21,6 +21,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
+    resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
 )
 
@@ -215,6 +216,9 @@ def build_receipt(
                 f"Stage211 {difficulty} train config {key} mismatch: "
                 f"actual={train_config.get(key)!r} expected={value!r}"
             )
+    nano_teacher_checkpoint_path = resolve_stage211_nano_teacher_checkpoint(
+        train_config
+    )
     tail_padding_sample_exposures = (
         tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
     )
@@ -253,6 +257,10 @@ def build_receipt(
         "provenance_sha256": sha256_file(provenance_path),
         "train_config_path": str(train_config_path),
         "train_config_sha256": sha256_file(train_config_path),
+        "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint_path),
+        "nano_teacher_checkpoint_sha256": sha256_file(
+            nano_teacher_checkpoint_path
+        ),
         "bucket_manifest_path": str(bucket_manifest_path),
         "bucket_manifest_sha256": sha256_file(bucket_manifest_path),
         "init_checkpoint_path": str(init_checkpoint_path),

@@ -10,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 stage211_receipt = importlib.import_module("scripts.create_stage211_curriculum_receipt")
 audit_stage211_checkpoint_delta = stage211_receipt.audit_stage211_checkpoint_delta
+resolve_stage211_nano_teacher_checkpoint = stage211_receipt.resolve_stage211_nano_teacher_checkpoint
 
 
 def _write_checkpoint(path: Path, state: dict[str, torch.Tensor]) -> None:
@@ -24,6 +25,31 @@ def _base_state() -> dict[str, torch.Tensor]:
         "ctc_decoder.layers.0.weight": torch.full((2, 2), 2.0),
         "ctc_head.weight": torch.full((2, 2), 3.0),
     }
+
+
+def test_resolve_stage211_nano_teacher_checkpoint(tmp_path: Path) -> None:
+    model_dir = tmp_path / "nano"
+    model_dir.mkdir()
+    checkpoint = model_dir / "model.pt"
+    checkpoint.write_bytes(b"nano-ctc")
+
+    resolved = resolve_stage211_nano_teacher_checkpoint(
+        {"ctc_teacher_online_model_path": str(model_dir)}
+    )
+
+    assert resolved == checkpoint.resolve()
+
+
+def test_resolve_stage211_nano_teacher_checkpoint_rejects_missing_path(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="lacks ctc_teacher_online_model_path"):
+        resolve_stage211_nano_teacher_checkpoint({})
+
+    with pytest.raises(ValueError, match="missing or empty"):
+        resolve_stage211_nano_teacher_checkpoint(
+            {"ctc_teacher_online_model_path": str(tmp_path / "missing")}
+        )
 
 
 def test_checkpoint_delta_allows_only_stage211_operator_path(tmp_path: Path) -> None:

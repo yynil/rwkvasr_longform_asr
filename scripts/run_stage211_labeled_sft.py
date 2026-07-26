@@ -13,7 +13,10 @@ from typing import Any
 import torch
 
 from rwkvasr.config import load_yaml
-from rwkvasr.eval.stage211_gate import sha256_file
+from rwkvasr.eval.stage211_gate import (
+    resolve_stage211_nano_teacher_checkpoint,
+    sha256_file,
+)
 
 try:
     from scripts.run_stage211_strict_chained_alignment import _audit_labeled_data
@@ -345,6 +348,7 @@ def _validate_completion(
         ("length_index_path", "length_index_sha256"),
         ("provenance_path", "provenance_sha256"),
         ("train_config_path", "train_config_sha256"),
+        ("nano_teacher_checkpoint_path", "nano_teacher_checkpoint_sha256"),
         ("init_checkpoint_path", "init_checkpoint_sha256"),
         (
             "logits_promotion_receipt_path",
@@ -356,6 +360,17 @@ def _validate_completion(
         path = Path(str(completion.get(path_key) or "")).resolve()
         if not path.is_file() or sha256_file(path) != completion.get(sha_key):
             raise ValueError(f"Stage211D completion artifact is unavailable or changed: {path}")
+    train_config_path = Path(str(completion["train_config_path"])).resolve()
+    configured_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(
+        load_yaml(train_config_path)
+    )
+    recorded_teacher_checkpoint = Path(
+        str(completion["nano_teacher_checkpoint_path"])
+    ).resolve()
+    if configured_teacher_checkpoint != recorded_teacher_checkpoint:
+        raise ValueError(
+            "Stage211D Nano teacher checkpoint differs from its train config."
+        )
     recorded_checkpoint = Path(str(completion["completion_checkpoint_path"])).resolve()
     if checkpoint_path is not None and recorded_checkpoint != checkpoint_path.resolve():
         raise ValueError("Stage211D completion checkpoint path mismatch.")
@@ -507,6 +522,9 @@ def run_sft(args: argparse.Namespace) -> Path | None:
                 f"Stage211D train config {key} mismatch: "
                 f"actual={train_config.get(key)!r} expected={value!r}"
             )
+    nano_teacher_checkpoint_path = resolve_stage211_nano_teacher_checkpoint(
+        train_config
+    )
     completion_path = output_dir / "sft_complete.json"
     _write_immutable_json(
         completion_path,
@@ -533,6 +551,10 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             "provenance_sha256": sha256_file(provenance_path),
             "train_config_path": str(train_config_path),
             "train_config_sha256": sha256_file(train_config_path),
+            "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint_path),
+            "nano_teacher_checkpoint_sha256": sha256_file(
+                nano_teacher_checkpoint_path
+            ),
             "init_checkpoint_path": str(init_checkpoint),
             "init_checkpoint_sha256": sha256_file(init_checkpoint),
             "logits_promotion_receipt_path": str(promotion_receipt),

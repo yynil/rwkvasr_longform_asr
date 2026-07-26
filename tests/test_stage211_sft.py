@@ -110,6 +110,7 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         "length_index": length_index,
         "provenance": tmp_path / "provenance.json",
         "train_config": tmp_path / "train_config.yaml",
+        "nano_teacher_checkpoint": tmp_path / "nano" / "model.pt",
         "init_checkpoint": tmp_path / "init.pt",
         "logits_promotion_receipt": tmp_path / "receipt.json",
         "completion_checkpoint": (
@@ -118,7 +119,15 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         "training_log": tmp_path / "train.log",
     }
     artifacts["provenance"].write_text("{}\n", encoding="utf-8")
-    artifacts["train_config"].write_text("{}\n", encoding="utf-8")
+    artifacts["nano_teacher_checkpoint"].parent.mkdir()
+    artifacts["nano_teacher_checkpoint"].write_bytes(b"nano-teacher")
+    artifacts["train_config"].write_text(
+        json.dumps(
+            {"ctc_teacher_online_model_path": str(artifacts["nano_teacher_checkpoint"].parent)}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     artifacts["logits_promotion_receipt"].write_text("{}\n", encoding="utf-8")
     artifacts["training_log"].write_text("complete\n", encoding="utf-8")
     torch.save({"step": 0}, artifacts["init_checkpoint"])
@@ -155,6 +164,10 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
 
     assert loaded == completion
     assert checkpoint == artifacts["completion_checkpoint"].resolve()
+
+    artifacts["nano_teacher_checkpoint"].write_bytes(b"changed")
+    with pytest.raises(ValueError, match="artifact is unavailable or changed"):
+        sft_runner._validate_completion(completion_path)
 
 
 def _public_benchmark(error_rates: dict[str, float]) -> dict[str, object]:

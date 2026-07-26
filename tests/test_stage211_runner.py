@@ -942,6 +942,10 @@ def _write_valid_phase_gate(
     checkpoint: Path,
 ) -> Path:
     segments = []
+    nano_teacher_dir = tmp_path / "nano-teacher"
+    nano_teacher_dir.mkdir()
+    nano_teacher_checkpoint = nano_teacher_dir / "model.pt"
+    nano_teacher_checkpoint.write_bytes(b"nano-teacher")
     previous_checkpoint = tmp_path / "phase-init.pt"
     previous_checkpoint.write_bytes(b"phase-init")
     for index, (difficulty, expected) in enumerate(STAGE211_AUDIO_CURRICULUM.items()):
@@ -950,7 +954,10 @@ def _write_valid_phase_gate(
         provenance = tmp_path / f"{difficulty}-provenance.json"
         provenance.write_text("{}\n", encoding="utf-8")
         train_config = tmp_path / f"{difficulty}-train-config.yaml"
-        train_config.write_text("{}\n", encoding="utf-8")
+        train_config.write_text(
+            json.dumps({"ctc_teacher_online_model_path": str(nano_teacher_dir.resolve())}) + "\n",
+            encoding="utf-8",
+        )
         completion = checkpoint if difficulty == "long" else tmp_path / f"{difficulty}.pt"
         if completion != checkpoint:
             completion.write_bytes(f"checkpoint-{index}".encode())
@@ -987,6 +994,8 @@ def _write_valid_phase_gate(
             "provenance_sha256": sha256_file(provenance),
             "train_config_path": str(train_config.resolve()),
             "train_config_sha256": sha256_file(train_config),
+            "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
+            "nano_teacher_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
             "bucket_manifest_path": str(manifest.resolve()),
             "bucket_manifest_sha256": sha256_file(manifest),
             "init_checkpoint_path": str(previous_checkpoint.resolve()),
@@ -1156,6 +1165,67 @@ def test_stage211_phase_gate_rejects_mutated_coverage_receipt(
     )
 
     with pytest.raises(ValueError, match="coverage receipt SHA-256 mismatch"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_nano_teacher(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    (tmp_path / "nano-teacher" / "model.pt").write_bytes(b"changed")
+
+    with pytest.raises(ValueError, match="Nano teacher checkpoint SHA-256 mismatch"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mixed_nano_teachers(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    alternate_dir = tmp_path / "alternate-nano"
+    alternate_dir.mkdir()
+    alternate_checkpoint = alternate_dir / "model.pt"
+    alternate_checkpoint.write_bytes(b"alternate-nano-teacher")
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    medium = report["full_data_coverage"]["segments"][1]
+    train_config = Path(medium["train_config_path"])
+    train_config.write_text(
+        json.dumps({"ctc_teacher_online_model_path": str(alternate_dir.resolve())}) + "\n",
+        encoding="utf-8",
+    )
+    medium["train_config_sha256"] = sha256_file(train_config)
+    medium["nano_teacher_checkpoint_path"] = str(alternate_checkpoint.resolve())
+    medium["nano_teacher_checkpoint_sha256"] = sha256_file(alternate_checkpoint)
+    receipt_path = Path(medium["receipt_path"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["train_config_sha256"] = medium["train_config_sha256"]
+    receipt["nano_teacher_checkpoint_path"] = medium["nano_teacher_checkpoint_path"]
+    receipt["nano_teacher_checkpoint_sha256"] = medium["nano_teacher_checkpoint_sha256"]
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    medium["receipt_sha256"] = sha256_file(receipt_path)
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="uses a different Nano teacher checkpoint"):
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",

@@ -6,6 +6,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from rwkvasr.config import load_yaml
+
 
 STAGE211_PHASE_GATE_SCHEMA_VERSION = 1
 STAGE211_FULL_DATA_EPOCHS = 3
@@ -75,6 +77,20 @@ def sha256_file(path: str | Path) -> str:
         while chunk := source.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def resolve_stage211_nano_teacher_checkpoint(train_config: dict[str, Any]) -> Path:
+    model_dir_value = train_config.get("ctc_teacher_online_model_path")
+    if not isinstance(model_dir_value, (str, Path)) or not str(model_dir_value).strip():
+        raise ValueError(
+            "Stage211 train config lacks ctc_teacher_online_model_path."
+        )
+    checkpoint_path = Path(model_dir_value).expanduser().resolve() / "model.pt"
+    if not checkpoint_path.is_file() or checkpoint_path.stat().st_size <= 0:
+        raise ValueError(
+            f"Stage211 Nano teacher checkpoint is missing or empty: {checkpoint_path}"
+        )
+    return checkpoint_path
 
 
 def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
@@ -210,6 +226,7 @@ def validate_stage211_full_data_coverage(
         )
 
     previous_checkpoint_sha256: str | None = None
+    nano_teacher_checkpoint_sha256: str | None = None
     for difficulty, expected in STAGE211_AUDIO_CURRICULUM.items():
         segment = by_difficulty[difficulty]
         expected_fields = {
@@ -280,10 +297,14 @@ def validate_stage211_full_data_coverage(
             or abs(hour_exposures - expected_hour_exposures) > 0.005
         ):
             raise ValueError(f"Stage211 {phase}/{difficulty} hour exposures mismatch.")
-        _validate_bound_file(
+        receipt_path = _validate_bound_file(
             segment,
             path_key="receipt_path",
             sha256_key="receipt_sha256",
+            label=f"Stage211 {phase}/{difficulty} coverage receipt",
+        )
+        receipt = _load_json_object(
+            receipt_path,
             label=f"Stage211 {phase}/{difficulty} coverage receipt",
         )
         _validate_bound_file(
@@ -292,7 +313,7 @@ def validate_stage211_full_data_coverage(
             sha256_key="provenance_sha256",
             label=f"Stage211 {phase}/{difficulty} provenance",
         )
-        _validate_bound_file(
+        train_config_path = _validate_bound_file(
             segment,
             path_key="train_config_path",
             sha256_key="train_config_sha256",
@@ -316,6 +337,42 @@ def validate_stage211_full_data_coverage(
             sha256_key="completion_checkpoint_sha256",
             label=f"Stage211 {phase}/{difficulty} completion checkpoint",
         )
+        teacher_checkpoint = _validate_bound_file(
+            segment,
+            path_key="nano_teacher_checkpoint_path",
+            sha256_key="nano_teacher_checkpoint_sha256",
+            label=f"Stage211 {phase}/{difficulty} Nano teacher checkpoint",
+        )
+        if teacher_checkpoint.name != "model.pt":
+            raise ValueError(
+                f"Stage211 {phase}/{difficulty} Nano teacher checkpoint must be model.pt."
+            )
+        for key in (
+            "nano_teacher_checkpoint_path",
+            "nano_teacher_checkpoint_sha256",
+        ):
+            if segment.get(key) != receipt.get(key):
+                raise ValueError(
+                    f"Stage211 {phase}/{difficulty} Nano teacher binding differs "
+                    "from its coverage receipt."
+                )
+        configured_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(
+            load_yaml(train_config_path)
+        )
+        if configured_teacher_checkpoint != teacher_checkpoint:
+            raise ValueError(
+                f"Stage211 {phase}/{difficulty} Nano teacher checkpoint differs "
+                "from its train config."
+            )
+        segment_teacher_sha256 = str(segment["nano_teacher_checkpoint_sha256"])
+        if (
+            nano_teacher_checkpoint_sha256 is not None
+            and segment_teacher_sha256 != nano_teacher_checkpoint_sha256
+        ):
+            raise ValueError(
+                f"Stage211 {phase}/{difficulty} uses a different Nano teacher checkpoint."
+            )
+        nano_teacher_checkpoint_sha256 = segment_teacher_sha256
         init_sha256 = str(segment.get("init_checkpoint_sha256") or "")
         if previous_checkpoint_sha256 is not None and init_sha256 != previous_checkpoint_sha256:
             raise ValueError(
