@@ -930,6 +930,11 @@ def test_bucketed_webdataset_loader_covers_all_rows_across_three_padded_epochs(
 
         assert rank_ids[0] == [["sid-1"], ["sid-3"]]
         assert rank_ids[1] == [["sid-2"], ["sid-3"]]
+        for loader in loaders:
+            resumed_iter, skipped = loader.iter_from_batch_offset(1)
+
+            assert skipped == 1
+            assert [batch.utt_ids for batch in resumed_iter] == [["sid-3"]]
 
 
 def test_bucketed_webdataset_loader_skips_corrupt_audio_when_configured(tmp_path: Path, capsys) -> None:
