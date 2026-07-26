@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -74,6 +75,70 @@ def test_stage211_public_eval_shards_large_second_stage(
     assert len(calls) == 1
     assert calls[0][1] is not None
     assert calls[0][1]["CTC_SHARD_STAGE2"] == "1"
+
+
+def test_stage211_logits_finalizer_runs_independent_alignment_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "step-105.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    receipt = tmp_path / "long-receipt.json"
+    receipt.write_text("{}\n", encoding="utf-8")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_resolve_curriculum",
+        lambda **kwargs: ({}, checkpoint, [receipt]),
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_run_public_eval",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_run_nano_comparison",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_run",
+        lambda command, *, dry_run, env=None: commands.append(command),
+    )
+    phase_root = tmp_path / "phase"
+    nano_prediction_dir = tmp_path / "nano" / "predictions"
+    stage211_phase_finalizer.finalize_phase(
+        SimpleNamespace(
+            phase="logits",
+            phase_root=phase_root,
+            public_manifest_dir=tmp_path / "manifests",
+            nano_prediction_dir=nano_prediction_dir,
+            nano_public_baseline_receipt=None,
+            output_dir=tmp_path / "eval",
+            devices="0,1,2,3",
+            dry_run=True,
+            baseline_public_comparison_report=None,
+        )
+    )
+
+    logits_command = next(
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.LOGITS_GATE_SCRIPT) in command
+    )
+    phase_gate_command = next(
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.PHASE_GATE_SCRIPT) in command
+    )
+    logits_gate_path = tmp_path / "eval" / "logits_gate.json"
+    assert logits_command[logits_command.index("--output") + 1] == str(
+        logits_gate_path
+    )
+    assert phase_gate_command[
+        phase_gate_command.index("--alignment-report") + 1
+    ] == str(logits_gate_path)
 
 
 def test_stage211_calibration_eval_reuse_binds_checkpoint_and_complete_metrics(
@@ -580,6 +645,7 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
     assert config["funasr_nano_ctc_init_checkpoint_path"] is None
     assert config["ctc_teacher_online_layer_ffn_loss_weight"] == 0.0
     assert config["step_eval_cache_batches"] is True
+    assert config["step_eval_feature_seed"] == 0
     if phase_name == "sft":
         assert config["length_bucket_drop_last"] is False
         assert config["skip_oversized_samples"] is False
@@ -1208,6 +1274,64 @@ def _write_valid_phase_gate(
         + "\n",
         encoding="utf-8",
     )
+    alignment_baseline_source = tmp_path / f"{phase}-alignment-baseline.yaml"
+    alignment_candidate_source = tmp_path / f"{phase}-alignment-candidate.yaml"
+    alignment_baseline_source.write_text("{}\n", encoding="utf-8")
+    alignment_candidate_source.write_text("{}\n", encoding="utf-8")
+    alignment_manifest = tmp_path / f"{phase}-alignment-manifest.json"
+    alignment_part = tmp_path / f"{phase}-alignment-part.jsonl"
+    alignment_manifest.write_text("{}\n", encoding="utf-8")
+    alignment_part.write_text("{}\n", encoding="utf-8")
+    alignment_provenance = {
+        "schema_version": 1,
+        "split": "eval",
+        "requested_samples": 256,
+        "feature_seed": 0,
+        "bucket_manifest_path": str(alignment_manifest.resolve()),
+        "bucket_manifest_sha256": sha256_file(alignment_manifest),
+        "split_samples": 256,
+        "parts": [
+            {
+                "path": str(alignment_part.resolve()),
+                "sha256": sha256_file(alignment_part),
+                "num_samples": 256,
+            }
+        ],
+    }
+    alignment_report = tmp_path / f"{phase}-alignment.json"
+    alignment_report.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": (
+                    "logits_alignment_gate"
+                    if phase == "logits"
+                    else "hidden_alignment_gate"
+                ),
+                "phase": phase,
+                "checkpoint_path": str(checkpoint.resolve()),
+                "checkpoint_sha256": sha256_file(checkpoint),
+                "gate_passed": True,
+                "baseline_report_path": str(
+                    alignment_baseline_source.resolve()
+                ),
+                "baseline_report_sha256": sha256_file(
+                    alignment_baseline_source
+                ),
+                "candidate_report_path": str(
+                    alignment_candidate_source.resolve()
+                ),
+                "candidate_report_sha256": sha256_file(
+                    alignment_candidate_source
+                ),
+                "baseline_eval_provenance": alignment_provenance,
+                "candidate_eval_provenance": alignment_provenance,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     gate_report = tmp_path / "mixer_gate.json"
     gate_report.write_text(
@@ -1222,6 +1346,15 @@ def _write_valid_phase_gate(
                 "gate_passed": True,
                 "alignment_gate_passed": True,
                 "public_progress_gate_passed": True,
+                "alignment_report": {
+                    "path": str(alignment_report.resolve()),
+                    "sha256": sha256_file(alignment_report),
+                    "artifact": (
+                        "logits_alignment_gate"
+                        if phase == "logits"
+                        else "hidden_alignment_gate"
+                    ),
+                },
                 "nano_public_baseline_receipt_path": str(
                     baseline_receipt.resolve()
                 ),
@@ -1394,6 +1527,91 @@ def test_stage211_phase_gate_rejects_mutated_coverage_receipt(
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_alignment_report(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="logits",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    alignment_path = Path(gate["alignment_report"]["path"])
+    alignment_path.write_text('{"gate_passed": false}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="alignment report SHA-256 mismatch"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="logits",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_alignment_source(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    alignment = json.loads(
+        Path(gate["alignment_report"]["path"]).read_text(encoding="utf-8")
+    )
+    Path(alignment["candidate_report_path"]).write_text(
+        "mutated\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="alignment candidate report SHA-256 mismatch",
+    ):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_logits_phase_gate_rejects_missing_fixed_feature_seed(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="logits",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    alignment_path = Path(gate["alignment_report"]["path"])
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment["baseline_eval_provenance"].pop("feature_seed")
+    alignment["candidate_eval_provenance"].pop("feature_seed")
+    alignment_path.write_text(
+        json.dumps(alignment) + "\n",
+        encoding="utf-8",
+    )
+    gate["alignment_report"]["sha256"] = sha256_file(alignment_path)
+    gate_report.write_text(
+        json.dumps(gate) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="fixed feature seed"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="logits",
             checkpoint_path=checkpoint,
         )
 

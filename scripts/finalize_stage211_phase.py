@@ -21,6 +21,7 @@ PYTHON = Path(sys.executable)
 PUBLIC_EVAL_SCRIPT = REPO_ROOT / "scripts" / "run_public_eval_benchmarks.sh"
 COMPARE_SCRIPT = REPO_ROOT / "scripts" / "compare_public_ctc_with_nano.py"
 HIDDEN_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_hidden_alignment_gate.py"
+LOGITS_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_logits_alignment_gate.py"
 PHASE_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_phase_gate.py"
 PROMOTION_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_promotion_receipt.py"
 DEFAULT_PUBLIC_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
@@ -203,12 +204,14 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         dry_run=bool(args.dry_run),
     )
 
-    hidden_gate_path: Path | None = None
+    alignment_gate_path: Path | None = None
+    baseline_report = phase_root / "easy" / "step_eval_baseline.yaml"
+    long_step = int(STAGE211_AUDIO_CURRICULUM["long"]["steps"])
+    candidate_report = (
+        phase_root / "long" / f"step_eval_layers_step-{long_step}.yaml"
+    )
     if phase in {"mixer", "block"}:
-        hidden_gate_path = output_dir / "hidden_gate.json"
-        baseline_report = phase_root / "easy" / "step_eval_baseline.yaml"
-        long_step = int(STAGE211_AUDIO_CURRICULUM["long"]["steps"])
-        candidate_report = phase_root / "long" / f"step_eval_layers_step-{long_step}.yaml"
+        alignment_gate_path = output_dir / "hidden_gate.json"
         _run(
             [
                 str(PYTHON),
@@ -222,7 +225,24 @@ def finalize_phase(args: argparse.Namespace) -> Path:
                 "--checkpoint",
                 str(checkpoint),
                 "--output",
-                str(hidden_gate_path),
+                str(alignment_gate_path),
+            ],
+            dry_run=bool(args.dry_run),
+        )
+    elif phase == "logits":
+        alignment_gate_path = output_dir / "logits_gate.json"
+        _run(
+            [
+                str(PYTHON),
+                str(LOGITS_GATE_SCRIPT),
+                "--baseline-report",
+                str(baseline_report),
+                "--candidate-report",
+                str(candidate_report),
+                "--checkpoint",
+                str(checkpoint),
+                "--output",
+                str(alignment_gate_path),
             ],
             dry_run=bool(args.dry_run),
         )
@@ -246,8 +266,10 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     ]
     for receipt_path in receipt_paths:
         phase_gate_command.extend(("--coverage-receipt", str(receipt_path)))
-    if hidden_gate_path is not None:
-        phase_gate_command.extend(("--alignment-report", str(hidden_gate_path)))
+    if alignment_gate_path is not None:
+        phase_gate_command.extend(
+            ("--alignment-report", str(alignment_gate_path))
+        )
     if phase in {"mixer", "block"}:
         if args.baseline_public_comparison_report is None:
             raise ValueError(

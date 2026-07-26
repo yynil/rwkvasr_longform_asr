@@ -22,6 +22,23 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_phase_gate_report,
 )
 
+try:
+    from scripts.create_stage211_hidden_alignment_gate import (
+        build_gate as build_hidden_alignment_gate,
+    )
+    from scripts.create_stage211_logits_alignment_gate import (
+        build_gate as build_logits_alignment_gate,
+    )
+except ModuleNotFoundError as error:
+    if error.name != "scripts":
+        raise
+    from create_stage211_hidden_alignment_gate import (
+        build_gate as build_hidden_alignment_gate,
+    )
+    from create_stage211_logits_alignment_gate import (
+        build_gate as build_logits_alignment_gate,
+    )
+
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     if not path.is_file() or path.stat().st_size <= 0:
@@ -261,7 +278,7 @@ def build_phase_gate(
     if public_report.get("student_checkpoint_sha256") != sha256_file(checkpoint_path):
         raise ValueError("Stage211 public comparison checkpoint SHA-256 mismatch.")
     coverage = _parse_coverage_receipts(coverage_receipt_paths, phase=phase)
-    alignment_gate_passed = phase == "logits"
+    alignment_gate_passed = False
     alignment_record: dict[str, Any] | None = None
     if alignment_report_path is not None:
         alignment_report_path = alignment_report_path.resolve()
@@ -273,17 +290,52 @@ def build_phase_gate(
             raise ValueError("Stage211 alignment report does not record a passing decision.")
         if alignment_report.get("phase") != phase:
             raise ValueError("Stage211 alignment report phase mismatch.")
+        expected_artifact = (
+            "logits_alignment_gate"
+            if phase == "logits"
+            else "hidden_alignment_gate"
+        )
+        if (
+            alignment_report.get("schema_version") != 1
+            or alignment_report.get("pipeline") != "stage211"
+            or alignment_report.get("artifact") != expected_artifact
+        ):
+            raise ValueError("Stage211 alignment report artifact mismatch.")
         alignment_checkpoint = Path(str(alignment_report.get("checkpoint_path") or "")).resolve()
         if alignment_checkpoint != checkpoint_path:
             raise ValueError("Stage211 alignment report checkpoint path mismatch.")
         if alignment_report.get("checkpoint_sha256") != sha256_file(checkpoint_path):
             raise ValueError("Stage211 alignment report checkpoint SHA-256 mismatch.")
+        baseline_alignment_report_path = Path(
+            str(alignment_report.get("baseline_report_path") or "")
+        ).resolve()
+        candidate_alignment_report_path = Path(
+            str(alignment_report.get("candidate_report_path") or "")
+        ).resolve()
+        if phase == "logits":
+            rebuilt_alignment_report = build_logits_alignment_gate(
+                baseline_report_path=baseline_alignment_report_path,
+                candidate_report_path=candidate_alignment_report_path,
+                checkpoint_path=checkpoint_path,
+            )
+        else:
+            rebuilt_alignment_report = build_hidden_alignment_gate(
+                phase=phase,
+                baseline_report_path=baseline_alignment_report_path,
+                candidate_report_path=candidate_alignment_report_path,
+                checkpoint_path=checkpoint_path,
+            )
+        if rebuilt_alignment_report != alignment_report:
+            raise ValueError(
+                "Stage211 alignment report does not match its bound source reports."
+            )
         alignment_gate_passed = True
         alignment_record = {
             "path": str(alignment_report_path),
             "sha256": sha256_file(alignment_report_path),
+            "artifact": expected_artifact,
         }
-    elif phase in {"mixer", "block"}:
+    else:
         raise ValueError(f"Stage211 {phase} requires an independent alignment gate report.")
 
     benchmark = _enrich_public_benchmark(public_report, manifest_dir=manifest_dir.resolve())

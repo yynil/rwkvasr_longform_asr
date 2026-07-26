@@ -325,6 +325,7 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument("--step-eval-feature-seed", default=None, type=int)
     parser.add_argument("--top-k-step-checkpoints", default=None, type=int)
     parser.add_argument(
         "--save-deepspeed-sharded-checkpoints",
@@ -555,6 +556,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "step_eval_shuffle",
         "step_eval_at_start",
         "step_eval_cache_batches",
+        "step_eval_feature_seed",
         "top_k_step_checkpoints",
         "periodic_checkpoint_keep_last",
         "save_deepspeed_sharded_checkpoints",

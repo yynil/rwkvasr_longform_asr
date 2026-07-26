@@ -15,6 +15,7 @@ STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
 STAGE211_FULL_DATA_FRAME_BUDGET = 24_000
+STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES = 256
 STAGE211_ALLOWED_OPERATOR_KEY_MARKERS = (".time_mixer.", ".input_proj.")
 STAGE211_AUDIO_CURRICULUM: dict[str, dict[str, float | int]] = {
     "easy": {
@@ -510,6 +511,55 @@ def validate_stage211_nano_public_baseline_receipt(
     return receipt
 
 
+def _validate_stage211_alignment_eval_provenance(
+    provenance: Any,
+    *,
+    label: str,
+) -> tuple[tuple[str, int], ...]:
+    if not isinstance(provenance, dict):
+        raise ValueError(f"Stage211 {label} lacks fixed-eval provenance.")
+    expected = {
+        "schema_version": 1,
+        "split": "eval",
+        "requested_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        "split_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+    }
+    if any(provenance.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"Stage211 {label} fixed-eval provenance is invalid.")
+    _validate_bound_file(
+        provenance,
+        path_key="bucket_manifest_path",
+        sha256_key="bucket_manifest_sha256",
+        label=f"Stage211 {label} fixed-eval manifest",
+    )
+    raw_parts = provenance.get("parts")
+    if not isinstance(raw_parts, list) or not raw_parts:
+        raise ValueError(f"Stage211 {label} fixed-eval provenance has no parts.")
+    fingerprint: list[tuple[str, int]] = []
+    total_samples = 0
+    for index, raw_part in enumerate(raw_parts):
+        if not isinstance(raw_part, dict):
+            raise ValueError(
+                f"Stage211 {label} fixed-eval part {index} is invalid."
+            )
+        _validate_bound_file(
+            raw_part,
+            path_key="path",
+            sha256_key="sha256",
+            label=f"Stage211 {label} fixed-eval part {index}",
+        )
+        num_samples = int(raw_part.get("num_samples", -1))
+        if num_samples <= 0:
+            raise ValueError(
+                f"Stage211 {label} fixed-eval part {index} sample count is invalid."
+            )
+        total_samples += num_samples
+        fingerprint.append((str(raw_part["sha256"]), num_samples))
+    if total_samples != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES:
+        raise ValueError(f"Stage211 {label} fixed-eval sample count mismatch.")
+    return tuple(fingerprint)
+
+
 def validate_stage211_runtime_epoch_coverage(
     coverage: Any,
     *,
@@ -977,9 +1027,87 @@ def validate_stage211_phase_gate_report(
         raise ValueError(
             "Stage211 phase gate Nano public-baseline checkpoint binding mismatch."
         )
+    alignment_record = report.get("alignment_report")
+    if not isinstance(alignment_record, dict):
+        raise ValueError("Stage211 phase gate lacks an alignment report binding.")
+    alignment_path = _validate_bound_file(
+        alignment_record,
+        path_key="path",
+        sha256_key="sha256",
+        label=f"Stage211 {expected_phase} alignment report",
+    )
+    alignment_report = _load_json_object(
+        alignment_path,
+        label=f"Stage211 {expected_phase} alignment report",
+    )
+    expected_alignment_artifact = (
+        "logits_alignment_gate"
+        if expected_phase == "logits"
+        else "hidden_alignment_gate"
+    )
+    expected_alignment_fields = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": expected_alignment_artifact,
+        "phase": expected_phase,
+        "gate_passed": True,
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": sha256_file(checkpoint_path),
+    }
+    if any(
+        alignment_report.get(key) != value
+        for key, value in expected_alignment_fields.items()
+    ):
+        raise ValueError(
+            f"Stage211 {expected_phase} alignment report contract mismatch."
+        )
+    for prefix in ("baseline_report", "candidate_report"):
+        _validate_bound_file(
+            alignment_report,
+            path_key=f"{prefix}_path",
+            sha256_key=f"{prefix}_sha256",
+            label=(
+                f"Stage211 {expected_phase} alignment "
+                f"{prefix.replace('_', ' ')}"
+            ),
+        )
+    baseline_fingerprint = _validate_stage211_alignment_eval_provenance(
+        alignment_report.get("baseline_eval_provenance"),
+        label=f"{expected_phase} alignment baseline",
+    )
+    candidate_fingerprint = _validate_stage211_alignment_eval_provenance(
+        alignment_report.get("candidate_eval_provenance"),
+        label=f"{expected_phase} alignment candidate",
+    )
+    if baseline_fingerprint != candidate_fingerprint:
+        raise ValueError(
+            f"Stage211 {expected_phase} alignment reports use different eval samples."
+        )
+    if expected_phase == "logits":
+        baseline_feature_seed = alignment_report[
+            "baseline_eval_provenance"
+        ].get("feature_seed")
+        candidate_feature_seed = alignment_report[
+            "candidate_eval_provenance"
+        ].get("feature_seed")
+        if (
+            not isinstance(baseline_feature_seed, int)
+            or baseline_feature_seed < 0
+            or candidate_feature_seed != baseline_feature_seed
+        ):
+            raise ValueError(
+                "Stage211 logits alignment reports require the same "
+                "non-negative fixed feature seed."
+            )
+    if alignment_record.get("artifact") != expected_alignment_artifact:
+        raise ValueError(
+            f"Stage211 {expected_phase} alignment report binding mismatch."
+        )
+    if report.get("alignment_gate_passed") is not True:
+        raise ValueError(
+            f"Stage211 {expected_phase} alignment gate did not pass."
+        )
     if expected_phase in {"mixer", "block"}:
-        if report.get("alignment_gate_passed") is not True:
-            raise ValueError(f"Stage211 {expected_phase} alignment gate did not pass.")
         if report.get("public_progress_gate_passed") is not True:
             raise ValueError(
                 f"Stage211 {expected_phase} public progress gate did not pass."

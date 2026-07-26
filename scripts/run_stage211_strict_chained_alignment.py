@@ -816,6 +816,7 @@ def _config(
                 else "train"
             ),
             "step_eval_cache_batches": True,
+            "step_eval_feature_seed": 0,
             "wandb_run_name": f"{output_dir.name}_{segment['name']}",
         }
     )

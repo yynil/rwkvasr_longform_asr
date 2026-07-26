@@ -128,6 +128,11 @@ def _build_step_eval_provenance(
     bucket_manifest_path: str | Path | None,
 ) -> dict[str, Any]:
     split = str(config.step_eval_split)
+    feature_seed = (
+        int(config.step_eval_feature_seed)
+        if config.step_eval_feature_seed is not None
+        else None
+    )
     requested_samples = (
         int(config.step_eval_samples)
         if config.step_eval_samples is not None
@@ -138,6 +143,7 @@ def _build_step_eval_provenance(
             "schema_version": 1,
             "split": split,
             "requested_samples": requested_samples,
+            "feature_seed": feature_seed,
             "bucket_manifest_path": None,
             "bucket_manifest_sha256": None,
             "split_samples": None,
@@ -173,6 +179,7 @@ def _build_step_eval_provenance(
         "schema_version": 1,
         "split": split,
         "requested_samples": requested_samples,
+        "feature_seed": feature_seed,
         "bucket_manifest_path": str(bucket_manifest_path),
         "bucket_manifest_sha256": _sha256_file(bucket_manifest_path),
         "split_samples": sum(int(bucket.num_samples) for bucket in buckets),
@@ -457,6 +464,7 @@ class DeepSpeedTrainConfig:
     step_eval_shuffle: bool = True
     step_eval_at_start: bool = False
     step_eval_cache_batches: bool = False
+    step_eval_feature_seed: int | None = 0
     top_k_step_checkpoints: int = 3
     periodic_checkpoint_keep_last: int | None = None
     save_deepspeed_sharded_checkpoints: bool = True
@@ -1353,6 +1361,7 @@ def _materialize_step_eval_batches(
     *,
     epoch: int,
     max_eval_samples: int,
+    feature_seed: int | None = None,
 ) -> tuple[list[Any], int]:
     """Decode a fixed per-rank eval subset once so every checkpoint sees identical features."""
 
@@ -1364,14 +1373,26 @@ def _materialize_step_eval_batches(
     local_limit = base + (1 if rank < extra else 0)
     batches: list[Any] = []
     sample_count = 0
-    for batch in loader:
-        remaining = local_limit - sample_count
-        if remaining <= 0:
-            break
-        if int(batch.features.size(0)) > remaining:
-            batch = batch.prefix(remaining)
-        batches.append(batch)
-        sample_count += int(batch.features.size(0))
+
+    def collect() -> None:
+        nonlocal sample_count
+        for batch in loader:
+            remaining = local_limit - sample_count
+            if remaining <= 0:
+                break
+            if int(batch.features.size(0)) > remaining:
+                batch = batch.prefix(remaining)
+            batches.append(batch)
+            sample_count += int(batch.features.size(0))
+
+    if feature_seed is None:
+        collect()
+    else:
+        if int(feature_seed) < 0:
+            raise ValueError("step_eval_feature_seed must be non-negative or null.")
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(feature_seed) + rank)
+            collect()
     return batches, sample_count
 
 
@@ -6748,6 +6769,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             step_eval_sampler,
             epoch=0,
             max_eval_samples=int(config.step_eval_samples),
+            feature_seed=config.step_eval_feature_seed,
         )
         if cached_local_samples <= 0:
             raise RuntimeError("step_eval_cache_batches materialized zero samples.")
@@ -6756,7 +6778,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         _rank_zero_log(
             "Cached fixed step-eval features in host memory: "
             f"rank0_samples={cached_local_samples} batches={len(cached_step_eval_batches)} "
-            f"global_target={int(config.step_eval_samples)}"
+            f"global_target={int(config.step_eval_samples)} "
+            f"feature_seed={config.step_eval_feature_seed}"
         )
     _rank_zero_log("Dataloader ready. Entering training loop.")
     active_length_index_path = None

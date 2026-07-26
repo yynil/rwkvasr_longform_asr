@@ -164,6 +164,58 @@ def test_materialize_step_eval_batches_replays_exact_features() -> None:
     assert loader.iteration == 1
 
 
+def test_materialize_step_eval_batches_uses_scoped_feature_seed() -> None:
+    class RandomLoader:
+        def __iter__(self):
+            yield ASRBatch(
+                features=torch.rand(2, 4, 2),
+                feature_lengths=torch.tensor([4, 4]),
+                targets=torch.tensor([1, 2]),
+                target_lengths=torch.tensor([1, 1]),
+                utt_ids=["a", "b"],
+            )
+
+    torch.manual_seed(1234)
+    initial_state = torch.random.get_rng_state()
+    first, first_samples = _materialize_step_eval_batches(
+        RandomLoader(),
+        None,
+        epoch=0,
+        max_eval_samples=2,
+        feature_seed=99,
+    )
+    assert torch.equal(torch.random.get_rng_state(), initial_state)
+    second, second_samples = _materialize_step_eval_batches(
+        RandomLoader(),
+        None,
+        epoch=0,
+        max_eval_samples=2,
+        feature_seed=99,
+    )
+    different, different_samples = _materialize_step_eval_batches(
+        RandomLoader(),
+        None,
+        epoch=0,
+        max_eval_samples=2,
+        feature_seed=100,
+    )
+
+    assert first_samples == second_samples == different_samples == 2
+    assert torch.equal(first[0].features, second[0].features)
+    assert not torch.equal(first[0].features, different[0].features)
+
+
+def test_materialize_step_eval_batches_rejects_negative_feature_seed() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        _materialize_step_eval_batches(
+            [],
+            None,
+            epoch=0,
+            max_eval_samples=1,
+            feature_seed=-1,
+        )
+
+
 def test_layer_hidden_sampler_keeps_boundaries_and_covers_every_layer() -> None:
     selections = [
         _select_layer_hidden_ids(
@@ -724,6 +776,7 @@ def test_step_eval_provenance_binds_manifest_and_eval_parts(
 
     assert provenance["split"] == "eval"
     assert provenance["requested_samples"] == 256
+    assert provenance["feature_seed"] == 0
     assert provenance["split_samples"] == 256
     assert provenance["bucket_manifest_path"] == str(manifest.resolve())
     assert len(provenance["bucket_manifest_sha256"]) == 64
