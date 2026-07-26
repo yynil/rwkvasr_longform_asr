@@ -184,6 +184,10 @@ def test_layer_hidden_sampler_keeps_boundaries_and_covers_every_layer() -> None:
 
     assert all(len(selection) == 8 for selection in selections)
     assert set().union(*map(set, selections)) == set(range(70))
+    counts = {
+        layer_id: sum(layer_id in selection for selection in selections) for layer_id in range(70)
+    }
+    assert set(counts.values()) == {8}
     assert {0, 49, 50, 69}.issubset(boundary_selection)
 
 
