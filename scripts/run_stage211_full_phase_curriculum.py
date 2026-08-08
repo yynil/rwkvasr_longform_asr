@@ -19,6 +19,10 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
     STAGE211_AUDIO_TOTAL_ROWS,
     STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES,
+    STAGE211_FULL_DATA_BATCH_SIZE,
+    STAGE211_FULL_DATA_EPOCHS,
+    STAGE211_FULL_DATA_FRAME_BUDGET,
+    STAGE211_FULL_DATA_WORLD_SIZE,
     sha256_file,
     validate_stage211_full_data_coverage,
 )
@@ -416,6 +420,155 @@ def _load_enriched_receipt(path: Path) -> dict[str, Any]:
     }
 
 
+def _validate_sha256_field(payload: dict[str, Any], key: str, *, label: str) -> None:
+    value = payload.get(key)
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{label} has an invalid {key}.")
+
+
+def _validate_reusable_runtime_coverage(
+    coverage: Any,
+    *,
+    difficulty: str,
+    steps_per_epoch: int,
+) -> None:
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "runtime_epoch_coverage",
+        "complete": True,
+        "epochs": STAGE211_FULL_DATA_EPOCHS,
+        "steps_per_epoch": steps_per_epoch,
+        "total_steps": STAGE211_FULL_DATA_EPOCHS * steps_per_epoch,
+    }
+    if not isinstance(coverage, dict) or any(
+        coverage.get(key) != value for key, value in expected.items()
+    ):
+        raise ValueError(f"Stage211 {difficulty} reusable runtime coverage is invalid.")
+    records = coverage.get("records")
+    if not isinstance(records, list) or len(records) != STAGE211_FULL_DATA_EPOCHS:
+        raise ValueError(f"Stage211 {difficulty} reusable runtime coverage is incomplete.")
+    for epoch, record in enumerate(records, start=1):
+        if not isinstance(record, dict) or any(
+            (
+                int(record.get("epoch", -1)) != epoch,
+                int(record.get("step", -1)) != epoch * steps_per_epoch,
+                int(record.get("epoch_batch_offset", -1)) != 0,
+                int(record.get("completed_epoch_batch_count", -1)) != steps_per_epoch,
+            )
+        ):
+            raise ValueError(
+                f"Stage211 {difficulty} reusable epoch {epoch} coverage is invalid."
+            )
+        checkpoint = Path(str(record.get("checkpoint_path") or "")).resolve()
+        if not checkpoint.is_file():
+            raise ValueError(
+                f"Stage211 {difficulty} reusable epoch checkpoint is unavailable: {checkpoint}"
+            )
+        _validate_sha256_field(
+            record,
+            "checkpoint_sha256",
+            label=f"Stage211 {difficulty} reusable epoch {epoch}",
+        )
+
+
+def _load_reusable_receipt(
+    receipt_path: Path,
+    *,
+    phase: str,
+    difficulty: str,
+    run_dir: Path,
+    manifest_path: Path,
+    init_checkpoint: Path,
+    completion_checkpoint: Path,
+) -> dict[str, Any]:
+    receipt = _load_json(receipt_path, label="Stage211 reusable curriculum receipt")
+    expected = STAGE211_AUDIO_CURRICULUM[difficulty]
+    expected_fields = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "curriculum_coverage",
+        "phase": phase,
+        "difficulty": difficulty,
+        "complete": True,
+        "full_data_profile": True,
+        "epochs": STAGE211_FULL_DATA_EPOCHS,
+        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "rows": int(expected["rows"]),
+        "row_exposures": int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS,
+        "tail_padding_sample_exposures": int(
+            expected["tail_padding_samples_per_epoch"]
+        )
+        * STAGE211_FULL_DATA_EPOCHS,
+        "executed_sample_exposures": (
+            int(expected["rows"])
+            + int(expected["tail_padding_samples_per_epoch"])
+        )
+        * STAGE211_FULL_DATA_EPOCHS,
+        "hours": float(expected["hours"]),
+        "hour_exposures": float(expected["hours"]) * STAGE211_FULL_DATA_EPOCHS,
+        "steps_per_epoch": int(expected["steps_per_epoch"]),
+        "steps": int(expected["steps"]),
+        "tail_padding_samples_per_epoch": int(
+            expected["tail_padding_samples_per_epoch"]
+        ),
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
+        "run_dir": str(run_dir.resolve()),
+        "bucket_manifest_path": str(manifest_path.resolve()),
+        "init_checkpoint_path": str(init_checkpoint.resolve()),
+        "completion_checkpoint_path": str(completion_checkpoint.resolve()),
+    }
+    if any(receipt.get(key) != value for key, value in expected_fields.items()):
+        raise ValueError(
+            f"Stage211 {phase}/{difficulty} reusable curriculum receipt does not match "
+            "the completed segment."
+        )
+    for path_key, sha_key in (
+        ("provenance_path", "provenance_sha256"),
+        ("train_config_path", "train_config_sha256"),
+        ("nano_teacher_checkpoint_path", "nano_teacher_checkpoint_sha256"),
+        ("bucket_manifest_path", "bucket_manifest_sha256"),
+        ("init_checkpoint_path", "init_checkpoint_sha256"),
+        ("completion_checkpoint_path", "completion_checkpoint_sha256"),
+    ):
+        bound_path = Path(str(receipt.get(path_key) or "")).resolve()
+        if not bound_path.is_file():
+            raise ValueError(
+                f"Stage211 {phase}/{difficulty} reusable artifact is unavailable: {bound_path}"
+            )
+        _validate_sha256_field(
+            receipt,
+            sha_key,
+            label=f"Stage211 {phase}/{difficulty} reusable receipt",
+        )
+    audit = receipt.get("parameter_delta_audit")
+    if (
+        not isinstance(audit, dict)
+        or audit.get("complete") is not True
+        or audit.get("policy") != "stage211_timemixer_and_input_projection_only"
+        or int(audit.get("forbidden_changed_tensors", -1)) != 0
+        or int(audit.get("allowed_changed_tensors", 0)) <= 0
+        or int(audit.get("allowed_changed_numel", 0)) <= 0
+    ):
+        raise ValueError(
+            f"Stage211 {phase}/{difficulty} reusable parameter-delta audit is invalid."
+        )
+    _validate_reusable_runtime_coverage(
+        receipt.get("runtime_epoch_coverage"),
+        difficulty=difficulty,
+        steps_per_epoch=int(expected["steps_per_epoch"]),
+    )
+    return {
+        **receipt,
+        "receipt_path": str(receipt_path.resolve()),
+        "receipt_sha256": sha256_file(receipt_path),
+    }
+
+
 def run_phase(args: argparse.Namespace) -> Path | None:
     phase = str(args.phase)
     output_root = args.output_root.expanduser().resolve()
@@ -510,17 +663,33 @@ def run_phase(args: argparse.Namespace) -> Path | None:
                 f"Stage211 {phase}/{difficulty} lacks exact completion checkpoint "
                 f"step={target_step}: {completion_checkpoint}"
             )
-        receipt_command = _receipt_command(
-            phase=phase,
-            difficulty=difficulty,
-            run_dir=run_dir,
-            manifest_path=manifests[difficulty],
-            init_checkpoint=current_init,
-            completion_checkpoint=completion_checkpoint,
-            output=receipt_path,
-        )
-        _run_command(receipt_command, dry_run=False)
-        receipt = _load_enriched_receipt(receipt_path)
+        if receipt_path.is_file():
+            receipt = _load_reusable_receipt(
+                receipt_path,
+                phase=phase,
+                difficulty=difficulty,
+                run_dir=run_dir,
+                manifest_path=manifests[difficulty],
+                init_checkpoint=current_init,
+                completion_checkpoint=completion_checkpoint,
+            )
+            print(
+                f"[stage211-full-phase] reused immutable receipt "
+                f"difficulty={difficulty} receipt={receipt_path}",
+                flush=True,
+            )
+        else:
+            receipt_command = _receipt_command(
+                phase=phase,
+                difficulty=difficulty,
+                run_dir=run_dir,
+                manifest_path=manifests[difficulty],
+                init_checkpoint=current_init,
+                completion_checkpoint=completion_checkpoint,
+                output=receipt_path,
+            )
+            _run_command(receipt_command, dry_run=False)
+            receipt = _load_enriched_receipt(receipt_path)
         receipts.append(receipt)
         print(
             f"[stage211-full-phase] segment complete "

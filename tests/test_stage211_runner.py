@@ -461,6 +461,131 @@ def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
         assert f"/{difficulty}/step-{expected['steps']}.pt" in result.stdout
 
 
+def test_stage211_reuses_completed_receipt_without_rehashing_bound_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phase = "mixer"
+    difficulty = "easy"
+    expected = STAGE211_AUDIO_CURRICULUM[difficulty]
+    run_dir = tmp_path / "easy"
+    run_dir.mkdir()
+    paths = {
+        "provenance": run_dir / "stage211_provenance.json",
+        "train_config": run_dir / "train_config.yaml",
+        "nano_teacher_checkpoint": tmp_path / "model.pt",
+        "bucket_manifest": tmp_path / "manifest.json",
+        "init_checkpoint": tmp_path / "init.pt",
+        "completion_checkpoint": run_dir / f"step-{expected['steps']}.pt",
+    }
+    for path in paths.values():
+        path.write_bytes(b"bound")
+    runtime_records = []
+    for epoch in range(1, STAGE211_FULL_DATA_EPOCHS + 1):
+        checkpoint = run_dir / f"epoch-{epoch}.pt"
+        checkpoint.write_bytes(b"epoch")
+        runtime_records.append(
+            {
+                "epoch": epoch,
+                "step": epoch * int(expected["steps_per_epoch"]),
+                "epoch_batch_offset": 0,
+                "completed_epoch_batch_count": int(expected["steps_per_epoch"]),
+                "checkpoint_path": str(checkpoint.resolve()),
+                "checkpoint_sha256": "a" * 64,
+            }
+        )
+    receipt = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "curriculum_coverage",
+        "phase": phase,
+        "difficulty": difficulty,
+        "complete": True,
+        "full_data_profile": True,
+        "epochs": STAGE211_FULL_DATA_EPOCHS,
+        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "rows": int(expected["rows"]),
+        "row_exposures": int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS,
+        "tail_padding_samples_per_epoch": int(
+            expected["tail_padding_samples_per_epoch"]
+        ),
+        "tail_padding_sample_exposures": int(
+            expected["tail_padding_samples_per_epoch"]
+        )
+        * STAGE211_FULL_DATA_EPOCHS,
+        "executed_sample_exposures": (
+            int(expected["rows"])
+            + int(expected["tail_padding_samples_per_epoch"])
+        )
+        * STAGE211_FULL_DATA_EPOCHS,
+        "hours": float(expected["hours"]),
+        "hour_exposures": float(expected["hours"]) * STAGE211_FULL_DATA_EPOCHS,
+        "steps_per_epoch": int(expected["steps_per_epoch"]),
+        "steps": int(expected["steps"]),
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
+        "run_dir": str(run_dir.resolve()),
+        "runtime_epoch_coverage": {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "runtime_epoch_coverage",
+            "complete": True,
+            "epochs": STAGE211_FULL_DATA_EPOCHS,
+            "steps_per_epoch": int(expected["steps_per_epoch"]),
+            "total_steps": int(expected["steps"]),
+            "records": runtime_records,
+        },
+        "parameter_delta_audit": {
+            "complete": True,
+            "policy": "stage211_timemixer_and_input_projection_only",
+            "forbidden_changed_tensors": 0,
+            "allowed_changed_tensors": 1,
+            "allowed_changed_numel": 1,
+        },
+    }
+    for name, path in paths.items():
+        receipt[f"{name}_path"] = str(path.resolve())
+        receipt[f"{name}_sha256"] = "b" * 64
+    receipt_path = tmp_path / "easy.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    real_sha256_file = sha256_file
+    hash_calls: list[Path] = []
+
+    def recording_sha256(path: Path) -> str:
+        hash_calls.append(Path(path).resolve())
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(stage211_full_phase, "sha256_file", recording_sha256)
+    reused = stage211_full_phase._load_reusable_receipt(
+        receipt_path,
+        phase=phase,
+        difficulty=difficulty,
+        run_dir=run_dir,
+        manifest_path=paths["bucket_manifest"],
+        init_checkpoint=paths["init_checkpoint"],
+        completion_checkpoint=paths["completion_checkpoint"],
+    )
+
+    assert reused["complete"] is True
+    assert hash_calls == [receipt_path.resolve()]
+
+    receipt["completion_checkpoint_path"] = str((tmp_path / "other.pt").resolve())
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match the completed segment"):
+        stage211_full_phase._load_reusable_receipt(
+            receipt_path,
+            phase=phase,
+            difficulty=difficulty,
+            run_dir=run_dir,
+            manifest_path=paths["bucket_manifest"],
+            init_checkpoint=paths["init_checkpoint"],
+            completion_checkpoint=paths["completion_checkpoint"],
+        )
+
+
 def test_stage211_full_phase_smoke_audit_rejects_teacher_misses(
     tmp_path: Path,
 ) -> None:
