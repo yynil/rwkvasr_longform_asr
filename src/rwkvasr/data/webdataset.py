@@ -4,6 +4,8 @@ import io
 import json
 import os
 import random
+import shutil
+import subprocess
 import sys
 import tarfile
 from dataclasses import dataclass
@@ -141,6 +143,74 @@ def log_webdataset_decode_skip(
     )
 
 
+def _decode_audio_bytes_with_ffmpeg(audio_bytes: bytes, *, key: str) -> tuple[torch.Tensor, int]:
+    import numpy as np
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(f"ffmpeg is unavailable for WebDataset sample key={key}")
+
+    sample_rate = 16000
+    command = [
+        ffmpeg,
+        "-v",
+        "error",
+        "-i",
+        "pipe:0",
+        "-f",
+        "f32le",
+        "-acodec",
+        "pcm_f32le",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "pipe:1",
+    ]
+    env = os.environ.copy()
+    loader_paths = ["/usr/lib/x86_64-linux-gnu/blas", "/usr/lib/x86_64-linux-gnu/lapack"]
+    existing = env.get("LD_LIBRARY_PATH")
+    env["LD_LIBRARY_PATH"] = ":".join([*loader_paths, existing] if existing else loader_paths)
+    result = subprocess.run(
+        command,
+        input=audio_bytes,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    if result.returncode != 0:
+        message = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg failed to decode WebDataset sample key={key}: {message}")
+    audio = np.frombuffer(result.stdout, dtype=np.float32).copy()
+    if audio.size == 0:
+        raise RuntimeError(f"ffmpeg decoded no samples for WebDataset sample key={key}")
+    return torch.from_numpy(audio).unsqueeze(0), sample_rate
+
+
+def load_webdataset_audio_bytes(audio_bytes: bytes, *, key: str) -> tuple[torch.Tensor, int]:
+    import soundfile as sf
+
+    try:
+        audio_array, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+        return torch.from_numpy(audio_array).transpose(0, 1), int(sample_rate)
+    except Exception as soundfile_exc:
+        try:
+            waveform, sample_rate = _decode_audio_bytes_with_ffmpeg(audio_bytes, key=key)
+            print(
+                f"[rwkvasr-webdataset] decoded via ffmpeg fallback key={key}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return waveform, sample_rate
+        except Exception as ffmpeg_exc:
+            raise RuntimeError(
+                "Could not decode WebDataset audio "
+                f"key={key}: soundfile={type(soundfile_exc).__name__}: {soundfile_exc}; "
+                f"ffmpeg={type(ffmpeg_exc).__name__}: {ffmpeg_exc}"
+            ) from ffmpeg_exc
+
+
 def decode_webdataset_sample(
     *,
     key: str,
@@ -176,8 +246,6 @@ def decode_webdataset_sample(
     decoder_prompt_language_label_noise_seed: int = 0,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    import soundfile as sf
-
     metadata = metadata or json.loads(metadata_bytes.decode("utf-8"))
     token_ids = metadata.get(token_ids_key)
     raw_text = metadata.get(text_key)
@@ -292,9 +360,7 @@ def decode_webdataset_sample(
             tokenizer=decoder_tokenizer,
         )
 
-    audio_buffer = io.BytesIO(audio_bytes)
-    audio_array, sample_rate = sf.read(audio_buffer, dtype="float32", always_2d=True)
-    waveform = torch.from_numpy(audio_array).transpose(0, 1)
+    waveform, sample_rate = load_webdataset_audio_bytes(audio_bytes, key=key)
     features = feature_extractor(waveform, sample_rate).float()
     targets = torch.tensor([int(token) for token in token_ids], dtype=torch.long)
 

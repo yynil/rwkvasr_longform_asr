@@ -7,6 +7,9 @@ import wave
 from pathlib import Path
 
 import torch
+import soundfile
+
+import rwkvasr.data.webdataset as webdataset_module
 
 from rwkvasr.data import (
     LengthBucketedBatchSampler,
@@ -243,6 +246,32 @@ def test_webdataset_iterable_decodes_audio_and_tokenizes_text(tmp_path: Path) ->
     assert all(sample["features"].dim() == 2 for sample in samples)
     assert all(sample["features"].size(1) == 80 for sample in samples)
     assert [sample["target_length"] for sample in samples] == [4, 4, 4]
+
+
+def test_webdataset_audio_uses_ffmpeg_fallback_without_skipping(tmp_path: Path, monkeypatch) -> None:
+    root = _build_root(tmp_path)
+    fallback_calls: list[tuple[bytes, str]] = []
+
+    def fail_soundfile(*args, **kwargs):
+        raise soundfile.LibsndfileError(1, "forced failure")
+
+    def fake_ffmpeg(audio_bytes: bytes, *, key: str) -> tuple[torch.Tensor, int]:
+        fallback_calls.append((audio_bytes, key))
+        return torch.zeros(1, 16000, dtype=torch.float32), 16000
+
+    monkeypatch.setattr(soundfile, "read", fail_soundfile)
+    monkeypatch.setattr(webdataset_module, "_decode_audio_bytes_with_ffmpeg", fake_ffmpeg)
+    dataset = WebDatasetASRIterableDataset(
+        root,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(shuffle_shards=False, skip_decode_errors=False),
+    )
+
+    samples = list(dataset)
+
+    assert [sample["utt_id"] for sample in samples] == ["sid-1", "sid-2", "sid-3"]
+    assert [key for _, key in fallback_calls] == ["0000000001", "0000000002", "0000000003"]
+    assert all(audio_bytes.startswith(b"RIFF") for audio_bytes, _ in fallback_calls)
 
 
 def test_webdataset_ctc_label_override_changes_only_ctc_targets(tmp_path: Path) -> None:
