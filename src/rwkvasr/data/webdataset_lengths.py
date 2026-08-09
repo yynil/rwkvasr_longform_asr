@@ -267,6 +267,17 @@ def load_webdataset_length_entries(
 
 
 def parse_webdataset_length_entry(raw: dict[str, Any]) -> WebDatasetLengthEntry:
+    audio_size = (
+        int(raw["audio_size"])
+        if raw.get("audio_size") is not None
+        else None
+    )
+    if audio_size is not None and audio_size <= 0:
+        sample_key = str(raw.get("key") or raw.get("utt_id") or "unknown")
+        raise ValueError(
+            "WebDataset length entry has a non-positive audio_size: "
+            f"key={sample_key!r} audio_size={audio_size}"
+        )
     return WebDatasetLengthEntry(
         shard_name=str(raw["shard_name"]),
         key=str(raw["key"]),
@@ -299,11 +310,7 @@ def parse_webdataset_length_entry(raw: dict[str, Any]) -> WebDatasetLengthEntry:
             if raw.get("audio_offset") is not None
             else None
         ),
-        audio_size=(
-            int(raw["audio_size"])
-            if raw.get("audio_size") is not None
-            else None
-        ),
+        audio_size=audio_size,
         json_offset=(
             int(raw["json_offset"])
             if raw.get("json_offset") is not None
