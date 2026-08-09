@@ -77,6 +77,7 @@ def _load_phase_config(
     device: str,
     teacher_device: str | None,
     audio_cache_dir: Path,
+    eval_bucket_manifest_path: Path | None = None,
 ) -> DeepSpeedTrainConfig:
     raw = dict(load_yaml(train_config_path))
     validate_stage211_phase_train_config(raw, phase=phase)
@@ -101,6 +102,10 @@ def _load_phase_config(
     )
     if teacher_device is not None:
         config_data["ctc_teacher_online_device"] = str(teacher_device)
+    if eval_bucket_manifest_path is not None:
+        config_data["webdataset_bucket_manifest_path"] = str(
+            eval_bucket_manifest_path.expanduser().resolve()
+        )
     return DeepSpeedTrainConfig(**config_data)
 
 
@@ -368,6 +373,15 @@ def evaluate_pair(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, A
         else candidate_output.parent / "teacher_audio_cache"
     )
     audio_cache_dir.mkdir(parents=True, exist_ok=True)
+    raw_eval_bucket_manifest = getattr(args, "eval_bucket_manifest", None)
+    eval_bucket_manifest_path = (
+        _resolved_file(
+            Path(raw_eval_bucket_manifest),
+            label="Stage211 sidecar eval bucket manifest",
+        )
+        if raw_eval_bucket_manifest is not None
+        else None
+    )
 
     device = torch.device(str(args.device))
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -384,6 +398,7 @@ def evaluate_pair(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, A
         device=str(device),
         teacher_device=args.teacher_device,
         audio_cache_dir=audio_cache_dir,
+        eval_bucket_manifest_path=eval_bucket_manifest_path,
     )
     model_config = RWKVCTCModelConfig(**load_yaml(model_config_path))
     student_dtype = _resolve_student_dtype(
@@ -521,6 +536,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--teacher-device", default=None)
     parser.add_argument("--audio-cache-dir", type=Path, default=None)
+    parser.add_argument(
+        "--eval-bucket-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Override only the eval bucket manifest. This supports immutable "
+            "diagnostic cells without changing the phase train config."
+        ),
+    )
     parser.add_argument(
         "--student-dtype",
         choices=("auto", "fp32", "bf16", "fp16"),

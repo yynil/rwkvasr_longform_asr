@@ -55,6 +55,39 @@ def test_stage211_pair_config_forces_one_deterministic_fixed_eval(
     assert config.num_workers == 2
 
 
+def test_stage211_pair_config_can_override_only_eval_manifest(
+    tmp_path: Path,
+) -> None:
+    train_config = tmp_path / "train.yaml"
+    original_manifest = tmp_path / "original.json"
+    sidecar_manifest = tmp_path / "sidecar.json"
+    payload = {
+        **stage211_phase_train_config_contract("mixer"),
+        "output_dir": str(tmp_path / "run"),
+        "deepspeed": {},
+        "webdataset_bucket_manifest_path": str(original_manifest),
+        "webdataset_length_index_path": str(tmp_path / "lengths.jsonl"),
+    }
+    save_yaml(train_config, payload)
+
+    config = pair_eval._load_phase_config(
+        phase="mixer",
+        train_config_path=train_config,
+        samples=256,
+        batch_size=4,
+        num_workers=0,
+        feature_seed=0,
+        device="cpu",
+        teacher_device="cpu",
+        audio_cache_dir=tmp_path / "cache",
+        eval_bucket_manifest_path=sidecar_manifest,
+    )
+
+    assert config.webdataset_bucket_manifest_path == str(sidecar_manifest.resolve())
+    assert config.webdataset_length_index_path == payload["webdataset_length_index_path"]
+    assert config.step_eval_split == "eval"
+
+
 def test_stage211_pair_metric_validation_requires_complete_outputs() -> None:
     layers = {
         layer_id: {"loss": 0.5, "cosine": 0.8, "rms_ratio": 1.0}
