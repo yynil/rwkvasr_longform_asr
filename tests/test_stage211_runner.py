@@ -304,6 +304,53 @@ def test_stage211_mixer_finalizer_runs_stratified_hidden_gate(
     ] == str(summary_path)
 
 
+def test_stage211_phase_gate_rebuilds_with_bound_stratified_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary_path = tmp_path / "stratified-summary.json"
+    summary_path.write_text("{}\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_hidden_gate(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"rebuilt": True}
+
+    monkeypatch.setattr(
+        stage211_phase_gate,
+        "build_hidden_alignment_gate",
+        fake_hidden_gate,
+    )
+    report = stage211_phase_gate._rebuild_alignment_gate(
+        phase="mixer",
+        alignment_report={
+            "stratified_summary_path": str(summary_path.resolve()),
+            "stratified_summary_sha256": sha256_file(summary_path),
+        },
+        baseline_report_path=tmp_path / "baseline.json",
+        candidate_report_path=tmp_path / "candidate.json",
+        phase_init_checkpoint=tmp_path / "init.pt",
+        checkpoint_path=tmp_path / "checkpoint.pt",
+    )
+
+    assert report == {"rebuilt": True}
+    assert captured["stratified_summary_path"] == summary_path.resolve()
+
+    summary_path.write_text('{"mutated": true}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="stratified summary is missing or changed"):
+        stage211_phase_gate._rebuild_alignment_gate(
+            phase="mixer",
+            alignment_report={
+                "stratified_summary_path": str(summary_path.resolve()),
+                "stratified_summary_sha256": "0" * 64,
+            },
+            baseline_report_path=tmp_path / "baseline.json",
+            candidate_report_path=tmp_path / "candidate.json",
+            phase_init_checkpoint=tmp_path / "init.pt",
+            checkpoint_path=tmp_path / "checkpoint.pt",
+        )
+
+
 def test_stage211_calibration_eval_reuse_binds_checkpoint_and_complete_metrics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

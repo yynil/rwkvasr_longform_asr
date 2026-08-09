@@ -249,6 +249,44 @@ def _build_public_progress(
     }
 
 
+def _rebuild_alignment_gate(
+    *,
+    phase: str,
+    alignment_report: dict[str, Any],
+    baseline_report_path: Path,
+    candidate_report_path: Path,
+    phase_init_checkpoint: Path,
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    if phase == "logits":
+        return build_logits_alignment_gate(
+            baseline_report_path=baseline_report_path,
+            candidate_report_path=candidate_report_path,
+            baseline_checkpoint_path=phase_init_checkpoint,
+            checkpoint_path=checkpoint_path,
+        )
+    stratified_summary_path: Path | None = None
+    recorded_path = alignment_report.get("stratified_summary_path")
+    recorded_sha256 = alignment_report.get("stratified_summary_sha256")
+    if recorded_path is not None or recorded_sha256 is not None:
+        stratified_summary_path = Path(str(recorded_path or "")).resolve()
+        if (
+            not stratified_summary_path.is_file()
+            or sha256_file(stratified_summary_path) != recorded_sha256
+        ):
+            raise ValueError(
+                "Stage211 hidden alignment stratified summary is missing or changed."
+            )
+    return build_hidden_alignment_gate(
+        phase=phase,
+        baseline_report_path=baseline_report_path,
+        candidate_report_path=candidate_report_path,
+        baseline_checkpoint_path=phase_init_checkpoint,
+        checkpoint_path=checkpoint_path,
+        stratified_summary_path=stratified_summary_path,
+    )
+
+
 def build_phase_gate(
     *,
     phase: str,
@@ -356,21 +394,14 @@ def build_phase_gate(
                 "Stage211 alignment pair does not bind the easy-segment "
                 "phase train config."
             )
-        if phase == "logits":
-            rebuilt_alignment_report = build_logits_alignment_gate(
-                baseline_report_path=baseline_alignment_report_path,
-                candidate_report_path=candidate_alignment_report_path,
-                baseline_checkpoint_path=phase_init_checkpoint,
-                checkpoint_path=checkpoint_path,
-            )
-        else:
-            rebuilt_alignment_report = build_hidden_alignment_gate(
-                phase=phase,
-                baseline_report_path=baseline_alignment_report_path,
-                candidate_report_path=candidate_alignment_report_path,
-                baseline_checkpoint_path=phase_init_checkpoint,
-                checkpoint_path=checkpoint_path,
-            )
+        rebuilt_alignment_report = _rebuild_alignment_gate(
+            phase=phase,
+            alignment_report=alignment_report,
+            baseline_report_path=baseline_alignment_report_path,
+            candidate_report_path=candidate_alignment_report_path,
+            phase_init_checkpoint=phase_init_checkpoint,
+            checkpoint_path=checkpoint_path,
+        )
         if rebuilt_alignment_report != alignment_report:
             raise ValueError(
                 "Stage211 alignment report does not match its bound source reports."
