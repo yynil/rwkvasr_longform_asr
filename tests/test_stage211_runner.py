@@ -87,6 +87,27 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
     checkpoint.write_bytes(b"checkpoint")
     receipt = tmp_path / "long-receipt.json"
     receipt.write_text("{}\n", encoding="utf-8")
+    stratified_cells = {}
+    for cell_name in stage211_phase_finalizer.STRATIFIED_HIDDEN_CELLS:
+        manifest = tmp_path / f"logits-manifest-{cell_name}.json"
+        manifest.write_text("{}\n", encoding="utf-8")
+        stratified_cells[cell_name] = {
+            "samples": 256,
+            "manifest_path": str(manifest.resolve()),
+            "manifest_sha256": sha256_file(manifest),
+        }
+    stratified_receipt = tmp_path / "logits-stratified-receipt.json"
+    stratified_receipt.write_text(
+        json.dumps(
+            {
+                "pipeline": "stage211",
+                "artifact": "stratified_hidden_eval_manifest",
+                "cells": stratified_cells,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     commands: list[list[str]] = []
     monkeypatch.setattr(
         stage211_phase_finalizer,
@@ -137,6 +158,7 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
             devices="0,1,2,3",
             dry_run=True,
             baseline_public_comparison_report=None,
+            stratified_hidden_receipt=stratified_receipt,
         )
     )
 
@@ -179,6 +201,25 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
     assert logits_command[
         logits_command.index("--baseline-checkpoint") + 1
     ] == str(baseline_checkpoint.resolve())
+    stratified_summary = tmp_path / "eval" / "alignment_stratified" / "summary.json"
+    assert logits_command[
+        logits_command.index("--stratified-summary") + 1
+    ] == str(stratified_summary)
+    pair_commands = [
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.ALIGNMENT_PAIR_EVAL_SCRIPT) in command
+    ]
+    assert len(pair_commands) == 8
+    summary_command = next(
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.STRATIFIED_LOGITS_SUMMARY_SCRIPT)
+        in command
+    )
+    assert summary_command[summary_command.index("--output") + 1] == str(
+        stratified_summary
+    )
     assert phase_gate_command[
         phase_gate_command.index("--alignment-report") + 1
     ] == str(logits_gate_path)
@@ -312,29 +353,36 @@ def test_stage211_phase_gate_rebuilds_with_bound_stratified_summary(
     summary_path.write_text("{}\n", encoding="utf-8")
     captured: dict[str, object] = {}
 
-    def fake_hidden_gate(**kwargs: object) -> dict[str, object]:
+    def fake_alignment_gate(**kwargs: object) -> dict[str, object]:
         captured.update(kwargs)
         return {"rebuilt": True}
 
     monkeypatch.setattr(
         stage211_phase_gate,
         "build_hidden_alignment_gate",
-        fake_hidden_gate,
+        fake_alignment_gate,
     )
-    report = stage211_phase_gate._rebuild_alignment_gate(
-        phase="mixer",
-        alignment_report={
-            "stratified_summary_path": str(summary_path.resolve()),
-            "stratified_summary_sha256": sha256_file(summary_path),
-        },
-        baseline_report_path=tmp_path / "baseline.json",
-        candidate_report_path=tmp_path / "candidate.json",
-        phase_init_checkpoint=tmp_path / "init.pt",
-        checkpoint_path=tmp_path / "checkpoint.pt",
+    monkeypatch.setattr(
+        stage211_phase_gate,
+        "build_logits_alignment_gate",
+        fake_alignment_gate,
     )
+    for phase in ("mixer", "logits"):
+        captured.clear()
+        report = stage211_phase_gate._rebuild_alignment_gate(
+            phase=phase,
+            alignment_report={
+                "stratified_summary_path": str(summary_path.resolve()),
+                "stratified_summary_sha256": sha256_file(summary_path),
+            },
+            baseline_report_path=tmp_path / "baseline.json",
+            candidate_report_path=tmp_path / "candidate.json",
+            phase_init_checkpoint=tmp_path / "init.pt",
+            checkpoint_path=tmp_path / "checkpoint.pt",
+        )
 
-    assert report == {"rebuilt": True}
-    assert captured["stratified_summary_path"] == summary_path.resolve()
+        assert report == {"rebuilt": True}
+        assert captured["stratified_summary_path"] == summary_path.resolve()
 
     summary_path.write_text('{"mutated": true}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="stratified summary is missing or changed"):

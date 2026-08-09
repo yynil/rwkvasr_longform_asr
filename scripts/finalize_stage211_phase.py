@@ -28,6 +28,9 @@ ALIGNMENT_PAIR_EVAL_SCRIPT = (
 STRATIFIED_SUMMARY_SCRIPT = (
     REPO_ROOT / "scripts" / "summarize_stage211_stratified_hidden_eval.py"
 )
+STRATIFIED_LOGITS_SUMMARY_SCRIPT = (
+    REPO_ROOT / "scripts" / "summarize_stage211_stratified_logits_eval.py"
+)
 PHASE_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_phase_gate.py"
 PROMOTION_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_promotion_receipt.py"
 DEFAULT_PUBLIC_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
@@ -303,7 +306,7 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     _run(pair_eval_command, dry_run=bool(args.dry_run))
 
     stratified_summary_path: Path | None = None
-    if phase in {"mixer", "block"}:
+    if phase in {"mixer", "block", "logits"}:
         stratified_receipt_path = Path(
             getattr(
                 args,
@@ -371,10 +374,15 @@ def finalize_phase(args: argparse.Namespace) -> Path:
                 )
             _run(cell_command, dry_run=bool(args.dry_run))
         stratified_summary_path = stratified_eval_dir / "summary.json"
+        summary_script = (
+            STRATIFIED_LOGITS_SUMMARY_SCRIPT
+            if phase == "logits"
+            else STRATIFIED_SUMMARY_SCRIPT
+        )
         _run(
             [
                 str(PYTHON),
-                str(STRATIFIED_SUMMARY_SCRIPT),
+                str(summary_script),
                 "--receipt",
                 str(stratified_receipt_path),
                 "--eval-dir",
@@ -433,23 +441,25 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         )
     elif phase == "logits":
         alignment_gate_path = output_dir / "logits_gate.json"
-        _run(
-            [
-                str(PYTHON),
-                str(LOGITS_GATE_SCRIPT),
-                "--baseline-report",
-                str(baseline_report),
-                "--candidate-report",
-                str(candidate_report),
-                "--baseline-checkpoint",
-                str(baseline_checkpoint),
-                "--checkpoint",
-                str(checkpoint),
-                "--output",
-                str(alignment_gate_path),
-            ],
-            dry_run=bool(args.dry_run),
-        )
+        logits_gate_command = [
+            str(PYTHON),
+            str(LOGITS_GATE_SCRIPT),
+            "--baseline-report",
+            str(baseline_report),
+            "--candidate-report",
+            str(candidate_report),
+            "--baseline-checkpoint",
+            str(baseline_checkpoint),
+            "--checkpoint",
+            str(checkpoint),
+            "--output",
+            str(alignment_gate_path),
+        ]
+        if stratified_summary_path is not None:
+            logits_gate_command.extend(
+                ("--stratified-summary", str(stratified_summary_path))
+            )
+        _run(logits_gate_command, dry_run=bool(args.dry_run))
 
     phase_gate_path = output_dir / "phase_gate.json"
     phase_gate_command = [

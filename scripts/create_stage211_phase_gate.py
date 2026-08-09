@@ -258,13 +258,6 @@ def _rebuild_alignment_gate(
     phase_init_checkpoint: Path,
     checkpoint_path: Path,
 ) -> dict[str, Any]:
-    if phase == "logits":
-        return build_logits_alignment_gate(
-            baseline_report_path=baseline_report_path,
-            candidate_report_path=candidate_report_path,
-            baseline_checkpoint_path=phase_init_checkpoint,
-            checkpoint_path=checkpoint_path,
-        )
     stratified_summary_path: Path | None = None
     recorded_path = alignment_report.get("stratified_summary_path")
     recorded_sha256 = alignment_report.get("stratified_summary_sha256")
@@ -275,8 +268,16 @@ def _rebuild_alignment_gate(
             or sha256_file(stratified_summary_path) != recorded_sha256
         ):
             raise ValueError(
-                "Stage211 hidden alignment stratified summary is missing or changed."
+                "Stage211 alignment stratified summary is missing or changed."
             )
+    if phase == "logits":
+        return build_logits_alignment_gate(
+            baseline_report_path=baseline_report_path,
+            candidate_report_path=candidate_report_path,
+            baseline_checkpoint_path=phase_init_checkpoint,
+            checkpoint_path=checkpoint_path,
+            stratified_summary_path=stratified_summary_path,
+        )
     return build_hidden_alignment_gate(
         phase=phase,
         baseline_report_path=baseline_report_path,
