@@ -527,6 +527,58 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert phase_offsets == sorted(phase_offsets)
 
 
+def test_stage211_hourly_monitor_scopes_errors_to_latest_attempt(
+    tmp_path: Path,
+) -> None:
+    monitor_script = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+    training_log = tmp_path / "train.log"
+    training_log.write_text(
+        "Traceback from an older failed attempt\n"
+        "[rwkvasr] Distributed init complete. world_size=4\n"
+        "[deepspeed-train] step=10 loss=0.2000 online_layer_missing=1\n"
+        "[rwkvasr] Distributed init complete. world_size=4\n"
+        "[deepspeed-train] step=20 loss=0.1000 "
+        "online_layer_missing=0 online_layer_frame_delta=0\n",
+        encoding="utf-8",
+    )
+
+    command = [
+        "bash",
+        "-c",
+        'source "$1"; stage211_current_attempt_start "$2"; '
+        'stage211_current_attempt_errors "$2"',
+        "stage211-monitor-test",
+        str(monitor_script),
+        str(training_log),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "4"
+    assert "Traceback" not in result.stdout
+    assert "online_layer_missing=1" not in result.stdout
+
+    with training_log.open("a", encoding="utf-8") as output:
+        output.write("[deepspeed-train] step=30 online_layer_frame_delta=1\n")
+    failed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert failed.returncode == 0, failed.stderr
+    assert failed.stdout.splitlines()[0] == "4"
+    assert "online_layer_frame_delta=1" in failed.stdout
+
+
 def test_stage211_calibration_eval_validator_cli_loads() -> None:
     result = subprocess.run(
         [
