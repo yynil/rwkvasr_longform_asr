@@ -225,3 +225,9 @@ def test_summarize_stage211_stratified_hidden_eval(tmp_path: Path) -> None:
     assert summary["macro"]["relative_change_pct"] == pytest.approx(-25.0)
     assert summary["cells"]["easy_en"]["layers_loss_improved"] == 70
     assert summary["cells"]["easy_en"]["layers_cosine_improved"] == 70
+    assert summary["layer_summary"]["loss_improved_layers"] == 70
+    assert summary["layer_summary"]["cosine_improved_layers"] == 70
+    assert set(summary["layer_summary"]["layers"]) == {
+        str(index) for index in range(70)
+    }
+    assert summary["decoder_hidden"] is None

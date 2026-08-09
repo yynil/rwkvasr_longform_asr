@@ -184,6 +184,126 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
     ] == str(logits_gate_path)
 
 
+def test_stage211_mixer_finalizer_runs_stratified_hidden_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_checkpoint = tmp_path / "init.pt"
+    baseline_checkpoint.write_bytes(b"initial")
+    checkpoint = tmp_path / "step-105.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    curriculum_receipt = tmp_path / "long-receipt.json"
+    curriculum_receipt.write_text("{}\n", encoding="utf-8")
+    stratified_cells = {}
+    for cell_name in stage211_phase_finalizer.STRATIFIED_HIDDEN_CELLS:
+        manifest = tmp_path / f"manifest_{cell_name}.json"
+        manifest.write_text("{}\n", encoding="utf-8")
+        stratified_cells[cell_name] = {
+            "samples": 256,
+            "manifest_path": str(manifest.resolve()),
+            "manifest_sha256": sha256_file(manifest),
+        }
+    stratified_receipt = tmp_path / "stratified-receipt.json"
+    stratified_receipt.write_text(
+        json.dumps(
+            {
+                "pipeline": "stage211",
+                "artifact": "stratified_hidden_eval_manifest",
+                "cells": stratified_cells,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_resolve_curriculum",
+        lambda **kwargs: (
+            {
+                "segments": [
+                    {
+                        "difficulty": "easy",
+                        "init_checkpoint_path": str(
+                            baseline_checkpoint.resolve()
+                        ),
+                        "init_checkpoint_sha256": sha256_file(
+                            baseline_checkpoint
+                        ),
+                    }
+                ]
+            },
+            checkpoint,
+            [curriculum_receipt],
+        ),
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_run_public_eval",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_run_nano_comparison",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_run",
+        lambda command, *, dry_run, env=None: commands.append(command),
+    )
+    output_dir = tmp_path / "eval"
+    stage211_phase_finalizer.finalize_phase(
+        SimpleNamespace(
+            phase="mixer",
+            phase_root=tmp_path / "phase",
+            public_manifest_dir=tmp_path / "manifests",
+            nano_prediction_dir=tmp_path / "nano" / "predictions",
+            nano_public_baseline_receipt=None,
+            output_dir=output_dir,
+            devices="0,1,2,3",
+            dry_run=True,
+            baseline_public_comparison_report=tmp_path / "baseline-public.json",
+            stratified_hidden_receipt=stratified_receipt,
+        )
+    )
+
+    pair_commands = [
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.ALIGNMENT_PAIR_EVAL_SCRIPT) in command
+    ]
+    assert len(pair_commands) == 8
+    sidecar_commands = [
+        command for command in pair_commands if "--eval-bucket-manifest" in command
+    ]
+    assert len(sidecar_commands) == 7
+    assert {
+        command[command.index("--eval-bucket-manifest") + 1]
+        for command in sidecar_commands
+    } == {
+        str(Path(cell["manifest_path"]).resolve())
+        for cell in stratified_cells.values()
+    }
+    summary_command = next(
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.STRATIFIED_SUMMARY_SCRIPT) in command
+    )
+    summary_path = output_dir / "alignment_stratified" / "summary.json"
+    assert summary_command[summary_command.index("--output") + 1] == str(
+        summary_path
+    )
+    hidden_gate_command = next(
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.HIDDEN_GATE_SCRIPT) in command
+    )
+    assert hidden_gate_command[
+        hidden_gate_command.index("--stratified-summary") + 1
+    ] == str(summary_path)
+
+
 def test_stage211_calibration_eval_reuse_binds_checkpoint_and_complete_metrics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

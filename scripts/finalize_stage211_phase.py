@@ -25,6 +25,9 @@ LOGITS_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_logits_alignment_g
 ALIGNMENT_PAIR_EVAL_SCRIPT = (
     REPO_ROOT / "scripts" / "evaluate_stage211_alignment_pair.py"
 )
+STRATIFIED_SUMMARY_SCRIPT = (
+    REPO_ROOT / "scripts" / "summarize_stage211_stratified_hidden_eval.py"
+)
 PHASE_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_phase_gate.py"
 PROMOTION_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_promotion_receipt.py"
 DEFAULT_PUBLIC_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
@@ -32,6 +35,22 @@ DEFAULT_NANO_PREDICTION_DIR = (
     Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512" / "predictions"
 )
 DEFAULT_EVAL_ROOT = Path.home() / "rwkvasr_eval" / "stage211_phase_gates"
+DEFAULT_STRATIFIED_HIDDEN_RECEIPT = (
+    Path.home()
+    / "rwkvasr_data"
+    / "stage211_full_curriculum"
+    / "stratified_hidden_eval_v1"
+    / "receipt.json"
+)
+STRATIFIED_HIDDEN_CELLS = (
+    "easy_en",
+    "easy_zh",
+    "medium_en",
+    "medium_zh",
+    "hard_en",
+    "hard_zh",
+    "long_zh",
+)
 DATASETS = (
     "aishell1_test",
     "librispeech_test_clean",
@@ -168,6 +187,37 @@ def _run_nano_comparison(
     _run(command, dry_run=dry_run)
 
 
+def _stratified_cell_manifests(receipt_path: Path) -> dict[str, Path]:
+    receipt_path = receipt_path.expanduser().resolve()
+    receipt = _load_json(
+        receipt_path,
+        label="Stage211 stratified hidden-eval receipt",
+    )
+    if (
+        receipt.get("pipeline") != "stage211"
+        or receipt.get("artifact") != "stratified_hidden_eval_manifest"
+    ):
+        raise ValueError("Invalid Stage211 stratified hidden-eval receipt.")
+    cells = receipt.get("cells")
+    if not isinstance(cells, dict) or set(cells) != set(STRATIFIED_HIDDEN_CELLS):
+        raise ValueError("Stage211 stratified hidden-eval cell coverage mismatch.")
+    manifests = {}
+    for cell_name in STRATIFIED_HIDDEN_CELLS:
+        cell = cells[cell_name]
+        if not isinstance(cell, dict) or int(cell.get("samples", -1)) != 256:
+            raise ValueError(f"Invalid Stage211 stratified cell: {cell_name}")
+        manifest_path = Path(str(cell.get("manifest_path") or "")).resolve()
+        if (
+            not manifest_path.is_file()
+            or sha256_file(manifest_path) != cell.get("manifest_sha256")
+        ):
+            raise ValueError(
+                f"Stage211 stratified cell manifest is missing or changed: {cell_name}"
+            )
+        manifests[cell_name] = manifest_path
+    return manifests
+
+
 def finalize_phase(args: argparse.Namespace) -> Path:
     phase = str(args.phase)
     phase_root = args.phase_root.expanduser().resolve()
@@ -252,6 +302,89 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         )
     _run(pair_eval_command, dry_run=bool(args.dry_run))
 
+    stratified_summary_path: Path | None = None
+    if phase in {"mixer", "block"}:
+        stratified_receipt_path = Path(
+            getattr(
+                args,
+                "stratified_hidden_receipt",
+                DEFAULT_STRATIFIED_HIDDEN_RECEIPT,
+            )
+            or DEFAULT_STRATIFIED_HIDDEN_RECEIPT
+        ).expanduser().resolve()
+        stratified_manifests = _stratified_cell_manifests(
+            stratified_receipt_path
+        )
+        stratified_eval_dir = output_dir / "alignment_stratified"
+        stratified_batch_size = int(
+            getattr(args, "stratified_alignment_batch_size", 1)
+        )
+        stratified_num_workers = int(
+            getattr(args, "stratified_alignment_num_workers", 2)
+        )
+        stratified_device = str(
+            getattr(
+                args,
+                "stratified_alignment_device",
+                getattr(args, "alignment_device", "cuda:0"),
+            )
+        )
+        stratified_teacher_device = getattr(
+            args,
+            "stratified_alignment_teacher_device",
+            getattr(args, "alignment_teacher_device", None),
+        )
+        for cell_name in STRATIFIED_HIDDEN_CELLS:
+            cell_command = [
+                str(PYTHON),
+                str(ALIGNMENT_PAIR_EVAL_SCRIPT),
+                "--phase",
+                phase,
+                "--train-config",
+                str(phase_root / "easy" / "train_config.yaml"),
+                "--model-config",
+                str(phase_root / "easy" / "model_config.yaml"),
+                "--baseline-checkpoint",
+                str(baseline_checkpoint),
+                "--candidate-checkpoint",
+                str(checkpoint),
+                "--baseline-output",
+                str(stratified_eval_dir / f"{cell_name}_baseline.json"),
+                "--candidate-output",
+                str(stratified_eval_dir / f"{cell_name}_candidate.json"),
+                "--eval-bucket-manifest",
+                str(stratified_manifests[cell_name]),
+                "--samples",
+                "256",
+                "--feature-seed",
+                "0",
+                "--batch-size",
+                str(stratified_batch_size),
+                "--num-workers",
+                str(stratified_num_workers),
+                "--device",
+                stratified_device,
+            ]
+            if stratified_teacher_device is not None:
+                cell_command.extend(
+                    ("--teacher-device", str(stratified_teacher_device))
+                )
+            _run(cell_command, dry_run=bool(args.dry_run))
+        stratified_summary_path = stratified_eval_dir / "summary.json"
+        _run(
+            [
+                str(PYTHON),
+                str(STRATIFIED_SUMMARY_SCRIPT),
+                "--receipt",
+                str(stratified_receipt_path),
+                "--eval-dir",
+                str(stratified_eval_dir),
+                "--output",
+                str(stratified_summary_path),
+            ],
+            dry_run=bool(args.dry_run),
+        )
+
     public_output = output_dir / "public"
     comparison_json = output_dir / "nano_comparison.json"
     comparison_md = output_dir / "nano_comparison.md"
@@ -274,23 +407,28 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     alignment_gate_path: Path | None = None
     if phase in {"mixer", "block"}:
         alignment_gate_path = output_dir / "hidden_gate.json"
+        hidden_gate_command = [
+            str(PYTHON),
+            str(HIDDEN_GATE_SCRIPT),
+            "--phase",
+            phase,
+            "--baseline-report",
+            str(baseline_report),
+            "--candidate-report",
+            str(candidate_report),
+            "--baseline-checkpoint",
+            str(baseline_checkpoint),
+            "--checkpoint",
+            str(checkpoint),
+            "--output",
+            str(alignment_gate_path),
+        ]
+        if stratified_summary_path is not None:
+            hidden_gate_command.extend(
+                ("--stratified-summary", str(stratified_summary_path))
+            )
         _run(
-            [
-                str(PYTHON),
-                str(HIDDEN_GATE_SCRIPT),
-                "--phase",
-                phase,
-                "--baseline-report",
-                str(baseline_report),
-                "--candidate-report",
-                str(candidate_report),
-                "--baseline-checkpoint",
-                str(baseline_checkpoint),
-                "--checkpoint",
-                str(checkpoint),
-                "--output",
-                str(alignment_gate_path),
-            ],
+            hidden_gate_command,
             dry_run=bool(args.dry_run),
         )
     elif phase == "logits":
@@ -415,6 +553,18 @@ def main() -> int:
     parser.add_argument("--alignment-teacher-device", default=None)
     parser.add_argument("--alignment-batch-size", type=int, default=4)
     parser.add_argument("--alignment-num-workers", type=int, default=4)
+    parser.add_argument(
+        "--stratified-hidden-receipt",
+        type=Path,
+        default=DEFAULT_STRATIFIED_HIDDEN_RECEIPT,
+    )
+    parser.add_argument("--stratified-alignment-device", default="cuda:0")
+    parser.add_argument(
+        "--stratified-alignment-teacher-device",
+        default=None,
+    )
+    parser.add_argument("--stratified-alignment-batch-size", type=int, default=1)
+    parser.add_argument("--stratified-alignment-num-workers", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -100,6 +101,99 @@ def _write_report(
         },
     )
     return path
+
+
+def _write_stratified_summary(
+    root: Path,
+    *,
+    baseline_checkpoint: Path,
+    checkpoint: Path,
+) -> Path:
+    receipt = root / "stratified-receipt.json"
+    receipt.write_text("{}\n", encoding="utf-8")
+    cells = {}
+    reports = {}
+    for cell_name in hidden_gate.STRATIFIED_CELLS:
+        manifest = root / f"manifest_{cell_name}.json"
+        manifest.write_text("{}\n", encoding="utf-8")
+        cells[cell_name] = {
+            "samples": 256,
+            "baseline_loss": 1.0,
+            "candidate_loss": 0.8,
+            "relative_change_pct": -20.0,
+            "layers_loss_improved": 70,
+            "layers_cosine_improved": 70,
+            "manifest_path": str(manifest.resolve()),
+            "manifest_sha256": sha256_file(manifest),
+        }
+        reports[cell_name] = {}
+        for role in ("baseline", "candidate"):
+            report = root / f"{cell_name}_{role}.json"
+            report.write_text(f'{{"role": "{role}"}}\n', encoding="utf-8")
+            reports[cell_name][role] = {
+                "path": str(report.resolve()),
+                "sha256": sha256_file(report),
+            }
+    layers = {
+        str(layer_id): {
+            "baseline_loss": 1.0,
+            "candidate_loss": 0.8,
+            "baseline_cosine": 0.5,
+            "candidate_cosine": 0.6,
+        }
+        for layer_id in hidden_gate.LAYER_IDS
+    }
+    summary = root / "stratified-summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "stratified_hidden_eval_summary",
+                "phase": "mixer",
+                "receipt_path": str(receipt.resolve()),
+                "receipt_sha256": sha256_file(receipt),
+                "checkpoints": {
+                    "baseline": {
+                        "path": str(baseline_checkpoint.resolve()),
+                        "sha256": sha256_file(baseline_checkpoint),
+                    },
+                    "candidate": {
+                        "path": str(checkpoint.resolve()),
+                        "sha256": sha256_file(checkpoint),
+                    },
+                },
+                "cells": cells,
+                "macro": {
+                    "cells": 7,
+                    "samples": 1792,
+                    "baseline_loss": 1.0,
+                    "candidate_loss": 0.8,
+                    "relative_change_pct": -20.0,
+                },
+                "layer_summary": {
+                    "loss_improved_layers": 70,
+                    "cosine_improved_layers": 70,
+                    "weak_bands": {
+                        band: {
+                            "baseline_loss": 1.0,
+                            "candidate_loss": 0.8,
+                            "baseline_cosine": 0.5,
+                            "candidate_cosine": 0.6,
+                        }
+                        for band in hidden_gate.WEAK_BANDS
+                    },
+                    "layers": layers,
+                },
+                "decoder_hidden": None,
+                "reports": reports,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return summary
 
 
 def test_stage211_hidden_gate_requires_identical_bound_eval_parts(
@@ -203,4 +297,68 @@ def test_stage211_hidden_gate_rejects_mutated_eval_part(tmp_path: Path) -> None:
             candidate_report_path=candidate,
             baseline_checkpoint_path=baseline_checkpoint,
             checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_hidden_gate_uses_bound_stratified_result_for_promotion(
+    tmp_path: Path,
+) -> None:
+    eval_part = tmp_path / "fixed_eval.jsonl"
+    eval_part.write_text('{"utt_id": "u1"}\n', encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    baseline_checkpoint = tmp_path / "init.pt"
+    baseline_checkpoint.write_bytes(b"initial")
+    checkpoint = tmp_path / "step-105.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    baseline = _write_report(
+        tmp_path / "baseline.yaml",
+        manifest=manifest,
+        part=eval_part,
+        role="baseline",
+        checkpoint=baseline_checkpoint,
+        loss=1.0,
+        cosine=0.6,
+    )
+    candidate = _write_report(
+        tmp_path / "candidate.yaml",
+        manifest=manifest,
+        part=eval_part,
+        role="candidate",
+        checkpoint=checkpoint,
+        loss=1.1,
+        cosine=0.5,
+    )
+    stratified_summary = _write_stratified_summary(
+        tmp_path,
+        baseline_checkpoint=baseline_checkpoint,
+        checkpoint=checkpoint,
+    )
+
+    report = hidden_gate.build_gate(
+        phase="mixer",
+        baseline_report_path=baseline,
+        candidate_report_path=candidate,
+        baseline_checkpoint_path=baseline_checkpoint,
+        checkpoint_path=checkpoint,
+        stratified_summary_path=stratified_summary,
+    )
+
+    assert report["legacy_gate_passed"] is False
+    assert report["stratified_gate_passed"] is True
+    assert report["gate_passed"] is True
+    assert report["stratified_summary_sha256"] == sha256_file(
+        stratified_summary
+    )
+
+    bound_report = tmp_path / "easy_en_candidate.json"
+    bound_report.write_text('{"mutated": true}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="report is missing or changed"):
+        hidden_gate.build_gate(
+            phase="mixer",
+            baseline_report_path=baseline,
+            candidate_report_path=candidate,
+            baseline_checkpoint_path=baseline_checkpoint,
+            checkpoint_path=checkpoint,
+            stratified_summary_path=stratified_summary,
         )
