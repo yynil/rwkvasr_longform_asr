@@ -144,6 +144,7 @@ def _read_train_rows(manifest_path: Path) -> tuple[list[dict], list[str]]:
 
 def test_build_stage211_retention_replay_is_balanced_and_immutable(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_manifests = {}
     source_keys = {}
@@ -209,6 +210,8 @@ def test_build_stage211_retention_replay_is_balanced_and_immutable(
     }
     assert set(receipt["cells"]["easy_en"]["sources"].values()) == {4}
     assert all(len(part["sha256"]) == 64 for part in receipt["output_parts"])
+    assert Path(receipt["capacity_preflight_path"]).is_file()
+    assert len(receipt["capacity_preflight_sha256"]) == 64
 
     validated = validator.validate_retention_replay(
         output_dir / "receipt.json",
@@ -217,6 +220,11 @@ def test_build_stage211_retention_replay_is_balanced_and_immutable(
     )
     assert validated["validated_unique_keys"] == 59
     assert len(validated["receipt_sha256"]) == 64
+
+    def reject_capacity_rescan(**_: object) -> None:
+        raise AssertionError("immutable capacity preflight was not reused")
+
+    monkeypatch.setattr(builder, "_scan_capacities", reject_capacity_rescan)
 
     repeated = builder.build_retention_replay(
         source_manifests=source_manifests,

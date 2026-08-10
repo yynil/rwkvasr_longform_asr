@@ -23,10 +23,10 @@ CELLS = tuple(
     for language in CELL_LANGUAGES[difficulty]
 )
 DEFAULT_CELL_TARGETS: dict[str, int | None] = {
-    "easy_en": 200_000,
-    "easy_zh": 200_000,
-    "medium_en": 200_000,
-    "medium_zh": 200_000,
+    "easy_en": 130_000,
+    "easy_zh": 130_000,
+    "medium_en": 270_000,
+    "medium_zh": 270_000,
     "hard_en": 100_000,
     "hard_zh": 100_000,
     "long_zh": None,
@@ -693,6 +693,24 @@ def _nested_counts(
     }
 
 
+def _flatten_nested_counts(payload: Any) -> Counter[tuple[str, str, int]]:
+    if not isinstance(payload, dict):
+        raise ValueError("Replay capacity preflight counts must be an object.")
+    output: Counter[tuple[str, str, int]] = Counter()
+    for cell, sources in payload.items():
+        if cell not in CELLS or not isinstance(sources, dict):
+            raise ValueError(f"Replay capacity preflight has an invalid cell: {cell}")
+        for source_dataset, buckets in sources.items():
+            if not isinstance(buckets, dict):
+                raise ValueError("Replay capacity preflight source buckets are invalid.")
+            for bucket_id, count in buckets.items():
+                value = int(count)
+                if value <= 0:
+                    raise ValueError("Replay capacity preflight counts must be positive.")
+                output[(str(cell), str(source_dataset), int(bucket_id))] += value
+    return output
+
+
 def build_retention_replay(
     *,
     source_manifests: Mapping[str, Path],
@@ -730,11 +748,48 @@ def build_retention_replay(
         parts_by_difficulty[difficulty] = parts
         source_records[difficulty] = record
 
-    capacities, scan = _scan_capacities(
-        source_parts=parts_by_difficulty,
-        exclusions=exclusions,
-        bucket_width=bucket_width,
-    )
+    preflight_path = output_dir / "capacity_preflight.json"
+    preflight_contract = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "retention_replay_capacity_preflight",
+        "bucket_width": bucket_width,
+        "source_manifests": source_records,
+        "exclusions": exclusion_records,
+        "exclusion_union": {
+            "unique_keys": len(exclusions),
+            "keys_sha256": _keys_sha256(exclusions),
+        },
+    }
+    if preflight_path.is_file():
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+        if not isinstance(preflight, dict) or any(
+            preflight.get(key) != value for key, value in preflight_contract.items()
+        ):
+            raise ValueError(f"Replay capacity preflight input binding mismatch: {preflight_path}")
+        capacities = _flatten_nested_counts(preflight.get("capacities"))
+        scan = preflight.get("scan")
+        if not isinstance(scan, dict):
+            raise ValueError("Replay capacity preflight scan summary is invalid.")
+        print(
+            f"stage211_retention_replay reused_capacity_preflight path={preflight_path}",
+            flush=True,
+        )
+    else:
+        capacities, scan = _scan_capacities(
+            source_parts=parts_by_difficulty,
+            exclusions=exclusions,
+            bucket_width=bucket_width,
+        )
+        preflight = {
+            **preflight_contract,
+            "scan": scan,
+            "capacities": _nested_counts(capacities),
+        }
+        _write_immutable(
+            preflight_path,
+            json.dumps(preflight, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        )
     quotas, realized_targets = _build_quotas(
         capacities=capacities,
         cell_targets=targets,
@@ -806,6 +861,8 @@ def build_retention_replay(
             ),
         },
         "source_manifests": source_records,
+        "capacity_preflight_path": str(preflight_path),
+        "capacity_preflight_sha256": sha256_file(preflight_path),
         "exclusions": exclusion_records,
         "exclusion_union": {
             "unique_keys": len(exclusions),

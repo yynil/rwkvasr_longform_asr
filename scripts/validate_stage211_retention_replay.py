@@ -20,10 +20,10 @@ EXPECTED_CELLS = (
     "long_zh",
 )
 DEFAULT_CELL_TARGETS: dict[str, int | None] = {
-    "easy_en": 200_000,
-    "easy_zh": 200_000,
-    "medium_en": 200_000,
-    "medium_zh": 200_000,
+    "easy_en": 130_000,
+    "easy_zh": 130_000,
+    "medium_en": 270_000,
+    "medium_zh": 270_000,
     "hard_en": 100_000,
     "hard_zh": 100_000,
     "long_zh": None,
@@ -243,6 +243,23 @@ def validate_retention_replay(
             "Replay fixed-eval sample count mismatch: "
             f"actual={fixed_eval_samples} expected={expected_fixed_eval_samples}"
         )
+    preflight_path = Path(str(receipt.get("capacity_preflight_path") or "")).resolve()
+    if not preflight_path.is_file() or receipt.get("capacity_preflight_sha256") != sha256_file(
+        preflight_path
+    ):
+        raise ValueError("Replay capacity preflight is missing or changed.")
+    preflight = _load_json(preflight_path, label="Stage211 replay capacity preflight")
+    expected_preflight_fields = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "retention_replay_capacity_preflight",
+        "bucket_width": 80,
+        "source_manifests": source_manifests,
+        "exclusions": receipt.get("exclusions"),
+        "exclusion_union": receipt.get("exclusion_union"),
+    }
+    if any(preflight.get(key) != value for key, value in expected_preflight_fields.items()):
+        raise ValueError("Replay capacity preflight contract mismatch.")
 
     selection = receipt.get("selection")
     if not isinstance(selection, dict):
@@ -411,10 +428,16 @@ def validate_retention_replay(
 
     quotas = _flatten_nested_counts(receipt.get("quotas"), label="quotas")
     capacities = _flatten_nested_counts(receipt.get("capacities"), label="capacities")
+    preflight_capacities = _flatten_nested_counts(
+        preflight.get("capacities"),
+        label="capacity preflight",
+    )
     if quotas != actual_strata or any(
         capacities[stratum] < count for stratum, count in quotas.items()
     ):
         raise ValueError("Replay quota/capacity audit mismatch.")
+    if capacities != preflight_capacities or receipt.get("scan") != preflight.get("scan"):
+        raise ValueError("Replay receipt differs from its capacity preflight.")
     cells = receipt.get("cells")
     if not isinstance(cells, dict) or set(cells) != set(EXPECTED_CELLS):
         raise ValueError("Replay cell summaries are incomplete.")
