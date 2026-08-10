@@ -1403,7 +1403,11 @@ def validate_stage211_full_data_coverage(
     return dict(coverage)
 
 
-def validate_stage211_public_benchmark(public_benchmark: Any) -> dict[str, Any]:
+def validate_stage211_public_benchmark(
+    public_benchmark: Any,
+    *,
+    require_metric_source_recomputed: bool = False,
+) -> dict[str, Any]:
     if not isinstance(public_benchmark, dict):
         raise ValueError("Stage211 phase gate lacks a public_benchmark object.")
     if public_benchmark.get("decode") != "greedy_ctc":
@@ -1435,6 +1439,13 @@ def validate_stage211_public_benchmark(public_benchmark: Any) -> dict[str, Any]:
             or int(result.get("normalized_reference_mismatch_count", -1)) != 0
         ):
             raise ValueError(f"Stage211 public benchmark coverage mismatch for {dataset}.")
+        if (
+            require_metric_source_recomputed
+            and result.get("metric_source_recomputed") is not True
+        ):
+            raise ValueError(
+                f"Stage211 public benchmark metrics were not source-recomputed for {dataset}."
+            )
         for prefix in ("manifest", "nano_prediction", "student_prediction"):
             _validate_bound_file(
                 result,
@@ -1516,7 +1527,10 @@ def validate_stage211_phase_gate_report(
         phase_init_checkpoint
     ) != easy_segment.get("init_checkpoint_sha256"):
         raise ValueError("Stage211 phase initialization checkpoint is missing or changed.")
-    benchmark = validate_stage211_public_benchmark(report.get("public_benchmark"))
+    benchmark = validate_stage211_public_benchmark(
+        report.get("public_benchmark"),
+        require_metric_source_recomputed=True,
+    )
     teacher_sha256_values = {
         str(segment.get("nano_teacher_checkpoint_sha256") or "")
         for segment in coverage["segments"]

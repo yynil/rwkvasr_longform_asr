@@ -83,6 +83,85 @@ def test_stage211_public_eval_shards_large_second_stage(
     assert calls[0][1]["CTC_SHARD_STAGE2"] == "1"
 
 
+def test_stage211_public_enrichment_recomputes_bound_predictions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = "librispeech_test_clean"
+    monkeypatch.setattr(
+        stage211_phase_gate,
+        "STAGE211_PUBLIC_BENCHMARKS",
+        {dataset: {"language": "en", "metric": "wer", "samples": 2}},
+    )
+    manifest = tmp_path / f"{dataset}.jsonl"
+    nano = tmp_path / f"{dataset}.nano.jsonl"
+    student = tmp_path / f"{dataset}.student.jsonl"
+    rows = [
+        {"utt_id": "utt-1", "ref_text": "hello world", "pred_text": "hello world"},
+        {"utt_id": "utt-2", "ref_text": "speech test", "pred_text": "speech test"},
+    ]
+    manifest.write_text(
+        "".join(
+            json.dumps({"utt_id": row["utt_id"], "text": row["ref_text"]}) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+    nano.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    student_rows = [dict(row) for row in rows]
+    student_rows[1]["pred_text"] = "speech"
+    student.write_text(
+        "".join(json.dumps(row) + "\n" for row in student_rows),
+        encoding="utf-8",
+    )
+    report = {
+        "decode": "greedy_ctc",
+        "normalization": "ctc",
+        "gate": {
+            "max_relative_ratio": 2.0,
+            "max_absolute_gap_points": 100.0,
+            "requires_every_dataset": True,
+        },
+        "all_datasets_pass": False,
+        "results": [
+            stage211_phase_gate.compare_dataset(
+                dataset=dataset,
+                nano_path=nano,
+                student_path=student,
+                normalization="ctc",
+                max_relative_ratio=2.0,
+                max_absolute_gap_points=100.0,
+            )
+        ],
+    }
+
+    enriched = stage211_phase_gate._enrich_public_benchmark(
+        report,
+        manifest_dir=tmp_path,
+    )
+
+    assert enriched["all_datasets_complete"] is True
+    assert enriched["results"][0]["metric_source_recomputed"] is True
+    assert enriched["results"][0]["student_error_rate"] == pytest.approx(0.25)
+
+    report["results"][0]["student_error_rate"] += 0.01
+    with pytest.raises(ValueError, match="recomputed student_error_rate mismatch"):
+        stage211_phase_gate._enrich_public_benchmark(
+            report,
+            manifest_dir=tmp_path,
+        )
+    report["results"][0]["student_error_rate"] -= 0.01
+    report["all_datasets_pass"] = True
+    with pytest.raises(ValueError, match="all_datasets_pass differs"):
+        stage211_phase_gate._enrich_public_benchmark(
+            report,
+            manifest_dir=tmp_path,
+        )
+
+
 def test_stage211_mixer_finalizer_evaluates_latest_retention_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1689,6 +1768,7 @@ def _write_valid_phase_gate(
                 "sample_count": expected["samples"],
                 "identical_utt_coverage": True,
                 "normalized_reference_mismatch_count": 0,
+                "metric_source_recomputed": True,
                 "nano_error_rate": 0.1,
                 "student_error_rate": 0.11,
                 "absolute_gap_points": 1.0,

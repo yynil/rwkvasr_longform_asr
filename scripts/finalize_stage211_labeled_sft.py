@@ -195,7 +195,10 @@ def _validate_final_report(
         raise ValueError("Stage211 final report checkpoint path mismatch.")
     if report.get("checkpoint_sha256") != sha256_file(checkpoint):
         raise ValueError("Stage211 final report checkpoint SHA-256 mismatch.")
-    benchmark = validate_stage211_public_benchmark(report.get("public_benchmark"))
+    benchmark = validate_stage211_public_benchmark(
+        report.get("public_benchmark"),
+        require_metric_source_recomputed=True,
+    )
     if benchmark.get("all_datasets_pass") is not True:
         raise ValueError("Stage211D did not pass the every-dataset Nano WER/CER gate.")
     progress = report.get("public_progress")

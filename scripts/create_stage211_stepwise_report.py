@@ -158,7 +158,10 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
         or coverage.get("complete") is not True
     ):
         raise ValueError("Stage211 SFT labeled-data coverage is incomplete.")
-    benchmark = validate_stage211_public_benchmark(report.get("public_benchmark"))
+    benchmark = validate_stage211_public_benchmark(
+        report.get("public_benchmark"),
+        require_metric_source_recomputed=True,
+    )
     if benchmark.get("all_datasets_pass") is not True:
         raise ValueError("Stage211 SFT did not pass the every-dataset Nano WER/CER gate.")
     for path_key, sha_key, label in (

@@ -393,6 +393,7 @@ def _bound_public_benchmark(
                 "sample_count": expected["samples"],
                 "identical_utt_coverage": True,
                 "normalized_reference_mismatch_count": 0,
+                "metric_source_recomputed": True,
                 "nano_error_rate": 0.1,
                 "student_error_rate": error_rate,
                 "absolute_gap_points": (error_rate - 0.1) * 100.0,

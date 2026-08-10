@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from rwkvasr.eval.stage211_gate import (
 )
 
 try:
+    from scripts.compare_public_ctc_with_nano import compare_dataset
     from scripts.create_stage211_hidden_alignment_gate import (
         build_gate as build_hidden_alignment_gate,
     )
@@ -28,6 +30,7 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
+    from compare_public_ctc_with_nano import compare_dataset
     from create_stage211_hidden_alignment_gate import (
         build_gate as build_hidden_alignment_gate,
     )
@@ -102,6 +105,65 @@ def _jsonl_records(
     return records
 
 
+def _recompute_public_result(
+    *,
+    report: dict[str, Any],
+    result: dict[str, Any],
+    dataset: str,
+    nano_path: Path,
+    student_path: Path,
+) -> dict[str, Any]:
+    gate = report.get("gate")
+    if not isinstance(gate, dict):
+        raise ValueError("Stage211 public comparison lacks its metric gate contract.")
+    if gate.get("requires_every_dataset") is not True:
+        raise ValueError("Stage211 public comparison must gate every dataset.")
+    recomputed = compare_dataset(
+        dataset=dataset,
+        nano_path=nano_path,
+        student_path=student_path,
+        normalization=str(report["normalization"]),
+        max_relative_ratio=float(gate.get("max_relative_ratio", float("nan"))),
+        max_absolute_gap_points=float(
+            gate.get("max_absolute_gap_points", float("nan"))
+        ),
+    )
+    for key, expected in recomputed.items():
+        actual = result.get(key)
+        if key in {"nano_prediction_path", "student_prediction_path"}:
+            if Path(str(actual or "")).resolve() != Path(str(expected)).resolve():
+                raise ValueError(
+                    f"Stage211 {dataset} recomputed {key} path mismatch."
+                )
+        elif isinstance(expected, bool):
+            if actual is not expected:
+                raise ValueError(
+                    f"Stage211 {dataset} recomputed {key} mismatch: "
+                    f"reported={actual!r} actual={expected!r}"
+                )
+        elif isinstance(expected, float):
+            try:
+                matches = math.isclose(
+                    float(actual),
+                    expected,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            except (TypeError, ValueError):
+                matches = False
+            if not matches:
+                raise ValueError(
+                    f"Stage211 {dataset} recomputed {key} mismatch: "
+                    f"reported={actual!r} actual={expected!r}"
+                )
+        elif actual != expected:
+            raise ValueError(
+                f"Stage211 {dataset} recomputed {key} mismatch: "
+                f"reported={actual!r} actual={expected!r}"
+            )
+    return recomputed
+
+
 def _enrich_public_benchmark(
     report: dict[str, Any],
     *,
@@ -123,8 +185,8 @@ def _enrich_public_benchmark(
         result = dict(by_dataset[dataset])
         language = str(STAGE211_PUBLIC_BENCHMARKS[dataset]["language"])
         manifest_path = (manifest_dir / f"{dataset}.jsonl").resolve()
-        nano_path = Path(str(result.pop("nano_prediction_path", "") or "")).resolve()
-        student_path = Path(str(result.pop("student_prediction_path", "") or "")).resolve()
+        nano_path = Path(str(result.get("nano_prediction_path", "") or "")).resolve()
+        student_path = Path(str(result.get("student_prediction_path", "") or "")).resolve()
         for label, path in (
             ("manifest", manifest_path),
             ("Nano prediction", nano_path),
@@ -167,20 +229,35 @@ def _enrich_public_benchmark(
                 f"Stage211 {dataset} normalized references differ from the manifest: "
                 f"mismatches={reference_mismatches}"
             )
+        recomputed = _recompute_public_result(
+            report=report,
+            result=result,
+            dataset=dataset,
+            nano_path=nano_path,
+            student_path=student_path,
+        )
         results.append(
             {
                 **result,
+                **recomputed,
                 "manifest_path": str(manifest_path),
                 "manifest_sha256": sha256_file(manifest_path),
                 "nano_prediction_path": str(nano_path),
                 "nano_prediction_sha256": sha256_file(nano_path),
                 "student_prediction_path": str(student_path),
                 "student_prediction_sha256": sha256_file(student_path),
+                "metric_source_recomputed": True,
             }
+        )
+    all_datasets_pass = all(bool(result["gate_pass"]) for result in results)
+    if report.get("all_datasets_pass") is not all_datasets_pass:
+        raise ValueError(
+            "Stage211 public comparison all_datasets_pass differs from source replay."
         )
     return {
         **report,
         "all_datasets_complete": True,
+        "all_datasets_pass": all_datasets_pass,
         "results": results,
     }
 
