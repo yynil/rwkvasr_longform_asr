@@ -2002,6 +2002,42 @@ def _write_retention_correction(
         encoding="utf-8",
     )
 
+    smoke_checkpoint = replay_root / "smoke-step-2.pt"
+    smoke_log = replay_root / "smoke.log"
+    smoke_checkpoint.write_bytes(b"smoke-checkpoint")
+    smoke_log.write_bytes(b"smoke-log")
+    smoke_marker = replay_root / "round-01-smoke-passed.json"
+    smoke_marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "full_profile_smoke",
+                "phase": "mixer",
+                "complete": True,
+                "correction_round": 1,
+                "init_checkpoint_path": str(init_checkpoint.resolve()),
+                "init_checkpoint_sha256": sha256_file(init_checkpoint),
+                "easy_manifest_path": str(replay_manifest.resolve()),
+                "easy_manifest_sha256": sha256_file(replay_manifest),
+                "replay_receipt_path": str(replay_receipt.resolve()),
+                "replay_receipt_sha256": sha256_file(replay_receipt),
+                "admission_gate_path": str(failed_gate.resolve()),
+                "admission_gate_sha256": sha256_file(failed_gate),
+                "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
+                "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+                "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
+                "smoke_checkpoint_sha256": sha256_file(smoke_checkpoint),
+                "smoke_log_path": str(smoke_log.resolve()),
+                "smoke_log_sha256": sha256_file(smoke_log),
+                "peak_reserved_gib": 6.0,
+                "max_peak_reserved_gib": 22.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     run_dir = tmp_path / "retention-round-01"
     run_dir.mkdir()
     train_config = run_dir / "train_config.yaml"
@@ -2024,6 +2060,8 @@ def _write_retention_correction(
             "stage211_post_coverage_replay_receipt_path": str(replay_receipt.resolve()),
             "stage211_post_coverage_admission_gate_path": str(failed_gate.resolve()),
             "stage211_post_coverage_original_coverage_unchanged": True,
+            "stage211_post_coverage_smoke_marker_path": str(smoke_marker.resolve()),
+            "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
         }
     )
     save_yaml(train_config, config)
@@ -2060,6 +2098,8 @@ def _write_retention_correction(
         "provenance_sha256": sha256_file(provenance),
         "train_config_path": str(train_config.resolve()),
         "train_config_sha256": sha256_file(train_config),
+        "smoke_marker_path": str(smoke_marker.resolve()),
+        "smoke_marker_sha256": sha256_file(smoke_marker),
         "replay_receipt_path": str(replay_receipt.resolve()),
         "replay_receipt_sha256": sha256_file(replay_receipt),
         "bucket_manifest_path": str(replay_manifest.resolve()),
@@ -2762,9 +2802,9 @@ def test_stage211_phase_gate_preserves_a_strict_failed_decision(
 
 
 def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
-    script = (
-        REPO_ROOT / "scripts" / "watch_stage211_strict_continuation.sh"
-    ).read_text(encoding="utf-8")
+    script = (REPO_ROOT / "scripts" / "watch_stage211_strict_continuation.sh").read_text(
+        encoding="utf-8"
+    )
 
     assert 'POLL_SECONDS="${POLL_SECONDS:-3600}"' in script
     assert 'while tmux has-session -t "${SUPERVISOR_SESSION}"' in script

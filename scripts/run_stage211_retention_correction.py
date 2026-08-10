@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,12 @@ try:
         _validate_output_storage,
         _validate_target_nano_teacher_checkpoint,
     )
+    from scripts.run_stage211_full_phase_curriculum import (
+        _audit_smoke as _audit_full_profile_smoke,
+    )
+    from scripts.run_stage211_full_phase_curriculum import (
+        _validate_smoke_marker as _validate_full_profile_smoke_marker,
+    )
     from scripts.validate_stage211_retention_replay import (
         validate_retention_replay,
     )
@@ -62,6 +69,12 @@ except ModuleNotFoundError as error:
         _segments,
         _validate_output_storage,
         _validate_target_nano_teacher_checkpoint,
+    )
+    from run_stage211_full_phase_curriculum import (
+        _audit_smoke as _audit_full_profile_smoke,
+    )
+    from run_stage211_full_phase_curriculum import (
+        _validate_smoke_marker as _validate_full_profile_smoke_marker,
     )
     from validate_stage211_retention_replay import validate_retention_replay
 
@@ -134,10 +147,7 @@ def _admit_failed_gate(
 
 def _audit_replay_storage(replay: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
     manifest_path = Path(str(replay.get("manifest_path") or "")).resolve()
-    if (
-        not manifest_path.is_file()
-        or replay.get("manifest_sha256") != sha256_file(manifest_path)
-    ):
+    if not manifest_path.is_file() or replay.get("manifest_sha256") != sha256_file(manifest_path):
         raise ValueError("Stage211 correction replay manifest is missing or changed.")
     manifest = load_webdataset_bucket_manifest(manifest_path)
     part_paths = [
@@ -148,9 +158,7 @@ def _audit_replay_storage(replay: dict[str, Any]) -> tuple[Path, dict[str, Any]]
     ]
     missing = [path for path in part_paths if not path.is_file()]
     if missing:
-        raise FileNotFoundError(
-            f"Stage211 correction replay parts are missing: {missing[:3]}"
-        )
+        raise FileNotFoundError(f"Stage211 correction replay parts are missing: {missing[:3]}")
     split_samples = {
         split: sum(bucket.num_samples for bucket in buckets)
         for split, buckets in manifest.splits.items()
@@ -197,6 +205,7 @@ def _provenance_payload(
     admission_gate: Path,
     init_checkpoint: Path,
     nano_checkpoint: Path,
+    smoke_marker: Path,
     steps_per_epoch: int,
 ) -> dict[str, Any]:
     return {
@@ -216,12 +225,175 @@ def _provenance_payload(
         "init_checkpoint_sha256": sha256_file(init_checkpoint),
         "nano_teacher_checkpoint_path": str(nano_checkpoint),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+        "smoke_marker_path": str(smoke_marker),
+        "smoke_marker_sha256": sha256_file(smoke_marker),
         "epochs": 1,
         "steps_per_epoch": steps_per_epoch,
         "learning_rate": CORRECTION_LR,
         "trainable_boundary": "mixer_only",
         "early_stopping": False,
     }
+
+
+def _correction_config_metadata(
+    *,
+    round_index: int,
+    replay_receipt: Path,
+    admission_gate: Path,
+) -> dict[str, Any]:
+    return {
+        "stage211_post_coverage_correction_round": round_index,
+        "stage211_post_coverage_replay_receipt_path": str(replay_receipt),
+        "stage211_post_coverage_admission_gate_path": str(admission_gate),
+        "stage211_post_coverage_original_coverage_unchanged": True,
+    }
+
+
+def _validate_correction_smoke_marker(
+    *,
+    marker_path: Path,
+    round_index: int,
+    init_checkpoint: Path,
+    replay_receipt: Path,
+    replay_manifest: Path,
+    admission_gate: Path,
+    nano_checkpoint: Path,
+) -> dict[str, Any]:
+    marker = _validate_full_profile_smoke_marker(
+        marker_path=marker_path,
+        phase="mixer",
+        init_checkpoint=init_checkpoint,
+        easy_manifest=replay_manifest,
+    )
+    expected = {
+        "schema_version": 1,
+        "correction_round": round_index,
+        "replay_receipt_path": str(replay_receipt),
+        "replay_receipt_sha256": sha256_file(replay_receipt),
+        "admission_gate_path": str(admission_gate),
+        "admission_gate_sha256": sha256_file(admission_gate),
+        "nano_teacher_checkpoint_path": str(nano_checkpoint),
+        "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+    }
+    if any(marker.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 correction smoke marker binding mismatch.")
+    peak = float(marker.get("peak_reserved_gib", float("nan")))
+    peak_limit = float(marker.get("max_peak_reserved_gib", float("nan")))
+    if (
+        not math.isfinite(peak)
+        or not math.isfinite(peak_limit)
+        or peak < 0.0
+        or peak_limit <= 0.0
+        or peak > peak_limit
+    ):
+        raise ValueError("Stage211 correction smoke marker memory contract mismatch.")
+    return marker
+
+
+def _run_correction_smoke(
+    *,
+    round_index: int,
+    run_dir: Path,
+    config_dir: Path,
+    replay_receipt: Path,
+    replay_manifest: Path,
+    admission_gate: Path,
+    init_checkpoint: Path,
+    nano_checkpoint: Path,
+    audio_data_audit: dict[str, Any],
+    master_port: int,
+    max_peak_reserved_gib: float,
+    formal_latest_step: int,
+    dry_run: bool,
+) -> Path:
+    smoke_run_dir = Path(f"{run_dir}_smoke")
+    marker_path = run_dir.parent / f"{run_dir.name}_smoke_passed.json"
+    if marker_path.is_file() and not dry_run:
+        _validate_correction_smoke_marker(
+            marker_path=marker_path,
+            round_index=round_index,
+            init_checkpoint=init_checkpoint,
+            replay_receipt=replay_receipt,
+            replay_manifest=replay_manifest,
+            admission_gate=admission_gate,
+            nano_checkpoint=nano_checkpoint,
+        )
+        return marker_path
+    if formal_latest_step > 0 and not dry_run:
+        raise ValueError("Stage211 correction formal training lacks its preflight smoke marker.")
+
+    phase = replace(PHASES["mixer"], lr=CORRECTION_LR)
+    segment = _segments(
+        phase=phase,
+        smoke=True,
+        difficulty="easy",
+        full_data_profile=True,
+    )[0]
+    smoke_latest_step = _latest_step(smoke_run_dir)
+    config = _stage211_config(
+        phase=phase,
+        segment=segment,
+        output_dir=smoke_run_dir,
+        init_checkpoint=init_checkpoint,
+        bucket_manifest=replay_manifest,
+        resume=smoke_latest_step > 0,
+        smoke=True,
+        nano_checkpoint=nano_checkpoint,
+        audio_data_audit=audio_data_audit,
+        full_data_profile=True,
+    )
+    config.update(
+        _correction_config_metadata(
+            round_index=round_index,
+            replay_receipt=replay_receipt,
+            admission_gate=admission_gate,
+        )
+    )
+    smoke_config_dir = config_dir / "smoke"
+    smoke_config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = smoke_config_dir / f"stage211_{segment['name']}.yaml"
+    save_yaml(config_path, config)
+    if smoke_latest_step < 2:
+        code = _run(
+            config_path,
+            smoke_run_dir / "logs" / f"{segment['name']}.log",
+            dry_run=dry_run,
+            master_port=master_port,
+        )
+        if code != 0:
+            raise RuntimeError(f"Stage211 correction smoke exited with code={code}.")
+    if dry_run:
+        return marker_path
+
+    marker = _audit_full_profile_smoke(
+        phase="mixer",
+        smoke_run_dir=smoke_run_dir,
+        init_checkpoint=init_checkpoint,
+        easy_manifest=replay_manifest,
+        max_peak_reserved_gib=max_peak_reserved_gib,
+    )
+    marker.update(
+        {
+            "correction_round": round_index,
+            "replay_receipt_path": str(replay_receipt),
+            "replay_receipt_sha256": sha256_file(replay_receipt),
+            "admission_gate_path": str(admission_gate),
+            "admission_gate_sha256": sha256_file(admission_gate),
+            "nano_teacher_checkpoint_path": str(nano_checkpoint),
+            "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+        }
+    )
+    _write_immutable_json(marker_path, marker)
+    _validate_correction_smoke_marker(
+        marker_path=marker_path,
+        round_index=round_index,
+        init_checkpoint=init_checkpoint,
+        replay_receipt=replay_receipt,
+        replay_manifest=replay_manifest,
+        admission_gate=admission_gate,
+        nano_checkpoint=nano_checkpoint,
+    )
+    return marker_path
 
 
 def run_correction(args: argparse.Namespace) -> Path | None:
@@ -280,25 +452,6 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         dry_run=bool(args.dry_run),
     )
     run_dir.mkdir(parents=True, exist_ok=True)
-    provenance_path = run_dir / "stage211_correction_provenance.json"
-    provenance = _provenance_payload(
-        round_index=round_index,
-        run_dir=run_dir,
-        replay_receipt=replay_receipt,
-        replay_manifest=replay_manifest,
-        admission_gate=admission_gate,
-        init_checkpoint=init_checkpoint,
-        nano_checkpoint=nano_checkpoint,
-        steps_per_epoch=steps_per_epoch,
-    )
-    if provenance_path.is_file():
-        if json.loads(provenance_path.read_text(encoding="utf-8")) != provenance:
-            raise ValueError(
-                f"Stage211 correction provenance cannot change in place: {provenance_path}"
-            )
-    elif not args.dry_run:
-        _write_immutable_json(provenance_path, provenance)
-
     latest_step = _latest_step(run_dir)
     if latest_step <= 0 and not args.skip_nano_weight_audit:
         audit = _audit_nano_non_attention_exact(
@@ -327,19 +480,58 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         full_data_profile=True,
     )
     config.update(
-        {
-            "stage211_post_coverage_correction_round": round_index,
-            "stage211_post_coverage_replay_receipt_path": str(replay_receipt),
-            "stage211_post_coverage_admission_gate_path": str(admission_gate),
-            "stage211_post_coverage_original_coverage_unchanged": True,
-        }
+        _correction_config_metadata(
+            round_index=round_index,
+            replay_receipt=replay_receipt,
+            admission_gate=admission_gate,
+        )
     )
     config_dir = (
-        args.config_dir.expanduser().resolve()
-        / "mixer"
-        / f"retention_round_{round_index:02d}"
+        args.config_dir.expanduser().resolve() / "mixer" / f"retention_round_{round_index:02d}"
     )
     config_dir.mkdir(parents=True, exist_ok=True)
+    smoke_marker_path = _run_correction_smoke(
+        round_index=round_index,
+        run_dir=run_dir,
+        config_dir=config_dir,
+        replay_receipt=replay_receipt,
+        replay_manifest=replay_manifest,
+        admission_gate=admission_gate,
+        init_checkpoint=init_checkpoint,
+        nano_checkpoint=nano_checkpoint,
+        audio_data_audit=audio_data_audit,
+        master_port=int(args.master_port),
+        max_peak_reserved_gib=float(args.max_peak_reserved_gib),
+        formal_latest_step=latest_step,
+        dry_run=bool(args.dry_run),
+    )
+    print(f"stage211_retention_correction_smoke={smoke_marker_path}", flush=True)
+    if not args.dry_run:
+        config.update(
+            {
+                "stage211_post_coverage_smoke_marker_path": str(smoke_marker_path),
+                "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker_path),
+            }
+        )
+        provenance_path = run_dir / "stage211_correction_provenance.json"
+        provenance = _provenance_payload(
+            round_index=round_index,
+            run_dir=run_dir,
+            replay_receipt=replay_receipt,
+            replay_manifest=replay_manifest,
+            admission_gate=admission_gate,
+            init_checkpoint=init_checkpoint,
+            nano_checkpoint=nano_checkpoint,
+            smoke_marker=smoke_marker_path,
+            steps_per_epoch=steps_per_epoch,
+        )
+        if provenance_path.is_file():
+            if json.loads(provenance_path.read_text(encoding="utf-8")) != provenance:
+                raise ValueError(
+                    f"Stage211 correction provenance cannot change in place: {provenance_path}"
+                )
+        else:
+            _write_immutable_json(provenance_path, provenance)
     config_path = config_dir / f"stage211_{segment['name']}.yaml"
     save_yaml(config_path, config)
     print(
@@ -405,11 +597,14 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--config-dir", type=Path, default=DEFAULT_CONFIG_DIR)
     parser.add_argument("--master-port", type=int, default=29641)
+    parser.add_argument("--max-peak-reserved-gib", type=float, default=22.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-nano-weight-audit", action="store_true")
     args = parser.parse_args()
     if args.skip_nano_weight_audit and not args.dry_run:
         parser.error("--skip-nano-weight-audit is allowed only with --dry-run")
+    if args.max_peak_reserved_gib <= 0:
+        parser.error("--max-peak-reserved-gib must be positive")
     run_correction(args)
     return 0
 

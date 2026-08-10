@@ -883,6 +883,10 @@ def _validate_stage211_correction_train_config(
             Path(str(correction["admission_gate_path"])).resolve()
         ),
         "stage211_post_coverage_original_coverage_unchanged": True,
+        "stage211_post_coverage_smoke_marker_path": str(
+            Path(str(correction["smoke_marker_path"])).resolve()
+        ),
+        "stage211_post_coverage_smoke_marker_sha256": str(correction["smoke_marker_sha256"]),
     }
     for key, expected in expected_fields.items():
         if config.get(key) != expected:
@@ -902,6 +906,66 @@ def _validate_stage211_correction_train_config(
         )
     if resolve_stage211_nano_teacher_checkpoint(config) != nano_teacher_checkpoint:
         raise ValueError("Stage211 retention correction train config uses another Nano teacher.")
+
+
+def _validate_stage211_correction_smoke_marker(
+    correction: dict[str, Any],
+    *,
+    replay_manifest: Path,
+    init_checkpoint: Path,
+    admission_gate: Path,
+    nano_teacher_checkpoint: Path,
+) -> None:
+    marker_path = _validate_bound_file(
+        correction,
+        path_key="smoke_marker_path",
+        sha256_key="smoke_marker_sha256",
+        label=(f"Stage211 retention correction round {int(correction['round'])} smoke marker"),
+    )
+    marker = _load_json_object(
+        marker_path,
+        label="Stage211 retention correction smoke marker",
+    )
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "full_profile_smoke",
+        "phase": "mixer",
+        "complete": True,
+        "correction_round": int(correction["round"]),
+        "init_checkpoint_path": str(init_checkpoint),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint),
+        "easy_manifest_path": str(replay_manifest),
+        "easy_manifest_sha256": sha256_file(replay_manifest),
+        "replay_receipt_path": str(Path(str(correction["replay_receipt_path"])).resolve()),
+        "replay_receipt_sha256": str(correction["replay_receipt_sha256"]),
+        "admission_gate_path": str(admission_gate),
+        "admission_gate_sha256": sha256_file(admission_gate),
+        "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint),
+        "nano_teacher_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
+    }
+    if any(marker.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 retention correction smoke marker mismatch.")
+    for path_key, sha_key in (
+        ("smoke_checkpoint_path", "smoke_checkpoint_sha256"),
+        ("smoke_log_path", "smoke_log_sha256"),
+    ):
+        _validate_bound_file(
+            marker,
+            path_key=path_key,
+            sha256_key=sha_key,
+            label="Stage211 retention correction smoke artifact",
+        )
+    peak = float(marker.get("peak_reserved_gib", float("nan")))
+    limit = float(marker.get("max_peak_reserved_gib", float("nan")))
+    if (
+        not math.isfinite(peak)
+        or not math.isfinite(limit)
+        or peak < 0.0
+        or limit <= 0.0
+        or peak > limit
+    ):
+        raise ValueError("Stage211 retention correction smoke memory mismatch.")
 
 
 def _validate_stage211_post_coverage_corrections(
@@ -1068,6 +1132,13 @@ def _validate_stage211_post_coverage_corrections(
             raise ValueError(
                 f"Stage211 retention correction round {round_index} admission chain mismatch."
             )
+        _validate_stage211_correction_smoke_marker(
+            correction,
+            replay_manifest=replay_manifest_path,
+            init_checkpoint=init_checkpoint,
+            admission_gate=admission_gate_path,
+            nano_teacher_checkpoint=nano_teacher_checkpoint,
+        )
         if int(replay.get("samples", -1)) != rows:
             raise ValueError("Stage211 retention correction replay sample count mismatch.")
         previous_checkpoint_sha256 = str(correction["completion_checkpoint_sha256"])

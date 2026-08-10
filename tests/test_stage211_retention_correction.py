@@ -18,6 +18,7 @@ from rwkvasr.eval.stage211_gate import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 correction = importlib.import_module("scripts.create_stage211_retention_correction_receipt")
+correction_runner = importlib.import_module("scripts.run_stage211_retention_correction")
 
 
 def _write_manifest(root: Path) -> Path:
@@ -75,6 +76,118 @@ def _write_manifest(root: Path) -> Path:
     return manifest
 
 
+def test_retention_correction_smoke_marker_binds_round_inputs(
+    tmp_path: Path,
+) -> None:
+    init_checkpoint = tmp_path / "init.pt"
+    replay_receipt = tmp_path / "replay.json"
+    replay_manifest = tmp_path / "manifest.json"
+    admission_gate = tmp_path / "failed-gate.json"
+    nano_checkpoint = tmp_path / "nano.pt"
+    smoke_checkpoint = tmp_path / "step-2.pt"
+    smoke_log = tmp_path / "smoke.log"
+    for path, content in (
+        (init_checkpoint, b"init"),
+        (replay_receipt, b"replay"),
+        (replay_manifest, b"manifest"),
+        (admission_gate, b"gate"),
+        (nano_checkpoint, b"nano"),
+        (smoke_checkpoint, b"smoke-checkpoint"),
+        (smoke_log, b"smoke-log"),
+    ):
+        path.write_bytes(content)
+    marker_path = tmp_path / "smoke-passed.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "full_profile_smoke",
+                "phase": "mixer",
+                "complete": True,
+                "init_checkpoint_path": str(init_checkpoint.resolve()),
+                "init_checkpoint_sha256": correction.sha256_file(init_checkpoint),
+                "easy_manifest_path": str(replay_manifest.resolve()),
+                "easy_manifest_sha256": correction.sha256_file(replay_manifest),
+                "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
+                "smoke_checkpoint_sha256": correction.sha256_file(smoke_checkpoint),
+                "smoke_log_path": str(smoke_log.resolve()),
+                "smoke_log_sha256": correction.sha256_file(smoke_log),
+                "peak_reserved_gib": 6.0,
+                "max_peak_reserved_gib": 22.0,
+                "correction_round": 1,
+                "replay_receipt_path": str(replay_receipt.resolve()),
+                "replay_receipt_sha256": correction.sha256_file(replay_receipt),
+                "admission_gate_path": str(admission_gate.resolve()),
+                "admission_gate_sha256": correction.sha256_file(admission_gate),
+                "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
+                "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    marker = correction_runner._validate_correction_smoke_marker(
+        marker_path=marker_path,
+        round_index=1,
+        init_checkpoint=init_checkpoint,
+        replay_receipt=replay_receipt,
+        replay_manifest=replay_manifest,
+        admission_gate=admission_gate,
+        nano_checkpoint=nano_checkpoint,
+    )
+    assert marker["correction_round"] == 1
+
+    admission_gate.write_bytes(b"changed-gate")
+    with pytest.raises(ValueError, match="binding mismatch"):
+        correction_runner._validate_correction_smoke_marker(
+            marker_path=marker_path,
+            round_index=1,
+            init_checkpoint=init_checkpoint,
+            replay_receipt=replay_receipt,
+            replay_manifest=replay_manifest,
+            admission_gate=admission_gate,
+            nano_checkpoint=nano_checkpoint,
+        )
+
+    admission_gate.write_bytes(b"gate")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["peak_reserved_gib"] = 23.0
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="memory contract mismatch"):
+        correction_runner._validate_correction_smoke_marker(
+            marker_path=marker_path,
+            round_index=1,
+            init_checkpoint=init_checkpoint,
+            replay_receipt=replay_receipt,
+            replay_manifest=replay_manifest,
+            admission_gate=admission_gate,
+            nano_checkpoint=nano_checkpoint,
+        )
+
+
+def test_retention_correction_resume_requires_smoke_marker(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="lacks its preflight smoke marker"):
+        correction_runner._run_correction_smoke(
+            round_index=1,
+            run_dir=tmp_path / "formal",
+            config_dir=tmp_path / "config",
+            replay_receipt=tmp_path / "replay.json",
+            replay_manifest=tmp_path / "manifest.json",
+            admission_gate=tmp_path / "gate.json",
+            init_checkpoint=tmp_path / "init.pt",
+            nano_checkpoint=tmp_path / "nano.pt",
+            audio_data_audit={},
+            master_port=29641,
+            max_peak_reserved_gib=22.0,
+            formal_latest_step=1,
+            dry_run=False,
+        )
+
+
 def test_create_stage211_retention_correction_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -94,6 +207,41 @@ def test_create_stage211_retention_correction_receipt(
     nano_dir.mkdir()
     nano_checkpoint = nano_dir / "model.pt"
     nano_checkpoint.write_bytes(b"nano")
+    smoke_checkpoint = tmp_path / "smoke-step-2.pt"
+    smoke_log = tmp_path / "smoke.log"
+    smoke_checkpoint.write_bytes(b"smoke-checkpoint")
+    smoke_log.write_bytes(b"smoke-log")
+    smoke_marker = tmp_path / "round-01-smoke-passed.json"
+    smoke_marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "full_profile_smoke",
+                "phase": "mixer",
+                "complete": True,
+                "correction_round": 1,
+                "init_checkpoint_path": str(init_checkpoint.resolve()),
+                "init_checkpoint_sha256": correction.sha256_file(init_checkpoint),
+                "easy_manifest_path": str(manifest.resolve()),
+                "easy_manifest_sha256": correction.sha256_file(manifest),
+                "replay_receipt_path": str(replay_receipt.resolve()),
+                "replay_receipt_sha256": correction.sha256_file(replay_receipt),
+                "admission_gate_path": str(admission_gate.resolve()),
+                "admission_gate_sha256": correction.sha256_file(admission_gate),
+                "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
+                "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
+                "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
+                "smoke_checkpoint_sha256": correction.sha256_file(smoke_checkpoint),
+                "smoke_log_path": str(smoke_log.resolve()),
+                "smoke_log_sha256": correction.sha256_file(smoke_log),
+                "peak_reserved_gib": 6.0,
+                "max_peak_reserved_gib": 22.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     config = stage211_phase_train_config_contract("mixer")
     config.update(
@@ -114,6 +262,8 @@ def test_create_stage211_retention_correction_receipt(
             "stage211_post_coverage_replay_receipt_path": str(replay_receipt.resolve()),
             "stage211_post_coverage_admission_gate_path": str(admission_gate.resolve()),
             "stage211_post_coverage_original_coverage_unchanged": True,
+            "stage211_post_coverage_smoke_marker_path": str(smoke_marker.resolve()),
+            "stage211_post_coverage_smoke_marker_sha256": correction.sha256_file(smoke_marker),
         }
     )
     save_yaml(run_dir / "train_config.yaml", config)
@@ -139,6 +289,8 @@ def test_create_stage211_retention_correction_receipt(
         "early_stopping": False,
         "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
         "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
+        "smoke_marker_path": str(smoke_marker.resolve()),
+        "smoke_marker_sha256": correction.sha256_file(smoke_marker),
     }
     (run_dir / "stage211_correction_provenance.json").write_text(
         json.dumps(provenance) + "\n",
@@ -192,6 +344,7 @@ def test_create_stage211_retention_correction_receipt(
     assert receipt["steps"] == 1
     assert receipt["learning_rate"] == correction.CORRECTION_LR
     assert receipt["nano_teacher_checkpoint_sha256"] == nano_sha256
+    assert receipt["smoke_marker_sha256"] == correction.sha256_file(smoke_marker)
 
     config["init_checkpoint_path"] = None
     config["resume_from"] = "latest"

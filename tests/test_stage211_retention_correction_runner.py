@@ -33,9 +33,7 @@ def test_stage211_correction_admission_requires_immediate_failed_gate(
     gate = {
         "gate_passed": False,
         "full_data_coverage": {
-            "segments": [
-                {"nano_teacher_checkpoint_sha256": teacher_sha256}
-            ],
+            "segments": [{"nano_teacher_checkpoint_sha256": teacher_sha256}],
             "post_coverage_corrections": [{"round": 1}],
         },
     }
@@ -78,12 +76,14 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     gate = tmp_path / "gate.json"
     init_checkpoint = tmp_path / "init.pt"
     nano_checkpoint = tmp_path / "model.pt"
+    smoke_marker = tmp_path / "smoke.json"
     for path in (
         replay_receipt,
         replay_manifest,
         gate,
         init_checkpoint,
         nano_checkpoint,
+        smoke_marker,
     ):
         path.write_bytes(path.name.encode())
     run_dir = tmp_path / "run"
@@ -96,6 +96,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
         admission_gate=gate,
         init_checkpoint=init_checkpoint,
         nano_checkpoint=nano_checkpoint,
+        smoke_marker=smoke_marker,
         steps_per_epoch=99,
     )
 
@@ -106,3 +107,4 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     assert provenance["trainable_boundary"] == "mixer_only"
     assert provenance["early_stopping"] is False
     assert len(provenance["admission_gate_sha256"]) == 64
+    assert provenance["smoke_marker_sha256"] == runner.sha256_file(smoke_marker)

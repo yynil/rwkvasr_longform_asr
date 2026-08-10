@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,57 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     return payload
 
 
+def _validate_correction_smoke_marker(
+    marker_path: Path,
+    *,
+    round_index: int,
+    replay_receipt: Path,
+    replay_manifest: Path,
+    admission_gate: Path,
+    init_checkpoint: Path,
+    nano_checkpoint: Path,
+) -> dict[str, Any]:
+    marker = _load_json(marker_path, label="Stage211 correction smoke marker")
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "full_profile_smoke",
+        "phase": "mixer",
+        "complete": True,
+        "correction_round": round_index,
+        "init_checkpoint_path": str(init_checkpoint),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint),
+        "easy_manifest_path": str(replay_manifest),
+        "easy_manifest_sha256": sha256_file(replay_manifest),
+        "replay_receipt_path": str(replay_receipt),
+        "replay_receipt_sha256": sha256_file(replay_receipt),
+        "admission_gate_path": str(admission_gate),
+        "admission_gate_sha256": sha256_file(admission_gate),
+        "nano_teacher_checkpoint_path": str(nano_checkpoint),
+        "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+    }
+    if any(marker.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 correction smoke marker contract mismatch.")
+    for path_key, sha_key in (
+        ("smoke_checkpoint_path", "smoke_checkpoint_sha256"),
+        ("smoke_log_path", "smoke_log_sha256"),
+    ):
+        path = Path(str(marker.get(path_key) or "")).resolve()
+        if not path.is_file() or marker.get(sha_key) != sha256_file(path):
+            raise ValueError("Stage211 correction smoke artifact is unavailable or changed.")
+    peak = float(marker.get("peak_reserved_gib", float("nan")))
+    peak_limit = float(marker.get("max_peak_reserved_gib", float("nan")))
+    if (
+        not math.isfinite(peak)
+        or not math.isfinite(peak_limit)
+        or peak < 0.0
+        or peak_limit <= 0.0
+        or peak > peak_limit
+    ):
+        raise ValueError("Stage211 correction smoke memory contract mismatch.")
+    return marker
+
+
 def _validate_correction_train_config(
     config: dict[str, Any],
     *,
@@ -74,6 +126,7 @@ def _validate_correction_train_config(
     replay_receipt: Path,
     admission_gate: Path,
     init_checkpoint: Path,
+    smoke_marker: Path,
 ) -> None:
     contract = stage211_phase_train_config_contract("mixer")
     contract["lr"] = CORRECTION_LR
@@ -103,6 +156,8 @@ def _validate_correction_train_config(
         "stage211_post_coverage_replay_receipt_path": str(replay_receipt),
         "stage211_post_coverage_admission_gate_path": str(admission_gate),
         "stage211_post_coverage_original_coverage_unchanged": True,
+        "stage211_post_coverage_smoke_marker_path": str(smoke_marker),
+        "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
     }
     for key, expected in expected_fields.items():
         if config.get(key) != expected:
@@ -219,6 +274,11 @@ def build_receipt(
         provenance_path,
         label="Stage211 correction provenance",
     )
+    smoke_marker_path = Path(str(provenance.get("smoke_marker_path") or "")).resolve()
+    if not smoke_marker_path.is_file() or provenance.get("smoke_marker_sha256") != sha256_file(
+        smoke_marker_path
+    ):
+        raise ValueError("Stage211 correction provenance smoke marker is unavailable or changed.")
     expected_provenance = {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -239,6 +299,8 @@ def build_receipt(
         "learning_rate": CORRECTION_LR,
         "trainable_boundary": "mixer_only",
         "early_stopping": False,
+        "smoke_marker_path": str(smoke_marker_path),
+        "smoke_marker_sha256": sha256_file(smoke_marker_path),
     }
     if any(provenance.get(key) != value for key, value in expected_provenance.items()):
         raise ValueError("Stage211 correction provenance contract mismatch.")
@@ -255,6 +317,7 @@ def build_receipt(
         replay_receipt=replay_receipt_path,
         admission_gate=admission_gate_path,
         init_checkpoint=init_checkpoint_path,
+        smoke_marker=smoke_marker_path,
     )
     nano_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(train_config)
     nano_teacher_sha256 = sha256_file(nano_teacher_checkpoint)
@@ -265,6 +328,15 @@ def build_receipt(
         or provenance.get("nano_teacher_checkpoint_sha256") != nano_teacher_sha256
     ):
         raise ValueError("Stage211 correction provenance Nano teacher binding mismatch.")
+    _validate_correction_smoke_marker(
+        smoke_marker_path,
+        round_index=round_index,
+        replay_receipt=replay_receipt_path,
+        replay_manifest=replay_manifest,
+        admission_gate=admission_gate_path,
+        init_checkpoint=init_checkpoint_path,
+        nano_checkpoint=nano_teacher_checkpoint,
+    )
 
     runtime_epoch_coverage = audit_stage211_runtime_epoch_coverage(
         run_dir=run_dir,
@@ -304,6 +376,8 @@ def build_receipt(
         "provenance_sha256": sha256_file(provenance_path),
         "train_config_path": str(train_config_path),
         "train_config_sha256": sha256_file(train_config_path),
+        "smoke_marker_path": str(smoke_marker_path),
+        "smoke_marker_sha256": sha256_file(smoke_marker_path),
         "replay_receipt_path": str(replay_receipt_path),
         "replay_receipt_sha256": sha256_file(replay_receipt_path),
         "bucket_manifest_path": str(replay_manifest),
