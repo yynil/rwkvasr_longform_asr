@@ -447,6 +447,18 @@ def build_stepwise_report(
     if len(unique_teacher_sha256) != 1 or len(next(iter(unique_teacher_sha256), "")) != 64:
         raise ValueError("Stage211 A/B/C/D Nano teacher checkpoint SHA-256 chain mismatch.")
     nano_teacher_checkpoint_sha256 = next(iter(unique_teacher_sha256))
+    global_dedup_bindings = {
+        (
+            str(phase_reports[phase].get("global_dedup_manifest_path") or ""),
+            str(phase_reports[phase].get("global_dedup_manifest_sha256") or ""),
+        )
+        for phase in ("mixer", "block", "logits")
+    }
+    if len(global_dedup_bindings) != 1:
+        raise ValueError("Stage211 A/B/C global dedup provenance chain mismatch.")
+    global_dedup_manifest_path, global_dedup_manifest_sha256 = next(
+        iter(global_dedup_bindings)
+    )
     baseline_bindings = {
         _nano_public_baseline_binding(phase_reports[phase])
         for phase in ("mixer", "block", "logits")
@@ -609,6 +621,8 @@ def build_stepwise_report(
         "nano_public_baseline_receipt_path": nano_public_baseline_receipt_path,
         "nano_public_baseline_receipt_sha256": (nano_public_baseline_receipt_sha256),
         "nano_public_baseline_checkpoint_sha256": (nano_public_baseline_checkpoint_sha256),
+        "global_dedup_manifest_path": global_dedup_manifest_path,
+        "global_dedup_manifest_sha256": global_dedup_manifest_sha256,
         "total_public_eval_samples_per_stage": sum(
             int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
         ),

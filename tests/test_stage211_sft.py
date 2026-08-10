@@ -18,6 +18,7 @@ from rwkvasr.eval.stage211_gate import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+GLOBAL_DEDUP_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "stage211_global_dedup_manifest.json"
 sys.path.insert(0, str(REPO_ROOT))
 sft_runner = importlib.import_module("scripts.run_stage211_labeled_sft")
 sft_finalizer = importlib.import_module("scripts.finalize_stage211_labeled_sft")
@@ -569,6 +570,8 @@ def _write_stepwise_inputs(
                     "gate_passed": True,
                     "checkpoint_path": str(checkpoints[stage].resolve()),
                     "checkpoint_sha256": sha256_file(checkpoints[stage]),
+                    "global_dedup_manifest_path": str(GLOBAL_DEDUP_FIXTURE.resolve()),
+                    "global_dedup_manifest_sha256": sha256_file(GLOBAL_DEDUP_FIXTURE),
                     "preflight_smoke": {
                         "marker_path": str(preflight_marker.resolve()),
                         "marker_sha256": sha256_file(preflight_marker),
@@ -844,6 +847,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["nano_teacher_chain_passed"] is True
     assert report["nano_teacher_checkpoint_sha256"] == sha256_file(
         tmp_path / "nano-teacher" / "model.pt"
+    )
+    assert report["global_dedup_manifest_sha256"] == sha256_file(
+        GLOBAL_DEDUP_FIXTURE
     )
     assert len(report["checkpoint_chain"]) == 4
     assert [row["stage"] for row in report["coverage_results"]] == [

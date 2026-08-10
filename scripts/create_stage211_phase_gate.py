@@ -9,6 +9,7 @@ from typing import Any
 from rwkvasr.eval import normalize_asr_text_for_metrics
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
+    DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
@@ -16,6 +17,7 @@ from rwkvasr.eval.stage211_gate import (
     load_stage211_post_coverage_correction_receipts,
     sha256_file,
     validate_stage211_full_profile_smoke_binding,
+    validate_stage211_global_dedup_manifest,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
 )
@@ -368,6 +370,7 @@ def build_phase_gate(
     manifest_dir: Path,
     coverage_receipt_paths: list[Path],
     preflight_smoke_marker_path: Path,
+    global_dedup_manifest_path: Path,
     alignment_report_path: Path | None,
     post_coverage_correction_receipt_paths: list[Path] | None = None,
     baseline_public_comparison_report_path: Path | None = None,
@@ -410,6 +413,8 @@ def build_phase_gate(
         init_checkpoint=phase_init_checkpoint,
         easy_manifest=Path(str(coverage[0].get("bucket_manifest_path") or "")).resolve(),
     )
+    global_dedup_manifest_path = global_dedup_manifest_path.expanduser().resolve()
+    validate_stage211_global_dedup_manifest(global_dedup_manifest_path)
     alignment_gate_passed = False
     alignment_record: dict[str, Any] | None = None
     if alignment_report_path is not None:
@@ -545,6 +550,8 @@ def build_phase_gate(
         "alignment_gate_passed": alignment_gate_passed,
         "public_progress_gate_passed": public_progress_gate_passed,
         "preflight_smoke": preflight_smoke,
+        "global_dedup_manifest_path": str(global_dedup_manifest_path),
+        "global_dedup_manifest_sha256": sha256_file(global_dedup_manifest_path),
         "alignment_report": alignment_record,
         "baseline_public_comparison_report": baseline_public_record,
         "public_progress": public_progress,
@@ -571,6 +578,11 @@ def main() -> int:
     parser.add_argument("--phase", choices=("mixer", "block", "logits"), required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--preflight-smoke-marker", type=Path, required=True)
+    parser.add_argument(
+        "--global-dedup-manifest",
+        type=Path,
+        default=DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
+    )
     parser.add_argument("--public-comparison-report", type=Path, required=True)
     parser.add_argument("--manifest-dir", type=Path, required=True)
     parser.add_argument(
@@ -606,6 +618,7 @@ def main() -> int:
         manifest_dir=args.manifest_dir,
         coverage_receipt_paths=list(args.coverage_receipt),
         preflight_smoke_marker_path=args.preflight_smoke_marker,
+        global_dedup_manifest_path=args.global_dedup_manifest,
         post_coverage_correction_receipt_paths=list(args.post_coverage_correction_receipt),
         alignment_report_path=args.alignment_report,
         baseline_public_comparison_report_path=(args.baseline_public_comparison_report),

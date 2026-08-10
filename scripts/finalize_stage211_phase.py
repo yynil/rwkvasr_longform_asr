@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.eval.stage211_gate import (
+    DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
     STAGE211_AUDIO_CURRICULUM,
     build_stage211_full_data_coverage,
     load_stage211_post_coverage_correction_receipts,
@@ -474,6 +475,18 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         str(checkpoint),
         "--preflight-smoke-marker",
         str(phase_root / "full_profile_smoke_passed.json"),
+        "--global-dedup-manifest",
+        str(
+            Path(
+                getattr(
+                    args,
+                    "global_dedup_manifest",
+                    DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
+                )
+            )
+            .expanduser()
+            .resolve()
+        ),
         "--public-comparison-report",
         str(comparison_json),
         "--manifest-dir",
@@ -578,6 +591,11 @@ def main() -> int:
         default=[],
     )
     parser.add_argument("--devices", default="0,1,2,3")
+    parser.add_argument(
+        "--global-dedup-manifest",
+        type=Path,
+        default=DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
+    )
     parser.add_argument("--alignment-device", default="cuda:0")
     parser.add_argument("--alignment-teacher-device", default=None)
     parser.add_argument("--alignment-batch-size", type=int, default=4)

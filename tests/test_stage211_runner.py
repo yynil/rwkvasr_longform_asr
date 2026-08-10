@@ -39,6 +39,7 @@ from rwkvasr.eval.stage211_gate import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+GLOBAL_DEDUP_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "stage211_global_dedup_manifest.json"
 sys.path.insert(0, str(REPO_ROOT))
 stage211 = importlib.import_module("scripts.run_stage211_strict_chained_alignment")
 stage211_phase_gate = importlib.import_module("scripts.create_stage211_phase_gate")
@@ -2063,6 +2064,8 @@ def _write_valid_phase_gate(
                 "gate_passed": True,
                 "alignment_gate_passed": True,
                 "public_progress_gate_passed": True,
+                "global_dedup_manifest_path": str(GLOBAL_DEDUP_FIXTURE.resolve()),
+                "global_dedup_manifest_sha256": sha256_file(GLOBAL_DEDUP_FIXTURE),
                 "preflight_smoke": {
                     "marker_path": str(smoke_marker.resolve()),
                     "marker_sha256": sha256_file(smoke_marker),
@@ -2732,6 +2735,33 @@ def test_stage211_phase_gate_rejects_smoke_sample_skipping(
     gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="smoke log failed validation"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_rewritten_global_dedup_manifest(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "long-complete.pt"
+    checkpoint.write_bytes(b"long-complete")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    rewritten_manifest = tmp_path / "rewritten-global-dedup.json"
+    manifest = json.loads(GLOBAL_DEDUP_FIXTURE.read_text(encoding="utf-8"))
+    manifest["total_unique_audio_rows"] -= 1
+    rewritten_manifest.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    report["global_dedup_manifest_path"] = str(rewritten_manifest.resolve())
+    report["global_dedup_manifest_sha256"] = sha256_file(rewritten_manifest)
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="global dedup manifest SHA-256 mismatch"):
         validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",

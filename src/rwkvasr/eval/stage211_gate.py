@@ -24,6 +24,16 @@ STAGE211_RETENTION_CORRECTION_LR = 1.0e-6
 STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES = 256
 STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT = "alignment_checkpoint_eval"
 STAGE211_ALLOWED_OPERATOR_KEY_MARKERS = (".time_mixer.", ".input_proj.")
+DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST = (
+    Path.home()
+    / "rwkvasr_data"
+    / "stage211_full_curriculum"
+    / "stage179_usbhd_dedup_alignment_manifest.json"
+)
+STAGE211_GLOBAL_DEDUP_MANIFEST_SHA256 = (
+    "9228d24a8befe24d0e35debd63070f24a6a6313bf318308452e95656dd6708ba"
+)
+STAGE211_GLOBAL_DEDUP_TOTAL_HOURS = 118_465.16068055555
 STAGE211_AUDIO_CURRICULUM: dict[str, dict[str, float | int]] = {
     "easy": {
         "rows": 1_174_987,
@@ -376,6 +386,77 @@ def validate_stage211_full_profile_smoke_binding(
     ):
         raise ValueError(f"Stage211 {phase} preflight smoke memory mismatch.")
     return dict(binding)
+
+
+def validate_stage211_global_dedup_manifest(
+    manifest_path: str | Path,
+    *,
+    expected_sha256: str = STAGE211_GLOBAL_DEDUP_MANIFEST_SHA256,
+) -> dict[str, Any]:
+    manifest_path = Path(manifest_path).expanduser().resolve()
+    if not manifest_path.is_file() or sha256_file(manifest_path) != expected_sha256:
+        raise ValueError(f"Stage211 global dedup manifest SHA-256 mismatch: {manifest_path}")
+    manifest = _load_json_object(
+        manifest_path,
+        label="Stage211 global dedup manifest",
+    )
+    expected = {
+        "version": 1,
+        "root": "/",
+        "curriculum": "usbhd_dedup_audio_only_online_ctc_alignment",
+        "split": "train",
+        "dedupe_key": (
+            "blake2b16(root_or_tar_path + audio_member + audio_offset + audio_size)"
+        ),
+        "total_unique_audio_rows": STAGE211_AUDIO_TOTAL_ROWS,
+    }
+    if any(manifest.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 global dedup manifest contract mismatch.")
+    total_hours = float(manifest.get("total_unique_hours", float("nan")))
+    if not math.isfinite(total_hours) or not math.isclose(
+        total_hours,
+        STAGE211_GLOBAL_DEDUP_TOTAL_HOURS,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError("Stage211 global dedup manifest total hours mismatch.")
+    rows_by_difficulty = manifest.get("rows_by_difficulty")
+    hours_by_difficulty = manifest.get("hours_by_difficulty")
+    stages = manifest.get("stages")
+    if not all(
+        isinstance(value, dict)
+        for value in (rows_by_difficulty, hours_by_difficulty, stages)
+    ):
+        raise ValueError("Stage211 global dedup manifest lacks difficulty partitions.")
+    if set(rows_by_difficulty) != set(STAGE211_AUDIO_CURRICULUM) or set(
+        hours_by_difficulty
+    ) != set(STAGE211_AUDIO_CURRICULUM):
+        raise ValueError("Stage211 global dedup manifest difficulty set mismatch.")
+    for difficulty, expected_segment in STAGE211_AUDIO_CURRICULUM.items():
+        expected_rows = int(expected_segment["rows"])
+        expected_hours = float(expected_segment["hours"])
+        if int(rows_by_difficulty[difficulty]) != expected_rows or not math.isclose(
+            float(hours_by_difficulty[difficulty]),
+            expected_hours,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                f"Stage211 global dedup manifest {difficulty} partition mismatch."
+            )
+    inputs = manifest.get("inputs")
+    if not isinstance(inputs, dict) or not inputs:
+        raise ValueError("Stage211 global dedup manifest lacks source inputs.")
+    accepted_rows = 0
+    for source, raw_input in inputs.items():
+        if not isinstance(raw_input, dict):
+            raise ValueError(f"Stage211 global dedup input {source} is invalid.")
+        if int(raw_input.get("duplicate_audio_rows", -1)) != 0:
+            raise ValueError(f"Stage211 global dedup input {source} contains duplicates.")
+        accepted_rows += int(raw_input.get("accepted_unique_audio_rows", -1))
+    if accepted_rows != STAGE211_AUDIO_TOTAL_ROWS:
+        raise ValueError("Stage211 global dedup source-row total mismatch.")
+    return manifest
 
 
 def _report_nano_checkpoint_path(report: dict[str, Any]) -> Path:
@@ -1610,6 +1691,13 @@ def validate_stage211_phase_gate_report(
         phase=expected_phase,
         checkpoint_path=checkpoint_path,
     )
+    global_dedup_manifest = _validate_bound_file(
+        report,
+        path_key="global_dedup_manifest_path",
+        sha256_key="global_dedup_manifest_sha256",
+        label="Stage211 global dedup manifest",
+    )
+    validate_stage211_global_dedup_manifest(global_dedup_manifest)
     phase_segments = coverage.get("segments")
     if not isinstance(phase_segments, list):
         raise ValueError("Stage211 phase gate lacks ordered curriculum segments.")

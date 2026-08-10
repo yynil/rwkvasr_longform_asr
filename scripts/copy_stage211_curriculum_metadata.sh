@@ -39,4 +39,18 @@ for stage in "${STAGES[@]}"; do
     "${stage}" "${destination_sha}"
 done
 
+global_manifest="stage179_usbhd_dedup_alignment_manifest.json"
+rsync \
+  --archive \
+  "${SOURCE_ROOT}/${global_manifest}" \
+  "${DEST_ROOT}/${global_manifest}"
+source_sha="$(sha256sum "${SOURCE_ROOT}/${global_manifest}" | awk '{print $1}')"
+destination_sha="$(sha256sum "${DEST_ROOT}/${global_manifest}" | awk '{print $1}')"
+if [[ "${source_sha}" != "${destination_sha}" ]]; then
+  echo "global dedup manifest SHA-256 mismatch after copy" >&2
+  exit 1
+fi
+printf '[stage211-metadata] verified global_dedup_manifest_sha256=%s\n' \
+  "${destination_sha}"
+
 printf '[stage211-metadata] complete destination=%s\n' "${DEST_ROOT}"
