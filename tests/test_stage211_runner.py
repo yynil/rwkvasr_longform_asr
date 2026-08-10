@@ -54,6 +54,75 @@ def test_stage211_controllers_preserve_virtualenv_python() -> None:
     assert stage211_phase_finalizer.PYTHON == expected
 
 
+def test_stage211_full_phase_smoke_marker_rebuilds_source_evidence(
+    tmp_path: Path,
+) -> None:
+    phase_root = tmp_path / "phase"
+    smoke_run_dir = phase_root / "full_profile_smoke"
+    log_dir = smoke_run_dir / "logs"
+    log_dir.mkdir(parents=True)
+    init_checkpoint = tmp_path / "init.pt"
+    easy_manifest = tmp_path / "easy.json"
+    marker_path = phase_root / "full_profile_smoke_passed.json"
+    torch.save({"step": 0}, init_checkpoint)
+    torch.save({"step": 2}, smoke_run_dir / "step-2.pt")
+    easy_manifest.write_text("{}\n", encoding="utf-8")
+    (log_dir / "block_smoke_2steps.log").write_text(
+        "[rwkvasr] Distributed init complete.\n"
+        "[deepspeed-train] step=1 loss=0.8 peak_reserved=5.50GiB\n"
+        "[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB\n",
+        encoding="utf-8",
+    )
+    marker = stage211_full_phase._audit_smoke(
+        phase="block",
+        smoke_run_dir=smoke_run_dir,
+        init_checkpoint=init_checkpoint,
+        easy_manifest=easy_manifest,
+        max_peak_reserved_gib=22.0,
+    )
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+
+    assert (
+        stage211_full_phase._validate_smoke_marker(
+            marker_path=marker_path,
+            phase="block",
+            smoke_run_dir=smoke_run_dir,
+            init_checkpoint=init_checkpoint,
+            easy_manifest=easy_manifest,
+            max_peak_reserved_gib=22.0,
+        )
+        == marker
+    )
+
+    marker["peak_reserved_gib"] = 5.0
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="rebuilt source evidence"):
+        stage211_full_phase._validate_smoke_marker(
+            marker_path=marker_path,
+            phase="block",
+            smoke_run_dir=smoke_run_dir,
+            init_checkpoint=init_checkpoint,
+            easy_manifest=easy_manifest,
+            max_peak_reserved_gib=22.0,
+        )
+
+
+def test_stage211_full_phase_formal_progress_detection_is_fail_closed(
+    tmp_path: Path,
+) -> None:
+    phase_root = tmp_path / "phase"
+    phase_root.mkdir()
+    assert stage211_full_phase._formal_phase_training_started(phase_root) is False
+
+    hard_log_dir = phase_root / "hard" / "logs"
+    hard_log_dir.mkdir(parents=True)
+    training_log = hard_log_dir / "hard.log"
+    training_log.write_text("[deepspeed-train] step=0 loss=1.0\n", encoding="utf-8")
+    assert stage211_full_phase._formal_phase_training_started(phase_root) is False
+    training_log.write_text("[deepspeed-train] step=1 loss=0.9\n", encoding="utf-8")
+    assert stage211_full_phase._formal_phase_training_started(phase_root) is True
+
+
 def test_stage211_public_eval_shards_large_second_stage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1943,6 +2012,44 @@ def _write_valid_phase_gate(
         encoding="utf-8",
     )
 
+    smoke_dir = tmp_path / f"{phase}-full-profile-smoke"
+    smoke_log_dir = smoke_dir / "logs"
+    smoke_log_dir.mkdir(parents=True)
+    smoke_checkpoint = smoke_dir / "step-2.pt"
+    smoke_log = smoke_log_dir / f"{phase}_smoke_2steps.log"
+    smoke_checkpoint.write_bytes(b"smoke-step-2")
+    smoke_log.write_text(
+        "[rwkvasr] Distributed init complete.\n"
+        "[deepspeed-train] step=1 loss=0.8 peak_reserved=5.50GiB\n"
+        "[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB\n",
+        encoding="utf-8",
+    )
+    easy_manifest = Path(str(segments[0]["bucket_manifest_path"])).resolve()
+    smoke_marker = tmp_path / f"{phase}-full-profile-smoke-passed.json"
+    smoke_marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "full_profile_smoke",
+                "phase": phase,
+                "complete": True,
+                "init_checkpoint_path": str(phase_init_checkpoint.resolve()),
+                "init_checkpoint_sha256": sha256_file(phase_init_checkpoint),
+                "easy_manifest_path": str(easy_manifest),
+                "easy_manifest_sha256": sha256_file(easy_manifest),
+                "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
+                "smoke_checkpoint_sha256": sha256_file(smoke_checkpoint),
+                "smoke_log_path": str(smoke_log.resolve()),
+                "smoke_log_sha256": sha256_file(smoke_log),
+                "peak_reserved_gib": 6.0,
+                "max_peak_reserved_gib": 22.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     gate_report = tmp_path / "mixer_gate.json"
     gate_report.write_text(
         json.dumps(
@@ -1956,6 +2063,10 @@ def _write_valid_phase_gate(
                 "gate_passed": True,
                 "alignment_gate_passed": True,
                 "public_progress_gate_passed": True,
+                "preflight_smoke": {
+                    "marker_path": str(smoke_marker.resolve()),
+                    "marker_sha256": sha256_file(smoke_marker),
+                },
                 "alignment_report": {
                     "path": str(alignment_report.resolve()),
                     "sha256": sha256_file(alignment_report),
@@ -2538,6 +2649,33 @@ def test_stage211_phase_gate_rejects_mutated_alignment_report(
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="logits",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_preflight_smoke_log(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "long-complete.pt"
+    checkpoint.write_bytes(b"long-complete")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    marker_path = Path(report["preflight_smoke"]["marker_path"])
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    smoke_log = Path(marker["smoke_log_path"])
+    smoke_log.write_text(
+        smoke_log.read_text(encoding="utf-8") + "tampered\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="smoke log SHA-256 mismatch"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
             checkpoint_path=checkpoint,
         )
 

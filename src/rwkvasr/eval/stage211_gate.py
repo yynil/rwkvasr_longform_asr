@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -275,6 +276,92 @@ def _validate_bound_file(
     if len(expected_sha256) != 64 or sha256_file(path) != expected_sha256:
         raise ValueError(f"{label} SHA-256 mismatch: {path}")
     return path
+
+
+def validate_stage211_full_profile_smoke_binding(
+    binding: Any,
+    *,
+    phase: str,
+    init_checkpoint: str | Path,
+    easy_manifest: str | Path,
+) -> dict[str, Any]:
+    if not isinstance(binding, dict):
+        raise ValueError(f"Stage211 {phase} phase gate lacks a preflight smoke binding.")
+    marker_path = _validate_bound_file(
+        binding,
+        path_key="marker_path",
+        sha256_key="marker_sha256",
+        label=f"Stage211 {phase} preflight smoke marker",
+    )
+    marker = _load_json_object(
+        marker_path,
+        label=f"Stage211 {phase} preflight smoke marker",
+    )
+    init_checkpoint = Path(init_checkpoint).resolve()
+    easy_manifest = Path(easy_manifest).resolve()
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "full_profile_smoke",
+        "phase": phase,
+        "complete": True,
+        "init_checkpoint_path": str(init_checkpoint),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint),
+        "easy_manifest_path": str(easy_manifest),
+        "easy_manifest_sha256": sha256_file(easy_manifest),
+    }
+    if any(marker.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"Stage211 {phase} preflight smoke marker contract mismatch.")
+    checkpoint = _validate_bound_file(
+        marker,
+        path_key="smoke_checkpoint_path",
+        sha256_key="smoke_checkpoint_sha256",
+        label=f"Stage211 {phase} preflight smoke checkpoint",
+    )
+    if checkpoint.name != "step-2.pt":
+        raise ValueError(f"Stage211 {phase} preflight smoke checkpoint is not step 2.")
+    log_path = _validate_bound_file(
+        marker,
+        path_key="smoke_log_path",
+        sha256_key="smoke_log_sha256",
+        label=f"Stage211 {phase} preflight smoke log",
+    )
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    attempt_start = log_text.rfind("[rwkvasr] Distributed init complete.")
+    if attempt_start >= 0:
+        log_text = log_text[attempt_start:]
+    rejected_patterns = (
+        re.compile(r"Traceback"),
+        re.compile(r"CUDA out of memory", re.IGNORECASE),
+        re.compile(r"OutOfMemory"),
+        re.compile(r"\bloss=(?:nan|inf)\b", re.IGNORECASE),
+        re.compile(r"\bonline_[a-z0-9_]*missing=[1-9][0-9]*\b"),
+        re.compile(r"\bonline_[a-z0-9_]*frame_delta=[1-9][0-9]*\b"),
+    )
+    if "[deepspeed-train] step=2" not in log_text or any(
+        pattern.search(log_text) is not None for pattern in rejected_patterns
+    ):
+        raise ValueError(f"Stage211 {phase} preflight smoke log failed validation.")
+    peak_values = [
+        float(value)
+        for value in re.findall(
+            r"peak_reserved=([0-9]+(?:\.[0-9]+)?)GiB",
+            log_text,
+        )
+    ]
+    peak = float(marker.get("peak_reserved_gib", float("nan")))
+    limit = float(marker.get("max_peak_reserved_gib", float("nan")))
+    if (
+        not peak_values
+        or not math.isfinite(peak)
+        or not math.isfinite(limit)
+        or peak < 0.0
+        or limit <= 0.0
+        or peak > limit
+        or not math.isclose(peak, max(peak_values), rel_tol=0.0, abs_tol=1e-9)
+    ):
+        raise ValueError(f"Stage211 {phase} preflight smoke memory mismatch.")
+    return dict(binding)
 
 
 def _report_nano_checkpoint_path(report: dict[str, Any]) -> Path:
@@ -1527,6 +1614,12 @@ def validate_stage211_phase_gate_report(
         phase_init_checkpoint
     ) != easy_segment.get("init_checkpoint_sha256"):
         raise ValueError("Stage211 phase initialization checkpoint is missing or changed.")
+    validate_stage211_full_profile_smoke_binding(
+        report.get("preflight_smoke"),
+        phase=expected_phase,
+        init_checkpoint=phase_init_checkpoint,
+        easy_manifest=Path(str(easy_segment.get("bucket_manifest_path") or "")).resolve(),
+    )
     benchmark = validate_stage211_public_benchmark(
         report.get("public_benchmark"),
         require_metric_source_recomputed=True,

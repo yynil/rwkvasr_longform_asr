@@ -104,6 +104,24 @@ def _checkpoint_step(path: Path) -> int:
         del payload
 
 
+def _formal_phase_training_started(phase_root: Path) -> bool:
+    if any((phase_root / "receipts").glob("*.json")):
+        return True
+    for difficulty in STAGE211_AUDIO_CURRICULUM:
+        run_dir = phase_root / difficulty
+        if _latest_step(run_dir) > 0 or (run_dir / "latest_checkpoint.yaml").exists():
+            return True
+        deepspeed_root = run_dir / "ds_checkpoints"
+        if deepspeed_root.is_dir() and any(deepspeed_root.glob("step-[1-9]*")):
+            return True
+        step_pattern = re.compile(r"\[deepspeed-train\] step=[1-9][0-9]*\b")
+        for log_path in (run_dir / "logs").glob("*.log"):
+            with log_path.open("r", encoding="utf-8", errors="replace") as source:
+                if any(step_pattern.search(line) is not None for line in source):
+                    return True
+    return False
+
+
 def _parse_manifest_overrides(
     values: list[str],
     *,
@@ -320,33 +338,21 @@ def _validate_smoke_marker(
     *,
     marker_path: Path,
     phase: str,
+    smoke_run_dir: Path,
     init_checkpoint: Path,
     easy_manifest: Path,
+    max_peak_reserved_gib: float,
 ) -> dict[str, Any]:
     marker = _load_json(marker_path, label="Stage211 full-profile smoke marker")
-    expected = {
-        "pipeline": "stage211",
-        "artifact": "full_profile_smoke",
-        "phase": phase,
-        "complete": True,
-        "init_checkpoint_path": str(init_checkpoint),
-        "init_checkpoint_sha256": sha256_file(init_checkpoint),
-        "easy_manifest_path": str(easy_manifest),
-        "easy_manifest_sha256": sha256_file(easy_manifest),
-    }
-    for key, value in expected.items():
-        if marker.get(key) != value:
-            raise ValueError(
-                f"Stage211 smoke marker {key} mismatch: "
-                f"expected={value!r} actual={marker.get(key)!r}"
-            )
-    for path_key, sha_key in (
-        ("smoke_checkpoint_path", "smoke_checkpoint_sha256"),
-        ("smoke_log_path", "smoke_log_sha256"),
-    ):
-        path = Path(str(marker.get(path_key) or "")).resolve()
-        if not path.is_file() or sha256_file(path) != marker.get(sha_key):
-            raise ValueError(f"Stage211 smoke artifact is unavailable or changed: {path}")
+    rebuilt = _audit_smoke(
+        phase=phase,
+        smoke_run_dir=smoke_run_dir,
+        init_checkpoint=init_checkpoint,
+        easy_manifest=easy_manifest,
+        max_peak_reserved_gib=max_peak_reserved_gib,
+    )
+    if any(marker.get(key) != value for key, value in rebuilt.items()):
+        raise ValueError("Stage211 smoke marker differs from its rebuilt source evidence.")
     return marker
 
 
@@ -370,8 +376,10 @@ def _run_smoke(
         marker = _validate_smoke_marker(
             marker_path=marker_path,
             phase=phase,
+            smoke_run_dir=smoke_run_dir,
             init_checkpoint=init_checkpoint,
             easy_manifest=easy_manifest,
+            max_peak_reserved_gib=max_peak_reserved_gib,
         )
         print(
             f"[stage211-full-phase] smoke already passed "
@@ -379,6 +387,11 @@ def _run_smoke(
             flush=True,
         )
         return
+    if _formal_phase_training_started(phase_root) and not dry_run:
+        raise ValueError(
+            f"Stage211 {phase} formal training has progress but lacks its preflight "
+            "smoke marker."
+        )
     latest_step = _latest_step(smoke_run_dir)
     command = _runner_command(
         phase=phase,
@@ -405,6 +418,14 @@ def _run_smoke(
         max_peak_reserved_gib=max_peak_reserved_gib,
     )
     _write_immutable_json(marker_path, marker)
+    _validate_smoke_marker(
+        marker_path=marker_path,
+        phase=phase,
+        smoke_run_dir=smoke_run_dir,
+        init_checkpoint=init_checkpoint,
+        easy_manifest=easy_manifest,
+        max_peak_reserved_gib=max_peak_reserved_gib,
+    )
     print(
         f"[stage211-full-phase] smoke passed peak_reserved_gib={marker['peak_reserved_gib']}",
         flush=True,

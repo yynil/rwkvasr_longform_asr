@@ -84,18 +84,26 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
     replay_manifest = tmp_path / "manifest.json"
     admission_gate = tmp_path / "failed-gate.json"
     nano_checkpoint = tmp_path / "nano.pt"
-    smoke_checkpoint = tmp_path / "step-2.pt"
-    smoke_log = tmp_path / "smoke.log"
+    smoke_dir = tmp_path / "smoke"
+    smoke_log_dir = smoke_dir / "logs"
+    smoke_log_dir.mkdir(parents=True)
+    smoke_checkpoint = smoke_dir / "step-2.pt"
+    smoke_log = smoke_log_dir / "mixer_smoke_2steps.log"
     for path, content in (
         (init_checkpoint, b"init"),
         (replay_receipt, b"replay"),
         (replay_manifest, b"manifest"),
         (admission_gate, b"gate"),
         (nano_checkpoint, b"nano"),
-        (smoke_checkpoint, b"smoke-checkpoint"),
-        (smoke_log, b"smoke-log"),
     ):
         path.write_bytes(content)
+    torch.save({"step": 2}, smoke_checkpoint)
+    smoke_log.write_text(
+        "[rwkvasr] Distributed init complete.\n"
+        "[deepspeed-train] step=1 loss=0.8 peak_reserved=5.50GiB\n"
+        "[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB\n",
+        encoding="utf-8",
+    )
     marker_path = tmp_path / "smoke-passed.json"
     marker_path.write_text(
         json.dumps(
@@ -155,7 +163,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     marker["peak_reserved_gib"] = 23.0
     marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="memory contract mismatch"):
+    with pytest.raises(ValueError, match="rebuilt source evidence|memory contract mismatch"):
         correction_runner._validate_correction_smoke_marker(
             marker_path=marker_path,
             round_index=1,

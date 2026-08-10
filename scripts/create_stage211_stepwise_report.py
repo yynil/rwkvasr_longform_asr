@@ -325,6 +325,7 @@ def _stage_record(
     data_coverage: dict[str, Any] | None,
     gate_passed: bool | None,
     nano_teacher_checkpoint_sha256: str | None,
+    preflight_smoke: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "stage": stage,
@@ -336,6 +337,7 @@ def _stage_record(
         "gate_passed": gate_passed,
         "gate_status": "baseline" if gate_passed is None else "pass",
         "nano_teacher_checkpoint_sha256": nano_teacher_checkpoint_sha256,
+        "preflight_smoke": preflight_smoke,
         "data_coverage": data_coverage,
         "public_benchmark": benchmark,
     }
@@ -550,6 +552,7 @@ def build_stepwise_report(
             data_coverage=None,
             gate_passed=None,
             nano_teacher_checkpoint_sha256=None,
+            preflight_smoke=None,
         ),
         *[
             _stage_record(
@@ -564,6 +567,7 @@ def build_stepwise_report(
                 data_coverage=phase_reports[phase]["full_data_coverage"],
                 gate_passed=True,
                 nano_teacher_checkpoint_sha256=teacher_sha256_by_stage[phase],
+                preflight_smoke=phase_reports[phase]["preflight_smoke"],
             )
             for phase in ("mixer", "block", "logits")
         ],
@@ -575,6 +579,7 @@ def build_stepwise_report(
             data_coverage=sft["labeled_data_coverage"],
             gate_passed=True,
             nano_teacher_checkpoint_sha256=teacher_sha256_by_stage["sft"],
+            preflight_smoke=None,
         ),
     ]
     coverage_results = [

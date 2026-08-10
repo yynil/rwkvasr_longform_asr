@@ -15,6 +15,7 @@ from rwkvasr.eval.stage211_gate import (
     build_stage211_full_data_coverage,
     load_stage211_post_coverage_correction_receipts,
     sha256_file,
+    validate_stage211_full_profile_smoke_binding,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
 )
@@ -366,6 +367,7 @@ def build_phase_gate(
     public_comparison_report_path: Path,
     manifest_dir: Path,
     coverage_receipt_paths: list[Path],
+    preflight_smoke_marker_path: Path,
     alignment_report_path: Path | None,
     post_coverage_correction_receipt_paths: list[Path] | None = None,
     baseline_public_comparison_report_path: Path | None = None,
@@ -397,6 +399,17 @@ def build_phase_gate(
         "init_checkpoint_sha256"
     ):
         raise ValueError("Stage211 phase initialization checkpoint is missing or changed.")
+    preflight_smoke_marker_path = preflight_smoke_marker_path.resolve()
+    preflight_smoke = {
+        "marker_path": str(preflight_smoke_marker_path),
+        "marker_sha256": sha256_file(preflight_smoke_marker_path),
+    }
+    validate_stage211_full_profile_smoke_binding(
+        preflight_smoke,
+        phase=phase,
+        init_checkpoint=phase_init_checkpoint,
+        easy_manifest=Path(str(coverage[0].get("bucket_manifest_path") or "")).resolve(),
+    )
     alignment_gate_passed = False
     alignment_record: dict[str, Any] | None = None
     if alignment_report_path is not None:
@@ -531,6 +544,7 @@ def build_phase_gate(
         "gate_passed": gate_passed,
         "alignment_gate_passed": alignment_gate_passed,
         "public_progress_gate_passed": public_progress_gate_passed,
+        "preflight_smoke": preflight_smoke,
         "alignment_report": alignment_record,
         "baseline_public_comparison_report": baseline_public_record,
         "public_progress": public_progress,
@@ -556,6 +570,7 @@ def main() -> int:
     )
     parser.add_argument("--phase", choices=("mixer", "block", "logits"), required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--preflight-smoke-marker", type=Path, required=True)
     parser.add_argument("--public-comparison-report", type=Path, required=True)
     parser.add_argument("--manifest-dir", type=Path, required=True)
     parser.add_argument(
@@ -590,6 +605,7 @@ def main() -> int:
         public_comparison_report_path=args.public_comparison_report,
         manifest_dir=args.manifest_dir,
         coverage_receipt_paths=list(args.coverage_receipt),
+        preflight_smoke_marker_path=args.preflight_smoke_marker,
         post_coverage_correction_receipt_paths=list(args.post_coverage_correction_receipt),
         alignment_report_path=args.alignment_report,
         baseline_public_comparison_report_path=(args.baseline_public_comparison_report),

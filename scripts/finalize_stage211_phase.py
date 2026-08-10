@@ -472,6 +472,8 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         phase,
         "--checkpoint",
         str(checkpoint),
+        "--preflight-smoke-marker",
+        str(phase_root / "full_profile_smoke_passed.json"),
         "--public-comparison-report",
         str(comparison_json),
         "--manifest-dir",

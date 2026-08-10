@@ -559,6 +559,8 @@ def _write_stepwise_inputs(
     reports = {"calibration": calibration_receipt}
     previous = "calibration"
     for index, stage in enumerate(("mixer", "block", "logits"), start=1):
+        preflight_marker = tmp_path / f"{stage}-preflight-smoke.json"
+        preflight_marker.write_text("{}\n", encoding="utf-8")
         gate = tmp_path / f"{stage}-gate.json"
         gate.write_text(
             json.dumps(
@@ -567,6 +569,10 @@ def _write_stepwise_inputs(
                     "gate_passed": True,
                     "checkpoint_path": str(checkpoints[stage].resolve()),
                     "checkpoint_sha256": sha256_file(checkpoints[stage]),
+                    "preflight_smoke": {
+                        "marker_path": str(preflight_marker.resolve()),
+                        "marker_sha256": sha256_file(preflight_marker),
+                    },
                     **nano_baseline_binding,
                     "full_data_coverage": {
                         "total_unique_rows": 100,
@@ -852,6 +858,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["stages"][-1]["checkpoint_sha256"] == sha256_file(checkpoints["sft"])
     assert report["stages"][0]["gate_passed"] is None
     assert report["stages"][0]["gate_status"] == "baseline"
+    assert report["stages"][1]["preflight_smoke"]["marker_sha256"] == sha256_file(
+        tmp_path / "mixer-preflight-smoke.json"
+    )
     assert "Layer A" in output_markdown.read_text(encoding="utf-8")
     assert "SFT D" in output_markdown.read_text(encoding="utf-8")
     assert "Training Coverage" in output_markdown.read_text(encoding="utf-8")

@@ -259,11 +259,21 @@ def _validate_correction_smoke_marker(
     admission_gate: Path,
     nano_checkpoint: Path,
 ) -> dict[str, Any]:
+    raw_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_marker, dict):
+        raise ValueError("Stage211 correction smoke marker must be a JSON object.")
+    smoke_checkpoint = Path(
+        str(raw_marker.get("smoke_checkpoint_path") or "")
+    ).resolve()
     marker = _validate_full_profile_smoke_marker(
         marker_path=marker_path,
         phase="mixer",
+        smoke_run_dir=smoke_checkpoint.parent,
         init_checkpoint=init_checkpoint,
         easy_manifest=replay_manifest,
+        max_peak_reserved_gib=float(
+            raw_marker.get("max_peak_reserved_gib", float("nan"))
+        ),
     )
     expected = {
         "schema_version": 1,
