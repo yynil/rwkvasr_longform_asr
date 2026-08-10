@@ -621,6 +621,36 @@ def test_resolve_mixer_gate_uses_bound_retention_selection(
         )
 
 
+def test_stepwise_cli_resolves_mixer_gate_from_final_report(
+    tmp_path: Path,
+) -> None:
+    selected_gate = tmp_path / "mixer-retention" / "phase_gate.json"
+    selected_gate.parent.mkdir()
+    selected_gate.write_text("{}\n", encoding="utf-8")
+    final_report = tmp_path / "stage211_complete.json"
+    final_report.write_text(
+        json.dumps({"mixer_phase_gate_path": str(selected_gate.resolve())}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        stepwise_report._resolve_cli_mixer_gate(
+            requested_gate=None,
+            sft_final_report_path=final_report,
+        )
+        == selected_gate.resolve()
+    )
+
+    explicit_gate = tmp_path / "explicit-gate.json"
+    assert (
+        stepwise_report._resolve_cli_mixer_gate(
+            requested_gate=explicit_gate,
+            sft_final_report_path=tmp_path / "missing-final-report.json",
+        )
+        == explicit_gate.resolve()
+    )
+
+
 def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
