@@ -126,7 +126,10 @@ def _validate_calibration_receipt(path: Path) -> tuple[dict[str, Any], Path]:
             sha_key=sha_key,
             label=f"Stage211 calibration {label}",
         )
-    validate_stage211_public_benchmark(receipt.get("public_benchmark"))
+    validate_stage211_public_benchmark(
+        receipt.get("public_benchmark"),
+        require_metric_source_recomputed=True,
+    )
     return receipt, checkpoint
 
 

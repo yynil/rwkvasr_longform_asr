@@ -230,9 +230,7 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
                 "complete": True,
                 "init_checkpoint_path": str(artifacts["init_checkpoint"]),
                 "init_checkpoint_sha256": sha256_file(artifacts["init_checkpoint"]),
-                "logits_promotion_receipt_path": str(
-                    artifacts["logits_promotion_receipt"]
-                ),
+                "logits_promotion_receipt_path": str(artifacts["logits_promotion_receipt"]),
                 "logits_promotion_receipt_sha256": sha256_file(
                     artifacts["logits_promotion_receipt"]
                 ),
@@ -848,9 +846,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["nano_teacher_checkpoint_sha256"] == sha256_file(
         tmp_path / "nano-teacher" / "model.pt"
     )
-    assert report["global_dedup_manifest_sha256"] == sha256_file(
-        GLOBAL_DEDUP_FIXTURE
-    )
+    assert report["global_dedup_manifest_sha256"] == sha256_file(GLOBAL_DEDUP_FIXTURE)
     assert len(report["checkpoint_chain"]) == 4
     assert [row["stage"] for row in report["coverage_results"]] == [
         "mixer",
@@ -961,3 +957,16 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
             logits_gate_path=reports["logits"],
             sft_final_report_path=reports["sft"],
         )
+
+
+def test_stage211_stepwise_report_rejects_unreplayed_calibration_metrics(
+    tmp_path: Path,
+) -> None:
+    _, reports = _write_stepwise_inputs(tmp_path)
+    calibration_path = reports["calibration"]
+    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    calibration["public_benchmark"]["results"][0].pop("metric_source_recomputed")
+    calibration_path.write_text(json.dumps(calibration) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not source-recomputed"):
+        stepwise_report._validate_calibration_receipt(calibration_path)
