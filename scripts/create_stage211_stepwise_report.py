@@ -32,6 +32,8 @@ except ModuleNotFoundError as error:
 
 
 STAGE_ORDER = ("calibration", "mixer", "block", "logits", "sft")
+REQUESTED_ALIGNMENT_STAGE_ORDER = ("rwkv_layer", "block", "logits", "sft")
+REQUESTED_TO_INTERNAL_STAGE = {"rwkv_layer": "mixer", "block": "block", "logits": "logits", "sft": "sft"}
 STAGE_LABELS = {
     "calibration": "Calibration",
     "mixer": "Layer / Mixer (A)",
@@ -593,6 +595,8 @@ def build_stepwise_report(
         "complete": True,
         "gate_passed": True,
         "strict_stage_order": list(STAGE_ORDER),
+        "requested_alignment_stage_order": list(REQUESTED_ALIGNMENT_STAGE_ORDER),
+        "requested_to_internal_stage": dict(REQUESTED_TO_INTERNAL_STAGE),
         "checkpoint_chain_passed": True,
         "nano_teacher_chain_passed": True,
         "nano_teacher_checkpoint_sha256": nano_teacher_checkpoint_sha256,

@@ -822,6 +822,18 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "logits",
         "sft",
     ]
+    assert report["requested_alignment_stage_order"] == [
+        "rwkv_layer",
+        "block",
+        "logits",
+        "sft",
+    ]
+    assert report["requested_to_internal_stage"] == {
+        "rwkv_layer": "mixer",
+        "block": "block",
+        "logits": "logits",
+        "sft": "sft",
+    }
     assert report["checkpoint_chain_passed"] is True
     assert report["nano_teacher_chain_passed"] is True
     assert report["nano_teacher_checkpoint_sha256"] == sha256_file(
