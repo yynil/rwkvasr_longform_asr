@@ -96,10 +96,23 @@ def test_stage211_pair_metric_validation_requires_complete_outputs() -> None:
     pair_eval._validate_report_metrics(
         phase="block",
         eval_samples=256,
-        layer_components={"block": layers},
+        layer_components={
+            "mixer": layers,
+            "ffn": layers,
+            "block": layers,
+        },
         logit_metrics={},
         decoder_hidden_metrics={"loss": 0.2},
     )
+
+    with pytest.raises(RuntimeError, match="ffn did not cover exactly 70 layers"):
+        pair_eval._validate_report_metrics(
+            phase="block",
+            eval_samples=256,
+            layer_components={"mixer": layers, "block": layers},
+            logit_metrics={},
+            decoder_hidden_metrics={"loss": 0.2},
+        )
 
     with pytest.raises(RuntimeError, match="exactly 70 layers"):
         pair_eval._validate_report_metrics(

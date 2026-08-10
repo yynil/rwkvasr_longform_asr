@@ -122,20 +122,26 @@ def _validate_report_metrics(
             "Stage211 alignment pair eval coverage mismatch: "
             f"{eval_samples} != {STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES}."
         )
-    if phase in {"mixer", "block"}:
-        component = layer_components.get(phase)
+    phase_components = {
+        "mixer": ("mixer",),
+        "block": ("mixer", "ffn", "block"),
+    }
+    for component_name in phase_components.get(phase, ()):
+        component = layer_components.get(component_name)
         if not isinstance(component, dict) or {
             str(layer_id) for layer_id in component
         } != LAYER_IDS:
             raise RuntimeError(
-                f"Stage211 {phase} pair eval did not cover exactly 70 layers."
+                f"Stage211 {phase} pair eval {component_name} did not cover "
+                "exactly 70 layers."
             )
         for layer_id, metrics in component.items():
             for name in ("loss", "cosine", "rms_ratio"):
                 value = float(metrics.get(name, float("nan")))
                 if not math.isfinite(value):
                     raise RuntimeError(
-                        f"Stage211 {phase} layer {layer_id} metric {name} is not finite."
+                        f"Stage211 {phase} {component_name} layer {layer_id} "
+                        f"metric {name} is not finite."
                     )
     if phase == "block":
         decoder_loss = float(decoder_hidden_metrics.get("loss", float("nan")))

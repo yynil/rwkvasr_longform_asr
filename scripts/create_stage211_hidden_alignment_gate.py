@@ -39,6 +39,10 @@ STRATIFIED_CELLS = (
 STRATIFIED_EVAL_SAMPLES = 256 * len(STRATIFIED_CELLS)
 MAX_STRATIFIED_CELL_REGRESSION_PCT = 10.0
 MIN_STRATIFIED_MACRO_IMPROVED_LAYERS = 68
+PHASE_COMPONENTS = {
+    "mixer": ("mixer",),
+    "block": ("mixer", "ffn", "block"),
+}
 
 
 def _layer_components(report: dict[str, Any]) -> dict[str, dict[str, dict[str, float]]]:
@@ -46,14 +50,19 @@ def _layer_components(report: dict[str, Any]) -> dict[str, dict[str, dict[str, f
     return value if isinstance(value, dict) else {}
 
 
-def _phase_layers(report: dict[str, Any], *, phase: str) -> dict[str, dict[str, float]]:
+def _component_layers(
+    report: dict[str, Any],
+    *,
+    phase: str,
+    component_name: str,
+) -> dict[str, dict[str, float]]:
     components = _layer_components(report)
-    component_name = "mixer" if phase == "mixer" else "block"
     layers = components.get(component_name)
-    if not isinstance(layers, dict):
-        layers = report.get("layers") or report.get("layer_metrics")
     if not isinstance(layers, dict) or set(layers) != {str(index) for index in LAYER_IDS}:
-        raise ValueError(f"Stage211 {phase} hidden report does not contain exactly 70 layers.")
+        raise ValueError(
+            f"Stage211 {phase} hidden report does not contain exactly 70 "
+            f"{component_name} layers."
+        )
     return layers
 
 
@@ -106,6 +115,23 @@ def _summary(
             "candidate_cosine": _mean(candidate, "cosine", layer_ids),
         }
     return result
+
+
+def _fixed_component_gate_passed(summary: dict[str, Any]) -> bool:
+    return (
+        float(summary["candidate_mean_loss"]) < float(summary["baseline_mean_loss"])
+        and float(summary["candidate_mean_cosine"])
+        > float(summary["baseline_mean_cosine"])
+        and int(summary["loss_improved_layers"])
+        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and int(summary["cosine_improved_layers"])
+        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and all(
+            float(row["candidate_loss"]) < float(row["baseline_loss"])
+            and float(row["candidate_cosine"]) > float(row["baseline_cosine"])
+            for row in summary["weak_bands"].values()
+        )
+    )
 
 
 def _validated_eval_provenance(
@@ -264,6 +290,101 @@ def _pair_shared_binding(report: dict[str, Any]) -> dict[str, Any]:
     return {key: report.get(key) for key in PAIR_SHARED_FIELDS}
 
 
+def _validate_stratified_component_summary(
+    component: Any,
+    *,
+    component_name: str,
+) -> dict[str, Any]:
+    if not isinstance(component, dict):
+        raise ValueError(
+            f"Stage211 stratified summary lacks {component_name} component metrics."
+        )
+    for key in (
+        "baseline_mean_loss",
+        "candidate_mean_loss",
+        "baseline_mean_cosine",
+        "candidate_mean_cosine",
+    ):
+        if not math.isfinite(float(component.get(key, float("nan")))):
+            raise ValueError(
+                f"Stage211 stratified {component_name} component {key} is invalid."
+            )
+    for key in ("loss_improved_layers", "cosine_improved_layers"):
+        value = int(component.get(key, -1))
+        if not 0 <= value <= len(LAYER_IDS):
+            raise ValueError(
+                f"Stage211 stratified {component_name} component {key} is invalid."
+            )
+    layers = component.get("layers")
+    if not isinstance(layers, dict) or set(layers) != {
+        str(index) for index in LAYER_IDS
+    }:
+        raise ValueError(
+            f"Stage211 stratified {component_name} component lacks exact layer coverage."
+        )
+    for layer_id, row in layers.items():
+        if not isinstance(row, dict) or not all(
+            math.isfinite(float(row.get(key, float("nan"))))
+            for key in (
+                "baseline_loss",
+                "candidate_loss",
+                "baseline_cosine",
+                "candidate_cosine",
+                "baseline_rms_ratio",
+                "candidate_rms_ratio",
+            )
+        ):
+            raise ValueError(
+                f"Stage211 stratified {component_name} layer is invalid: {layer_id}"
+            )
+    weak_bands = component.get("weak_bands")
+    if not isinstance(weak_bands, dict) or set(weak_bands) != set(WEAK_BANDS):
+        raise ValueError(
+            f"Stage211 stratified {component_name} weak-band coverage mismatch."
+        )
+    for band_name, row in weak_bands.items():
+        if not isinstance(row, dict) or not all(
+            math.isfinite(float(row.get(key, float("nan"))))
+            for key in (
+                "baseline_loss",
+                "candidate_loss",
+                "baseline_cosine",
+                "candidate_cosine",
+            )
+        ):
+            raise ValueError(
+                f"Stage211 stratified {component_name} weak band is invalid: {band_name}"
+            )
+    cells = component.get("cells")
+    if not isinstance(cells, dict) or set(cells) != set(STRATIFIED_CELLS):
+        raise ValueError(
+            f"Stage211 stratified {component_name} cell coverage mismatch."
+        )
+    for cell_name, row in cells.items():
+        if not isinstance(row, dict) or not all(
+            math.isfinite(float(row.get(key, float("nan"))))
+            for key in (
+                "baseline_loss",
+                "candidate_loss",
+                "relative_change_pct",
+                "baseline_cosine",
+                "candidate_cosine",
+            )
+        ):
+            raise ValueError(
+                f"Stage211 stratified {component_name} cell is invalid: {cell_name}"
+            )
+        if not all(
+            0 <= int(row.get(key, -1)) <= len(LAYER_IDS)
+            for key in ("layers_loss_improved", "layers_cosine_improved")
+        ):
+            raise ValueError(
+                f"Stage211 stratified {component_name} cell layer counts are invalid: "
+                f"{cell_name}"
+            )
+    return component
+
+
 def _validated_stratified_summary(
     path: Path,
     *,
@@ -381,6 +502,20 @@ def _validated_stratified_summary(
     weak_bands = layer_summary.get("weak_bands")
     if not isinstance(weak_bands, dict) or set(weak_bands) != set(WEAK_BANDS):
         raise ValueError("Stage211 stratified summary weak-band coverage mismatch.")
+    try:
+        required_components = PHASE_COMPONENTS[phase]
+    except KeyError as error:
+        raise ValueError(f"Unsupported Stage211 hidden phase: {phase!r}") from error
+    component_summaries = summary.get("component_summaries")
+    if not isinstance(component_summaries, dict) or set(component_summaries) != set(
+        required_components
+    ):
+        raise ValueError("Stage211 stratified component-summary coverage mismatch.")
+    for component_name in required_components:
+        _validate_stratified_component_summary(
+            component_summaries[component_name],
+            component_name=component_name,
+        )
     report_bindings = summary.get("reports")
     if not isinstance(report_bindings, dict) or set(report_bindings) != set(
         STRATIFIED_CELLS
@@ -407,6 +542,37 @@ def _validated_stratified_summary(
     return summary
 
 
+def _stratified_component_gate_passed(component: dict[str, Any]) -> bool:
+    cells = component["cells"]
+    return (
+        float(component["candidate_mean_loss"]) < float(component["baseline_mean_loss"])
+        and float(component["candidate_mean_cosine"])
+        > float(component["baseline_mean_cosine"])
+        and int(component["loss_improved_layers"])
+        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and int(component["cosine_improved_layers"])
+        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and all(
+            float(cells[cell_name]["candidate_loss"])
+            < float(cells[cell_name]["baseline_loss"])
+            and int(cells[cell_name]["layers_loss_improved"])
+            >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+            and int(cells[cell_name]["layers_cosine_improved"])
+            >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+            for cell_name in ("hard_en", "hard_zh")
+        )
+        and all(
+            float(cell["relative_change_pct"]) <= MAX_STRATIFIED_CELL_REGRESSION_PCT
+            for cell in cells.values()
+        )
+        and all(
+            float(row["candidate_loss"]) < float(row["baseline_loss"])
+            and float(row["candidate_cosine"]) > float(row["baseline_cosine"])
+            for row in component["weak_bands"].values()
+        )
+    )
+
+
 def _stratified_gate_passed(
     summary: dict[str, Any],
     *,
@@ -431,6 +597,11 @@ def _stratified_gate_passed(
             and int(decoder.get("cells", -1)) == len(STRATIFIED_CELLS)
             and float(decoder["candidate_loss"]) < float(decoder["baseline_loss"])
         )
+    component_summaries = summary["component_summaries"]
+    components_pass = all(
+        _stratified_component_gate_passed(component_summaries[component_name])
+        for component_name in PHASE_COMPONENTS[phase]
+    )
     return (
         float(macro["candidate_loss"]) < float(macro["baseline_loss"])
         and int(layer_summary["loss_improved_layers"])
@@ -451,6 +622,7 @@ def _stratified_gate_passed(
             for row in weak_bands.values()
         )
         and decoder_pass
+        and components_pass
     )
 
 
@@ -502,9 +674,30 @@ def build_gate(
         raise ValueError(
             "Stage211 baseline and candidate hidden reports use different eval samples."
         )
-    baseline_layers = _phase_layers(baseline_report, phase=phase)
-    candidate_layers = _phase_layers(candidate_report, phase=phase)
-    summary = _summary(baseline_layers, candidate_layers)
+    try:
+        required_components = PHASE_COMPONENTS[phase]
+    except KeyError as error:
+        raise ValueError(f"Unsupported Stage211 hidden phase: {phase!r}") from error
+    component_summaries = {
+        component_name: _summary(
+            _component_layers(
+                baseline_report,
+                phase=phase,
+                component_name=component_name,
+            ),
+            _component_layers(
+                candidate_report,
+                phase=phase,
+                component_name=component_name,
+            ),
+        )
+        for component_name in required_components
+    }
+    summary = component_summaries[phase]
+    component_gate_passed = all(
+        _fixed_component_gate_passed(component_summaries[component_name])
+        for component_name in required_components
+    )
     baseline_eval_loss = float(baseline_report["eval_loss"])
     candidate_eval_loss = float(candidate_report["eval_loss"])
     weak_bands_pass = all(
@@ -533,6 +726,7 @@ def build_gate(
         and int(summary["cosine_improved_layers"]) == len(LAYER_IDS)
         and weak_bands_pass
         and decoder_gate_passed
+        and component_gate_passed
     )
     stratified_summary = None
     stratified_gate_passed = None
@@ -548,10 +742,13 @@ def build_gate(
             stratified_summary,
             phase=phase,
         )
-    gate_passed = (
+    selected_hidden_gate_passed = (
         bool(stratified_gate_passed)
         if stratified_gate_passed is not None
         else legacy_gate_passed
+    )
+    gate_passed = selected_hidden_gate_passed and (
+        component_gate_passed if phase == "block" else True
     )
     return {
         "schema_version": 1,
@@ -585,6 +782,8 @@ def build_gate(
         "baseline_eval_loss": baseline_eval_loss,
         "candidate_eval_loss": candidate_eval_loss,
         "layer_summary": summary,
+        "component_summaries": component_summaries,
+        "component_gate_passed": component_gate_passed,
         "decoder_hidden": decoder_hidden,
     }
 

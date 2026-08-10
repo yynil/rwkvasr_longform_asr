@@ -227,7 +227,59 @@ def test_summarize_stage211_stratified_hidden_eval(tmp_path: Path) -> None:
     assert summary["cells"]["easy_en"]["layers_cosine_improved"] == 70
     assert summary["layer_summary"]["loss_improved_layers"] == 70
     assert summary["layer_summary"]["cosine_improved_layers"] == 70
+    assert set(summary["component_summaries"]) == {"mixer"}
+    assert summary["component_summaries"]["mixer"]["loss_improved_layers"] == 70
+    assert summary["component_summaries"]["mixer"]["cells"]["easy_en"][
+        "layers_cosine_improved"
+    ] == 70
     assert set(summary["layer_summary"]["layers"]) == {
         str(index) for index in range(70)
     }
     assert summary["decoder_hidden"] is None
+
+    block_eval_dir = tmp_path / "block_eval"
+    block_eval_dir.mkdir()
+    for role, checkpoint, loss in (
+        ("baseline", baseline_checkpoint, 1.0),
+        ("candidate", candidate_checkpoint, 0.75),
+    ):
+        report_layers = {
+            layer_id: {
+                **metrics,
+                "loss": metrics["loss"] * loss,
+                "cosine": metrics["cosine"] + (0.1 if role == "candidate" else 0.0),
+            }
+            for layer_id, metrics in layers.items()
+        }
+        report = {
+            "role": role,
+            "phase": "block",
+            "eval_samples": 2,
+            "eval_loss": loss,
+            "checkpoint_path": str(checkpoint),
+            "checkpoint_sha256": summarizer.sha256_file(checkpoint),
+            "eval_provenance": {
+                "bucket_manifest_path": str(manifest.resolve()),
+                "bucket_manifest_sha256": summarizer.sha256_file(manifest),
+                "split_samples": 2,
+            },
+            "layer_components": {
+                component_name: report_layers
+                for component_name in ("mixer", "ffn", "block")
+            },
+            "decoder_hidden_metrics": {"loss": loss},
+        }
+        (block_eval_dir / f"easy_en_{role}.json").write_text(
+            json.dumps(report),
+            encoding="utf-8",
+        )
+
+    block_summary = summarizer.summarize(
+        receipt_path=receipt_path,
+        eval_dir=block_eval_dir,
+        output_path=tmp_path / "block_summary.json",
+    )
+
+    assert set(block_summary["component_summaries"]) == {"mixer", "ffn", "block"}
+    assert block_summary["component_summaries"]["ffn"]["loss_improved_layers"] == 70
+    assert block_summary["decoder_hidden"]["candidate_loss"] == pytest.approx(0.75)

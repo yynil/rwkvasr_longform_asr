@@ -49,6 +49,9 @@ def _write_report(
     checkpoint: Path,
     loss: float,
     cosine: float,
+    phase: str = "mixer",
+    component_metrics: dict[str, tuple[float, float]] | None = None,
+    decoder_loss: float | None = None,
 ) -> Path:
     train_config = path.parent / "pair-train.yaml"
     model_config = path.parent / "pair-model.yaml"
@@ -62,13 +65,17 @@ def _write_report(
         if role == "candidate"
         else 17
     )
-    layers = {
-        str(layer_id): {
-            "loss": loss,
-            "cosine": cosine,
-            "rms_ratio": 0.9,
+    component_metrics = component_metrics or {phase: (loss, cosine)}
+    layer_components = {
+        component_name: {
+            str(layer_id): {
+                "loss": component_loss,
+                "cosine": component_cosine,
+                "rms_ratio": 0.9,
+            }
+            for layer_id in range(70)
         }
-        for layer_id in range(70)
+        for component_name, (component_loss, component_cosine) in component_metrics.items()
     }
     save_yaml(
         path,
@@ -76,7 +83,7 @@ def _write_report(
             "schema_version": 1,
             "pipeline": "stage211",
             "artifact": "alignment_checkpoint_eval",
-            "phase": "mixer",
+            "phase": phase,
             "role": role,
             "pair_eval_id": "a" * 64,
             "step": 0 if role == "baseline" else checkpoint_step,
@@ -96,8 +103,10 @@ def _write_report(
                 manifest=manifest,
                 part=part,
             ),
-            "layer_component_metrics": {"mixer": layers},
-            "decoder_hidden_metrics": {},
+            "layer_component_metrics": layer_components,
+            "decoder_hidden_metrics": (
+                {"loss": decoder_loss} if decoder_loss is not None else {}
+            ),
         },
     )
     return path
@@ -140,8 +149,31 @@ def _write_stratified_summary(
             "candidate_loss": 0.8,
             "baseline_cosine": 0.5,
             "candidate_cosine": 0.6,
+            "baseline_rms_ratio": 1.0,
+            "candidate_rms_ratio": 1.0,
         }
         for layer_id in hidden_gate.LAYER_IDS
+    }
+    weak_bands = {
+        band: {
+            "baseline_loss": 1.0,
+            "candidate_loss": 0.8,
+            "baseline_cosine": 0.5,
+            "candidate_cosine": 0.6,
+        }
+        for band in hidden_gate.WEAK_BANDS
+    }
+    component_cells = {
+        cell_name: {
+            "baseline_loss": 1.0,
+            "candidate_loss": 0.8,
+            "relative_change_pct": -20.0,
+            "baseline_cosine": 0.5,
+            "candidate_cosine": 0.6,
+            "layers_loss_improved": 70,
+            "layers_cosine_improved": 70,
+        }
+        for cell_name in hidden_gate.STRATIFIED_CELLS
     }
     summary = root / "stratified-summary.json"
     summary.write_text(
@@ -174,16 +206,21 @@ def _write_stratified_summary(
                 "layer_summary": {
                     "loss_improved_layers": 70,
                     "cosine_improved_layers": 70,
-                    "weak_bands": {
-                        band: {
-                            "baseline_loss": 1.0,
-                            "candidate_loss": 0.8,
-                            "baseline_cosine": 0.5,
-                            "candidate_cosine": 0.6,
-                        }
-                        for band in hidden_gate.WEAK_BANDS
-                    },
+                    "weak_bands": weak_bands,
                     "layers": layers,
+                },
+                "component_summaries": {
+                    "mixer": {
+                        "baseline_mean_loss": 1.0,
+                        "candidate_mean_loss": 0.8,
+                        "baseline_mean_cosine": 0.5,
+                        "candidate_mean_cosine": 0.6,
+                        "loss_improved_layers": 70,
+                        "cosine_improved_layers": 70,
+                        "weak_bands": weak_bands,
+                        "cells": component_cells,
+                        "layers": layers,
+                    }
                 },
                 "decoder_hidden": None,
                 "reports": reports,
@@ -259,6 +296,116 @@ def test_stage211_hidden_gate_requires_identical_bound_eval_parts(
             baseline_checkpoint_path=baseline_checkpoint,
             checkpoint_path=checkpoint,
         )
+
+
+def test_stage211_block_gate_requires_mixer_ffn_and_block_improvement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_part = tmp_path / "fixed_eval.jsonl"
+    eval_part.write_text('{"utt_id": "u1"}\n', encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    baseline_checkpoint = tmp_path / "init.pt"
+    candidate_checkpoint = tmp_path / "step-105.pt"
+    baseline_checkpoint.write_bytes(b"initial")
+    candidate_checkpoint.write_bytes(b"candidate")
+    baseline = _write_report(
+        tmp_path / "baseline.yaml",
+        manifest=manifest,
+        part=eval_part,
+        role="baseline",
+        checkpoint=baseline_checkpoint,
+        loss=1.0,
+        cosine=0.5,
+        phase="block",
+        component_metrics={
+            "mixer": (1.0, 0.5),
+            "ffn": (1.0, 0.5),
+            "block": (1.0, 0.5),
+        },
+        decoder_loss=1.0,
+    )
+    regressed_ffn = _write_report(
+        tmp_path / "regressed_ffn.yaml",
+        manifest=manifest,
+        part=eval_part,
+        role="candidate",
+        checkpoint=candidate_checkpoint,
+        loss=0.8,
+        cosine=0.6,
+        phase="block",
+        component_metrics={
+            "mixer": (0.8, 0.6),
+            "ffn": (1.1, 0.4),
+            "block": (0.8, 0.6),
+        },
+        decoder_loss=0.8,
+    )
+
+    rejected = hidden_gate.build_gate(
+        phase="block",
+        baseline_report_path=baseline,
+        candidate_report_path=regressed_ffn,
+        baseline_checkpoint_path=baseline_checkpoint,
+        checkpoint_path=candidate_checkpoint,
+    )
+
+    assert rejected["component_gate_passed"] is False
+    assert rejected["gate_passed"] is False
+    assert rejected["component_summaries"]["ffn"]["candidate_mean_loss"] == pytest.approx(
+        1.1
+    )
+
+    stratified_summary = tmp_path / "stratified-summary.json"
+    stratified_summary.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        hidden_gate,
+        "_validated_stratified_summary",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        hidden_gate,
+        "_stratified_gate_passed",
+        lambda *args, **kwargs: True,
+    )
+    still_rejected = hidden_gate.build_gate(
+        phase="block",
+        baseline_report_path=baseline,
+        candidate_report_path=regressed_ffn,
+        baseline_checkpoint_path=baseline_checkpoint,
+        checkpoint_path=candidate_checkpoint,
+        stratified_summary_path=stratified_summary,
+    )
+    assert still_rejected["stratified_gate_passed"] is True
+    assert still_rejected["gate_passed"] is False
+
+    aligned = _write_report(
+        tmp_path / "aligned.yaml",
+        manifest=manifest,
+        part=eval_part,
+        role="candidate",
+        checkpoint=candidate_checkpoint,
+        loss=0.8,
+        cosine=0.6,
+        phase="block",
+        component_metrics={
+            "mixer": (0.8, 0.6),
+            "ffn": (0.8, 0.6),
+            "block": (0.8, 0.6),
+        },
+        decoder_loss=0.8,
+    )
+    admitted = hidden_gate.build_gate(
+        phase="block",
+        baseline_report_path=baseline,
+        candidate_report_path=aligned,
+        baseline_checkpoint_path=baseline_checkpoint,
+        checkpoint_path=candidate_checkpoint,
+    )
+
+    assert admitted["component_gate_passed"] is True
+    assert admitted["gate_passed"] is True
 
 
 def test_stage211_hidden_gate_rejects_mutated_eval_part(tmp_path: Path) -> None:
