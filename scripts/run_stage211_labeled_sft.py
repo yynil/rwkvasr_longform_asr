@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import yaml
 
 from rwkvasr.config import load_yaml
 from rwkvasr.eval.stage211_gate import (
@@ -88,6 +89,36 @@ def _latest_step(run_dir: Path) -> int:
         if match:
             latest = max(latest, int(match.group(1)))
     return latest
+
+
+def _formal_training_started(run_dir: Path) -> bool:
+    if _latest_step(run_dir) > 0:
+        return True
+    latest_record = run_dir / "latest_checkpoint.yaml"
+    if latest_record.is_file():
+        try:
+            record = load_yaml(latest_record)
+        except (OSError, TypeError, ValueError, yaml.YAMLError):
+            return True
+        if not isinstance(record, dict):
+            return True
+        try:
+            if int(record.get("step", 0)) > 0:
+                return True
+        except (TypeError, ValueError):
+            return True
+    deepspeed_root = run_dir / "ds_checkpoints"
+    if deepspeed_root.is_dir():
+        for candidate in deepspeed_root.iterdir():
+            match = re.fullmatch(r"step-([0-9]+)", candidate.name)
+            if candidate.is_dir() and match and int(match.group(1)) > 0:
+                return True
+    step_pattern = re.compile(r"\[deepspeed-train\] step=[1-9][0-9]*\b")
+    for log_path in (run_dir / "logs").glob("sft_full_*steps.log"):
+        with log_path.open("r", encoding="utf-8", errors="replace") as source:
+            if any(step_pattern.search(line) is not None for line in source):
+                return True
+    return False
 
 
 def _checkpoint_step(path: Path) -> int:
@@ -294,6 +325,7 @@ def _validate_smoke_marker(
 ) -> dict[str, Any]:
     marker = _load_json(marker_path, label="Stage211D smoke marker")
     expected = {
+        "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "labeled_sft_smoke",
         "phase": "sft",
@@ -310,13 +342,45 @@ def _validate_smoke_marker(
     for key, value in expected.items():
         if marker.get(key) != value:
             raise ValueError(f"Stage211D smoke marker {key} mismatch.")
-    for path_key, sha_key in (
-        ("smoke_checkpoint_path", "smoke_checkpoint_sha256"),
-        ("smoke_log_path", "smoke_log_sha256"),
+    smoke_checkpoint = Path(str(marker.get("smoke_checkpoint_path") or "")).resolve()
+    if (
+        not smoke_checkpoint.is_file()
+        or sha256_file(smoke_checkpoint) != marker.get("smoke_checkpoint_sha256")
+        or _checkpoint_step(smoke_checkpoint) != 2
     ):
-        path = Path(str(marker.get(path_key) or "")).resolve()
-        if not path.is_file() or sha256_file(path) != marker.get(sha_key):
-            raise ValueError(f"Stage211D smoke artifact is unavailable or changed: {path}")
+        raise ValueError(
+            f"Stage211D smoke checkpoint is unavailable, changed, or not step 2: "
+            f"{smoke_checkpoint}"
+        )
+    smoke_log = Path(str(marker.get("smoke_log_path") or "")).resolve()
+    if not smoke_log.is_file() or sha256_file(smoke_log) != marker.get("smoke_log_sha256"):
+        raise ValueError(f"Stage211D smoke log is unavailable or changed: {smoke_log}")
+    log_text = smoke_log.read_text(encoding="utf-8", errors="replace")
+    if "[deepspeed-train] step=2" not in log_text:
+        raise ValueError("Stage211D smoke marker log lacks the second optimizer step.")
+    for pattern in BAD_SMOKE_PATTERNS:
+        match = pattern.search(log_text)
+        if match is not None:
+            raise ValueError(f"Stage211D smoke marker log contains: {match.group(0)}")
+    peak_values = [
+        float(value)
+        for value in re.findall(
+            r"peak_reserved=([0-9]+(?:\.[0-9]+)?)GiB",
+            log_text,
+        )
+    ]
+    peak = float(marker.get("peak_reserved_gib", float("nan")))
+    peak_limit = float(marker.get("max_peak_reserved_gib", float("nan")))
+    if (
+        not peak_values
+        or not math.isfinite(peak)
+        or not math.isfinite(peak_limit)
+        or peak < 0.0
+        or peak_limit <= 0.0
+        or peak > peak_limit
+        or abs(peak - max(peak_values)) > 1e-9
+    ):
+        raise ValueError("Stage211D smoke marker memory contract mismatch.")
     return marker
 
 
@@ -367,10 +431,20 @@ def _validate_completion(
         ),
         ("completion_checkpoint_path", "completion_checkpoint_sha256"),
         ("training_log_path", "training_log_sha256"),
+        ("smoke_marker_path", "smoke_marker_sha256"),
     ):
         path = Path(str(completion.get(path_key) or "")).resolve()
         if not path.is_file() or sha256_file(path) != completion.get(sha_key):
             raise ValueError(f"Stage211D completion artifact is unavailable or changed: {path}")
+    _validate_smoke_marker(
+        Path(str(completion["smoke_marker_path"])).resolve(),
+        init_checkpoint=Path(str(completion["init_checkpoint_path"])).resolve(),
+        promotion_receipt=Path(
+            str(completion["logits_promotion_receipt_path"])
+        ).resolve(),
+        bucket_manifest=Path(str(completion["bucket_manifest_path"])).resolve(),
+        length_index=Path(str(completion["length_index_path"])).resolve(),
+    )
     train_config_path = Path(str(completion["train_config_path"])).resolve()
     train_config = load_yaml(train_config_path)
     validate_stage211_phase_train_config(train_config, phase="sft")
@@ -434,6 +508,7 @@ def run_sft(args: argparse.Namespace) -> Path | None:
 
     smoke_dir = Path(f"{output_dir}_smoke")
     smoke_marker_path = output_dir.parent / f"{output_dir.name}_smoke_passed.json"
+    formal_training_started = _formal_training_started(output_dir)
     if smoke_marker_path.is_file() and not args.dry_run:
         _validate_smoke_marker(
             smoke_marker_path,
@@ -443,6 +518,10 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             length_index=length_index,
         )
     else:
+        if formal_training_started and not args.dry_run:
+            raise ValueError(
+                "Stage211D formal training has progress but lacks its preflight smoke marker."
+            )
         smoke_latest_step = _latest_step(smoke_dir)
         _run_command(
             _runner_command(
@@ -471,6 +550,13 @@ def run_sft(args: argparse.Namespace) -> Path | None:
                     length_index=length_index,
                     max_peak_reserved_gib=float(args.max_peak_reserved_gib),
                 ),
+            )
+            _validate_smoke_marker(
+                smoke_marker_path,
+                init_checkpoint=init_checkpoint,
+                promotion_receipt=promotion_receipt,
+                bucket_manifest=bucket_manifest,
+                length_index=length_index,
             )
     if args.smoke_only or args.dry_run:
         return None
@@ -582,6 +668,8 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             "completion_checkpoint_sha256": sha256_file(completion_checkpoint),
             "training_log_path": str(training_log),
             "training_log_sha256": sha256_file(training_log),
+            "smoke_marker_path": str(smoke_marker_path),
+            "smoke_marker_sha256": sha256_file(smoke_marker_path),
             "runtime_epoch_coverage": runtime_epoch_coverage,
         },
     )

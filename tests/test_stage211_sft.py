@@ -4,6 +4,7 @@ import importlib
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -108,6 +109,79 @@ def test_stage211_sft_runner_command_distinguishes_fresh_and_resume(
     assert "--promotion-receipt" not in resumed
 
 
+def test_stage211_sft_formal_progress_detection_is_fail_closed(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    assert sft_runner._formal_training_started(run_dir) is False
+
+    (run_dir / "latest_checkpoint.yaml").write_text("- invalid-record\n", encoding="utf-8")
+    assert sft_runner._formal_training_started(run_dir) is True
+
+    (run_dir / "latest_checkpoint.yaml").unlink()
+    log_dir = run_dir / "logs"
+    log_dir.mkdir()
+    training_log = log_dir / "sft_full_12045steps.log"
+    training_log.write_text("[deepspeed-train] step=0 loss=1.0\n", encoding="utf-8")
+    assert sft_runner._formal_training_started(run_dir) is False
+    training_log.write_text("[deepspeed-train] step=1 loss=0.9\n", encoding="utf-8")
+    assert sft_runner._formal_training_started(run_dir) is True
+
+
+def test_stage211_sft_refuses_retroactive_smoke_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, length_index, manifest = _labeled_paths(tmp_path)
+    output_dir = tmp_path / "run"
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "sft_full_12045steps.log").write_text(
+        "[deepspeed-train] step=1 loss=0.9\n",
+        encoding="utf-8",
+    )
+    init_checkpoint = tmp_path / "init.pt"
+    promotion_receipt = tmp_path / "promotion.json"
+    nano_checkpoint = tmp_path / "nano.pt"
+    torch.save({"step": 0}, init_checkpoint)
+    promotion_receipt.write_text("{}\n", encoding="utf-8")
+    nano_checkpoint.write_bytes(b"nano")
+    audit = {
+        "webdataset_root": str(root.resolve()),
+        "length_index_path": str(length_index.resolve()),
+        "bucket_manifest_path": str(manifest.resolve()),
+        **LABELED_EXPECTED,
+    }
+    monkeypatch.setattr(sft_runner, "_audit_labeled_data", lambda **_: audit)
+    monkeypatch.setattr(
+        sft_runner,
+        "_resolve_chain_inputs",
+        lambda **_: (init_checkpoint.resolve(), promotion_receipt.resolve()),
+    )
+
+    def unexpected_command(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("training command must not run")
+
+    monkeypatch.setattr(sft_runner, "_run_command", unexpected_command)
+    args = SimpleNamespace(
+        output_dir=output_dir,
+        config_dir=tmp_path / "configs",
+        labeled_webdataset_root=root,
+        labeled_length_index=length_index,
+        bucket_manifest=manifest,
+        nano_checkpoint=nano_checkpoint,
+        init_checkpoint=init_checkpoint,
+        logits_promotion_receipt=promotion_receipt,
+        dry_run=False,
+        smoke_only=False,
+        master_port=29634,
+        max_peak_reserved_gib=22.0,
+        final_checkpoint_path_output=None,
+    )
+
+    with pytest.raises(ValueError, match="formal training has progress"):
+        sft_runner.run_sft(args)
+
+
 def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> None:
     root, length_index, manifest = _labeled_paths(tmp_path)
     artifacts: dict[str, Path] = {
@@ -122,6 +196,7 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
             tmp_path / f"step-{LABELED_EXPECTED['estimated_train_steps']}.pt"
         ),
         "training_log": tmp_path / "train.log",
+        "smoke_marker": tmp_path / "sft_smoke_passed.json",
     }
     artifacts["provenance"].write_text("{}\n", encoding="utf-8")
     artifacts["nano_teacher_checkpoint"].parent.mkdir()
@@ -135,6 +210,46 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
     torch.save(
         {"step": LABELED_EXPECTED["estimated_train_steps"]},
         artifacts["completion_checkpoint"],
+    )
+    smoke_checkpoint = tmp_path / "smoke-step-2.pt"
+    smoke_log = tmp_path / "smoke.log"
+    torch.save({"step": 2}, smoke_checkpoint)
+    smoke_log.write_text(
+        "[deepspeed-train] step=1 loss=0.8 peak_reserved=5.50GiB\n"
+        "[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB\n",
+        encoding="utf-8",
+    )
+    artifacts["smoke_marker"].write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "labeled_sft_smoke",
+                "phase": "sft",
+                "complete": True,
+                "init_checkpoint_path": str(artifacts["init_checkpoint"]),
+                "init_checkpoint_sha256": sha256_file(artifacts["init_checkpoint"]),
+                "logits_promotion_receipt_path": str(
+                    artifacts["logits_promotion_receipt"]
+                ),
+                "logits_promotion_receipt_sha256": sha256_file(
+                    artifacts["logits_promotion_receipt"]
+                ),
+                "bucket_manifest_path": str(manifest),
+                "bucket_manifest_sha256": sha256_file(manifest),
+                "length_index_path": str(length_index),
+                "length_index_sha256": sha256_file(length_index),
+                "smoke_checkpoint_path": str(smoke_checkpoint),
+                "smoke_checkpoint_sha256": sha256_file(smoke_checkpoint),
+                "smoke_log_path": str(smoke_log),
+                "smoke_log_sha256": sha256_file(smoke_log),
+                "peak_reserved_gib": 6.0,
+                "max_peak_reserved_gib": 22.0,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
     epoch_checkpoint = tmp_path / "epoch-1.pt"
     torch.save(
