@@ -37,17 +37,79 @@ def _labeled_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     length_index.write_text("{}\n", encoding="utf-8")
     manifest = root / "manifest.json"
     manifest.write_text("{}\n", encoding="utf-8")
+    (root / "webdataset_lengths.summary.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "output_dir": str(root.resolve()),
+                "length_index_path": str(length_index.resolve()),
+                "tokenizer_type": "sensevoice_tiktoken",
+                "tokenizer_model_path": str(
+                    (REPO_ROOT / "assets/fun-asr-nano-2512/multilingual.tiktoken").resolve()
+                ),
+                "text_normalization": "ctc",
+                "frontend_downsample": "sensevoice_lfr6",
+                "drop_unk_token": True,
+                "unk_token_id": None,
+                "num_input_samples": 285_302,
+                "num_kept_samples": 285_302,
+                "num_dropped_samples": 0,
+                "counts": {
+                    "input_by_split": {"eval": 1_434, "train": 283_868},
+                    "kept_by_split": {"eval": 1_434, "train": 283_868},
+                    "kept_by_source": {"aishell3": 63_262, "librispeech": 222_040},
+                    "kept_by_language": {"en": 222_040, "zh": 63_262},
+                    "kept_by_split_source": {
+                        "eval/aishell3": 310,
+                        "eval/librispeech": 1_124,
+                        "train/aishell3": 62_952,
+                        "train/librispeech": 220_916,
+                    },
+                    "kept_by_split_language": {
+                        "eval/en": 1_124,
+                        "eval/zh": 310,
+                        "train/en": 220_916,
+                        "train/zh": 62_952,
+                    },
+                    "dropped_by_reason": {},
+                    "dropped_by_source": {},
+                    "dropped_by_language": {},
+                    "dropped_unk_tokens_by_source": {},
+                    "dropped_unk_tokens_by_language": {},
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "prepare_ctc_aligned.log").write_text(
+        "tokenizer_type=sensevoice_tiktoken\n"
+        "text_normalization=ctc\n"
+        "frontend_downsample=sensevoice_lfr6\n"
+        "drop_unk_token=1\n"
+        "CTC-aligned clean preprocessing complete\n",
+        encoding="utf-8",
+    )
     return root, length_index, manifest
 
 
-def test_validate_stage211_labeled_audit_exact_contract(tmp_path: Path) -> None:
-    root, length_index, manifest = _labeled_paths(tmp_path)
-    audit = {
+def _labeled_audit(root: Path, length_index: Path, manifest: Path) -> dict[str, object]:
+    return {
         "webdataset_root": str(root.resolve()),
         "length_index_path": str(length_index.resolve()),
         "bucket_manifest_path": str(manifest.resolve()),
         **LABELED_EXPECTED,
+        "label_preparation": sft_runner._label_preparation_proof(
+            webdataset_root=root,
+            length_index_path=length_index,
+        ),
     }
+
+
+def test_validate_stage211_labeled_audit_exact_contract(tmp_path: Path) -> None:
+    root, length_index, manifest = _labeled_paths(tmp_path)
+    audit = _labeled_audit(root, length_index, manifest)
 
     assert (
         sft_runner._validate_labeled_audit(
@@ -67,6 +129,36 @@ def test_validate_stage211_labeled_audit_exact_contract(tmp_path: Path) -> None:
             length_index=length_index,
             bucket_manifest=manifest,
         )
+
+    audit["ctc_tokens"] += 1
+    audit["label_preparation"]["text_normalization"] = "none"
+    with pytest.raises(ValueError, match="label-preparation summary/log proof"):
+        sft_runner._validate_labeled_audit(
+            audit,
+            labeled_root=root,
+            length_index=length_index,
+            bucket_manifest=manifest,
+        )
+
+
+def test_stage211_stepwise_ctc_label_proof_rejects_changed_normalization(
+    tmp_path: Path,
+) -> None:
+    root, length_index, manifest = _labeled_paths(tmp_path)
+    audit = _labeled_audit(root, length_index, manifest)
+    coverage = {
+        **LABELED_EXPECTED,
+        "ctc_suppress_non_pronunciation_tokens": True,
+        "labeled_data_audit": audit,
+    }
+
+    proof = stepwise_report._sft_ctc_label_proof(coverage)
+    assert proof["full_length_index_audit_passed"] is True
+    assert proof["pronunciation_target_samples"] == 285_302
+
+    audit["label_preparation"]["text_normalization"] = "none"
+    with pytest.raises(ValueError, match="text_normalization mismatch"):
+        stepwise_report._sft_ctc_label_proof(coverage)
 
 
 def test_stage211_sft_runner_command_distinguishes_fresh_and_resume(
@@ -146,12 +238,7 @@ def test_stage211_sft_refuses_retroactive_smoke_marker(
     torch.save({"step": 0}, init_checkpoint)
     promotion_receipt.write_text("{}\n", encoding="utf-8")
     nano_checkpoint.write_bytes(b"nano")
-    audit = {
-        "webdataset_root": str(root.resolve()),
-        "length_index_path": str(length_index.resolve()),
-        "bucket_manifest_path": str(manifest.resolve()),
-        **LABELED_EXPECTED,
-    }
+    audit = _labeled_audit(root, length_index, manifest)
     monkeypatch.setattr(sft_runner, "_audit_labeled_data", lambda **_: audit)
     monkeypatch.setattr(
         sft_runner,
@@ -185,6 +272,7 @@ def test_stage211_sft_refuses_retroactive_smoke_marker(
 
 def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> None:
     root, length_index, manifest = _labeled_paths(tmp_path)
+    labeled_audit = _labeled_audit(root, length_index, manifest)
     artifacts: dict[str, Path] = {
         "bucket_manifest": manifest,
         "length_index": length_index,
@@ -199,7 +287,10 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         "training_log": tmp_path / "train.log",
         "smoke_marker": tmp_path / "sft_smoke_passed.json",
     }
-    artifacts["provenance"].write_text("{}\n", encoding="utf-8")
+    artifacts["provenance"].write_text(
+        json.dumps({"labeled_data_audit": labeled_audit}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     artifacts["nano_teacher_checkpoint"].parent.mkdir()
     artifacts["nano_teacher_checkpoint"].write_bytes(b"nano-teacher")
     train_config = stage211_phase_train_config_contract("sft")
@@ -276,7 +367,9 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
+        "ctc_suppress_non_pronunciation_tokens": True,
         **LABELED_EXPECTED,
+        "labeled_data_audit": labeled_audit,
         "labeled_webdataset_root": str(root),
         "runtime_epoch_coverage": {
             "schema_version": 1,
@@ -311,6 +404,15 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
 
     assert loaded == completion
     assert checkpoint == artifacts["completion_checkpoint"].resolve()
+
+    completion["labeled_data_audit"]["ctc_unk_tokens"] = 1
+    completion_path.write_text(
+        json.dumps(completion, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="ctc_unk_tokens mismatch"):
+        sft_runner._validate_completion(completion_path)
+    completion["labeled_data_audit"]["ctc_unk_tokens"] = 0
 
     completion["runtime_epoch_coverage"]["records"][0]["completed_epoch_batch_count"] -= 1
     completion_path.write_text(
@@ -492,6 +594,12 @@ def _write_nano_baseline_receipt(
 def _write_stepwise_inputs(
     tmp_path: Path,
 ) -> tuple[dict[str, Path], dict[str, Path]]:
+    labeled_root, labeled_length_index, labeled_manifest = _labeled_paths(tmp_path)
+    labeled_audit = _labeled_audit(
+        labeled_root,
+        labeled_length_index,
+        labeled_manifest,
+    )
     nano_teacher_dir = tmp_path / "nano-teacher"
     nano_teacher_dir.mkdir()
     nano_teacher_checkpoint = nano_teacher_dir / "model.pt"
@@ -700,10 +808,9 @@ def _write_stepwise_inputs(
                     "phase": "sft",
                     "complete": True,
                     "epochs": 1,
-                    "train_samples": 80,
-                    "eval_samples": 10,
-                    "total_hours": 8.0,
-                    "executed_sample_exposures": 81,
+                    "ctc_suppress_non_pronunciation_tokens": True,
+                    **LABELED_EXPECTED,
+                    "labeled_data_audit": labeled_audit,
                     "init_checkpoint_path": str(checkpoints["logits"].resolve()),
                     "init_checkpoint_sha256": sha256_file(checkpoints["logits"]),
                     "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
@@ -1072,6 +1179,15 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     }
     assert report["checkpoint_chain_passed"] is True
     assert report["nano_initialization_chain_passed"] is True
+    assert report["ctc_label_normalization_chain_passed"] is True
+    assert report["ctc_label_proof"]["full_length_index_audit_passed"] is True
+    assert report["ctc_label_proof"]["text_normalization"] == "ctc"
+    assert report["ctc_label_proof"]["ctc_unk_tokens"] == 0
+    assert report["ctc_label_proof"]["ctc_suppress_non_pronunciation_tokens"] is True
+    assert report["ctc_label_proof"]["language_counts"] == {
+        "en": 222_040,
+        "zh": 63_262,
+    }
     assert report["initialization_receipt_sha256"] == sha256_file(
         reports["initialization"]
     )
@@ -1109,7 +1225,10 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["coverage_results"][0]["epochs"] == 3
     assert report["coverage_results"][0]["supplemental_unique_rows"] == 20
     assert len(report["coverage_results"][0]["training_segments"]) == 5
-    assert report["coverage_results"][-1]["unique_or_train_rows"] == 80
+    assert (
+        report["coverage_results"][-1]["unique_or_train_rows"]
+        == LABELED_EXPECTED["train_samples"]
+    )
     assert len(report["dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert report["stages"][-1]["checkpoint_sha256"] == sha256_file(checkpoints["sft"])
     assert report["stages"][0]["gate_passed"] is None
@@ -1121,6 +1240,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "SFT D" in output_markdown.read_text(encoding="utf-8")
     assert "Training Coverage" in output_markdown.read_text(encoding="utf-8")
     assert "Full Data Segment Proof" in output_markdown.read_text(encoding="utf-8")
+    assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")
     sft_finalizer._validate_final_report(
         reports["sft"],
         checkpoint=checkpoints["sft"],

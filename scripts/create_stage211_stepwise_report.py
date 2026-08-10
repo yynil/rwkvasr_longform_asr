@@ -22,18 +22,24 @@ from rwkvasr.eval.stage211_initialization import (
 
 try:
     from scripts.run_stage211_labeled_sft import (
+        LABELED_EXPECTED,
         _validate_completion as _validate_sft_completion,
     )
     from scripts.run_stage211_strict_chained_alignment import (
+        STAGE211_LABELED_LANGUAGE_COUNTS,
+        STAGE211_LABELED_SOURCE_COUNTS,
         _validate_promotion_receipt as _validate_sft_promotion_receipt,
     )
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
     from run_stage211_labeled_sft import (
+        LABELED_EXPECTED,
         _validate_completion as _validate_sft_completion,
     )
     from run_stage211_strict_chained_alignment import (
+        STAGE211_LABELED_LANGUAGE_COUNTS,
+        STAGE211_LABELED_SOURCE_COUNTS,
         _validate_promotion_receipt as _validate_sft_promotion_receipt,
     )
 
@@ -336,6 +342,81 @@ def _sft_initial_checkpoint(report: dict[str, Any]) -> tuple[Path, str]:
     )
 
 
+def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
+    audit = coverage.get("labeled_data_audit")
+    if not isinstance(audit, dict):
+        raise ValueError("Stage211 SFT coverage lacks the full labeled-data audit.")
+    for key, expected in LABELED_EXPECTED.items():
+        audit_value = audit.get(key)
+        coverage_value = coverage.get(key)
+        if key == "total_hours":
+            if not math.isclose(
+                float(audit_value),
+                float(expected),
+                rel_tol=0.0,
+                abs_tol=1e-5,
+            ) or not math.isclose(
+                float(coverage_value),
+                float(expected),
+                rel_tol=0.0,
+                abs_tol=1e-5,
+            ):
+                raise ValueError(f"Stage211 SFT CTC label proof {key} mismatch.")
+        elif audit_value != expected or coverage_value != expected:
+            raise ValueError(f"Stage211 SFT CTC label proof {key} mismatch.")
+    if coverage.get("ctc_suppress_non_pronunciation_tokens") is not True:
+        raise ValueError("Stage211 SFT did not suppress non-pronunciation CTC logits.")
+    preparation = audit.get("label_preparation")
+    if not isinstance(preparation, dict):
+        raise ValueError("Stage211 SFT CTC label-preparation proof is missing.")
+    expected_preparation = {
+        "tokenizer_type": "sensevoice_tiktoken",
+        "text_normalization": "ctc",
+        "frontend_downsample": "sensevoice_lfr6",
+        "drop_unk_token": True,
+        "ctc_unk_tokens": 0,
+        "non_pronunciation_target_policy": "ctc_normalization",
+        "non_pronunciation_logit_policy": "tokenizer_special_tokens_suppressed",
+        "source_counts": STAGE211_LABELED_SOURCE_COUNTS,
+        "language_counts": STAGE211_LABELED_LANGUAGE_COUNTS,
+    }
+    for key, expected in expected_preparation.items():
+        if preparation.get(key) != expected:
+            raise ValueError(
+                f"Stage211 SFT CTC label-preparation {key} mismatch."
+            )
+    for path_key, sha_key in (
+        ("summary_path", "summary_sha256"),
+        ("log_path", "log_sha256"),
+        ("tokenizer_model_path", "tokenizer_model_sha256"),
+    ):
+        path = Path(str(preparation.get(path_key) or "")).resolve()
+        if not path.is_file() or preparation.get(sha_key) != sha256_file(path):
+            raise ValueError(
+                f"Stage211 SFT CTC label-preparation artifact is unavailable or changed: {path}"
+            )
+    return {
+        "full_length_index_audit_passed": True,
+        "ctc_label_normalization_chain_passed": True,
+        "ctc_suppress_non_pronunciation_tokens": True,
+        "train_samples": int(audit["train_samples"]),
+        "eval_samples": int(audit["eval_samples"]),
+        "total_samples": int(audit["total_samples"]),
+        "unique_utterance_ids": int(audit["unique_utterance_ids"]),
+        "pronunciation_target_samples": int(audit["pronunciation_target_samples"]),
+        "ctc_feasible_samples": int(audit["ctc_feasible_samples"]),
+        "ctc_tokens": int(audit["ctc_tokens"]),
+        "ctc_unk_tokens": int(audit["ctc_unk_tokens"]),
+        **expected_preparation,
+        "summary_path": str(preparation["summary_path"]),
+        "summary_sha256": str(preparation["summary_sha256"]),
+        "log_path": str(preparation["log_path"]),
+        "log_sha256": str(preparation["log_sha256"]),
+        "tokenizer_model_path": str(preparation["tokenizer_model_path"]),
+        "tokenizer_model_sha256": str(preparation["tokenizer_model_sha256"]),
+    }
+
+
 def _require_chain_link(
     *,
     source_stage: str,
@@ -495,6 +576,7 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
     if stage == "sft":
         epochs = int(coverage["epochs"])
         total_hours = float(coverage["total_hours"])
+        label_proof = _sft_ctc_label_proof(coverage)
         return {
             "stage": stage,
             "label": STAGE_LABELS[stage],
@@ -510,6 +592,9 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
             "correction_row_exposures": 0,
             "correction_hour_exposures": 0.0,
             "effective_hour_exposures": total_hours * epochs,
+            "ctc_tokens": int(coverage["ctc_tokens"]),
+            "ctc_unk_tokens": int(coverage["ctc_unk_tokens"]),
+            "ctc_label_proof": label_proof,
         }
     raise ValueError(f"Stage211 stage has no training coverage: {stage!r}")
 
@@ -800,6 +885,7 @@ def build_stepwise_report(
         )
         for stage in ("mixer", "block", "logits", "sft")
     ]
+    ctc_label_proof = _sft_ctc_label_proof(sft["labeled_data_coverage"])
     return {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -811,6 +897,8 @@ def build_stepwise_report(
         "requested_to_internal_stage": dict(REQUESTED_TO_INTERNAL_STAGE),
         "checkpoint_chain_passed": True,
         "nano_initialization_chain_passed": True,
+        "ctc_label_normalization_chain_passed": True,
+        "ctc_label_proof": ctc_label_proof,
         "initialization_receipt_path": str(initialization_receipt_path),
         "initialization_receipt_sha256": sha256_file(initialization_receipt_path),
         "initialization_proof": {
@@ -864,6 +952,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"Nano public baseline provenance: `{report['nano_public_baseline_receipt_sha256']}`",
         "",
         f"Supplemental inventory: `{report['supplemental_inventory_sha256']}`",
+        "",
+        "CTC label normalization: `ctc`, tokenizer: `sensevoice_tiktoken`, "
+        f"unknown tokens: `{int(report['ctc_label_proof']['ctc_unk_tokens'])}`, "
+        "non-pronunciation logits suppressed: `true`",
         "",
         "| Dataset | Metric | Samples | Nano | Calibration | Layer A | Block B | "
         "Logits C | SFT D | Final gap |",

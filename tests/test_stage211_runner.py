@@ -2074,6 +2074,60 @@ def _write_minimal_labeled_data(tmp_path: Path) -> tuple[Path, Path, Path]:
         ),
         encoding="utf-8",
     )
+    (length_index.parent / "webdataset_lengths.summary.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "output_dir": str(webdataset_root.resolve()),
+                "length_index_path": str(length_index.resolve()),
+                "tokenizer_type": "sensevoice_tiktoken",
+                "tokenizer_model_path": str(
+                    (REPO_ROOT / "assets/fun-asr-nano-2512/multilingual.tiktoken").resolve()
+                ),
+                "text_normalization": "ctc",
+                "frontend_downsample": "sensevoice_lfr6",
+                "drop_unk_token": True,
+                "unk_token_id": None,
+                "num_input_samples": 285_302,
+                "num_kept_samples": 285_302,
+                "num_dropped_samples": 0,
+                "counts": {
+                    "input_by_split": {"eval": 1_434, "train": 283_868},
+                    "kept_by_split": {"eval": 1_434, "train": 283_868},
+                    "kept_by_source": {"aishell3": 63_262, "librispeech": 222_040},
+                    "kept_by_language": {"en": 222_040, "zh": 63_262},
+                    "kept_by_split_source": {
+                        "eval/aishell3": 310,
+                        "eval/librispeech": 1_124,
+                        "train/aishell3": 62_952,
+                        "train/librispeech": 220_916,
+                    },
+                    "kept_by_split_language": {
+                        "eval/en": 1_124,
+                        "eval/zh": 310,
+                        "train/en": 220_916,
+                        "train/zh": 62_952,
+                    },
+                    "dropped_by_reason": {},
+                    "dropped_by_source": {},
+                    "dropped_by_language": {},
+                    "dropped_unk_tokens_by_source": {},
+                    "dropped_unk_tokens_by_language": {},
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (length_index.parent / "prepare_ctc_aligned.log").write_text(
+        "tokenizer_type=sensevoice_tiktoken\n"
+        "text_normalization=ctc\n"
+        "frontend_downsample=sensevoice_lfr6\n"
+        "drop_unk_token=1\n"
+        "CTC-aligned clean preprocessing complete\n",
+        encoding="utf-8",
+    )
     return webdataset_root, length_index, manifest
 
 
@@ -2089,6 +2143,11 @@ def test_stage211_sft_labeled_data_audit_and_epoch_estimate(tmp_path: Path) -> N
     assert audit["train_samples"] == 1
     assert audit["eval_samples"] == 1
     assert audit["ctc_tokens"] == 10
+    assert audit["ctc_unk_tokens"] == 0
+    assert audit["unique_utterance_ids"] == 2
+    assert audit["pronunciation_target_samples"] == 2
+    assert audit["ctc_feasible_samples"] == 2
+    assert audit["label_preparation"]["text_normalization"] == "ctc"
     assert audit["estimated_train_steps"] == 1
     assert audit["tail_padding_samples_per_epoch"] == 47
     assert audit["executed_sample_exposures"] == 48
@@ -3975,6 +4034,8 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert "FINAL_STEPWISE_REPORT" in script
     assert ".checkpoint_chain_passed == true" in script
     assert ".nano_initialization_chain_passed == true" in script
+    assert ".ctc_label_normalization_chain_passed == true" in script
+    assert ".ctc_label_proof.ctc_unk_tokens == 0" in script
     assert ".nano_teacher_chain_passed == true" in script
     assert ".supplemental_inventory_chain_passed == true" in script
     assert ".all_stage_public_metrics_complete == true" in script
@@ -4023,7 +4084,7 @@ def _run_stage211_continuation_watcher_fixture(
         '  stages=\'{"calibration":{},"mixer":{},"block":{},"logits":{},"sft":{}}\'\n'
         '  dataset_proof=\'"public_metric_stage_order":["calibration","mixer","block","logits","sft"],"all_stage_public_metrics_complete":true,"english_wer_datasets":["en1","en2","en3"],"chinese_cer_datasets":["zh1","zh2"],"dataset_results":[{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'}]\'\n'
         "fi\n"
-        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_initialization_chain_passed":true,"nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],\'"${dataset_proof}"\'}\' >"${output_json}"\n'
+        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_initialization_chain_passed":true,"ctc_label_normalization_chain_passed":true,"ctc_label_proof":{"full_length_index_audit_passed":true,"ctc_suppress_non_pronunciation_tokens":true,"ctc_unk_tokens":0},"nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],\'"${dataset_proof}"\'}\' >"${output_json}"\n'
         "printf '%s\\n' '# stepwise' >\"${output_markdown}\"\n",
         encoding="utf-8",
     )

@@ -25,11 +25,17 @@ from rwkvasr.eval.stage211_runtime import (
 )
 
 try:
-    from scripts.run_stage211_strict_chained_alignment import _audit_labeled_data
+    from scripts.run_stage211_strict_chained_alignment import (
+        _audit_labeled_data,
+        _label_preparation_proof,
+    )
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
-    from run_stage211_strict_chained_alignment import _audit_labeled_data
+    from run_stage211_strict_chained_alignment import (
+        _audit_labeled_data,
+        _label_preparation_proof,
+    )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +56,10 @@ LABELED_EXPECTED = {
     "total_samples": 285_302,
     "total_hours": 809.12755,
     "ctc_tokens": 8_792_460,
+    "ctc_unk_tokens": 0,
+    "unique_utterance_ids": 285_302,
+    "pronunciation_target_samples": 285_302,
+    "ctc_feasible_samples": 285_302,
     "estimated_train_steps": 12_045,
     "tail_padding_samples_per_epoch": 368,
     "tail_padding_sample_exposures": 368,
@@ -160,6 +170,14 @@ def _validate_labeled_audit(
             raise ValueError(
                 f"Stage211D labeled audit {key} mismatch: expected={expected} actual={actual}"
             )
+    preparation = _label_preparation_proof(
+        webdataset_root=labeled_root,
+        length_index_path=length_index,
+    )
+    if audit.get("label_preparation") != preparation:
+        raise ValueError(
+            "Stage211D labeled audit differs from its label-preparation summary/log proof."
+        )
     return dict(audit)
 
 
@@ -405,6 +423,7 @@ def _validate_completion(
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
+        "ctc_suppress_non_pronunciation_tokens": True,
         **LABELED_EXPECTED,
     }
     for key, value in expected.items():
@@ -450,6 +469,26 @@ def _validate_completion(
     train_config_path = Path(str(completion["train_config_path"])).resolve()
     train_config = load_yaml(train_config_path)
     validate_stage211_phase_train_config(train_config, phase="sft")
+    labeled_root = Path(str(completion.get("labeled_webdataset_root") or "")).resolve()
+    length_index = Path(str(completion["length_index_path"])).resolve()
+    bucket_manifest = Path(str(completion["bucket_manifest_path"])).resolve()
+    labeled_audit = completion.get("labeled_data_audit")
+    if not isinstance(labeled_audit, dict):
+        raise ValueError("Stage211D completion lacks its full labeled-data audit.")
+    validated_labeled_audit = _validate_labeled_audit(
+        labeled_audit,
+        labeled_root=labeled_root,
+        length_index=length_index,
+        bucket_manifest=bucket_manifest,
+    )
+    provenance = _load_json(
+        Path(str(completion["provenance_path"])).resolve(),
+        label="Stage211D provenance",
+    )
+    if provenance.get("labeled_data_audit") != validated_labeled_audit:
+        raise ValueError(
+            "Stage211D completion labeled-data audit differs from immutable provenance."
+        )
     configured_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(
         train_config
     )
@@ -648,7 +687,9 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             "length_bucket_drop_last": False,
             "skip_oversized_samples": False,
             "webdataset_skip_decode_errors": False,
+            "ctc_suppress_non_pronunciation_tokens": True,
             **LABELED_EXPECTED,
+            "labeled_data_audit": audit,
             "labeled_webdataset_root": str(labeled_root),
             "bucket_manifest_path": str(bucket_manifest),
             "bucket_manifest_sha256": sha256_file(bucket_manifest),

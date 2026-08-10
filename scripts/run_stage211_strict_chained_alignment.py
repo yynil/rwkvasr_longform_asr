@@ -82,6 +82,9 @@ TRAIN_WORLD_SIZE = STAGE211_FULL_DATA_WORLD_SIZE
 TRAIN_FRAME_BUDGET = 8_000
 FORMAL_RESUME_SAVE_INTERVAL = 2_000
 FIXED_HIDDEN_EVAL_SAMPLES = 256
+STAGE211_LABELED_TOTAL_SAMPLES = 285_302
+STAGE211_LABELED_SOURCE_COUNTS = {"aishell3": 63_262, "librispeech": 222_040}
+STAGE211_LABELED_LANGUAGE_COUNTS = {"en": 222_040, "zh": 63_262}
 LEGACY_CURRICULUM_STEPS = {
     "easy": 30_064,
     "medium": 1_010_185,
@@ -597,6 +600,98 @@ def _audit_audio_bucket_storage(bucket_manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def _label_preparation_proof(
+    *,
+    webdataset_root: Path,
+    length_index_path: Path,
+) -> dict[str, Any]:
+    summary_path = length_index_path.parent / "webdataset_lengths.summary.json"
+    log_path = length_index_path.parent / "prepare_ctc_aligned.log"
+    if not summary_path.is_file() or summary_path.stat().st_size <= 0:
+        raise ValueError(f"Stage211 SFT label-preparation summary is unavailable: {summary_path}")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(summary, dict):
+        raise ValueError("Stage211 SFT label-preparation summary must be a JSON object.")
+    expected = {
+        "version": 1,
+        "output_dir": str(webdataset_root.resolve()),
+        "length_index_path": str(length_index_path.resolve()),
+        "tokenizer_type": "sensevoice_tiktoken",
+        "text_normalization": "ctc",
+        "frontend_downsample": "sensevoice_lfr6",
+        "drop_unk_token": True,
+        "unk_token_id": None,
+        "num_input_samples": STAGE211_LABELED_TOTAL_SAMPLES,
+        "num_kept_samples": STAGE211_LABELED_TOTAL_SAMPLES,
+        "num_dropped_samples": 0,
+    }
+    if any(summary.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 SFT label-preparation summary contract mismatch.")
+    tokenizer_model_path = Path(str(summary.get("tokenizer_model_path") or "")).resolve()
+    expected_tokenizer = (
+        REPO_ROOT / "assets" / "fun-asr-nano-2512" / "multilingual.tiktoken"
+    ).resolve()
+    if tokenizer_model_path != expected_tokenizer or not tokenizer_model_path.is_file():
+        raise ValueError("Stage211 SFT label-preparation tokenizer binding mismatch.")
+    counts = summary.get("counts")
+    expected_counts = {
+        "input_by_split": {"eval": 1_434, "train": 283_868},
+        "kept_by_split": {"eval": 1_434, "train": 283_868},
+        "kept_by_source": STAGE211_LABELED_SOURCE_COUNTS,
+        "kept_by_language": STAGE211_LABELED_LANGUAGE_COUNTS,
+        "kept_by_split_source": {
+            "eval/aishell3": 310,
+            "eval/librispeech": 1_124,
+            "train/aishell3": 62_952,
+            "train/librispeech": 220_916,
+        },
+        "kept_by_split_language": {
+            "eval/en": 1_124,
+            "eval/zh": 310,
+            "train/en": 220_916,
+            "train/zh": 62_952,
+        },
+        "dropped_by_reason": {},
+        "dropped_by_source": {},
+        "dropped_by_language": {},
+        "dropped_unk_tokens_by_source": {},
+        "dropped_unk_tokens_by_language": {},
+    }
+    if not isinstance(counts, dict) or any(
+        counts.get(key) != value for key, value in expected_counts.items()
+    ):
+        raise ValueError("Stage211 SFT label-preparation source/language counts mismatch.")
+    if not log_path.is_file() or log_path.stat().st_size <= 0:
+        raise ValueError(f"Stage211 SFT label-preparation log is unavailable: {log_path}")
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    for marker in (
+        "tokenizer_type=sensevoice_tiktoken",
+        "text_normalization=ctc",
+        "frontend_downsample=sensevoice_lfr6",
+        "drop_unk_token=1",
+        "CTC-aligned clean preprocessing complete",
+    ):
+        if marker not in log_text:
+            raise ValueError(f"Stage211 SFT label-preparation log lacks {marker!r}.")
+    return {
+        "summary_path": str(summary_path.resolve()),
+        "summary_sha256": _sha256_file(summary_path),
+        "log_path": str(log_path.resolve()),
+        "log_sha256": _sha256_file(log_path),
+        "tokenizer_type": "sensevoice_tiktoken",
+        "tokenizer_model_path": str(tokenizer_model_path),
+        "tokenizer_model_sha256": _sha256_file(tokenizer_model_path),
+        "text_normalization": "ctc",
+        "frontend_downsample": "sensevoice_lfr6",
+        "drop_unk_token": True,
+        "ctc_unk_tokens": 0,
+        "non_pronunciation_target_policy": "ctc_normalization",
+        "non_pronunciation_logit_policy": "tokenizer_special_tokens_suppressed",
+        "source_counts": dict(STAGE211_LABELED_SOURCE_COUNTS),
+        "language_counts": dict(STAGE211_LABELED_LANGUAGE_COUNTS),
+    }
+
+
 def _audit_labeled_data(
     *,
     webdataset_root: Path,
@@ -631,6 +726,7 @@ def _audit_labeled_data(
     seen_ids: dict[str, str] = {}
     total_frames = 0
     total_tokens = 0
+    total_unk_tokens = 0
     required_fields = (
         "json_member",
         "normalized_text_chars",
@@ -688,6 +784,7 @@ def _audit_labeled_data(
             split_counts[split] += 1
             total_frames += num_frames
             total_tokens += ctc_tokens
+            total_unk_tokens += ctc_unk_tokens
 
     if split_counts != manifest_counts:
         raise ValueError(
@@ -718,10 +815,18 @@ def _audit_labeled_data(
         "total_samples": sum(split_counts.values()),
         "total_hours": total_frames / 100.0 / 3600.0,
         "ctc_tokens": total_tokens,
+        "ctc_unk_tokens": total_unk_tokens,
+        "unique_utterance_ids": len(seen_ids),
+        "pronunciation_target_samples": sum(split_counts.values()),
+        "ctc_feasible_samples": sum(split_counts.values()),
         "estimated_train_steps": estimated_steps,
         "tail_padding_samples_per_epoch": tail_padding_samples,
         "tail_padding_sample_exposures": tail_padding_samples,
         "executed_sample_exposures": split_counts["train"] + tail_padding_samples,
+        "label_preparation": _label_preparation_proof(
+            webdataset_root=webdataset_root,
+            length_index_path=length_index_path,
+        ),
     }
 
 
