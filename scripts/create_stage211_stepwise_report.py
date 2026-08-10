@@ -319,6 +319,62 @@ def _stage_record(
     }
 
 
+def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
+    if stage in {"mixer", "block", "logits"}:
+        unique_rows = int(coverage["total_unique_rows"])
+        row_exposures = int(coverage["total_row_exposures"])
+        if unique_rows <= 0 or row_exposures % unique_rows != 0:
+            raise ValueError(f"Stage211 {stage} coverage does not contain exact full epochs.")
+        correction = coverage.get("post_coverage_correction_exposure")
+        if not isinstance(correction, dict):
+            correction = {
+                "rounds": 0,
+                "row_exposures": 0,
+                "hour_exposures": 0.0,
+                "steps": 0,
+                "executed_sample_exposures": 0,
+            }
+        correction_hour_exposures = float(correction.get("hour_exposures", 0.0))
+        return {
+            "stage": stage,
+            "label": STAGE_LABELS[stage],
+            "objective": "online_nano_ctc_distillation",
+            "unique_or_train_rows": unique_rows,
+            "evaluation_rows": 0,
+            "hours_per_epoch": float(coverage["total_hours"]),
+            "epochs": row_exposures // unique_rows,
+            "row_exposures": row_exposures,
+            "hour_exposures": float(coverage["total_hour_exposures"]),
+            "executed_sample_exposures": int(coverage["total_executed_sample_exposures"]),
+            "correction_rounds": int(correction.get("rounds", 0)),
+            "correction_row_exposures": int(correction.get("row_exposures", 0)),
+            "correction_hour_exposures": correction_hour_exposures,
+            "effective_hour_exposures": (
+                float(coverage["total_hour_exposures"]) + correction_hour_exposures
+            ),
+        }
+    if stage == "sft":
+        epochs = int(coverage["epochs"])
+        total_hours = float(coverage["total_hours"])
+        return {
+            "stage": stage,
+            "label": STAGE_LABELS[stage],
+            "objective": "labeled_ctc_sft",
+            "unique_or_train_rows": int(coverage["train_samples"]),
+            "evaluation_rows": int(coverage["eval_samples"]),
+            "hours_per_epoch": total_hours,
+            "epochs": epochs,
+            "row_exposures": int(coverage["train_samples"]) * epochs,
+            "hour_exposures": total_hours * epochs,
+            "executed_sample_exposures": int(coverage["executed_sample_exposures"]),
+            "correction_rounds": 0,
+            "correction_row_exposures": 0,
+            "correction_hour_exposures": 0.0,
+            "effective_hour_exposures": total_hours * epochs,
+        }
+    raise ValueError(f"Stage211 stage has no training coverage: {stage!r}")
+
+
 def build_stepwise_report(
     *,
     calibration_receipt_path: Path,
@@ -499,6 +555,17 @@ def build_stepwise_report(
             nano_teacher_checkpoint_sha256=teacher_sha256_by_stage["sft"],
         ),
     ]
+    coverage_results = [
+        _coverage_record(
+            stage=stage,
+            coverage=(
+                phase_reports[stage]["full_data_coverage"]
+                if stage in {"mixer", "block", "logits"}
+                else sft["labeled_data_coverage"]
+            ),
+        )
+        for stage in ("mixer", "block", "logits", "sft")
+    ]
     return {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -518,6 +585,7 @@ def build_stepwise_report(
         ),
         "checkpoint_chain": chain,
         "stages": stage_records,
+        "coverage_results": coverage_results,
         "dataset_results": dataset_results,
     }
 
@@ -549,6 +617,34 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{float(stages['block']['student_error_rate']) * 100.0:.3f}% | "
             f"{float(stages['logits']['student_error_rate']) * 100.0:.3f}% | "
             f"{final:.3f}% | {final - nano:+.3f} pt |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Training Coverage",
+            "",
+            "| Stage | Objective | Train rows | Eval rows | Hours/epoch | "
+            "Epochs | Executed exposures | Post-coverage correction |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+        )
+    )
+    for coverage in report["coverage_results"]:
+        correction = (
+            "none"
+            if int(coverage["correction_rounds"]) == 0
+            else (
+                f"{int(coverage['correction_rounds'])} round(s), "
+                f"{int(coverage['correction_row_exposures']):,} rows / "
+                f"{float(coverage['correction_hour_exposures']):,.3f} h"
+            )
+        )
+        lines.append(
+            f"| {coverage['label']} | `{coverage['objective']}` | "
+            f"{int(coverage['unique_or_train_rows']):,} | "
+            f"{int(coverage['evaluation_rows']):,} | "
+            f"{float(coverage['hours_per_epoch']):,.3f} | "
+            f"{int(coverage['epochs'])} | "
+            f"{int(coverage['executed_sample_exposures']):,} | {correction} |"
         )
     lines.extend(
         (

@@ -453,13 +453,18 @@ def _write_stepwise_inputs(
                     "checkpoint_sha256": sha256_file(checkpoints[stage]),
                     **nano_baseline_binding,
                     "full_data_coverage": {
+                        "total_unique_rows": 100,
+                        "total_hours": 10.0,
+                        "total_row_exposures": 300,
+                        "total_hour_exposures": 30.0,
+                        "total_executed_sample_exposures": 304,
                         "segments": [
                             {
                                 "init_checkpoint_path": str(checkpoints[previous].resolve()),
                                 "init_checkpoint_sha256": sha256_file(checkpoints[previous]),
                                 "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
                             }
-                        ]
+                        ],
                     },
                     "public_benchmark": _bound_public_benchmark(
                         tmp_path,
@@ -521,6 +526,11 @@ def _write_stepwise_inputs(
                 "labeled_data_coverage": {
                     "phase": "sft",
                     "complete": True,
+                    "epochs": 1,
+                    "train_samples": 80,
+                    "eval_samples": 10,
+                    "total_hours": 8.0,
+                    "executed_sample_exposures": 81,
                     "init_checkpoint_path": str(checkpoints["logits"].resolve()),
                     "init_checkpoint_sha256": sha256_file(checkpoints["logits"]),
                     "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
@@ -672,12 +682,21 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         tmp_path / "nano-teacher" / "model.pt"
     )
     assert len(report["checkpoint_chain"]) == 4
+    assert [row["stage"] for row in report["coverage_results"]] == [
+        "mixer",
+        "block",
+        "logits",
+        "sft",
+    ]
+    assert report["coverage_results"][0]["epochs"] == 3
+    assert report["coverage_results"][-1]["unique_or_train_rows"] == 80
     assert len(report["dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert report["stages"][-1]["checkpoint_sha256"] == sha256_file(checkpoints["sft"])
     assert report["stages"][0]["gate_passed"] is None
     assert report["stages"][0]["gate_status"] == "baseline"
     assert "Layer A" in output_markdown.read_text(encoding="utf-8")
     assert "SFT D" in output_markdown.read_text(encoding="utf-8")
+    assert "Training Coverage" in output_markdown.read_text(encoding="utf-8")
     sft_finalizer._validate_final_report(
         reports["sft"],
         checkpoint=checkpoints["sft"],
