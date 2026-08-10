@@ -11,6 +11,7 @@ from typing import Any
 
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
+    DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
     STAGE211_AUDIO_CURRICULUM,
     build_stage211_full_data_coverage,
     load_stage211_post_coverage_correction_receipts,
@@ -487,6 +488,18 @@ def finalize_phase(args: argparse.Namespace) -> Path:
             .expanduser()
             .resolve()
         ),
+        "--loaded-manifest-receipt",
+        str(
+            Path(
+                getattr(
+                    args,
+                    "loaded_manifest_receipt",
+                    DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
+                )
+            )
+            .expanduser()
+            .resolve()
+        ),
         "--public-comparison-report",
         str(comparison_json),
         "--manifest-dir",
@@ -595,6 +608,11 @@ def main() -> int:
         "--global-dedup-manifest",
         type=Path,
         default=DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
+    )
+    parser.add_argument(
+        "--loaded-manifest-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
     )
     parser.add_argument("--alignment-device", default="cuda:0")
     parser.add_argument("--alignment-teacher-device", default=None)

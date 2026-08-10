@@ -30,10 +30,25 @@ DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST = (
     / "stage211_full_curriculum"
     / "stage179_usbhd_dedup_alignment_manifest.json"
 )
+DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT = (
+    Path.home()
+    / "rwkvasr_data"
+    / "stage211_full_curriculum"
+    / "stage211_loaded_manifest_chain_receipt.json"
+)
+STAGE211_LOADED_MANIFEST_RECEIPT_SHA256 = (
+    "af7c38a72fd714148390de5dea7d4d32a062a78ed1e25143928e0c3db88561c1"
+)
 STAGE211_GLOBAL_DEDUP_MANIFEST_SHA256 = (
     "9228d24a8befe24d0e35debd63070f24a6a6313bf318308452e95656dd6708ba"
 )
 STAGE211_GLOBAL_DEDUP_TOTAL_HOURS = 118_465.16068055555
+STAGE211_AUDIO_TRAIN_PART_COUNTS = {
+    "easy": 70,
+    "medium": 436,
+    "hard": 218,
+    "long": 21,
+}
 STAGE211_AUDIO_CURRICULUM: dict[str, dict[str, float | int]] = {
     "easy": {
         "rows": 1_174_987,
@@ -405,9 +420,7 @@ def validate_stage211_global_dedup_manifest(
         "root": "/",
         "curriculum": "usbhd_dedup_audio_only_online_ctc_alignment",
         "split": "train",
-        "dedupe_key": (
-            "blake2b16(root_or_tar_path + audio_member + audio_offset + audio_size)"
-        ),
+        "dedupe_key": ("blake2b16(root_or_tar_path + audio_member + audio_offset + audio_size)"),
         "total_unique_audio_rows": STAGE211_AUDIO_TOTAL_ROWS,
     }
     if any(manifest.get(key) != value for key, value in expected.items()):
@@ -424,13 +437,12 @@ def validate_stage211_global_dedup_manifest(
     hours_by_difficulty = manifest.get("hours_by_difficulty")
     stages = manifest.get("stages")
     if not all(
-        isinstance(value, dict)
-        for value in (rows_by_difficulty, hours_by_difficulty, stages)
+        isinstance(value, dict) for value in (rows_by_difficulty, hours_by_difficulty, stages)
     ):
         raise ValueError("Stage211 global dedup manifest lacks difficulty partitions.")
-    if set(rows_by_difficulty) != set(STAGE211_AUDIO_CURRICULUM) or set(
-        hours_by_difficulty
-    ) != set(STAGE211_AUDIO_CURRICULUM):
+    if set(rows_by_difficulty) != set(STAGE211_AUDIO_CURRICULUM) or set(hours_by_difficulty) != set(
+        STAGE211_AUDIO_CURRICULUM
+    ):
         raise ValueError("Stage211 global dedup manifest difficulty set mismatch.")
     for difficulty, expected_segment in STAGE211_AUDIO_CURRICULUM.items():
         expected_rows = int(expected_segment["rows"])
@@ -441,9 +453,7 @@ def validate_stage211_global_dedup_manifest(
             rel_tol=0.0,
             abs_tol=1e-9,
         ):
-            raise ValueError(
-                f"Stage211 global dedup manifest {difficulty} partition mismatch."
-            )
+            raise ValueError(f"Stage211 global dedup manifest {difficulty} partition mismatch.")
     inputs = manifest.get("inputs")
     if not isinstance(inputs, dict) or not inputs:
         raise ValueError("Stage211 global dedup manifest lacks source inputs.")
@@ -457,6 +467,282 @@ def validate_stage211_global_dedup_manifest(
     if accepted_rows != STAGE211_AUDIO_TOTAL_ROWS:
         raise ValueError("Stage211 global dedup source-row total mismatch.")
     return manifest
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    rendered = json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(rendered).hexdigest()
+
+
+def _resolve_manifest_part_path(manifest_path: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return path.resolve()
+
+
+def _manifest_train_parts(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> list[tuple[Path, int]]:
+    train = manifest.get("splits", {}).get("train")
+    if not isinstance(train, dict) or not isinstance(train.get("buckets"), list):
+        raise ValueError(f"Stage211 runtime manifest lacks train buckets: {manifest_path}")
+    parts: list[tuple[Path, int]] = []
+    for bucket in train["buckets"]:
+        if not isinstance(bucket, dict) or not isinstance(bucket.get("parts"), list):
+            raise ValueError(
+                f"Stage211 runtime manifest has an invalid train bucket: {manifest_path}"
+            )
+        for part in bucket["parts"]:
+            if not isinstance(part, dict):
+                raise ValueError(
+                    f"Stage211 runtime manifest has an invalid train part: {manifest_path}"
+                )
+            parts.append(
+                (
+                    _resolve_manifest_part_path(manifest_path, str(part.get("path") or "")),
+                    int(part.get("num_samples", -1)),
+                )
+            )
+    return parts
+
+
+def validate_stage211_loaded_manifest_receipt(
+    receipt_path: str | Path,
+    *,
+    expected_global_dedup_manifest: str | Path = DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
+    expected_sha256: str | None = None,
+    verify_part_sha256: bool = False,
+) -> dict[str, Any]:
+    receipt_path = Path(receipt_path).expanduser().resolve()
+    expected_global_dedup_manifest = Path(expected_global_dedup_manifest).expanduser().resolve()
+    if (
+        expected_sha256 is None
+        and expected_global_dedup_manifest == DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST.resolve()
+    ):
+        expected_sha256 = STAGE211_LOADED_MANIFEST_RECEIPT_SHA256
+    if expected_sha256 is not None and sha256_file(receipt_path) != expected_sha256:
+        raise ValueError(f"Stage211 loaded-manifest receipt SHA-256 mismatch: {receipt_path}")
+    receipt = _load_json_object(
+        receipt_path,
+        label="Stage211 loaded-manifest chain receipt",
+    )
+    expected_fields = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "loaded_manifest_chain",
+        "complete": True,
+        "part_hash_algorithm": "sha256",
+        "part_hash_audit_complete": True,
+        "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
+    }
+    if any(receipt.get(key) != value for key, value in expected_fields.items()):
+        raise ValueError("Stage211 loaded-manifest receipt contract mismatch.")
+    if receipt.get("dedupe_key") != (
+        "blake2b16(root_or_tar_path + audio_member + audio_offset + audio_size)"
+    ):
+        raise ValueError("Stage211 loaded-manifest dedupe-key mismatch.")
+    total_hours = float(receipt.get("total_hours", float("nan")))
+    if not math.isfinite(total_hours) or not math.isclose(
+        total_hours,
+        STAGE211_GLOBAL_DEDUP_TOTAL_HOURS,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError("Stage211 loaded-manifest aggregate hours mismatch.")
+
+    global_manifest_path = (
+        Path(str(receipt.get("global_dedup_manifest_path") or "")).expanduser().resolve()
+    )
+    if global_manifest_path != expected_global_dedup_manifest:
+        raise ValueError("Stage211 loaded-manifest global-dedup path mismatch.")
+    if str(receipt.get("global_dedup_manifest_sha256") or "") != sha256_file(global_manifest_path):
+        raise ValueError("Stage211 loaded-manifest global-dedup SHA-256 mismatch.")
+    global_manifest = validate_stage211_global_dedup_manifest(global_manifest_path)
+
+    fixed_eval = receipt.get("fixed_eval")
+    if not isinstance(fixed_eval, dict) or int(fixed_eval.get("rows", -1)) != 256:
+        raise ValueError("Stage211 loaded-manifest receipt lacks the fixed eval binding.")
+    fixed_eval_path = Path(str(fixed_eval.get("path") or "")).expanduser().resolve()
+    if not fixed_eval_path.is_file() or str(fixed_eval.get("sha256") or "") != sha256_file(
+        fixed_eval_path
+    ):
+        raise ValueError("Stage211 loaded-manifest fixed eval changed.")
+
+    raw_segments = receipt.get("segments")
+    if not isinstance(raw_segments, list):
+        raise ValueError("Stage211 loaded-manifest receipt lacks segments.")
+    segments = {
+        str(segment.get("difficulty") or ""): segment
+        for segment in raw_segments
+        if isinstance(segment, dict)
+    }
+    if list(segments) != list(STAGE211_AUDIO_CURRICULUM):
+        raise ValueError("Stage211 loaded-manifest segments are not in curriculum order.")
+
+    total_rows = 0
+    total_parts = 0
+    global_stages = global_manifest.get("stages")
+    if not isinstance(global_stages, dict):
+        raise ValueError("Stage211 global dedup manifest lacks stage records.")
+    for difficulty, expected in STAGE211_AUDIO_CURRICULUM.items():
+        segment = segments[difficulty]
+        if any(
+            segment.get(key) != value
+            for key, value in {
+                "difficulty": difficulty,
+                "train_rows": int(expected["rows"]),
+                "train_parts": STAGE211_AUDIO_TRAIN_PART_COUNTS[difficulty],
+                "steps_per_epoch": int(expected["steps_per_epoch"]),
+                "epochs": STAGE211_FULL_DATA_EPOCHS,
+                "total_steps": int(expected["steps"]),
+                "tail_padding_samples_per_epoch": int(expected["tail_padding_samples_per_epoch"]),
+            }.items()
+        ):
+            raise ValueError(f"Stage211 {difficulty} loaded-manifest totals mismatch.")
+        runtime_manifest_path = (
+            Path(str(segment.get("runtime_manifest_path") or "")).expanduser().resolve()
+        )
+        source_manifest_path = (
+            Path(str(segment.get("source_manifest_path") or "")).expanduser().resolve()
+        )
+        for path, key, label in (
+            (runtime_manifest_path, "runtime_manifest_sha256", "runtime"),
+            (source_manifest_path, "source_manifest_sha256", "source"),
+        ):
+            if not path.is_file() or str(segment.get(key) or "") != sha256_file(path):
+                raise ValueError(f"Stage211 {difficulty} {label} manifest changed.")
+        runtime_manifest = _load_json_object(
+            runtime_manifest_path,
+            label=f"Stage211 {difficulty} runtime manifest",
+        )
+        source_manifest = _load_json_object(
+            source_manifest_path,
+            label=f"Stage211 {difficulty} source manifest",
+        )
+        runtime_without_eval = json.loads(json.dumps(runtime_manifest))
+        runtime_without_eval.get("splits", {}).pop("eval", None)
+        if runtime_without_eval != source_manifest:
+            raise ValueError(
+                f"Stage211 {difficulty} runtime manifest changes more than the eval split."
+            )
+        runtime_train = runtime_manifest.get("splits", {}).get("train")
+        source_train = source_manifest.get("splits", {}).get("train")
+        train_split_sha256 = _canonical_json_sha256(runtime_train)
+        if runtime_train != source_train or segment.get("train_split_sha256") != train_split_sha256:
+            raise ValueError(f"Stage211 {difficulty} train split identity mismatch.")
+        if str(runtime_manifest.get("source_length_index_path") or "") != str(
+            segment.get("source_length_index_path") or ""
+        ):
+            raise ValueError(f"Stage211 {difficulty} length-index binding mismatch.")
+
+        eval_parts = []
+        eval_rows = 0
+        eval_split = runtime_manifest.get("splits", {}).get("eval")
+        if isinstance(eval_split, dict):
+            eval_rows = int(eval_split.get("num_samples", -1))
+            for bucket in eval_split.get("buckets", []):
+                for part in bucket.get("parts", []):
+                    eval_parts.append(
+                        _resolve_manifest_part_path(
+                            runtime_manifest_path,
+                            str(part.get("path") or ""),
+                        )
+                    )
+        if eval_rows != 256 or eval_parts != [fixed_eval_path]:
+            raise ValueError(f"Stage211 {difficulty} fixed eval split mismatch.")
+
+        runtime_parts = _manifest_train_parts(runtime_manifest_path, runtime_manifest)
+        if len({path for path, _ in runtime_parts}) != len(runtime_parts):
+            raise ValueError(f"Stage211 {difficulty} train part paths are not unique.")
+        raw_part_records = segment.get("part_records")
+        if not isinstance(raw_part_records, list) or len(raw_part_records) != len(runtime_parts):
+            raise ValueError(f"Stage211 {difficulty} part receipt count mismatch.")
+        part_rows = 0
+        for (part_path, declared_rows), raw_record in zip(
+            runtime_parts,
+            raw_part_records,
+            strict=True,
+        ):
+            if not isinstance(raw_record, dict):
+                raise ValueError(f"Stage211 {difficulty} part receipt is invalid.")
+            if Path(str(raw_record.get("path") or "")).expanduser().resolve() != part_path:
+                raise ValueError(f"Stage211 {difficulty} train part path mismatch.")
+            if int(raw_record.get("rows", -1)) != declared_rows:
+                raise ValueError(f"Stage211 {difficulty} train part row count mismatch.")
+            if not part_path.is_file():
+                raise ValueError(f"Stage211 {difficulty} train part is missing: {part_path}")
+            stat = part_path.stat()
+            if (
+                int(raw_record.get("size_bytes", -1)) != stat.st_size
+                or int(raw_record.get("mtime_ns", -1)) != stat.st_mtime_ns
+            ):
+                raise ValueError(f"Stage211 {difficulty} train part metadata changed: {part_path}")
+            recorded_part_sha256 = str(raw_record.get("sha256") or "")
+            if len(recorded_part_sha256) != 64:
+                raise ValueError(f"Stage211 {difficulty} train part digest is invalid: {part_path}")
+            if verify_part_sha256 and recorded_part_sha256 != sha256_file(part_path):
+                raise ValueError(f"Stage211 {difficulty} train part content changed: {part_path}")
+            part_rows += declared_rows
+        if part_rows != int(expected["rows"]):
+            raise ValueError(f"Stage211 {difficulty} part rows do not cover the partition.")
+        if segment.get("part_records_sha256") != _canonical_json_sha256(raw_part_records):
+            raise ValueError(f"Stage211 {difficulty} part-record digest mismatch.")
+
+        global_stage_name = str(segment.get("global_stage_name") or "")
+        global_stage = global_stages.get(global_stage_name)
+        global_source_manifest_path = (
+            Path(str(segment.get("global_source_manifest_path") or "")).expanduser().resolve()
+        )
+        if (
+            not isinstance(global_stage, dict)
+            or global_stage.get("difficulty") != difficulty
+            or int(global_stage.get("selected_rows", -1)) != int(expected["rows"])
+            or str(global_stage.get("length_index_path") or "")
+            != str(segment.get("source_length_index_path") or "")
+            or str(global_stage.get("bucket_manifest_path") or "")
+            != str(segment.get("global_source_manifest_path") or "")
+        ):
+            raise ValueError(f"Stage211 {difficulty} global stage binding mismatch.")
+        train_hours = float(segment.get("train_hours", float("nan")))
+        if not math.isfinite(train_hours) or not math.isclose(
+            train_hours,
+            float(global_stage.get("selected_hours", float("nan"))),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(f"Stage211 {difficulty} global hours mismatch.")
+        global_source_sha256 = str(segment.get("global_source_manifest_sha256") or "")
+        if len(global_source_sha256) != 64:
+            raise ValueError(f"Stage211 {difficulty} global source digest is invalid.")
+        if (
+            global_source_manifest_path.is_file()
+            and sha256_file(global_source_manifest_path) != global_source_sha256
+        ):
+            raise ValueError(f"Stage211 {difficulty} global source manifest changed.")
+        if segment.get("repartitioned") is True:
+            loaded_digest = str(segment.get("loaded_audio_key_set_sha256") or "")
+            global_digest = str(segment.get("global_audio_key_set_sha256") or "")
+            if len(loaded_digest) != 64 or loaded_digest != global_digest:
+                raise ValueError(f"Stage211 {difficulty} repartitioned key-set proof mismatch.")
+        elif segment.get("global_source_manifest_sha256") != segment.get("source_manifest_sha256"):
+            raise ValueError(f"Stage211 {difficulty} source manifest identity mismatch.")
+        total_rows += part_rows
+        total_parts += len(runtime_parts)
+
+    if total_rows != STAGE211_AUDIO_TOTAL_ROWS or total_parts != sum(
+        STAGE211_AUDIO_TRAIN_PART_COUNTS.values()
+    ):
+        raise ValueError("Stage211 loaded-manifest aggregate coverage mismatch.")
+    if int(receipt.get("total_train_parts", -1)) != total_parts:
+        raise ValueError("Stage211 loaded-manifest aggregate part count mismatch.")
+    return receipt
 
 
 def _report_nano_checkpoint_path(report: dict[str, Any]) -> Path:
@@ -1621,10 +1907,7 @@ def validate_stage211_public_benchmark(
             or int(result.get("normalized_reference_mismatch_count", -1)) != 0
         ):
             raise ValueError(f"Stage211 public benchmark coverage mismatch for {dataset}.")
-        if (
-            require_metric_source_recomputed
-            and result.get("metric_source_recomputed") is not True
-        ):
+        if require_metric_source_recomputed and result.get("metric_source_recomputed") is not True:
             raise ValueError(
                 f"Stage211 public benchmark metrics were not source-recomputed for {dataset}."
             )
@@ -1698,6 +1981,20 @@ def validate_stage211_phase_gate_report(
         label="Stage211 global dedup manifest",
     )
     validate_stage211_global_dedup_manifest(global_dedup_manifest)
+    loaded_manifest_receipt_path = _validate_bound_file(
+        report,
+        path_key="loaded_manifest_receipt_path",
+        sha256_key="loaded_manifest_receipt_sha256",
+        label="Stage211 loaded-manifest chain receipt",
+    )
+    loaded_manifest_receipt = validate_stage211_loaded_manifest_receipt(
+        loaded_manifest_receipt_path,
+        expected_global_dedup_manifest=global_dedup_manifest,
+    )
+    loaded_segments = {
+        str(segment.get("difficulty") or ""): segment
+        for segment in loaded_manifest_receipt["segments"]
+    }
     phase_segments = coverage.get("segments")
     if not isinstance(phase_segments, list):
         raise ValueError("Stage211 phase gate lacks ordered curriculum segments.")
@@ -1711,6 +2008,23 @@ def validate_stage211_phase_gate_report(
     )
     if easy_segment is None:
         raise ValueError("Stage211 phase gate lacks the easy initialization segment.")
+    for phase_segment in phase_segments:
+        if not isinstance(phase_segment, dict):
+            raise ValueError("Stage211 phase gate has an invalid curriculum segment.")
+        difficulty = str(phase_segment.get("difficulty") or "")
+        loaded_segment = loaded_segments.get(difficulty)
+        if not isinstance(loaded_segment, dict):
+            raise ValueError(f"Stage211 phase gate lacks {difficulty} loader provenance.")
+        if Path(
+            str(phase_segment.get("bucket_manifest_path") or "")
+        ).expanduser().resolve() != Path(
+            str(loaded_segment.get("runtime_manifest_path") or "")
+        ).expanduser().resolve() or str(phase_segment.get("bucket_manifest_sha256") or "") != str(
+            loaded_segment.get("runtime_manifest_sha256") or ""
+        ):
+            raise ValueError(
+                f"Stage211 {difficulty} phase gate does not bind the audited runtime manifest."
+            )
     phase_init_checkpoint = Path(str(easy_segment.get("init_checkpoint_path") or "")).resolve()
     if not phase_init_checkpoint.is_file() or sha256_file(
         phase_init_checkpoint

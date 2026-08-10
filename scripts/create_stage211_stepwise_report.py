@@ -33,7 +33,12 @@ except ModuleNotFoundError as error:
 
 STAGE_ORDER = ("calibration", "mixer", "block", "logits", "sft")
 REQUESTED_ALIGNMENT_STAGE_ORDER = ("rwkv_layer", "block", "logits", "sft")
-REQUESTED_TO_INTERNAL_STAGE = {"rwkv_layer": "mixer", "block": "block", "logits": "logits", "sft": "sft"}
+REQUESTED_TO_INTERNAL_STAGE = {
+    "rwkv_layer": "mixer",
+    "block": "block",
+    "logits": "logits",
+    "sft": "sft",
+}
 STAGE_LABELS = {
     "calibration": "Calibration",
     "mixer": "Layer / Mixer (A)",
@@ -456,8 +461,18 @@ def build_stepwise_report(
     }
     if len(global_dedup_bindings) != 1:
         raise ValueError("Stage211 A/B/C global dedup provenance chain mismatch.")
-    global_dedup_manifest_path, global_dedup_manifest_sha256 = next(
-        iter(global_dedup_bindings)
+    global_dedup_manifest_path, global_dedup_manifest_sha256 = next(iter(global_dedup_bindings))
+    loaded_manifest_bindings = {
+        (
+            str(phase_reports[phase].get("loaded_manifest_receipt_path") or ""),
+            str(phase_reports[phase].get("loaded_manifest_receipt_sha256") or ""),
+        )
+        for phase in ("mixer", "block", "logits")
+    }
+    if len(loaded_manifest_bindings) != 1:
+        raise ValueError("Stage211 A/B/C loaded-manifest provenance chain mismatch.")
+    loaded_manifest_receipt_path, loaded_manifest_receipt_sha256 = next(
+        iter(loaded_manifest_bindings)
     )
     baseline_bindings = {
         _nano_public_baseline_binding(phase_reports[phase])
@@ -623,6 +638,8 @@ def build_stepwise_report(
         "nano_public_baseline_checkpoint_sha256": (nano_public_baseline_checkpoint_sha256),
         "global_dedup_manifest_path": global_dedup_manifest_path,
         "global_dedup_manifest_sha256": global_dedup_manifest_sha256,
+        "loaded_manifest_receipt_path": loaded_manifest_receipt_path,
+        "loaded_manifest_receipt_sha256": loaded_manifest_receipt_sha256,
         "total_public_eval_samples_per_stage": sum(
             int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
         ),

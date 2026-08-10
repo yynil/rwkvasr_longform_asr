@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import os
 import subprocess
@@ -21,10 +22,12 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
     STAGE211_AUDIO_TOTAL_ROWS,
     STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES,
+    STAGE211_AUDIO_TRAIN_PART_COUNTS,
     STAGE211_FULL_DATA_BATCH_SIZE,
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
+    STAGE211_GLOBAL_DEDUP_TOTAL_HOURS,
     STAGE211_PUBLIC_BENCHMARKS,
     STAGE211_RETENTION_CORRECTION_EPOCHS,
     STAGE211_RETENTION_CORRECTION_LR,
@@ -33,6 +36,7 @@ from rwkvasr.eval.stage211_gate import (
     stage211_post_coverage_correction_exposure,
     stage211_phase_train_config_contract,
     validate_stage211_nano_public_baseline_receipt,
+    validate_stage211_loaded_manifest_receipt,
     validate_stage211_phase_gate_report,
     validate_stage211_phase_train_config,
 )
@@ -172,8 +176,7 @@ def test_stage211_public_enrichment_recomputes_bound_predictions(
     ]
     manifest.write_text(
         "".join(
-            json.dumps({"utt_id": row["utt_id"], "text": row["ref_text"]}) + "\n"
-            for row in rows
+            json.dumps({"utt_id": row["utt_id"], "text": row["ref_text"]}) + "\n" for row in rows
         ),
         encoding="utf-8",
     )
@@ -1729,12 +1732,193 @@ def test_stage211_sft_labeled_data_audit_and_epoch_estimate(tmp_path: Path) -> N
     assert audit["executed_sample_exposures"] == 48
 
 
+def _canonical_json_sha256(value: object) -> str:
+    rendered = json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(rendered).hexdigest()
+
+
+def _write_loaded_manifest_fixture(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
+    root = tmp_path / "loaded-manifest-fixture"
+    receipt_path = root / "receipt.json"
+    if receipt_path.is_file():
+        return receipt_path, {
+            difficulty: root / difficulty / "manifest_stage211_fixed_eval.json"
+            for difficulty in STAGE211_AUDIO_CURRICULUM
+        }
+    root.mkdir()
+    fixed_eval = root / "fixed-eval.jsonl"
+    fixed_eval.write_text("{}\n", encoding="utf-8")
+    global_manifest = json.loads(GLOBAL_DEDUP_FIXTURE.read_text(encoding="utf-8"))
+    global_stages = global_manifest["stages"]
+    segments = []
+    runtime_manifests: dict[str, Path] = {}
+    for difficulty, expected in STAGE211_AUDIO_CURRICULUM.items():
+        stage_name, global_stage = next(
+            (
+                (name, stage)
+                for name, stage in global_stages.items()
+                if stage["difficulty"] == difficulty
+            )
+        )
+        segment_root = root / difficulty
+        part_root = segment_root / "train"
+        part_root.mkdir(parents=True)
+        part_count = STAGE211_AUDIO_TRAIN_PART_COUNTS[difficulty]
+        remaining_rows = int(expected["rows"])
+        manifest_parts = []
+        part_records = []
+        for index in range(part_count):
+            part_rows = remaining_rows - (part_count - index - 1) if index == 0 else 1
+            remaining_rows -= part_rows
+            part_path = part_root / f"part-{index:04d}.jsonl"
+            part_path.write_text("{}\n", encoding="utf-8")
+            stat = part_path.stat()
+            manifest_parts.append(
+                {
+                    "path": str(part_path.relative_to(segment_root)),
+                    "num_samples": part_rows,
+                }
+            )
+            part_records.append(
+                {
+                    "path": str(part_path.resolve()),
+                    "rows": part_rows,
+                    "size_bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "sha256": sha256_file(part_path),
+                }
+            )
+        source_manifest = {
+            "version": 1,
+            "root": "/",
+            "source_length_index_path": global_stage["length_index_path"],
+            "splits": {
+                "train": {
+                    "num_samples": int(expected["rows"]),
+                    "buckets": [
+                        {
+                            "bucket_id": 0,
+                            "num_samples": int(expected["rows"]),
+                            "parts": manifest_parts,
+                        }
+                    ],
+                }
+            },
+        }
+        source_manifest_path = segment_root / "manifest.json"
+        source_manifest_path.write_text(json.dumps(source_manifest) + "\n", encoding="utf-8")
+        runtime_manifest = json.loads(json.dumps(source_manifest))
+        runtime_manifest["splits"]["eval"] = {
+            "num_samples": 256,
+            "buckets": [
+                {
+                    "bucket_id": 0,
+                    "num_samples": 256,
+                    "parts": [{"path": str(fixed_eval.resolve()), "num_samples": 256}],
+                }
+            ],
+        }
+        runtime_manifest_path = segment_root / "manifest_stage211_fixed_eval.json"
+        runtime_manifest_path.write_text(json.dumps(runtime_manifest) + "\n", encoding="utf-8")
+        runtime_manifests[difficulty] = runtime_manifest_path
+        global_source_path = Path(global_stage["bucket_manifest_path"])
+        global_source_sha256 = (
+            sha256_file(global_source_path) if global_source_path.is_file() else "0" * 64
+        )
+        key_set_sha256 = sha256_file(part_records[0]["path"])
+        segments.append(
+            {
+                "difficulty": difficulty,
+                "global_stage_name": stage_name,
+                "train_rows": int(expected["rows"]),
+                "train_hours": float(global_stage["selected_hours"]),
+                "train_parts": part_count,
+                "steps_per_epoch": int(expected["steps_per_epoch"]),
+                "epochs": STAGE211_FULL_DATA_EPOCHS,
+                "total_steps": int(expected["steps"]),
+                "tail_padding_samples_per_epoch": int(expected["tail_padding_samples_per_epoch"]),
+                "source_length_index_path": global_stage["length_index_path"],
+                "global_source_manifest_path": str(global_source_path),
+                "global_source_manifest_sha256": global_source_sha256,
+                "source_manifest_path": str(source_manifest_path.resolve()),
+                "source_manifest_sha256": sha256_file(source_manifest_path),
+                "runtime_manifest_path": str(runtime_manifest_path.resolve()),
+                "runtime_manifest_sha256": sha256_file(runtime_manifest_path),
+                "train_split_sha256": _canonical_json_sha256(runtime_manifest["splits"]["train"]),
+                "repartitioned": True,
+                "loaded_audio_key_set_sha256": key_set_sha256,
+                "global_audio_key_set_sha256": key_set_sha256,
+                "part_records_sha256": _canonical_json_sha256(part_records),
+                "part_records": part_records,
+            }
+        )
+    receipt = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "loaded_manifest_chain",
+        "complete": True,
+        "part_hash_algorithm": "sha256",
+        "part_hash_audit_complete": True,
+        "global_dedup_manifest_path": str(GLOBAL_DEDUP_FIXTURE.resolve()),
+        "global_dedup_manifest_sha256": sha256_file(GLOBAL_DEDUP_FIXTURE),
+        "dedupe_key": global_manifest["dedupe_key"],
+        "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
+        "total_hours": STAGE211_GLOBAL_DEDUP_TOTAL_HOURS,
+        "total_train_parts": sum(STAGE211_AUDIO_TRAIN_PART_COUNTS.values()),
+        "fixed_eval": {
+            "path": str(fixed_eval.resolve()),
+            "sha256": sha256_file(fixed_eval),
+            "rows": 256,
+        },
+        "segments": segments,
+    }
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    return receipt_path, runtime_manifests
+
+
+def test_stage211_loaded_manifest_receipt_binds_actual_runtime_manifests(
+    tmp_path: Path,
+) -> None:
+    receipt_path, runtime_manifests = _write_loaded_manifest_fixture(tmp_path)
+
+    receipt = validate_stage211_loaded_manifest_receipt(
+        receipt_path,
+        expected_global_dedup_manifest=GLOBAL_DEDUP_FIXTURE,
+    )
+
+    assert receipt["total_unique_rows"] == STAGE211_AUDIO_TOTAL_ROWS
+    assert receipt["total_train_parts"] == 745
+    assert {
+        segment["difficulty"]: Path(segment["runtime_manifest_path"])
+        for segment in receipt["segments"]
+    } == runtime_manifests
+
+
+def test_stage211_loaded_manifest_receipt_rejects_runtime_manifest_rewrite(
+    tmp_path: Path,
+) -> None:
+    receipt_path, runtime_manifests = _write_loaded_manifest_fixture(tmp_path)
+    runtime_manifests["hard"].write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="hard runtime manifest changed"):
+        validate_stage211_loaded_manifest_receipt(
+            receipt_path,
+            expected_global_dedup_manifest=GLOBAL_DEDUP_FIXTURE,
+        )
+
+
 def _write_valid_phase_gate(
     tmp_path: Path,
     *,
     phase: str,
     checkpoint: Path,
 ) -> Path:
+    loaded_manifest_receipt, runtime_manifests = _write_loaded_manifest_fixture(tmp_path)
     segments = []
     nano_teacher_dir = tmp_path / "nano-teacher"
     nano_teacher_dir.mkdir()
@@ -1743,8 +1927,7 @@ def _write_valid_phase_gate(
     previous_checkpoint = tmp_path / "phase-init.pt"
     previous_checkpoint.write_bytes(b"phase-init")
     for index, (difficulty, expected) in enumerate(STAGE211_AUDIO_CURRICULUM.items()):
-        manifest = tmp_path / f"{difficulty}-manifest.json"
-        manifest.write_text("{}\n", encoding="utf-8")
+        manifest = runtime_manifests[difficulty]
         provenance = tmp_path / f"{difficulty}-provenance.json"
         provenance.write_text("{}\n", encoding="utf-8")
         train_config = tmp_path / f"{difficulty}-train-config.yaml"
@@ -2066,6 +2249,8 @@ def _write_valid_phase_gate(
                 "public_progress_gate_passed": True,
                 "global_dedup_manifest_path": str(GLOBAL_DEDUP_FIXTURE.resolve()),
                 "global_dedup_manifest_sha256": sha256_file(GLOBAL_DEDUP_FIXTURE),
+                "loaded_manifest_receipt_path": str(loaded_manifest_receipt.resolve()),
+                "loaded_manifest_receipt_sha256": sha256_file(loaded_manifest_receipt),
                 "preflight_smoke": {
                     "marker_path": str(smoke_marker.resolve()),
                     "marker_sha256": sha256_file(smoke_marker),
@@ -2769,6 +2954,32 @@ def test_stage211_phase_gate_rejects_rewritten_global_dedup_manifest(
         )
 
 
+def test_stage211_phase_gate_rejects_rewritten_loaded_manifest_receipt(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    receipt_path = Path(gate["loaded_manifest_receipt_path"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["part_hash_audit_complete"] = False
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    gate["loaded_manifest_receipt_sha256"] = sha256_file(receipt_path)
+    gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="loaded-manifest receipt contract mismatch"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
 def test_stage211_phase_gate_rejects_mutated_alignment_source(
     tmp_path: Path,
 ) -> None:
@@ -3123,8 +3334,8 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert "stage211_final_proof_valid" in script
     assert "create_stage211_stepwise_report.py" in script
     assert "FINAL_STEPWISE_REPORT" in script
-    assert '.checkpoint_chain_passed == true' in script
-    assert '.nano_teacher_chain_passed == true' in script
+    assert ".checkpoint_chain_passed == true" in script
+    assert ".nano_teacher_chain_passed == true" in script
     assert '.strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"]' in script
     assert "post_mixer" in script
     assert "tmux kill-session" not in script
@@ -3141,8 +3352,8 @@ def _run_stage211_continuation_watcher_fixture(
     tmux = fake_bin / "tmux"
     tmux.write_text(
         "#!/usr/bin/env bash\n"
-        "printf '%s\\n' \"$*\" >>\"${TMUX_CALLS}\"\n"
-        "if [[ \"${1:-}\" == has-session ]]; then exit 1; fi\n"
+        'printf \'%s\\n\' "$*" >>"${TMUX_CALLS}"\n'
+        'if [[ "${1:-}" == has-session ]]; then exit 1; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -3150,18 +3361,18 @@ def _run_stage211_continuation_watcher_fixture(
     uv = fake_bin / "uv"
     uv.write_text(
         "#!/usr/bin/env bash\n"
-        "if [[ \"${UV_MODE}\" != success ]]; then exit 42; fi\n"
+        'if [[ "${UV_MODE}" != success ]]; then exit 42; fi\n'
         "output_json=\n"
         "output_markdown=\n"
         "while (($#)); do\n"
-        "  case \"$1\" in\n"
-        "    --output-json) output_json=\"$2\"; shift 2 ;;\n"
-        "    --output-markdown) output_markdown=\"$2\"; shift 2 ;;\n"
+        '  case "$1" in\n'
+        '    --output-json) output_json="$2"; shift 2 ;;\n'
+        '    --output-markdown) output_markdown="$2"; shift 2 ;;\n'
         "    *) shift ;;\n"
         "  esac\n"
         "done\n"
-        "mkdir -p \"$(dirname \"${output_json}\")\"\n"
-        "printf '%s\\n' '{\"pipeline\":\"stage211\",\"artifact\":\"stepwise_final_results\",\"complete\":true,\"gate_passed\":true,\"strict_stage_order\":[\"calibration\",\"mixer\",\"block\",\"logits\",\"sft\"],\"checkpoint_chain_passed\":true,\"nano_teacher_chain_passed\":true,\"nano_public_baseline_provenance_passed\":true,\"coverage_results\":[1,2,3,4],\"dataset_results\":[1,2,3,4,5]}' >\"${output_json}\"\n"
+        'mkdir -p "$(dirname "${output_json}")"\n'
+        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"coverage_results":[1,2,3,4],"dataset_results":[1,2,3,4,5]}\' >"${output_json}"\n'
         "printf '%s\\n' '# stepwise' >\"${output_markdown}\"\n",
         encoding="utf-8",
     )

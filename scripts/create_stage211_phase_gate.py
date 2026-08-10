@@ -8,8 +8,9 @@ from typing import Any
 
 from rwkvasr.eval import normalize_asr_text_for_metrics
 from rwkvasr.eval.stage211_gate import (
-    DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
     DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
+    DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
+    DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
@@ -18,6 +19,7 @@ from rwkvasr.eval.stage211_gate import (
     sha256_file,
     validate_stage211_full_profile_smoke_binding,
     validate_stage211_global_dedup_manifest,
+    validate_stage211_loaded_manifest_receipt,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
 )
@@ -127,17 +129,13 @@ def _recompute_public_result(
         student_path=student_path,
         normalization=str(report["normalization"]),
         max_relative_ratio=float(gate.get("max_relative_ratio", float("nan"))),
-        max_absolute_gap_points=float(
-            gate.get("max_absolute_gap_points", float("nan"))
-        ),
+        max_absolute_gap_points=float(gate.get("max_absolute_gap_points", float("nan"))),
     )
     for key, expected in recomputed.items():
         actual = result.get(key)
         if key in {"nano_prediction_path", "student_prediction_path"}:
             if Path(str(actual or "")).resolve() != Path(str(expected)).resolve():
-                raise ValueError(
-                    f"Stage211 {dataset} recomputed {key} path mismatch."
-                )
+                raise ValueError(f"Stage211 {dataset} recomputed {key} path mismatch.")
         elif isinstance(expected, bool):
             if actual is not expected:
                 raise ValueError(
@@ -254,9 +252,7 @@ def _enrich_public_benchmark(
         )
     all_datasets_pass = all(bool(result["gate_pass"]) for result in results)
     if report.get("all_datasets_pass") is not all_datasets_pass:
-        raise ValueError(
-            "Stage211 public comparison all_datasets_pass differs from source replay."
-        )
+        raise ValueError("Stage211 public comparison all_datasets_pass differs from source replay.")
     return {
         **report,
         "all_datasets_complete": True,
@@ -371,6 +367,7 @@ def build_phase_gate(
     coverage_receipt_paths: list[Path],
     preflight_smoke_marker_path: Path,
     global_dedup_manifest_path: Path,
+    loaded_manifest_receipt_path: Path,
     alignment_report_path: Path | None,
     post_coverage_correction_receipt_paths: list[Path] | None = None,
     baseline_public_comparison_report_path: Path | None = None,
@@ -415,6 +412,28 @@ def build_phase_gate(
     )
     global_dedup_manifest_path = global_dedup_manifest_path.expanduser().resolve()
     validate_stage211_global_dedup_manifest(global_dedup_manifest_path)
+    loaded_manifest_receipt_path = loaded_manifest_receipt_path.expanduser().resolve()
+    loaded_manifest_receipt = validate_stage211_loaded_manifest_receipt(
+        loaded_manifest_receipt_path,
+        expected_global_dedup_manifest=global_dedup_manifest_path,
+    )
+    loaded_by_difficulty = {
+        str(segment.get("difficulty") or ""): segment
+        for segment in loaded_manifest_receipt["segments"]
+    }
+    for segment in coverage:
+        difficulty = str(segment.get("difficulty") or "")
+        loaded_segment = loaded_by_difficulty.get(difficulty)
+        if not isinstance(loaded_segment, dict):
+            raise ValueError(f"Stage211 phase coverage lacks {difficulty} loader provenance.")
+        if Path(str(segment.get("bucket_manifest_path") or "")).expanduser().resolve() != Path(
+            str(loaded_segment.get("runtime_manifest_path") or "")
+        ).expanduser().resolve() or str(segment.get("bucket_manifest_sha256") or "") != str(
+            loaded_segment.get("runtime_manifest_sha256") or ""
+        ):
+            raise ValueError(
+                f"Stage211 {difficulty} phase coverage does not use the audited runtime manifest."
+            )
     alignment_gate_passed = False
     alignment_record: dict[str, Any] | None = None
     if alignment_report_path is not None:
@@ -552,6 +571,8 @@ def build_phase_gate(
         "preflight_smoke": preflight_smoke,
         "global_dedup_manifest_path": str(global_dedup_manifest_path),
         "global_dedup_manifest_sha256": sha256_file(global_dedup_manifest_path),
+        "loaded_manifest_receipt_path": str(loaded_manifest_receipt_path),
+        "loaded_manifest_receipt_sha256": sha256_file(loaded_manifest_receipt_path),
         "alignment_report": alignment_record,
         "baseline_public_comparison_report": baseline_public_record,
         "public_progress": public_progress,
@@ -582,6 +603,11 @@ def main() -> int:
         "--global-dedup-manifest",
         type=Path,
         default=DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
+    )
+    parser.add_argument(
+        "--loaded-manifest-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
     )
     parser.add_argument("--public-comparison-report", type=Path, required=True)
     parser.add_argument("--manifest-dir", type=Path, required=True)
@@ -619,6 +645,7 @@ def main() -> int:
         coverage_receipt_paths=list(args.coverage_receipt),
         preflight_smoke_marker_path=args.preflight_smoke_marker,
         global_dedup_manifest_path=args.global_dedup_manifest,
+        loaded_manifest_receipt_path=args.loaded_manifest_receipt,
         post_coverage_correction_receipt_paths=list(args.post_coverage_correction_receipt),
         alignment_report_path=args.alignment_report,
         baseline_public_comparison_report_path=(args.baseline_public_comparison_report),
