@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -2812,5 +2813,110 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert 'START_STAGE="${start_stage}"' in script
     assert "REUSE_COMPLETED_CALIBRATION_EVAL=1" in script
     assert "stage211_choose_start_stage" in script
+    assert "stage211_final_proof_valid" in script
+    assert "create_stage211_stepwise_report.py" in script
+    assert "FINAL_STEPWISE_REPORT" in script
+    assert '.checkpoint_chain_passed == true' in script
+    assert '.nano_teacher_chain_passed == true' in script
+    assert '.strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"]' in script
     assert "post_mixer" in script
     assert "tmux kill-session" not in script
+
+
+def _run_stage211_continuation_watcher_fixture(
+    tmp_path: Path,
+    *,
+    uv_mode: str,
+) -> tuple[subprocess.CompletedProcess[str], str, Path]:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_calls = tmp_path / "tmux-calls.log"
+    tmux = fake_bin / "tmux"
+    tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >>\"${TMUX_CALLS}\"\n"
+        "if [[ \"${1:-}\" == has-session ]]; then exit 1; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    tmux.chmod(0o755)
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${UV_MODE}\" != success ]]; then exit 42; fi\n"
+        "output_json=\n"
+        "output_markdown=\n"
+        "while (($#)); do\n"
+        "  case \"$1\" in\n"
+        "    --output-json) output_json=\"$2\"; shift 2 ;;\n"
+        "    --output-markdown) output_markdown=\"$2\"; shift 2 ;;\n"
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        "mkdir -p \"$(dirname \"${output_json}\")\"\n"
+        "printf '%s\\n' '{\"pipeline\":\"stage211\",\"artifact\":\"stepwise_final_results\",\"complete\":true,\"gate_passed\":true,\"strict_stage_order\":[\"calibration\",\"mixer\",\"block\",\"logits\",\"sft\"],\"checkpoint_chain_passed\":true,\"nano_teacher_chain_passed\":true,\"nano_public_baseline_provenance_passed\":true,\"coverage_results\":[1,2,3,4],\"dataset_results\":[1,2,3,4,5]}' >\"${output_json}\"\n"
+        "printf '%s\\n' '# stepwise' >\"${output_markdown}\"\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+
+    phase_gate_root = tmp_path / "gates"
+    final_report = phase_gate_root / "sft" / "stage211_complete.json"
+    final_report.parent.mkdir(parents=True)
+    final_report.write_text(
+        json.dumps(
+            {
+                "pipeline": "stage211",
+                "artifact": "final_completion",
+                "complete": True,
+                "gate_passed": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "watch_stage211_strict_continuation.sh")],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TMUX_CALLS": str(tmux_calls),
+            "UV_MODE": uv_mode,
+            "PHASE_GATE_ROOT": str(phase_gate_root),
+            "FULL_OUTPUT_ROOT": str(tmp_path / "runs"),
+            "WATCH_LOG": str(tmp_path / "watch.log"),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, tmux_calls.read_text(encoding="utf-8"), phase_gate_root
+
+
+def test_stage211_continuation_watcher_accepts_only_deep_stepwise_proof(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, phase_gate_root = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="success",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "SFT and stepwise proofs pass" in result.stdout
+    assert "new-session" not in tmux_calls
+    assert (phase_gate_root / "sft" / "stage211_stepwise_results.json").is_file()
+
+
+def test_stage211_continuation_watcher_restarts_after_stepwise_failure(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="failure",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "stepwise proof is missing or invalid" in result.stdout
+    assert "START_STAGE=full" in result.stdout
+    assert "new-session" in tmux_calls

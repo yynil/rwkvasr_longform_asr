@@ -22,6 +22,9 @@ MIXER_SELECTION="${PHASE_GATE_ROOT}/mixer_selected.json"
 BLOCK_PROMOTION="${PHASE_GATE_ROOT}/block/block_promotion_receipt.json"
 LOGITS_PROMOTION="${PHASE_GATE_ROOT}/logits/logits_promotion_receipt.json"
 FINAL_REPORT="${PHASE_GATE_ROOT}/sft/stage211_complete.json"
+FINAL_STEPWISE_REPORT="${PHASE_GATE_ROOT}/sft/stage211_stepwise_results.json"
+FINAL_STEPWISE_MARKDOWN="${PHASE_GATE_ROOT}/sft/stage211_stepwise_results.md"
+CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${HOME}/rwkvasr_eval/stage211_calibration_selected_full/public/reuse_receipt.json}"
 
 stage211_log() {
   mkdir -p "$(dirname "${WATCH_LOG}")"
@@ -62,6 +65,33 @@ stage211_choose_start_stage() {
   else
     printf '%s\n' full
   fi
+}
+
+stage211_final_proof_valid() {
+  if ! stage211_json_matches \
+    "${FINAL_REPORT}" \
+    '.pipeline == "stage211" and .artifact == "final_completion" and .complete == true and .gate_passed == true'; then
+    return 1
+  fi
+
+  stage211_log "deep-validating final Stage211 stepwise proof"
+  if ! (
+    cd "${REPO_ROOT}"
+    uv run python "${REPO_ROOT}/scripts/create_stage211_stepwise_report.py" \
+      --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
+      --block-phase-gate "${PHASE_GATE_ROOT}/block/phase_gate.json" \
+      --logits-phase-gate "${PHASE_GATE_ROOT}/logits/phase_gate.json" \
+      --sft-final-report "${FINAL_REPORT}" \
+      --output-json "${FINAL_STEPWISE_REPORT}" \
+      --output-markdown "${FINAL_STEPWISE_MARKDOWN}"
+  ) >>"${WATCH_LOG}" 2>&1; then
+    stage211_log "final Stage211 stepwise proof is missing or invalid"
+    return 1
+  fi
+
+  stage211_json_matches \
+    "${FINAL_STEPWISE_REPORT}" \
+    '.pipeline == "stage211" and .artifact == "stepwise_final_results" and .complete == true and .gate_passed == true and .strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"] and .checkpoint_chain_passed == true and .nano_teacher_chain_passed == true and .nano_public_baseline_provenance_passed == true and (.coverage_results | length) == 4 and (.dataset_results | length) == 5'
 }
 
 stage211_start_supervisor() {
@@ -107,10 +137,8 @@ stage211_main() {
     sleep "${POLL_SECONDS}"
   done
 
-  if stage211_json_matches \
-    "${FINAL_REPORT}" \
-    '.pipeline == "stage211" and .artifact == "final_completion" and .complete == true and .gate_passed == true'; then
-    stage211_log "final Stage211 report already passes; continuation not required"
+  if stage211_final_proof_valid; then
+    stage211_log "final Stage211 SFT and stepwise proofs pass; continuation not required"
     return
   fi
 
