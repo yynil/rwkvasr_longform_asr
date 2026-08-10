@@ -39,6 +39,7 @@ LOGITS_CORRECTION_RUN_ROOT="${LOGITS_CORRECTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/st
 LOGITS_CORRECTION_GATE_ROOT="${LOGITS_CORRECTION_GATE_ROOT:-${PHASE_GATE_ROOT}/logits_correction}"
 LOGITS_SELECTION="${LOGITS_SELECTION:-${PHASE_GATE_ROOT}/logits_selected.json}"
 SUPPLEMENTAL_INVENTORY="${SUPPLEMENTAL_INVENTORY:-${HOME}/rwkvasr_data/stage211_supplemental_natural_v1/supplemental_inventory.json}"
+SUPPLEMENTAL_PROFILE_RECEIPT="${SUPPLEMENTAL_PROFILE_RECEIPT:-${HOME}/rwkvasr_data/stage211_supplemental_natural_v1/supplemental_profile_receipt.json}"
 
 log() {
   printf '[stage211-abcd-bootstrap] %(%Y-%m-%d %H:%M:%S)T %s\n' -1 "$*"
@@ -178,6 +179,7 @@ run_full_mixer_phase() {
     --easy-manifest "${HOME}/rwkvasr_data/stage211_easy_source_grouped_buckets/manifest_stage211_fixed_eval.json" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --supplemental-inventory "${SUPPLEMENTAL_INVENTORY}" \
+    --supplemental-profile-receipt "${SUPPLEMENTAL_PROFILE_RECEIPT}" \
     --master-port "${MASTER_PORT}" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211A full curriculum finished; starting strict retention/evaluation loop"
@@ -221,6 +223,7 @@ run_full_block_phase() {
     --easy-manifest "${HOME}/rwkvasr_data/stage211_easy_source_grouped_buckets/manifest_stage211_fixed_eval.json" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --supplemental-inventory "${SUPPLEMENTAL_INVENTORY}" \
+    --supplemental-profile-receipt "${SUPPLEMENTAL_PROFILE_RECEIPT}" \
     --master-port "$((MASTER_PORT + 1))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211B full curriculum finished; starting strict correction/evaluation loop"
@@ -259,6 +262,7 @@ run_full_logits_phase() {
     --easy-manifest "${HOME}/rwkvasr_data/stage211_easy_source_grouped_buckets/manifest_stage211_fixed_eval.json" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --supplemental-inventory "${SUPPLEMENTAL_INVENTORY}" \
+    --supplemental-profile-receipt "${SUPPLEMENTAL_PROFILE_RECEIPT}" \
     --master-port "$((MASTER_PORT + 2))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211C full curriculum finished; starting strict correction/evaluation loop"

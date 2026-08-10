@@ -993,6 +993,11 @@ def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
     supplemental_inventory, supplemental_profile = _write_supplemental_inventory_fixture(
         tmp_path
     )
+    supplemental_profile_receipt = tmp_path / "supplemental-profile-receipt.json"
+    stage211_supplemental_profile_receipt.write_immutable_receipt(
+        supplemental_profile_receipt,
+        stage211_supplemental_profile_receipt.build_receipt(supplemental_inventory),
+    )
     command = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "run_stage211_full_phase_curriculum.py"),
@@ -1010,6 +1015,8 @@ def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
         str(manifests["easy"]),
         "--supplemental-inventory",
         str(supplemental_inventory),
+        "--supplemental-profile-receipt",
+        str(supplemental_profile_receipt),
         "--dry-run",
     ]
     for difficulty in ("medium", "hard", "long"):
@@ -1785,9 +1792,21 @@ def test_stage211_supplemental_profile_receipt_is_complete_and_immutable(
     output = tmp_path / "supplemental-profile-receipt.json"
     stage211_supplemental_profile_receipt.write_immutable_receipt(output, receipt)
     stage211_supplemental_profile_receipt.write_immutable_receipt(output, receipt)
+    validated = stage211_full_phase._validate_supplemental_profile_receipt(
+        output,
+        inventory_path=inventory_path,
+    )
+    assert validated["sha256"] == sha256_file(output)
     changed = {**receipt, "steps": int(receipt["steps"]) + 1}
     with pytest.raises(ValueError, match="Refusing to replace a different"):
         stage211_supplemental_profile_receipt.write_immutable_receipt(output, changed)
+    forged = tmp_path / "forged-supplemental-profile-receipt.json"
+    forged.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="differs from the current inventory"):
+        stage211_full_phase._validate_supplemental_profile_receipt(
+            forged,
+            inventory_path=inventory_path,
+        )
 
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
     train_part = Path(inventory["part_records"][0]["path"])

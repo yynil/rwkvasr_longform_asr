@@ -23,9 +23,18 @@ from rwkvasr.eval.stage211_gate import (
 )
 from rwkvasr.eval.stage211_supplemental import (
     DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
+    DEFAULT_STAGE211_SUPPLEMENTAL_ROOT,
     STAGE211_SUPPLEMENTAL_DIFFICULTY,
     stage211_supplemental_profile,
 )
+try:
+    from scripts.create_stage211_supplemental_profile_receipt import (
+        build_receipt as build_supplemental_profile_receipt,
+    )
+except ModuleNotFoundError:  # Direct execution places scripts/ rather than the repo on sys.path.
+    from create_stage211_supplemental_profile_receipt import (
+        build_receipt as build_supplemental_profile_receipt,
+    )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -341,6 +350,29 @@ def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
         raise ValueError(f"Refusing to overwrite a different Stage211 artifact: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(rendered, encoding="utf-8")
+
+
+def _validate_supplemental_profile_receipt(
+    receipt_path: Path,
+    *,
+    inventory_path: Path,
+) -> dict[str, Any]:
+    receipt_path = receipt_path.expanduser().resolve()
+    actual = _load_json(
+        receipt_path,
+        label="Stage211 supplemental profile receipt",
+    )
+    expected = build_supplemental_profile_receipt(inventory_path)
+    if actual != expected:
+        raise ValueError(
+            "Stage211 supplemental profile receipt differs from the current inventory: "
+            f"{receipt_path}"
+        )
+    return {
+        "path": str(receipt_path),
+        "sha256": sha256_file(receipt_path),
+        "receipt": actual,
+    }
 
 
 def _migrate_legacy_curriculum_summary(*, phase_root: Path, phase: str) -> None:
@@ -661,6 +693,10 @@ def run_phase(args: argparse.Namespace) -> Path | None:
                 f"Stage211 {difficulty} fixed-eval manifest unavailable: {manifest}"
             )
     supplemental_inventory = args.supplemental_inventory.expanduser().resolve()
+    supplemental_profile_receipt = _validate_supplemental_profile_receipt(
+        args.supplemental_profile_receipt,
+        inventory_path=supplemental_inventory,
+    )
     supplemental_profile = stage211_supplemental_profile(
         supplemental_inventory,
         epochs=STAGE211_FULL_DATA_EPOCHS,
@@ -671,6 +707,11 @@ def run_phase(args: argparse.Namespace) -> Path | None:
         verify_part_sha256=False,
     )
     supplemental_manifest = Path(str(supplemental_profile["bucket_manifest_path"])).resolve()
+    print(
+        "[stage211-full-phase] supplemental profile receipt "
+        f"sha256={supplemental_profile_receipt['sha256']}",
+        flush=True,
+    )
     nano_checkpoint = args.nano_checkpoint.expanduser().resolve()
     if not nano_checkpoint.is_file() or nano_checkpoint.stat().st_size <= 0:
         raise FileNotFoundError(str(nano_checkpoint))
@@ -940,6 +981,13 @@ def main() -> int:
         "--supplemental-inventory",
         type=Path,
         default=DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
+    )
+    parser.add_argument(
+        "--supplemental-profile-receipt",
+        type=Path,
+        default=(
+            DEFAULT_STAGE211_SUPPLEMENTAL_ROOT / "supplemental_profile_receipt.json"
+        ),
     )
     parser.add_argument("--master-port", type=int, default=29631)
     parser.add_argument("--max-peak-reserved-gib", type=float, default=22.0)
