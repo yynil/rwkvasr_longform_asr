@@ -279,6 +279,8 @@ run_labeled_sft_phase() {
     --baseline-public-comparison-report "${PHASE_GATE_ROOT}/logits/nano_comparison.json" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
+    --phase-gate-root "${PHASE_GATE_ROOT}" \
+    --mixer-gate-selection "${MIXER_SELECTION}" \
     --devices 0,1,2,3
   log "Stage211 A/B/C/D strict alignment pipeline completed"
 }

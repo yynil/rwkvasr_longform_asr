@@ -589,6 +589,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert 'START_STAGE="${START_STAGE:-full}"' in script
     assert "run_stage211_mixer_retention_loop.py" in script
     assert "MIXER_SELECTION" in script
+    assert '--mixer-gate-selection "${MIXER_SELECTION}"' in script
     assert "post_mixer)" in script
 
     main_body = script[script.index("main() {") :]
