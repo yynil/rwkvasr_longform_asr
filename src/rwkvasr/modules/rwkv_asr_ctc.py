@@ -1538,6 +1538,7 @@ class RWKVCTCModel(nn.Module):
         targets: Tensor,
         target_lengths: Tensor,
     ) -> Tensor:
+        self._validate_ctc_targets(targets, target_lengths)
         log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)
         return F.ctc_loss(
             log_probs,
@@ -1547,3 +1548,43 @@ class RWKVCTCModel(nn.Module):
             blank=self.config.blank_id,
             zero_infinity=True,
         )
+
+    def _validate_ctc_targets(self, targets: Tensor, target_lengths: Tensor) -> None:
+        if targets.dim() != 1 or target_lengths.dim() != 1:
+            raise ValueError(
+                "CTC training requires one-dimensional packed targets and target lengths."
+            )
+        if target_lengths.numel() and bool((target_lengths < 0).any().item()):
+            raise ValueError("CTC target lengths must be non-negative.")
+        packed_length = int(target_lengths.to(dtype=torch.long).sum().item())
+        if packed_length != int(targets.numel()):
+            raise ValueError(
+                "Packed CTC target length mismatch: "
+                f"target_lengths sum to {packed_length}, but targets contain {targets.numel()} tokens."
+            )
+        if targets.numel() == 0:
+            return
+
+        ctc_vocab_size = int(self.config.ctc_vocab_size)
+        out_of_range = targets[(targets < 0) | (targets >= ctc_vocab_size)]
+        if out_of_range.numel():
+            token_ids = sorted({int(token_id) for token_id in out_of_range.detach().cpu().tolist()})
+            raise ValueError(
+                f"CTC targets contain token ids outside [0, {ctc_vocab_size}): {token_ids}"
+            )
+
+        blank_id = int(self.config.blank_id)
+        if bool((targets == blank_id).any().item()):
+            raise ValueError(f"CTC targets must not contain the blank token id {blank_id}.")
+
+        suppressed = self.ctc_suppressed_token_ids
+        if suppressed.numel() == 0:
+            return
+        suppressed_targets = targets[
+            torch.isin(targets, suppressed.to(device=targets.device))
+        ]
+        if suppressed_targets.numel():
+            token_ids = sorted(
+                {int(token_id) for token_id in suppressed_targets.detach().cpu().tolist()}
+            )
+            raise ValueError(f"CTC targets contain suppressed non-pronunciation token ids: {token_ids}")

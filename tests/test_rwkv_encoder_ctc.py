@@ -930,6 +930,65 @@ def test_ctc_suppressed_token_ids_mask_logits_but_not_blank() -> None:
     assert torch.equal(masked[..., 0], logits[..., 0])
 
 
+def test_ctc_loss_rejects_suppressed_non_pronunciation_target() -> None:
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=1,
+            head_size=4,
+            vocab_size=8,
+            blank_id=7,
+            ctc_suppressed_token_ids=(3,),
+        )
+    )
+
+    with pytest.raises(ValueError, match=r"suppressed non-pronunciation token ids: \[3\]"):
+        model.ctc_loss(
+            torch.zeros(1, 3, 8),
+            torch.tensor([3]),
+            torch.tensor([1, 3]),
+            torch.tensor([2]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("targets", "target_lengths", "message"),
+    (
+        ([1, 7], [2], "must not contain the blank token id 7"),
+        ([1, 8], [2], r"outside \[0, 8\): \[8\]"),
+        ([1, 2], [1], "Packed CTC target length mismatch"),
+    ),
+)
+def test_ctc_loss_rejects_invalid_packed_targets(
+    targets: list[int],
+    target_lengths: list[int],
+    message: str,
+) -> None:
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=1,
+            head_size=4,
+            vocab_size=8,
+            blank_id=7,
+        )
+    )
+
+    with pytest.raises(ValueError, match=message):
+        model.ctc_loss(
+            torch.zeros(1, 3, 8),
+            torch.tensor([3]),
+            torch.tensor(targets),
+            torch.tensor(target_lengths),
+        )
+
+
 def test_ctc_teacher_nonblank_hard_loss_selects_teacher_emission_frames() -> None:
     student_logits = torch.zeros(1, 4, 6)
     student_logits[0, 1, 5] = 3.0

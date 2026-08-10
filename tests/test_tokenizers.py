@@ -274,6 +274,13 @@ def test_sensevoice_tiktoken_ctc_suppresses_non_pronunciation_units(tmp_path: Pa
     assert 255 in suppressed
     assert text_id not in suppressed
 
+    project_blank_id = tokenizer.vocab_size
+    project_suppressed = set(tokenizer.ctc_suppressed_token_ids(blank_id=project_blank_id))
+    assert project_blank_id not in project_suppressed
+    assert all(int(token_id) in project_suppressed for token_id in special_tokens.values())
+    assert timestamp_id in project_suppressed
+    assert text_id not in project_suppressed
+
 
 def test_build_text_tokenizer_creates_sensevoice_tiktoken(tmp_path: Path) -> None:
     pytest.importorskip("tiktoken")
