@@ -644,6 +644,8 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
     if stage179_rows <= 0 or not math.isfinite(stage179_hours) or stage179_hours <= 0.0:
         raise ValueError("Stage211 supplemental Stage179 coverage binding is invalid.")
     return {
+        "inventory_schema_version": int(inventory.get("schema_version", -1)),
+        "inventory_artifact": str(inventory.get("artifact") or ""),
         "mode": cross_pool["mode"],
         "source_sets_disjoint": True,
         "content_fingerprint_complete": False,
@@ -653,6 +655,12 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
         "stage179_manifest_sha256": stage179_manifest_sha256,
         "stage179_unique_rows": stage179_rows,
         "stage179_hours": stage179_hours,
+        "social_normalized_pcm_exact_complete": bool(
+            cross_pool.get("social_normalized_pcm_exact_complete", False)
+        ),
+        "social_public_overlap_mode": cross_pool.get("social_public_overlap_mode"),
+        "near_duplicate_complete": cross_pool.get("near_duplicate_complete"),
+        "component_inventories": inventory.get("component_inventories", {}),
     }
 
 
@@ -1044,6 +1052,13 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"`{report['supplemental_dedupe_proof']['mode']}`, "
         "source sets disjoint: `true`, content fingerprint complete: `false`, "
         "known exclusions: `llaso_gigaspeech,llaso_librispeech`",
+        "",
+        "Supplemental components: "
+        f"schema `{report['supplemental_dedupe_proof']['inventory_schema_version']}`, "
+        "social normalized-PCM exact dedupe/public filtering: "
+        f"`{str(report['supplemental_dedupe_proof']['social_normalized_pcm_exact_complete']).lower()}`/"
+        f"`{report['supplemental_dedupe_proof']['social_public_overlap_mode']}`, "
+        "acoustic near-duplicate coverage: `false`",
         "",
         "CTC label normalization: `ctc`, tokenizer: `sensevoice_tiktoken`, "
         f"unknown tokens: `{int(report['ctc_label_proof']['ctc_unk_tokens'])}`, "

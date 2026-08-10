@@ -60,6 +60,9 @@ def build_receipt(inventory_path: Path) -> dict[str, Any]:
         "executed_sample_exposures": int(profile["executed_sample_exposures"]),
         "selected_counts_by_source": inventory["selected_counts_by_source"],
         "selected_hours_by_source": inventory["selected_hours_by_source"],
+        "storage_kinds": inventory["storage_kinds"],
+        "languages": inventory["language"],
+        "component_inventories": inventory.get("component_inventories", {}),
         "train_part_count": len(inventory["part_records"]),
         "archive_status_counts": dict(sorted(archive_status_counts.items())),
     }

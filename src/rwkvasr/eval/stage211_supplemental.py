@@ -16,18 +16,19 @@ from rwkvasr.data import (
 
 STAGE211_SUPPLEMENTAL_DIFFICULTY = "supplemental_natural"
 DEFAULT_STAGE211_SUPPLEMENTAL_ROOT = (
-    Path.home() / "rwkvasr_data" / "stage211_supplemental_natural_v1"
+    Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v2"
 )
 DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY = (
     DEFAULT_STAGE211_SUPPLEMENTAL_ROOT / "supplemental_inventory.json"
 )
-STAGE211_SUPPLEMENTAL_SOURCES = {
+STAGE211_BASE_SUPPLEMENTAL_SOURCES = {
     "ljspeech",
     "mls_english",
     "peoples_speech_clean",
     "peoples_speech_dirty",
     "vctk",
 }
+STAGE211_SUPPLEMENTAL_SOURCES = STAGE211_BASE_SUPPLEMENTAL_SOURCES
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -65,6 +66,110 @@ def _bound_file(
     return path
 
 
+def _validate_combined_component_inventories(
+    inventory: dict[str, Any],
+    *,
+    verify_part_sha256: bool,
+) -> tuple[dict[str, Any], dict[str, Any], set[str]]:
+    components = inventory.get("component_inventories")
+    if not isinstance(components, dict) or set(components) != {"base_natural", "social_vad"}:
+        raise ValueError("Stage211 combined supplemental component inventory proof is invalid.")
+
+    base_record = components["base_natural"]
+    social_record = components["social_vad"]
+    if not isinstance(base_record, dict) or not isinstance(social_record, dict):
+        raise ValueError("Stage211 combined supplemental component binding is invalid.")
+    base_path = _bound_file(
+        base_record,
+        path_key="inventory_path",
+        sha256_key="inventory_sha256",
+        label="Stage211 base supplemental inventory",
+        verify_sha256=True,
+    )
+    base = validate_stage211_supplemental_inventory(
+        base_path,
+        require_training_ready=True,
+        verify_part_sha256=verify_part_sha256,
+    )
+    if base["inventory"].get("schema_version") != 1:
+        raise ValueError("Stage211 combined base component must be the version-1 natural pool.")
+    if (
+        int(base_record.get("rows", -1)) != int(base["rows"])
+        or not math.isclose(
+            float(base_record.get("hours", float("nan"))),
+            float(base["hours"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or base_record.get("bucket_manifest_sha256") != base["bucket_manifest_sha256"]
+    ):
+        raise ValueError("Stage211 combined base component totals changed.")
+
+    social_path = _bound_file(
+        social_record,
+        path_key="inventory_path",
+        sha256_key="inventory_sha256",
+        label="Stage211 filtered social inventory",
+        verify_sha256=True,
+    )
+    social = _load_json(social_path, label="Stage211 filtered social inventory")
+    expected_social = {
+        "schema_version": 1,
+        "artifact": "stage211_social_pcm_filtered_inventory",
+        "complete": True,
+        "training_ready": True,
+        "admission_state": "normalized_pcm_exact_filtered",
+        "storage_kinds": ["tar"],
+        "language": "zh",
+        "uses_text_labels": False,
+        "near_duplicate_detection_complete": False,
+    }
+    if any(social.get(key) != value for key, value in expected_social.items()):
+        raise ValueError("Stage211 filtered social component contract mismatch.")
+    if (
+        social.get("dedupe", {}).get("mode") != "normalized_pcm_exact"
+        or social.get("public_overlap", {}).get("mode") != "normalized_pcm_exact"
+        or social.get("public_overlap", {}).get("near_duplicate_complete") is not False
+    ):
+        raise ValueError("Stage211 filtered social exact-content proof changed.")
+    social_rows = int(social.get("selected_rows", -1))
+    social_hours = float(social.get("selected_hours", float("nan")))
+    social_sources = set((social.get("selected_counts_by_source") or {}).keys())
+    if (
+        social_rows <= 0
+        or not math.isfinite(social_hours)
+        or social_hours <= 0.0
+        or not social_sources
+        or any(not source.startswith("social_") for source in social_sources)
+        or int(social_record.get("rows", -1)) != social_rows
+        or not math.isclose(
+            float(social_record.get("hours", float("nan"))),
+            social_hours,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        raise ValueError("Stage211 filtered social component totals are invalid.")
+    social_manifest = _bound_file(
+        social,
+        path_key="bucket_manifest_path",
+        sha256_key="bucket_manifest_sha256",
+        label="Stage211 filtered social bucket manifest",
+        verify_sha256=True,
+    )
+    if social_record.get("bucket_manifest_sha256") != _sha256_file(social_manifest):
+        raise ValueError("Stage211 combined social component manifest changed.")
+    loaded_social_manifest = load_webdataset_bucket_manifest(social_manifest)
+    if (
+        sum(bucket.num_samples for bucket in loaded_social_manifest.splits.get("train", ()))
+        != social_rows
+        or sum(bucket.num_samples for bucket in loaded_social_manifest.splits.get("eval", ()))
+        != 256
+    ):
+        raise ValueError("Stage211 filtered social component manifest totals changed.")
+    return base, social, social_sources
+
+
 def validate_stage211_supplemental_inventory(
     inventory_path: str | Path,
     *,
@@ -73,16 +178,33 @@ def validate_stage211_supplemental_inventory(
 ) -> dict[str, Any]:
     inventory_path = Path(inventory_path).expanduser().resolve()
     inventory = _load_json(inventory_path, label="Stage211 supplemental inventory")
-    expected_fields = {
-        "schema_version": 1,
-        "artifact": "stage211_supplemental_natural_inventory",
-        "complete": True,
-        "hash_archives": True,
-        "require_production_layout": True,
-        "language": "en",
-        "uses_text_labels": False,
-        "storage_kinds": ["parquet", "zip"],
-    }
+    combined = (
+        inventory.get("schema_version") == 2
+        and inventory.get("artifact") == "stage211_supplemental_combined_inventory"
+    )
+    expected_fields = (
+        {
+            "schema_version": 2,
+            "artifact": "stage211_supplemental_combined_inventory",
+            "complete": True,
+            "hash_archives": True,
+            "require_production_layout": True,
+            "language": ["en", "zh"],
+            "uses_text_labels": False,
+            "storage_kinds": ["parquet", "tar", "zip"],
+        }
+        if combined
+        else {
+            "schema_version": 1,
+            "artifact": "stage211_supplemental_natural_inventory",
+            "complete": True,
+            "hash_archives": True,
+            "require_production_layout": True,
+            "language": "en",
+            "uses_text_labels": False,
+            "storage_kinds": ["parquet", "zip"],
+        }
+    )
     if any(inventory.get(key) != value for key, value in expected_fields.items()):
         raise ValueError("Stage211 supplemental inventory contract mismatch.")
     if require_training_ready and inventory.get("training_ready") is not True:
@@ -99,14 +221,29 @@ def validate_stage211_supplemental_inventory(
         source_hour_values = [float(value) for value in (source_hours or {}).values()]
     except (AttributeError, TypeError, ValueError) as error:
         raise ValueError("Stage211 supplemental selected source totals are invalid.") from error
+    component_base: dict[str, Any] | None = None
+    component_social: dict[str, Any] | None = None
+    social_sources: set[str] = set()
+    if combined:
+        component_base, component_social, social_sources = (
+            _validate_combined_component_inventories(
+                inventory,
+                verify_part_sha256=verify_part_sha256,
+            )
+        )
+    expected_sources = (
+        STAGE211_BASE_SUPPLEMENTAL_SOURCES | social_sources
+        if combined
+        else STAGE211_BASE_SUPPLEMENTAL_SOURCES
+    )
     if (
         selected_rows <= 0
         or not math.isfinite(selected_hours)
         or selected_hours <= 0.0
         or not isinstance(source_counts, dict)
         or not isinstance(source_hours, dict)
-        or set(source_counts) != STAGE211_SUPPLEMENTAL_SOURCES
-        or set(source_hours) != STAGE211_SUPPLEMENTAL_SOURCES
+        or set(source_counts) != expected_sources
+        or set(source_hours) != expected_sources
         or any(value <= 0 for value in source_count_values)
         or any(not math.isfinite(value) or value <= 0.0 for value in source_hour_values)
         or sum(source_count_values) != selected_rows
@@ -118,10 +255,28 @@ def validate_stage211_supplemental_inventory(
         )
     ):
         raise ValueError("Stage211 supplemental selected source totals are invalid.")
+    if combined:
+        assert component_base is not None and component_social is not None
+        expected_rows = int(component_base["rows"]) + int(component_social["selected_rows"])
+        expected_hours = float(component_base["hours"]) + float(
+            component_social["selected_hours"]
+        )
+        if selected_rows != expected_rows or not math.isclose(
+            selected_hours,
+            expected_hours,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("Stage211 combined supplemental component sum changed.")
     dedupe = inventory.get("dedupe")
     if (
         not isinstance(dedupe, dict)
-        or dedupe.get("algorithm") != "blake2b16(corpus + NUL + source_identity)"
+        or dedupe.get("algorithm")
+        != (
+            "component_bound_base_source_identity_plus_social_normalized_pcm_exact"
+            if combined
+            else "blake2b16(corpus + NUL + source_identity)"
+        )
         or int(dedupe.get("accepted_unique_rows", -1)) != selected_rows
     ):
         raise ValueError("Stage211 supplemental source-identity dedupe proof is invalid.")
@@ -131,11 +286,17 @@ def validate_stage211_supplemental_inventory(
         or cross_pool.get("mode") != "source_identity_plus_known_corpus_exclusion"
         or cross_pool.get("content_fingerprint_complete") is not False
         or cross_pool.get("source_sets_disjoint") is not True
-        or set(cross_pool.get("supplemental_sources") or []) != STAGE211_SUPPLEMENTAL_SOURCES
+        or set(cross_pool.get("supplemental_sources") or []) != expected_sources
         or set(cross_pool.get("known_overlap_exclusions") or [])
         != {"llaso_gigaspeech", "llaso_librispeech"}
     ):
         raise ValueError("Stage211 supplemental cross-pool dedupe proof is invalid.")
+    if combined and (
+        cross_pool.get("social_normalized_pcm_exact_complete") is not True
+        or cross_pool.get("social_public_overlap_mode") != "normalized_pcm_exact"
+        or cross_pool.get("near_duplicate_complete") is not False
+    ):
+        raise ValueError("Stage211 combined social dedupe disclosure is invalid.")
     stage179 = cross_pool.get("stage179")
     if not isinstance(stage179, dict) or stage179.get("expected_source_set_match") is not True:
         raise ValueError("Stage211 supplemental inventory lacks the Stage179 source binding.")
