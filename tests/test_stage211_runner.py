@@ -927,6 +927,43 @@ def test_stage211_hourly_monitor_reports_bound_live_progress(
     assert "step=25 loss=0.1000" in result.stdout
 
 
+def test_stage211_hourly_monitor_resolves_one_config_from_four_ranks(
+    tmp_path: Path,
+) -> None:
+    monitor_script = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ps = fake_bin / "ps"
+    fake_ps.write_text(
+        "#!/usr/bin/env bash\n"
+        "for rank in 0 1 2 3; do\n"
+        "  printf '%s\\n' \"python3 -m rwkvasr.cli.train_ctc_deepspeed "
+        "--config-yaml /tmp/stage211_active.yaml --rank ${rank}\"\n"
+        "done\n"
+        "printf '%s\\n' 'python3 -m unrelated --config-yaml /tmp/ignored.yaml'\n",
+        encoding="utf-8",
+    )
+    fake_ps.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; stage211_active_config_paths',
+            "stage211-monitor-test",
+            str(monitor_script),
+        ],
+        cwd=REPO_ROOT,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["/tmp/stage211_active.yaml"]
+
+
 def test_stage211_calibration_eval_validator_cli_loads() -> None:
     result = subprocess.run(
         [

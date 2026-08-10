@@ -72,9 +72,9 @@ stage211_active_config_paths() {
   ps -C python3 -o args= 2>/dev/null |
     awk '
       /rwkvasr\.cli\.train_ctc_deepspeed/ && /stage211/ {
-        for (index = 1; index <= NF; ++index) {
-          if ($index == "--config-yaml" && index < NF) {
-            print $(index + 1)
+        for (field_index = 1; field_index <= NF; ++field_index) {
+          if ($field_index == "--config-yaml" && field_index < NF) {
+            print $(field_index + 1)
           }
         }
       }
