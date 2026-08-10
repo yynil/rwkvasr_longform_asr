@@ -1,11 +1,14 @@
 import io
 import json
+import pickle
 import sys
 import tarfile
 import types
 import wave
+import zipfile
 from pathlib import Path
 
+import pytest
 import torch
 import soundfile
 
@@ -13,6 +16,7 @@ import rwkvasr.data.webdataset as webdataset_module
 
 from rwkvasr.data import (
     LengthBucketedBatchSampler,
+    LengthIndexedWebDatasetDataset,
     StableHashSplitConfig,
     WebDatasetASRIterableDataset,
     WebDatasetConfig,
@@ -29,6 +33,7 @@ from rwkvasr.data import (
     load_webdataset_bucket_manifest,
     load_webdataset_length_entries,
 )
+from rwkvasr.data.webdataset_lengths import parse_webdataset_length_entry
 from rwkvasr.data.webdataset_bucketed import (
     _BucketEntryStream,
     _SourceInterleavedBucketEntryStream,
@@ -554,6 +559,227 @@ def test_webdataset_supports_mp3_audio_members_and_random_access_length_reads(tm
 
     assert batch.features.shape[0] >= 1
     assert batch.features.shape[2] == 80
+
+
+def _supplemental_entry(
+    *,
+    shard_name: str,
+    storage_kind: str,
+    audio_member: str,
+    audio_size: int | None,
+    **storage_fields: object,
+) -> dict[str, object]:
+    return {
+        "shard_name": shard_name,
+        "key": "supplemental-1",
+        "utt_id": "supplemental-1",
+        "split": "train",
+        "num_frames": 100,
+        "audio_member": audio_member,
+        "audio_format": "wav",
+        "audio_size": audio_size,
+        "json_member": "",
+        "storage_kind": storage_kind,
+        "language": "en",
+        "sample_rate": 16000,
+        "source_dataset": "supplemental_test",
+        **storage_fields,
+    }
+
+
+def test_bucketed_loader_reads_audio_only_zip_and_forwards_teacher_bytes(tmp_path: Path) -> None:
+    root = tmp_path / "zip_root"
+    root.mkdir()
+    audio_bytes = _make_wav_bytes(16000)
+    zip_path = root / "supplemental.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("LJSpeech/wavs/sample.wav", audio_bytes)
+        info = archive.getinfo("LJSpeech/wavs/sample.wav")
+    entry = _supplemental_entry(
+        shard_name=zip_path.name,
+        storage_kind="zip",
+        audio_member=info.filename,
+        audio_size=info.file_size,
+        zip_crc32=info.CRC,
+        zip_compress_type=info.compress_type,
+    )
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[("train/bucket_0001/part_000000.jsonl", [entry])],
+    )
+    loader = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            split="train",
+            allow_missing_targets=True,
+        ),
+        batch_size=1,
+        num_workers=0,
+        rank=0,
+        world_size=1,
+    )
+
+    batch = next(iter(loader))
+
+    assert batch.utt_ids == ["supplemental-1"]
+    assert batch.features.shape == (1, 98, 80)
+    assert batch.ctc_teacher_audio_rows is not None
+    assert batch.ctc_teacher_audio_rows[0] is not None
+    assert batch.ctc_teacher_audio_rows[0]["storage_kind"] == "zip"
+    assert batch.ctc_teacher_audio_rows[0]["_audio_bytes"] == audio_bytes
+
+
+def test_bucketed_loader_reads_audio_only_parquet_and_forwards_teacher_bytes(
+    tmp_path: Path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "parquet_root"
+    root.mkdir()
+    audio_bytes = _make_wav_bytes(16000)
+    parquet_path = root / "supplemental.parquet"
+    audio_type = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    table = pa.table(
+        {
+            "id": pa.array(["supplemental-1"]),
+            "audio": pa.array(
+                [{"bytes": audio_bytes, "path": "supplemental-1.wav"}],
+                type=audio_type,
+            ),
+            "duration_ms": pa.array([1000], type=pa.int32()),
+            "text": pa.array(["not used by online distillation"]),
+        }
+    )
+    pq.write_table(table, parquet_path, row_group_size=1)
+    entry = _supplemental_entry(
+        shard_name=parquet_path.name,
+        storage_kind="parquet",
+        audio_member="supplemental-1.wav",
+        audio_size=None,
+        parquet_row_group=0,
+        parquet_row_index=0,
+        parquet_id="supplemental-1",
+    )
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[("train/bucket_0001/part_000000.jsonl", [entry])],
+    )
+    loader = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            split="train",
+            allow_missing_targets=True,
+        ),
+        batch_size=1,
+        num_workers=0,
+        rank=0,
+        world_size=1,
+    )
+
+    batch = next(iter(loader))
+
+    assert batch.utt_ids == ["supplemental-1"]
+    assert batch.features.shape == (1, 98, 80)
+    assert batch.ctc_teacher_audio_rows is not None
+    assert batch.ctc_teacher_audio_rows[0] is not None
+    assert batch.ctc_teacher_audio_rows[0]["storage_kind"] == "parquet"
+    assert batch.ctc_teacher_audio_rows[0]["_audio_bytes"] == audio_bytes
+
+
+def test_length_index_rejects_unknown_storage_and_incomplete_parquet_locator() -> None:
+    base = _supplemental_entry(
+        shard_name="supplemental.bin",
+        storage_kind="unknown",
+        audio_member="sample.wav",
+        audio_size=1,
+    )
+    with pytest.raises(ValueError, match="Unsupported length-index storage_kind"):
+        parse_webdataset_length_entry(base)
+
+    base["storage_kind"] = "parquet"
+    with pytest.raises(ValueError, match="parquet_row_group"):
+        parse_webdataset_length_entry(base)
+
+
+def test_length_index_dataset_pickle_drops_open_zip_reader_cache(tmp_path: Path) -> None:
+    audio_bytes = _make_wav_bytes(16000)
+    zip_path = tmp_path / "supplemental.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("sample.wav", audio_bytes)
+        info = archive.getinfo("sample.wav")
+    entry = parse_webdataset_length_entry(
+        _supplemental_entry(
+            shard_name=zip_path.name,
+            storage_kind="zip",
+            audio_member=info.filename,
+            audio_size=info.file_size,
+            zip_crc32=info.CRC,
+            zip_compress_type=info.compress_type,
+        )
+    )
+    dataset = LengthIndexedWebDatasetDataset(
+        tmp_path,
+        [entry],
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(allow_missing_targets=True),
+    )
+    assert dataset[0]["utt_id"] == "supplemental-1"
+    assert len(dataset._reader_cache) == 1
+
+    restored = pickle.loads(pickle.dumps(dataset))
+
+    assert len(restored._reader_cache) == 0
+    assert restored[0]["utt_id"] == "supplemental-1"
+
+
+def test_bucketed_loader_refuses_truncated_zip_archive(tmp_path: Path) -> None:
+    root = tmp_path / "bad_zip_root"
+    root.mkdir()
+    audio_bytes = _make_wav_bytes(16000)
+    zip_path = root / "truncated.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("sample.wav", audio_bytes)
+        info = archive.getinfo("sample.wav")
+    zip_path.write_bytes(zip_path.read_bytes()[:-22])
+    entry = _supplemental_entry(
+        shard_name=zip_path.name,
+        storage_kind="zip",
+        audio_member=info.filename,
+        audio_size=info.file_size,
+        zip_crc32=info.CRC,
+        zip_compress_type=info.compress_type,
+    )
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[("train/bucket_0001/part_000000.jsonl", [entry])],
+    )
+    loader = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            split="train",
+            allow_missing_targets=True,
+            skip_decode_errors=False,
+        ),
+        batch_size=1,
+        num_workers=0,
+        rank=0,
+        world_size=1,
+    )
+
+    with pytest.raises(zipfile.BadZipFile):
+        next(iter(loader))
 
 
 def test_length_bucketed_batch_sampler_splits_global_batches_across_ranks() -> None:

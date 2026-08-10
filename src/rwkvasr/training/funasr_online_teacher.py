@@ -330,6 +330,33 @@ def _resolve_audio_path(
     if audio_cache_dir is None:
         raise ValueError("row has no usable audio_path; set ctc_teacher_online_audio_cache_dir")
 
+    audio_member = str(row.get("audio_member") or row.get("wav_member") or "").strip()
+    if not audio_member:
+        raise ValueError("row has no audio_member/wav_member for archive-backed audio")
+
+    audio_cache_dir.mkdir(parents=True, exist_ok=True)
+    out_path = audio_cache_dir / _safe_audio_name(utt_id, audio_member)
+    audio_size_raw = row.get("audio_size")
+    expected_size = int(audio_size_raw) if audio_size_raw is not None else None
+    embedded_audio = row.get("_audio_bytes")
+    if isinstance(embedded_audio, (bytes, bytearray, memoryview)):
+        payload = bytes(embedded_audio)
+        if expected_size is not None and len(payload) != expected_size:
+            raise ValueError(
+                f"Embedded audio size changed for {utt_id}: "
+                f"expected {expected_size} got {len(payload)}"
+            )
+        if (
+            keep_audio_cache
+            and out_path.exists()
+            and (expected_size is None or out_path.stat().st_size == expected_size)
+        ):
+            return _ResolvedAudioPath(str(out_path), temporary=False)
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        tmp_path.write_bytes(payload)
+        tmp_path.replace(out_path)
+        return _ResolvedAudioPath(str(out_path), temporary=not bool(keep_audio_cache))
+
     tar_path_value = str(row.get("tar_path") or row.get("shard_path") or "").strip()
     if not tar_path_value:
         shard_name = str(row.get("shard_name") or row.get("shard") or "").strip()
@@ -342,14 +369,6 @@ def _resolve_audio_path(
     if not tar_path.exists():
         raise FileNotFoundError(str(tar_path))
 
-    audio_member = str(row.get("audio_member") or row.get("wav_member") or "").strip()
-    if not audio_member:
-        raise ValueError("row has no audio_member/wav_member for tar-backed audio")
-
-    audio_cache_dir.mkdir(parents=True, exist_ok=True)
-    out_path = audio_cache_dir / _safe_audio_name(utt_id, audio_member)
-    audio_size_raw = row.get("audio_size")
-    expected_size = int(audio_size_raw) if audio_size_raw is not None else None
     if (
         keep_audio_cache
         and out_path.exists()

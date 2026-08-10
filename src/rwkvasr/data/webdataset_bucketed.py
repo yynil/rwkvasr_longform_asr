@@ -4,13 +4,12 @@ import queue
 import json
 import math
 import random
-import tarfile
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Iterable, Iterator, TextIO
+from typing import Any, Callable, Iterable, Iterator, TextIO
 
 from .manifest import ASRBatch, FeatureCollator, TokenizerLike, WenetFbankFeatureExtractor
 from .webdataset import (
@@ -19,7 +18,12 @@ from .webdataset import (
     log_webdataset_decode_skip,
     preload_decoder_ctc_draft_cache,
 )
-from .webdataset_lengths import WebDatasetLengthEntry, parse_webdataset_length_entry
+from .webdataset_lengths import (
+    WebDatasetLengthEntry,
+    _make_shard_reader,
+    _read_indexed_entry_payload,
+    parse_webdataset_length_entry,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,51 +164,6 @@ def estimate_bucket_manifest_tail_padding_samples(
     return total_padding
 
 
-class _TarShardReader:
-    def __init__(self, shard_path: Path):
-        self.shard_path = shard_path
-        self._binary: BinaryIO | None = None
-        self._archive: tarfile.TarFile | None = None
-
-    def close(self) -> None:
-        if self._archive is not None:
-            self._archive.close()
-            self._archive = None
-        if self._binary is not None:
-            self._binary.close()
-            self._binary = None
-
-    @property
-    def is_open(self) -> bool:
-        return self._archive is not None or self._binary is not None
-
-    def _binary_handle(self) -> BinaryIO:
-        if self._binary is None:
-            self._binary = self.shard_path.open("rb")
-        return self._binary
-
-    def _archive_handle(self) -> tarfile.TarFile:
-        if self._archive is None:
-            self._archive = tarfile.open(self.shard_path, "r")
-        return self._archive
-
-    def read_member(self, member_name: str, *, offset: int | None, size: int | None) -> bytes:
-        if offset is not None and size is not None:
-            handle = self._binary_handle()
-            handle.seek(offset)
-            payload = handle.read(size)
-            if len(payload) != size:
-                raise EOFError(
-                    f"Short read for {self.shard_path.name}:{member_name}; expected {size} bytes got {len(payload)}"
-                )
-            return payload
-
-        extracted = self._archive_handle().extractfile(member_name)
-        if extracted is None:
-            raise FileNotFoundError(f"Missing tar member {self.shard_path.name}:{member_name}")
-        return extracted.read()
-
-
 class _BucketEntryStream:
     def __init__(self, manifest_path: Path, parts: tuple[WebDatasetBucketPart, ...]):
         self._manifest_path = manifest_path
@@ -320,25 +279,26 @@ class _ThreadLocalTarReaderPool:
         self._shard_root = shard_root
         self._max_open_shards_per_worker = max(1, int(max_open_shards_per_worker))
         self._local = threading.local()
-        self._created: list[_TarShardReader] = []
+        self._created: list[Any] = []
         self._created_lock = threading.Lock()
 
-    def get(self, shard_name: str) -> _TarShardReader:
+    def get(self, shard_name: str, *, storage_kind: str = "tar") -> Any:
         readers = getattr(self._local, "readers", None)
         if readers is None:
             readers = OrderedDict()
             self._local.readers = readers
-        reader = readers.get(shard_name)
+        cache_key = shard_name if storage_kind == "tar" else f"{storage_kind}\0{shard_name}"
+        reader = readers.get(cache_key)
         if reader is None:
-            reader = _TarShardReader(self._shard_root / shard_name)
-            readers[shard_name] = reader
+            reader = _make_shard_reader(storage_kind, self._shard_root / shard_name)
+            readers[cache_key] = reader
             with self._created_lock:
                 self._created.append(reader)
             while len(readers) > self._max_open_shards_per_worker:
                 _, evicted = readers.popitem(last=False)
                 evicted.close()
         else:
-            readers.move_to_end(shard_name)
+            readers.move_to_end(cache_key)
         return reader
 
     def close(self) -> None:
@@ -638,6 +598,7 @@ class BucketedWebDatasetBatchLoader:
         row.setdefault("wav_member", entry.audio_member)
         row["audio_format"] = entry.audio_format
         row["json_member"] = entry.json_member
+        row["storage_kind"] = entry.storage_kind
         if entry.audio_offset is not None:
             row["audio_offset"] = int(entry.audio_offset)
         if entry.audio_size is not None:
@@ -646,6 +607,14 @@ class BucketedWebDatasetBatchLoader:
             row["json_offset"] = int(entry.json_offset)
         if entry.json_size is not None:
             row["json_size"] = int(entry.json_size)
+        if entry.zip_crc32 is not None:
+            row["zip_crc32"] = int(entry.zip_crc32)
+        if entry.zip_compress_type is not None:
+            row["zip_compress_type"] = int(entry.zip_compress_type)
+        if entry.parquet_row_group is not None:
+            row["parquet_row_group"] = int(entry.parquet_row_group)
+        if entry.parquet_row_index is not None:
+            row["parquet_row_index"] = int(entry.parquet_row_index)
         row.setdefault("split", entry.split)
         row.setdefault("num_frames", int(entry.num_frames))
         return row
@@ -656,17 +625,11 @@ class BucketedWebDatasetBatchLoader:
         reader_pool: _ThreadLocalTarReaderPool,
     ) -> dict[str, Any] | None:
         try:
-            reader = reader_pool.get(entry.shard_name)
-            audio_bytes = reader.read_member(
-                entry.audio_member,
-                offset=entry.audio_offset,
-                size=entry.audio_size,
+            reader = reader_pool.get(
+                entry.shard_name,
+                storage_kind=entry.storage_kind,
             )
-            metadata_bytes = reader.read_member(
-                entry.json_member,
-                offset=entry.json_offset,
-                size=entry.json_size,
-            )
+            audio_bytes, metadata_bytes = _read_indexed_entry_payload(reader, entry)
             sample = decode_webdataset_sample(
                 key=entry.key,
                 audio_bytes=audio_bytes,
@@ -707,6 +670,8 @@ class BucketedWebDatasetBatchLoader:
                 sample,
                 tar_path=reader.shard_path,
             )
+            if entry.storage_kind != "tar":
+                sample["ctc_teacher_audio_row"]["_audio_bytes"] = audio_bytes
             return sample
         except Exception as exc:
             if not self.config.skip_decode_errors:

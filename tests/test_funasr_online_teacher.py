@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from rwkvasr.training.funasr_online_teacher import (
     FunASROnlineCTCTeacherConfig,
     _capture_funasr_ctc_decoder_hiddens,
     _capture_funasr_encoder_hiddens,
+    _resolve_audio_path,
 )
 
 
@@ -80,6 +82,25 @@ class _FakeNanoModel(nn.Module):
         self.ctc_decoder = _FakeCTCDecoder()
         self.ctc = _FakeCTC(dim, vocab_size)
         self.blank_id = vocab_size - 1
+
+
+def test_resolve_audio_path_materializes_embedded_archive_bytes(tmp_path) -> None:
+    payload = b"embedded-audio-payload"
+    resolved = _resolve_audio_path(
+        {
+            "audio_member": "MLS/sample.wav",
+            "audio_size": len(payload),
+            "_audio_bytes": payload,
+        },
+        "utt-embedded",
+        shard_paths={},
+        audio_cache_dir=tmp_path,
+        keep_audio_cache=False,
+    )
+
+    assert resolved.temporary is True
+    assert resolved.path != ""
+    assert Path(resolved.path).read_bytes() == payload
 
 
 def test_capture_funasr_encoder_hiddens_collects_requested_components() -> None:

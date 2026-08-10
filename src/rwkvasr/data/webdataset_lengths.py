@@ -4,6 +4,8 @@ import json
 import random
 import tarfile
 import time
+import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
@@ -21,6 +23,7 @@ from .webdataset_common import AUDIO_SUFFIXES
 from .webdataset_index import StableHashSplitConfig, assign_split, resolve_sample_id
 
 MAX_IN_MEMORY_LENGTH_INDEX_BYTES = 1 << 30
+SUPPORTED_LENGTH_INDEX_STORAGE_KINDS = frozenset({"tar", "zip", "parquet"})
 
 
 def _log(message: str) -> None:
@@ -37,6 +40,7 @@ class WebDatasetLengthEntry:
     audio_member: str
     audio_format: str
     json_member: str
+    storage_kind: str = "tar"
     num_text_tokens: int | None = None
     num_text_chars: int | None = None
     text_bytes: int | None = None
@@ -44,6 +48,10 @@ class WebDatasetLengthEntry:
     audio_size: int | None = None
     json_offset: int | None = None
     json_size: int | None = None
+    zip_crc32: int | None = None
+    zip_compress_type: int | None = None
+    parquet_row_group: int | None = None
+    parquet_row_index: int | None = None
     raw: dict[str, Any] | None = None
 
     @property
@@ -267,6 +275,12 @@ def load_webdataset_length_entries(
 
 
 def parse_webdataset_length_entry(raw: dict[str, Any]) -> WebDatasetLengthEntry:
+    storage_kind = str(raw.get("storage_kind") or "tar").strip().lower()
+    if storage_kind not in SUPPORTED_LENGTH_INDEX_STORAGE_KINDS:
+        raise ValueError(
+            f"Unsupported length-index storage_kind={storage_kind!r}; "
+            f"expected one of {sorted(SUPPORTED_LENGTH_INDEX_STORAGE_KINDS)}"
+        )
     audio_size = (
         int(raw["audio_size"])
         if raw.get("audio_size") is not None
@@ -278,6 +292,29 @@ def parse_webdataset_length_entry(raw: dict[str, Any]) -> WebDatasetLengthEntry:
             "WebDataset length entry has a non-positive audio_size: "
             f"key={sample_key!r} audio_size={audio_size}"
         )
+    parquet_row_group = (
+        int(raw["parquet_row_group"])
+        if raw.get("parquet_row_group") is not None
+        else None
+    )
+    parquet_row_index = (
+        int(raw["parquet_row_index"])
+        if raw.get("parquet_row_index") is not None
+        else None
+    )
+    if storage_kind == "parquet" and (
+        parquet_row_group is None
+        or parquet_row_group < 0
+        or parquet_row_index is None
+        or parquet_row_index < 0
+    ):
+        raise ValueError(
+            "Parquet length-index entries require non-negative "
+            "parquet_row_group and parquet_row_index values."
+        )
+    json_member = str(raw.get("json_member") or "")
+    if storage_kind == "tar" and not json_member:
+        raise ValueError("Tar length-index entries require json_member.")
     return WebDatasetLengthEntry(
         shard_name=str(raw["shard_name"]),
         key=str(raw["key"]),
@@ -304,7 +341,8 @@ def parse_webdataset_length_entry(raw: dict[str, Any]) -> WebDatasetLengthEntry:
             raw.get("audio_format")
             or _member_audio_format(str(raw.get("audio_member") or raw["wav_member"]))
         ),
-        json_member=str(raw["json_member"]),
+        json_member=json_member,
+        storage_kind=storage_kind,
         audio_offset=(
             int(raw["audio_offset"])
             if raw.get("audio_offset") is not None
@@ -321,6 +359,18 @@ def parse_webdataset_length_entry(raw: dict[str, Any]) -> WebDatasetLengthEntry:
             if raw.get("json_size") is not None
             else None
         ),
+        zip_crc32=(
+            int(raw["zip_crc32"])
+            if raw.get("zip_crc32") is not None
+            else None
+        ),
+        zip_compress_type=(
+            int(raw["zip_compress_type"])
+            if raw.get("zip_compress_type") is not None
+            else None
+        ),
+        parquet_row_group=parquet_row_group,
+        parquet_row_index=parquet_row_index,
         raw=dict(raw),
     )
 
@@ -346,6 +396,10 @@ class _TarShardReader:
         if self._binary is not None:
             self._binary.close()
             self._binary = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._archive is not None or self._binary is not None
 
     def _binary_handle(self) -> BinaryIO:
         if self._binary is None:
@@ -374,6 +428,219 @@ class _TarShardReader:
         return extracted.read()
 
 
+class _ZipShardReader:
+    def __init__(self, shard_path: Path):
+        self.shard_path = shard_path
+        self._archive: zipfile.ZipFile | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {"shard_path": self.shard_path}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.shard_path = Path(state["shard_path"])
+        self._archive = None
+
+    def close(self) -> None:
+        if self._archive is not None:
+            self._archive.close()
+            self._archive = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._archive is not None
+
+    def _archive_handle(self) -> zipfile.ZipFile:
+        if self._archive is None:
+            self._archive = zipfile.ZipFile(self.shard_path, "r")
+        return self._archive
+
+    def read_member(
+        self,
+        member_name: str,
+        *,
+        size: int | None,
+        crc32: int | None,
+        compress_type: int | None,
+    ) -> bytes:
+        archive = self._archive_handle()
+        info = archive.getinfo(member_name)
+        if size is not None and int(info.file_size) != int(size):
+            raise ValueError(
+                f"ZIP member size changed for {self.shard_path.name}:{member_name}; "
+                f"expected {size} got {info.file_size}"
+            )
+        if crc32 is not None and int(info.CRC) != int(crc32):
+            raise ValueError(
+                f"ZIP member CRC changed for {self.shard_path.name}:{member_name}; "
+                f"expected {crc32} got {info.CRC}"
+            )
+        if compress_type is not None and int(info.compress_type) != int(compress_type):
+            raise ValueError(
+                f"ZIP compression changed for {self.shard_path.name}:{member_name}; "
+                f"expected {compress_type} got {info.compress_type}"
+            )
+        payload = archive.read(info)
+        if size is not None and len(payload) != int(size):
+            raise EOFError(
+                f"Short ZIP read for {self.shard_path.name}:{member_name}; "
+                f"expected {size} bytes got {len(payload)}"
+            )
+        return payload
+
+
+class _ParquetShardReader:
+    AUDIO_COLUMNS = ("id", "audio", "duration_ms")
+
+    def __init__(self, shard_path: Path):
+        self.shard_path = shard_path
+        self._parquet_file: Any | None = None
+        self._cached_row_group: int | None = None
+        self._cached_table: Any | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {"shard_path": self.shard_path}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.shard_path = Path(state["shard_path"])
+        self._parquet_file = None
+        self._cached_row_group = None
+        self._cached_table = None
+
+    def close(self) -> None:
+        self._cached_table = None
+        self._cached_row_group = None
+        self._parquet_file = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._parquet_file is not None
+
+    def _handle(self) -> Any:
+        if self._parquet_file is None:
+            try:
+                import pyarrow.parquet as pq
+            except ImportError as exc:  # pragma: no cover - covered by preprocess environments
+                raise RuntimeError(
+                    "Reading Parquet-backed audio requires the preprocess extra (pyarrow)."
+                ) from exc
+            self._parquet_file = pq.ParquetFile(self.shard_path)
+        return self._parquet_file
+
+    def read_audio_row(self, *, row_group: int, row_index: int) -> tuple[bytes, dict[str, Any]]:
+        if self._cached_row_group != row_group or self._cached_table is None:
+            self._cached_table = self._handle().read_row_group(
+                row_group,
+                columns=list(self.AUDIO_COLUMNS),
+            )
+            self._cached_row_group = int(row_group)
+        table = self._cached_table
+        if row_index < 0 or row_index >= len(table):
+            raise IndexError(
+                f"Parquet row index {row_index} outside row-group size {len(table)} "
+                f"for {self.shard_path.name} row_group={row_group}"
+            )
+        audio_value = table.column("audio")[row_index].as_py()
+        if not isinstance(audio_value, dict):
+            raise ValueError(
+                f"Parquet audio value is not a struct for {self.shard_path.name} "
+                f"row_group={row_group} row={row_index}"
+            )
+        audio_bytes = audio_value.get("bytes")
+        if not isinstance(audio_bytes, (bytes, bytearray, memoryview)) or not audio_bytes:
+            raise ValueError(
+                f"Parquet audio payload is empty for {self.shard_path.name} "
+                f"row_group={row_group} row={row_index}"
+            )
+        metadata = {
+            "id": str(table.column("id")[row_index].as_py() or ""),
+            "duration_ms": int(table.column("duration_ms")[row_index].as_py() or 0),
+            "audio_path": str(audio_value.get("path") or ""),
+        }
+        return bytes(audio_bytes), metadata
+
+
+def _make_shard_reader(storage_kind: str, shard_path: Path) -> Any:
+    if storage_kind == "tar":
+        return _TarShardReader(shard_path)
+    if storage_kind == "zip":
+        return _ZipShardReader(shard_path)
+    if storage_kind == "parquet":
+        return _ParquetShardReader(shard_path)
+    raise ValueError(f"Unsupported storage_kind={storage_kind!r}")
+
+
+def _generated_metadata(entry: WebDatasetLengthEntry) -> dict[str, Any]:
+    raw = entry.raw or {}
+    metadata = {
+        "text": str(raw.get("text") or ""),
+        "sid": entry.utt_id,
+        "utt_id": entry.utt_id,
+        "id": entry.utt_id,
+        "language": str(raw.get("language") or raw.get("lang") or "unknown"),
+        "format": entry.audio_format,
+        "duration": float(entry.num_frames) / 100.0,
+        "num_frames": int(entry.num_frames),
+    }
+    if raw.get("sample_rate") is not None:
+        metadata["sample_rate"] = int(raw["sample_rate"])
+    return metadata
+
+
+def _read_indexed_entry_payload(
+    reader: Any,
+    entry: WebDatasetLengthEntry,
+) -> tuple[bytes, bytes]:
+    if entry.storage_kind == "tar":
+        audio_bytes = reader.read_member(
+            entry.audio_member,
+            offset=entry.audio_offset,
+            size=entry.audio_size,
+        )
+        metadata_bytes = reader.read_member(
+            entry.json_member,
+            offset=entry.json_offset,
+            size=entry.json_size,
+        )
+        return audio_bytes, metadata_bytes
+
+    metadata = _generated_metadata(entry)
+    if entry.storage_kind == "zip":
+        audio_bytes = reader.read_member(
+            entry.audio_member,
+            size=entry.audio_size,
+            crc32=entry.zip_crc32,
+            compress_type=entry.zip_compress_type,
+        )
+    elif entry.storage_kind == "parquet":
+        assert entry.parquet_row_group is not None
+        assert entry.parquet_row_index is not None
+        audio_bytes, parquet_metadata = reader.read_audio_row(
+            row_group=entry.parquet_row_group,
+            row_index=entry.parquet_row_index,
+        )
+        expected_id = str((entry.raw or {}).get("parquet_id") or entry.utt_id)
+        actual_id = str(parquet_metadata.get("id") or "")
+        if expected_id and actual_id != expected_id:
+            raise ValueError(
+                f"Parquet row identity changed for {reader.shard_path.name}: "
+                f"expected {expected_id!r} got {actual_id!r}"
+            )
+        duration_ms = int(parquet_metadata.get("duration_ms") or 0)
+        if duration_ms <= 0:
+            raise ValueError(
+                f"Parquet duration is non-positive for {reader.shard_path.name}: "
+                f"row_group={entry.parquet_row_group} row={entry.parquet_row_index}"
+            )
+        metadata["duration_ms"] = duration_ms
+        metadata["duration"] = duration_ms / 1000.0
+        audio_path = str(parquet_metadata.get("audio_path") or "")
+        if audio_path:
+            metadata["audio_path"] = audio_path
+    else:  # pragma: no cover - parser rejects this first
+        raise ValueError(f"Unsupported storage_kind={entry.storage_kind!r}")
+    return audio_bytes, json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+
+
 class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
@@ -392,7 +659,7 @@ class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
         self.feature_extractor = feature_extractor or WenetFbankFeatureExtractor()
         self.config = config or WebDatasetConfig()
         preload_decoder_ctc_draft_cache(self.config)
-        self._reader_cache: dict[str, _TarShardReader] = {}
+        self._reader_cache: OrderedDict[str, Any] = OrderedDict()
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -406,25 +673,25 @@ class LengthIndexedWebDatasetDataset(Dataset[dict[str, Any]]):
     def __len__(self) -> int:
         return len(self.entries)
 
-    def _reader(self, shard_name: str) -> _TarShardReader:
-        reader = self._reader_cache.get(shard_name)
+    def _reader(self, entry: WebDatasetLengthEntry) -> Any:
+        cache_key = f"{entry.storage_kind}\0{entry.shard_name}"
+        reader = self._reader_cache.get(cache_key)
         if reader is None:
-            reader = _TarShardReader(self.shard_root / shard_name)
-            self._reader_cache[shard_name] = reader
+            reader = _make_shard_reader(
+                entry.storage_kind,
+                self.shard_root / entry.shard_name,
+            )
+            self._reader_cache[cache_key] = reader
+            while len(self._reader_cache) > max(1, int(self.config.max_open_shards_per_worker)):
+                _, evicted = self._reader_cache.popitem(last=False)
+                evicted.close()
+        else:
+            self._reader_cache.move_to_end(cache_key)
         return reader
 
     def _decode_entry(self, entry: WebDatasetLengthEntry) -> dict[str, Any]:
-        reader = self._reader(entry.shard_name)
-        audio_bytes = reader.read_member(
-            entry.audio_member,
-            offset=entry.audio_offset,
-            size=entry.audio_size,
-        )
-        metadata_bytes = reader.read_member(
-            entry.json_member,
-            offset=entry.json_offset,
-            size=entry.json_size,
-        )
+        reader = self._reader(entry)
+        audio_bytes, metadata_bytes = _read_indexed_entry_payload(reader, entry)
         return decode_webdataset_sample(
             key=entry.key,
             audio_bytes=audio_bytes,
