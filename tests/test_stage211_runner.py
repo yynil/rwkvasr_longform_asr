@@ -578,10 +578,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
         "--baseline-public-comparison-report "
         '"${CALIBRATION_EVAL_DIR}/public/nano_comparison.json"' in script
     )
-    assert (
-        "--baseline-public-comparison-report "
-        '"${PHASE_GATE_ROOT}/mixer/nano_comparison.json"' in script
-    )
+    assert '--baseline-public-comparison-report "${mixer_gate_dir}/nano_comparison.json"' in script
     assert (
         "--baseline-public-comparison-report "
         '"${PHASE_GATE_ROOT}/logits/nano_comparison.json"' in script
@@ -589,15 +586,21 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert '--calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}"' in script
     assert "create_stage211_nano_baseline_receipt.py" in script
     assert '--output "${NANO_BASELINE_RECEIPT}"' in script
+    assert 'START_STAGE="${START_STAGE:-full}"' in script
+    assert "run_stage211_mixer_retention_loop.py" in script
+    assert "MIXER_SELECTION" in script
+    assert "post_mixer)" in script
 
     main_body = script[script.index("main() {") :]
+    full_branch = main_body[main_body.index("full)") : main_body.index("post_mixer)")]
+    assert "run_full_mixer_phase" in full_branch
+    continuation = main_body[main_body.index("esac") :]
     phase_calls = (
-        "run_full_mixer_phase",
         "run_full_block_phase",
         "run_full_logits_phase",
         "run_labeled_sft_phase",
     )
-    phase_offsets = [main_body.index(call) for call in phase_calls]
+    phase_offsets = [continuation.index(call) for call in phase_calls]
     assert phase_offsets == sorted(phase_offsets)
 
 

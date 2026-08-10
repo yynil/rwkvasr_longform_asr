@@ -27,6 +27,11 @@ LABELED_ROOT="${LABELED_ROOT:-/media/usbhd/training_data/asr/curriculum/clean_ct
 SFT_OUTPUT_DIR="${SFT_OUTPUT_DIR:-${FULL_OUTPUT_ROOT}/stage211d_labeled_ctc_sft_1ep}"
 REUSE_COMPLETED_CALIBRATION_EVAL="${REUSE_COMPLETED_CALIBRATION_EVAL:-0}"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${CALIBRATION_EVAL_DIR}/public/reuse_receipt.json}"
+START_STAGE="${START_STAGE:-full}"
+RETENTION_REPLAY_RECEIPT="${RETENTION_REPLAY_RECEIPT:-${METADATA_ROOT}/retention_replay_v1/receipt.json}"
+RETENTION_RUN_ROOT="${RETENTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211a_mixer_retention_correction}"
+RETENTION_GATE_ROOT="${RETENTION_GATE_ROOT:-${PHASE_GATE_ROOT}/mixer_retention}"
+MIXER_SELECTION="${MIXER_SELECTION:-${PHASE_GATE_ROOT}/mixer_selected.json}"
 
 log() {
   printf '[stage211-abcd-bootstrap] %(%Y-%m-%d %H:%M:%S)T %s\n' -1 "$*"
@@ -167,22 +172,35 @@ run_full_mixer_phase() {
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --master-port "${MASTER_PORT}" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
-  log "Stage211A full curriculum finished; starting complete phase evaluation"
-  uv run python "${REPO_ROOT}/scripts/finalize_stage211_phase.py" \
-    --phase mixer \
+  log "Stage211A full curriculum finished; starting strict retention/evaluation loop"
+  run_mixer_retention_loop
+  log "Stage211A Mixer gate passed"
+}
+
+run_mixer_retention_loop() {
+  uv run python "${REPO_ROOT}/scripts/run_stage211_mixer_retention_loop.py" \
     --phase-root "${FULL_OUTPUT_ROOT}/stage211a_mixer_full_data_3ep" \
-    --output-dir "${PHASE_GATE_ROOT}/mixer" \
+    --original-gate-dir "${PHASE_GATE_ROOT}/mixer" \
+    --correction-run-root "${RETENTION_RUN_ROOT}" \
+    --correction-gate-root "${RETENTION_GATE_ROOT}" \
+    --replay-receipt "${RETENTION_REPLAY_RECEIPT}" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
+    --nano-checkpoint "${NANO_CHECKPOINT}" \
     --baseline-public-comparison-report "${CALIBRATION_EVAL_DIR}/public/nano_comparison.json" \
+    --config-dir "${FULL_CONFIG_ROOT}" \
+    --selection "${MIXER_SELECTION}" \
+    --master-port "$((MASTER_PORT + 10))" \
     --devices 0,1,2,3
-  log "Stage211A full phase evaluation and promotion gate finished"
 }
 
 run_full_block_phase() {
   local init_checkpoint
-  IFS= read -r init_checkpoint <"${FULL_OUTPUT_ROOT}/stage211a_mixer_full_data_3ep/final_checkpoint.txt"
-  local promotion_receipt="${PHASE_GATE_ROOT}/mixer/mixer_promotion_receipt.json"
+  init_checkpoint="$(jq -er '.checkpoint_path' "${MIXER_SELECTION}")"
+  local promotion_receipt
+  promotion_receipt="$(jq -er '.promotion_receipt_path' "${MIXER_SELECTION}")"
+  local mixer_gate_dir
+  mixer_gate_dir="$(jq -er '.gate_dir' "${MIXER_SELECTION}")"
   local final_checkpoint_file="${FULL_OUTPUT_ROOT}/stage211b_block_full_data_3ep/final_checkpoint.txt"
   log "starting strict Stage211B full-data controller"
   uv run python "${REPO_ROOT}/scripts/run_stage211_full_phase_curriculum.py" \
@@ -203,7 +221,7 @@ run_full_block_phase() {
     --output-dir "${PHASE_GATE_ROOT}/block" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
-    --baseline-public-comparison-report "${PHASE_GATE_ROOT}/mixer/nano_comparison.json" \
+    --baseline-public-comparison-report "${mixer_gate_dir}/nano_comparison.json" \
     --devices 0,1,2,3
   log "Stage211B full phase evaluation and promotion gate finished"
 }
@@ -267,18 +285,41 @@ run_labeled_sft_phase() {
 
 main() {
   cd "${REPO_ROOT}"
-  wait_for_session "${METADATA_SESSION}" "metadata copy"
-  build_fixed_manifests
-  wait_for_session "${NANO_SESSION}" "Nano full benchmark"
-  validate_nano_predictions
-  wait_for_session "${CALIBRATION_SESSION}" "Stage211A calibration"
-  select_calibration_checkpoint
-  if truthy "${REUSE_COMPLETED_CALIBRATION_EVAL}"; then
-    validate_completed_calibration_eval
-  else
-    evaluate_calibration_checkpoint
-  fi
-  run_full_mixer_phase
+  case "${START_STAGE}" in
+    full)
+      wait_for_session "${METADATA_SESSION}" "metadata copy"
+      build_fixed_manifests
+      wait_for_session "${NANO_SESSION}" "Nano full benchmark"
+      validate_nano_predictions
+      wait_for_session "${CALIBRATION_SESSION}" "Stage211A calibration"
+      select_calibration_checkpoint
+      if truthy "${REUSE_COMPLETED_CALIBRATION_EVAL}"; then
+        validate_completed_calibration_eval
+      else
+        evaluate_calibration_checkpoint
+      fi
+      run_full_mixer_phase
+      ;;
+    post_mixer)
+      run_mixer_retention_loop
+      ;;
+    block)
+      run_mixer_retention_loop
+      ;;
+    logits)
+      run_full_logits_phase
+      run_labeled_sft_phase
+      return
+      ;;
+    sft)
+      run_labeled_sft_phase
+      return
+      ;;
+    *)
+      echo "Unsupported START_STAGE=${START_STAGE}; expected full/post_mixer/block/logits/sft" >&2
+      exit 2
+      ;;
+  esac
   run_full_block_phase
   run_full_logits_phase
   run_labeled_sft_phase
