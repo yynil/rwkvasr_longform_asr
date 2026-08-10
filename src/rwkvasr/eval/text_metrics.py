@@ -8,10 +8,6 @@ from typing import Any
 
 from rwkvasr.data import normalize_asr_text
 
-_WER_TOKEN_PATTERN = re.compile(
-    r"[A-Za-z0-9]+|[\u4e00-\u9fff]"
-)
-
 _APOSTROPHE_CHARS = {"'", "\u2019", "\u02bc", "\uff07"}
 
 _METRIC_EQUIVALENCE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -92,7 +88,26 @@ def tokenize_for_wer(text: str) -> list[str]:
     normalized = _normalize_text_for_error_tokens(text)
     if not normalized:
         return []
-    return _WER_TOKEN_PATTERN.findall(normalized)
+    tokens: list[str] = []
+    word: list[str] = []
+
+    def flush_word() -> None:
+        if word:
+            tokens.append("".join(word))
+            word.clear()
+
+    for ch in normalized:
+        if "\u4e00" <= ch <= "\u9fff":
+            flush_word()
+            tokens.append(ch)
+        elif ch.isalnum():
+            word.append(ch)
+        elif word and unicodedata.category(ch).startswith("M"):
+            word.append(ch)
+        else:
+            flush_word()
+    flush_word()
+    return tokens
 
 
 def tokenize_for_cer(text: str) -> list[str]:

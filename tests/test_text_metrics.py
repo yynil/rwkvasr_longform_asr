@@ -26,6 +26,13 @@ def test_tokenization_is_word_and_char_aware() -> None:
     assert tokenize_for_wer("OK okay O.K.") == ["ok", "ok", "ok"]
     assert tokenize_for_wer("你好世界") == ["你", "好", "世", "界"]
     assert tokenize_for_wer("mix中文text") == ["mix", "中", "文", "text"]
+    assert tokenize_for_wer("Popayán Hückeswagen Wipperfürth Fortià") == [
+        "popayán",
+        "hückeswagen",
+        "wipperfürth",
+        "fortià",
+    ]
+    assert tokenize_for_wer("a\u0338 mix中café") == ["a\u0338", "mix", "中", "café"]
     assert tokenize_for_cer("a b") == ["a", "b"]
     assert tokenize_for_cer("a,b.") == ["a", "b"]
     assert tokenize_for_cer("okay O.K.") == ["o", "k", "o", "k"]
