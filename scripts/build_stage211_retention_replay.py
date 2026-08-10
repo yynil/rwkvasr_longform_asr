@@ -419,15 +419,10 @@ def _make_candidate(
     key: str,
     num_frames: int,
     seed: int,
+    score_hex: str,
+    score_int: int,
 ) -> ReplayCandidate:
     row_sha256 = _payload_sha256(row)
-    score_hex, score_int = _score_candidate(
-        seed=seed,
-        cell=cell,
-        source_dataset=source_dataset,
-        bucket_id=bucket_id,
-        key=key,
-    )
     output_row = dict(row)
     output_row["_stage211_replay_cell"] = cell
     output_row["_stage211_replay_source"] = source_dataset
@@ -524,6 +519,16 @@ def _sample_candidates(
                 quota = quotas.get(stratum, 0)
                 if quota <= 0 or key in heap_keys[stratum]:
                     continue
+                score_hex, score_int = _score_candidate(
+                    seed=seed,
+                    cell=cell,
+                    source_dataset=source_dataset,
+                    bucket_id=bucket_id,
+                    key=key,
+                )
+                heap = heaps[stratum]
+                if len(heap) >= quota and score_int >= -heap[0][0]:
+                    continue
                 candidate = _make_candidate(
                     row=row,
                     part=part,
@@ -534,8 +539,9 @@ def _sample_candidates(
                     key=key,
                     num_frames=num_frames,
                     seed=seed,
+                    score_hex=score_hex,
+                    score_int=score_int,
                 )
-                heap = heaps[stratum]
                 serial += 1
                 entry = (-candidate.score_int, serial, candidate)
                 if len(heap) < quota:

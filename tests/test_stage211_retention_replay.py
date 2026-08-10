@@ -286,3 +286,49 @@ def test_build_stage211_retention_replay_rejects_insufficient_capacity(
             fixed_eval_part=fixed_eval_part,
             cell_targets=targets,
         )
+
+
+def test_stage211_replay_serializes_only_admitted_reservoir_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_manifests = {
+        difficulty: _write_source_manifest(tmp_path / "sources", difficulty=difficulty)[0]
+        for difficulty in builder.DIFFICULTIES
+    }
+    sidecar_receipt, fixed_eval_part = _write_exclusions(
+        tmp_path,
+        sidecar_keys=[],
+        fixed_keys=[],
+    )
+    targets = {
+        "easy_en": 1,
+        "easy_zh": 1,
+        "medium_en": 1,
+        "medium_zh": 1,
+        "hard_en": 1,
+        "hard_zh": 1,
+        "long_zh": 1,
+    }
+    calls = 0
+    original = builder._make_candidate
+
+    def counted_candidate(**kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(builder, "_make_candidate", counted_candidate)
+    receipt = builder.build_retention_replay(
+        source_manifests=source_manifests,
+        output_dir=tmp_path / "output",
+        stratified_receipt=sidecar_receipt,
+        fixed_eval_part=fixed_eval_part,
+        cell_targets=targets,
+        seed=2111,
+    )
+
+    assert receipt["samples"] == 7
+    assert calls < sum(
+        record["declared_train_samples"] for record in receipt["source_manifests"].values()
+    )
