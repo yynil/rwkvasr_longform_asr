@@ -267,9 +267,7 @@ def _rebuild_alignment_gate(
             not stratified_summary_path.is_file()
             or sha256_file(stratified_summary_path) != recorded_sha256
         ):
-            raise ValueError(
-                "Stage211 alignment stratified summary is missing or changed."
-            )
+            raise ValueError("Stage211 alignment stratified summary is missing or changed.")
     if phase == "logits":
         return build_logits_alignment_gate(
             baseline_report_path=baseline_report_path,
@@ -297,9 +295,7 @@ def build_phase_gate(
     coverage_receipt_paths: list[Path],
     alignment_report_path: Path | None,
     baseline_public_comparison_report_path: Path | None = None,
-    nano_public_baseline_receipt_path: Path = (
-        DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT
-    ),
+    nano_public_baseline_receipt_path: Path = (DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT),
 ) -> dict[str, Any]:
     checkpoint_path = checkpoint_path.resolve()
     if not checkpoint_path.is_file():
@@ -317,17 +313,11 @@ def build_phase_gate(
     if public_report.get("student_checkpoint_sha256") != sha256_file(checkpoint_path):
         raise ValueError("Stage211 public comparison checkpoint SHA-256 mismatch.")
     coverage = _parse_coverage_receipts(coverage_receipt_paths, phase=phase)
-    phase_init_checkpoint = Path(
-        str(coverage[0].get("init_checkpoint_path") or "")
-    ).resolve()
-    if (
-        not phase_init_checkpoint.is_file()
-        or sha256_file(phase_init_checkpoint)
-        != coverage[0].get("init_checkpoint_sha256")
+    phase_init_checkpoint = Path(str(coverage[0].get("init_checkpoint_path") or "")).resolve()
+    if not phase_init_checkpoint.is_file() or sha256_file(phase_init_checkpoint) != coverage[0].get(
+        "init_checkpoint_sha256"
     ):
-        raise ValueError(
-            "Stage211 phase initialization checkpoint is missing or changed."
-        )
+        raise ValueError("Stage211 phase initialization checkpoint is missing or changed.")
     alignment_gate_passed = False
     alignment_record: dict[str, Any] | None = None
     if alignment_report_path is not None:
@@ -336,14 +326,13 @@ def build_phase_gate(
             alignment_report_path,
             label="Stage211 alignment gate report",
         )
-        if alignment_report.get("gate_passed") is not True:
-            raise ValueError("Stage211 alignment report does not record a passing decision.")
+        alignment_decision = alignment_report.get("gate_passed")
+        if not isinstance(alignment_decision, bool):
+            raise ValueError("Stage211 alignment report lacks a boolean decision.")
         if alignment_report.get("phase") != phase:
             raise ValueError("Stage211 alignment report phase mismatch.")
         expected_artifact = (
-            "logits_alignment_gate"
-            if phase == "logits"
-            else "hidden_alignment_gate"
+            "logits_alignment_gate" if phase == "logits" else "hidden_alignment_gate"
         )
         if (
             alignment_report.get("schema_version") != 1
@@ -356,20 +345,12 @@ def build_phase_gate(
             raise ValueError("Stage211 alignment report checkpoint path mismatch.")
         if alignment_report.get("checkpoint_sha256") != sha256_file(checkpoint_path):
             raise ValueError("Stage211 alignment report checkpoint SHA-256 mismatch.")
-        if (
-            Path(
-                str(
-                    alignment_report.get("baseline_checkpoint_path")
-                    or ""
-                )
-            ).resolve()
-            != phase_init_checkpoint
-            or alignment_report.get("baseline_checkpoint_sha256")
-            != sha256_file(phase_init_checkpoint)
-        ):
-            raise ValueError(
-                "Stage211 alignment report baseline checkpoint mismatch."
-            )
+        if Path(
+            str(alignment_report.get("baseline_checkpoint_path") or "")
+        ).resolve() != phase_init_checkpoint or alignment_report.get(
+            "baseline_checkpoint_sha256"
+        ) != sha256_file(phase_init_checkpoint):
+            raise ValueError("Stage211 alignment report baseline checkpoint mismatch.")
         baseline_alignment_report_path = Path(
             str(alignment_report.get("baseline_report_path") or "")
         ).resolve()
@@ -381,19 +362,13 @@ def build_phase_gate(
             label="Stage211 alignment baseline source report",
         )
         if (
-            Path(
-                str(
-                    baseline_alignment_source.get("train_config_path")
-                    or ""
-                )
-            ).resolve()
+            Path(str(baseline_alignment_source.get("train_config_path") or "")).resolve()
             != Path(str(coverage[0]["train_config_path"])).resolve()
             or baseline_alignment_source.get("train_config_sha256")
             != coverage[0]["train_config_sha256"]
         ):
             raise ValueError(
-                "Stage211 alignment pair does not bind the easy-segment "
-                "phase train config."
+                "Stage211 alignment pair does not bind the easy-segment phase train config."
             )
         rebuilt_alignment_report = _rebuild_alignment_gate(
             phase=phase,
@@ -404,10 +379,8 @@ def build_phase_gate(
             checkpoint_path=checkpoint_path,
         )
         if rebuilt_alignment_report != alignment_report:
-            raise ValueError(
-                "Stage211 alignment report does not match its bound source reports."
-            )
-        alignment_gate_passed = True
+            raise ValueError("Stage211 alignment report does not match its bound source reports.")
+        alignment_gate_passed = alignment_decision
         alignment_record = {
             "path": str(alignment_report_path),
             "sha256": sha256_file(alignment_report_path),
@@ -418,17 +391,14 @@ def build_phase_gate(
 
     benchmark = _enrich_public_benchmark(public_report, manifest_dir=manifest_dir.resolve())
     teacher_sha256_values = {
-        str(segment.get("nano_teacher_checkpoint_sha256") or "")
-        for segment in coverage
+        str(segment.get("nano_teacher_checkpoint_sha256") or "") for segment in coverage
     }
     if len(teacher_sha256_values) != 1:
         raise ValueError(
             "Stage211 phase coverage does not bind one Nano teacher checkpoint SHA-256."
         )
     nano_teacher_checkpoint_sha256 = next(iter(teacher_sha256_values))
-    nano_public_baseline_receipt_path = (
-        nano_public_baseline_receipt_path.expanduser().resolve()
-    )
+    nano_public_baseline_receipt_path = nano_public_baseline_receipt_path.expanduser().resolve()
     nano_public_baseline = validate_stage211_nano_public_baseline_receipt(
         nano_public_baseline_receipt_path,
         expected_nano_checkpoint_sha256=nano_teacher_checkpoint_sha256,
@@ -495,24 +465,16 @@ def build_phase_gate(
             "total_tail_padding_sample_exposures": (
                 STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
             ),
-            "total_executed_sample_exposures": (
-                STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
-            ),
+            "total_executed_sample_exposures": (STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES),
             "segments": coverage,
             "final_checkpoint_path": str(checkpoint_path),
             "final_checkpoint_sha256": final_checkpoint_sha256,
         },
         "public_comparison_report_path": str(public_comparison_report_path),
         "public_comparison_report_sha256": sha256_file(public_comparison_report_path),
-        "nano_public_baseline_receipt_path": str(
-            nano_public_baseline_receipt_path
-        ),
-        "nano_public_baseline_receipt_sha256": sha256_file(
-            nano_public_baseline_receipt_path
-        ),
-        "nano_public_baseline_checkpoint_sha256": nano_public_baseline[
-            "nano_checkpoint_sha256"
-        ],
+        "nano_public_baseline_receipt_path": str(nano_public_baseline_receipt_path),
+        "nano_public_baseline_receipt_sha256": sha256_file(nano_public_baseline_receipt_path),
+        "nano_public_baseline_checkpoint_sha256": nano_public_baseline["nano_checkpoint_sha256"],
         "public_benchmark": benchmark,
     }
     return report
@@ -566,6 +528,7 @@ def main() -> int:
         output_path,
         expected_phase=str(args.phase),
         checkpoint_path=args.checkpoint,
+        require_passed=False,
     )
     print(
         f"phase_gate={output_path} phase={args.phase} gate_passed={report['gate_passed']} "

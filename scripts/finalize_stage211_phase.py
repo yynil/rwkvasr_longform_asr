@@ -22,12 +22,8 @@ PUBLIC_EVAL_SCRIPT = REPO_ROOT / "scripts" / "run_public_eval_benchmarks.sh"
 COMPARE_SCRIPT = REPO_ROOT / "scripts" / "compare_public_ctc_with_nano.py"
 HIDDEN_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_hidden_alignment_gate.py"
 LOGITS_GATE_SCRIPT = REPO_ROOT / "scripts" / "create_stage211_logits_alignment_gate.py"
-ALIGNMENT_PAIR_EVAL_SCRIPT = (
-    REPO_ROOT / "scripts" / "evaluate_stage211_alignment_pair.py"
-)
-STRATIFIED_SUMMARY_SCRIPT = (
-    REPO_ROOT / "scripts" / "summarize_stage211_stratified_hidden_eval.py"
-)
+ALIGNMENT_PAIR_EVAL_SCRIPT = REPO_ROOT / "scripts" / "evaluate_stage211_alignment_pair.py"
+STRATIFIED_SUMMARY_SCRIPT = REPO_ROOT / "scripts" / "summarize_stage211_stratified_hidden_eval.py"
 STRATIFIED_LOGITS_SUMMARY_SCRIPT = (
     REPO_ROOT / "scripts" / "summarize_stage211_stratified_logits_eval.py"
 )
@@ -210,10 +206,7 @@ def _stratified_cell_manifests(receipt_path: Path) -> dict[str, Path]:
         if not isinstance(cell, dict) or int(cell.get("samples", -1)) != 256:
             raise ValueError(f"Invalid Stage211 stratified cell: {cell_name}")
         manifest_path = Path(str(cell.get("manifest_path") or "")).resolve()
-        if (
-            not manifest_path.is_file()
-            or sha256_file(manifest_path) != cell.get("manifest_sha256")
-        ):
+        if not manifest_path.is_file() or sha256_file(manifest_path) != cell.get("manifest_sha256"):
             raise ValueError(
                 f"Stage211 stratified cell manifest is missing or changed: {cell_name}"
             )
@@ -248,24 +241,19 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         (
             segment
             for segment in segments
-            if isinstance(segment, dict)
-            and str(segment.get("difficulty") or "") == "easy"
+            if isinstance(segment, dict) and str(segment.get("difficulty") or "") == "easy"
         ),
         None,
     )
     if easy_segment is None:
         raise ValueError("Stage211 phase coverage lacks the easy initialization segment.")
-    baseline_checkpoint = Path(
-        str(easy_segment.get("init_checkpoint_path") or "")
-    ).expanduser().resolve()
-    if (
-        not baseline_checkpoint.is_file()
-        or sha256_file(baseline_checkpoint)
-        != easy_segment.get("init_checkpoint_sha256")
+    baseline_checkpoint = (
+        Path(str(easy_segment.get("init_checkpoint_path") or "")).expanduser().resolve()
+    )
+    if not baseline_checkpoint.is_file() or sha256_file(baseline_checkpoint) != easy_segment.get(
+        "init_checkpoint_sha256"
     ):
-        raise ValueError(
-            "Stage211 phase initialization checkpoint is missing or changed."
-        )
+        raise ValueError("Stage211 phase initialization checkpoint is missing or changed.")
 
     alignment_eval_dir = output_dir / "alignment_pair"
     baseline_report = alignment_eval_dir / "baseline.json"
@@ -300,31 +288,27 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     ]
     alignment_teacher_device = getattr(args, "alignment_teacher_device", None)
     if alignment_teacher_device is not None:
-        pair_eval_command.extend(
-            ("--teacher-device", str(alignment_teacher_device))
-        )
+        pair_eval_command.extend(("--teacher-device", str(alignment_teacher_device)))
     _run(pair_eval_command, dry_run=bool(args.dry_run))
 
     stratified_summary_path: Path | None = None
     if phase in {"mixer", "block", "logits"}:
-        stratified_receipt_path = Path(
-            getattr(
-                args,
-                "stratified_hidden_receipt",
-                DEFAULT_STRATIFIED_HIDDEN_RECEIPT,
+        stratified_receipt_path = (
+            Path(
+                getattr(
+                    args,
+                    "stratified_hidden_receipt",
+                    DEFAULT_STRATIFIED_HIDDEN_RECEIPT,
+                )
+                or DEFAULT_STRATIFIED_HIDDEN_RECEIPT
             )
-            or DEFAULT_STRATIFIED_HIDDEN_RECEIPT
-        ).expanduser().resolve()
-        stratified_manifests = _stratified_cell_manifests(
-            stratified_receipt_path
+            .expanduser()
+            .resolve()
         )
+        stratified_manifests = _stratified_cell_manifests(stratified_receipt_path)
         stratified_eval_dir = output_dir / "alignment_stratified"
-        stratified_batch_size = int(
-            getattr(args, "stratified_alignment_batch_size", 1)
-        )
-        stratified_num_workers = int(
-            getattr(args, "stratified_alignment_num_workers", 2)
-        )
+        stratified_batch_size = int(getattr(args, "stratified_alignment_batch_size", 1))
+        stratified_num_workers = int(getattr(args, "stratified_alignment_num_workers", 2))
         stratified_device = str(
             getattr(
                 args,
@@ -369,15 +353,11 @@ def finalize_phase(args: argparse.Namespace) -> Path:
                 stratified_device,
             ]
             if stratified_teacher_device is not None:
-                cell_command.extend(
-                    ("--teacher-device", str(stratified_teacher_device))
-                )
+                cell_command.extend(("--teacher-device", str(stratified_teacher_device)))
             _run(cell_command, dry_run=bool(args.dry_run))
         stratified_summary_path = stratified_eval_dir / "summary.json"
         summary_script = (
-            STRATIFIED_LOGITS_SUMMARY_SCRIPT
-            if phase == "logits"
-            else STRATIFIED_SUMMARY_SCRIPT
+            STRATIFIED_LOGITS_SUMMARY_SCRIPT if phase == "logits" else STRATIFIED_SUMMARY_SCRIPT
         )
         _run(
             [
@@ -432,9 +412,7 @@ def finalize_phase(args: argparse.Namespace) -> Path:
             str(alignment_gate_path),
         ]
         if stratified_summary_path is not None:
-            hidden_gate_command.extend(
-                ("--stratified-summary", str(stratified_summary_path))
-            )
+            hidden_gate_command.extend(("--stratified-summary", str(stratified_summary_path)))
         _run(
             hidden_gate_command,
             dry_run=bool(args.dry_run),
@@ -456,9 +434,7 @@ def finalize_phase(args: argparse.Namespace) -> Path:
             str(alignment_gate_path),
         ]
         if stratified_summary_path is not None:
-            logits_gate_command.extend(
-                ("--stratified-summary", str(stratified_summary_path))
-            )
+            logits_gate_command.extend(("--stratified-summary", str(stratified_summary_path)))
         _run(logits_gate_command, dry_run=bool(args.dry_run))
 
     phase_gate_path = output_dir / "phase_gate.json"
@@ -481,9 +457,7 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     for receipt_path in receipt_paths:
         phase_gate_command.extend(("--coverage-receipt", str(receipt_path)))
     if alignment_gate_path is not None:
-        phase_gate_command.extend(
-            ("--alignment-report", str(alignment_gate_path))
-        )
+        phase_gate_command.extend(("--alignment-report", str(alignment_gate_path)))
     if phase in {"mixer", "block"}:
         if args.baseline_public_comparison_report is None:
             raise ValueError(
@@ -498,6 +472,15 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     _run(phase_gate_command, dry_run=bool(args.dry_run))
 
     promotion_receipt = output_dir / f"{phase}_promotion_receipt.json"
+    if not args.dry_run:
+        report = _load_json(phase_gate_path, label="Stage211 phase gate")
+        if report.get("checkpoint_sha256") != sha256_file(checkpoint):
+            raise ValueError(f"Stage211 {phase} phase gate checkpoint changed.")
+        if report.get("gate_passed") is not True:
+            raise ValueError(
+                f"Stage211 {phase} phase gate did not pass; "
+                f"failure evidence is preserved at {phase_gate_path}."
+            )
     _run(
         [
             str(PYTHON),
@@ -514,12 +497,6 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         ],
         dry_run=bool(args.dry_run),
     )
-    if not args.dry_run:
-        report = _load_json(phase_gate_path, label="Stage211 phase gate")
-        if report.get("gate_passed") is not True or report.get("checkpoint_sha256") != sha256_file(
-            checkpoint
-        ):
-            raise ValueError(f"Stage211 {phase} phase gate did not pass.")
     print(
         f"[stage211-finalize] complete phase={phase} checkpoint={checkpoint} "
         f"gate={phase_gate_path} promotion={promotion_receipt}",

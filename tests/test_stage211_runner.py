@@ -117,12 +117,8 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
                 "segments": [
                     {
                         "difficulty": "easy",
-                        "init_checkpoint_path": str(
-                            baseline_checkpoint.resolve()
-                        ),
-                        "init_checkpoint_sha256": sha256_file(
-                            baseline_checkpoint
-                        ),
+                        "init_checkpoint_path": str(baseline_checkpoint.resolve()),
+                        "init_checkpoint_sha256": sha256_file(baseline_checkpoint),
                     }
                 ]
             },
@@ -176,35 +172,24 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
     pair_command = next(
         command
         for command in commands
-        if str(stage211_phase_finalizer.ALIGNMENT_PAIR_EVAL_SCRIPT)
-        in command
+        if str(stage211_phase_finalizer.ALIGNMENT_PAIR_EVAL_SCRIPT) in command
     )
-    assert pair_command[
-        pair_command.index("--baseline-checkpoint") + 1
-    ] == str(baseline_checkpoint.resolve())
+    assert pair_command[pair_command.index("--baseline-checkpoint") + 1] == str(
+        baseline_checkpoint.resolve()
+    )
     assert pair_command[pair_command.index("--feature-seed") + 1] == "0"
-    pair_baseline_report = pair_command[
-        pair_command.index("--baseline-output") + 1
-    ]
-    pair_candidate_report = pair_command[
-        pair_command.index("--candidate-output") + 1
-    ]
-    assert logits_command[
-        logits_command.index("--baseline-report") + 1
-    ] == pair_baseline_report
-    assert logits_command[
-        logits_command.index("--candidate-report") + 1
-    ] == pair_candidate_report
-    assert logits_command[logits_command.index("--output") + 1] == str(
-        logits_gate_path
+    pair_baseline_report = pair_command[pair_command.index("--baseline-output") + 1]
+    pair_candidate_report = pair_command[pair_command.index("--candidate-output") + 1]
+    assert logits_command[logits_command.index("--baseline-report") + 1] == pair_baseline_report
+    assert logits_command[logits_command.index("--candidate-report") + 1] == pair_candidate_report
+    assert logits_command[logits_command.index("--output") + 1] == str(logits_gate_path)
+    assert logits_command[logits_command.index("--baseline-checkpoint") + 1] == str(
+        baseline_checkpoint.resolve()
     )
-    assert logits_command[
-        logits_command.index("--baseline-checkpoint") + 1
-    ] == str(baseline_checkpoint.resolve())
     stratified_summary = tmp_path / "eval" / "alignment_stratified" / "summary.json"
-    assert logits_command[
-        logits_command.index("--stratified-summary") + 1
-    ] == str(stratified_summary)
+    assert logits_command[logits_command.index("--stratified-summary") + 1] == str(
+        stratified_summary
+    )
     pair_commands = [
         command
         for command in commands
@@ -214,15 +199,12 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
     summary_command = next(
         command
         for command in commands
-        if str(stage211_phase_finalizer.STRATIFIED_LOGITS_SUMMARY_SCRIPT)
-        in command
+        if str(stage211_phase_finalizer.STRATIFIED_LOGITS_SUMMARY_SCRIPT) in command
     )
-    assert summary_command[summary_command.index("--output") + 1] == str(
-        stratified_summary
+    assert summary_command[summary_command.index("--output") + 1] == str(stratified_summary)
+    assert phase_gate_command[phase_gate_command.index("--alignment-report") + 1] == str(
+        logits_gate_path
     )
-    assert phase_gate_command[
-        phase_gate_command.index("--alignment-report") + 1
-    ] == str(logits_gate_path)
 
 
 def test_stage211_mixer_finalizer_runs_stratified_hidden_gate(
@@ -265,12 +247,8 @@ def test_stage211_mixer_finalizer_runs_stratified_hidden_gate(
                 "segments": [
                     {
                         "difficulty": "easy",
-                        "init_checkpoint_path": str(
-                            baseline_checkpoint.resolve()
-                        ),
-                        "init_checkpoint_sha256": sha256_file(
-                            baseline_checkpoint
-                        ),
+                        "init_checkpoint_path": str(baseline_checkpoint.resolve()),
+                        "init_checkpoint_sha256": sha256_file(baseline_checkpoint),
                     }
                 ]
             },
@@ -315,34 +293,26 @@ def test_stage211_mixer_finalizer_runs_stratified_hidden_gate(
         if str(stage211_phase_finalizer.ALIGNMENT_PAIR_EVAL_SCRIPT) in command
     ]
     assert len(pair_commands) == 8
-    sidecar_commands = [
-        command for command in pair_commands if "--eval-bucket-manifest" in command
-    ]
+    sidecar_commands = [command for command in pair_commands if "--eval-bucket-manifest" in command]
     assert len(sidecar_commands) == 7
     assert {
-        command[command.index("--eval-bucket-manifest") + 1]
-        for command in sidecar_commands
-    } == {
-        str(Path(cell["manifest_path"]).resolve())
-        for cell in stratified_cells.values()
-    }
+        command[command.index("--eval-bucket-manifest") + 1] for command in sidecar_commands
+    } == {str(Path(cell["manifest_path"]).resolve()) for cell in stratified_cells.values()}
     summary_command = next(
         command
         for command in commands
         if str(stage211_phase_finalizer.STRATIFIED_SUMMARY_SCRIPT) in command
     )
     summary_path = output_dir / "alignment_stratified" / "summary.json"
-    assert summary_command[summary_command.index("--output") + 1] == str(
-        summary_path
-    )
+    assert summary_command[summary_command.index("--output") + 1] == str(summary_path)
     hidden_gate_command = next(
         command
         for command in commands
         if str(stage211_phase_finalizer.HIDDEN_GATE_SCRIPT) in command
     )
-    assert hidden_gate_command[
-        hidden_gate_command.index("--stratified-summary") + 1
-    ] == str(summary_path)
+    assert hidden_gate_command[hidden_gate_command.index("--stratified-summary") + 1] == str(
+        summary_path
+    )
 
 
 def test_stage211_phase_gate_rebuilds_with_bound_stratified_summary(
@@ -501,15 +471,15 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert "REUSE_COMPLETED_CALIBRATION_EVAL" in script
     assert "validate_stage211_calibration_eval.py" in script
     assert (
-        '--baseline-public-comparison-report '
+        "--baseline-public-comparison-report "
         '"${CALIBRATION_EVAL_DIR}/public/nano_comparison.json"' in script
     )
     assert (
-        '--baseline-public-comparison-report '
+        "--baseline-public-comparison-report "
         '"${PHASE_GATE_ROOT}/mixer/nano_comparison.json"' in script
     )
     assert (
-        '--baseline-public-comparison-report '
+        "--baseline-public-comparison-report "
         '"${PHASE_GATE_ROOT}/logits/nano_comparison.json"' in script
     )
     assert '--calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}"' in script
@@ -545,8 +515,7 @@ def test_stage211_hourly_monitor_scopes_errors_to_latest_attempt(
     command = [
         "bash",
         "-c",
-        'source "$1"; stage211_current_attempt_start "$2"; '
-        'stage211_current_attempt_errors "$2"',
+        'source "$1"; stage211_current_attempt_start "$2"; stage211_current_attempt_errors "$2"',
         "stage211-monitor-test",
         str(monitor_script),
         str(training_log),
@@ -604,14 +573,9 @@ def test_stage211_formal_defaults_use_persistent_storage_and_local_teacher() -> 
     assert not output_dir.is_relative_to(Path("/dev/shm"))
     assert output_dir.is_relative_to(Path.home() / "rwkvasr_runs")
     assert stage211.NANO_CHECKPOINT == (
-        Path.home()
-        / "models"
-        / "Fun-ASR-Nano-2512-modelscope"
-        / "model.pt"
+        Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
     )
-    assert stage211.NANO_CHECKPOINT != (
-        REPO_ROOT / "assets" / "fun-asr-nano-2512" / "model.pt"
-    )
+    assert stage211.NANO_CHECKPOINT != (REPO_ROOT / "assets" / "fun-asr-nano-2512" / "model.pt")
 
 
 def test_stage211_phase_gate_normalizes_bound_references(tmp_path: Path) -> None:
@@ -775,16 +739,11 @@ def test_stage211_reuses_completed_receipt_without_rehashing_bound_models(
         "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
         "rows": int(expected["rows"]),
         "row_exposures": int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS,
-        "tail_padding_samples_per_epoch": int(
-            expected["tail_padding_samples_per_epoch"]
-        ),
-        "tail_padding_sample_exposures": int(
-            expected["tail_padding_samples_per_epoch"]
-        )
+        "tail_padding_samples_per_epoch": int(expected["tail_padding_samples_per_epoch"]),
+        "tail_padding_sample_exposures": int(expected["tail_padding_samples_per_epoch"])
         * STAGE211_FULL_DATA_EPOCHS,
         "executed_sample_exposures": (
-            int(expected["rows"])
-            + int(expected["tail_padding_samples_per_epoch"])
+            int(expected["rows"]) + int(expected["tail_padding_samples_per_epoch"])
         )
         * STAGE211_FULL_DATA_EPOCHS,
         "hours": float(expected["hours"]),
@@ -886,8 +845,7 @@ def test_stage211_full_phase_smoke_audit_rejects_teacher_misses(
 
     log_path.write_text(
         "Traceback from an older failed attempt\n"
-        "[rwkvasr] Distributed init complete. world_size=4\n"
-        + valid_log,
+        "[rwkvasr] Distributed init complete. world_size=4\n" + valid_log,
         encoding="utf-8",
     )
     retried_report = stage211_full_phase._audit_smoke(
@@ -1379,21 +1337,13 @@ def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
                 "full_data_profile": True,
                 "completion_checkpoint_path": str(checkpoint.resolve()),
                 "completion_checkpoint_sha256": sha256_file(checkpoint),
-                "nano_teacher_checkpoint_path": str(
-                    nano_checkpoint.resolve()
-                ),
-                "nano_teacher_checkpoint_sha256": sha256_file(
-                    nano_checkpoint
-                ),
+                "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
+                "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
                 "runtime_epoch_coverage": _write_runtime_epoch_coverage(
                     tmp_path,
                     prefix="medium-admission-easy",
                     epochs=STAGE211_FULL_DATA_EPOCHS,
-                    steps_per_epoch=int(
-                        STAGE211_AUDIO_CURRICULUM["easy"][
-                            "steps_per_epoch"
-                        ]
-                    ),
+                    steps_per_epoch=int(STAGE211_AUDIO_CURRICULUM["easy"]["steps_per_epoch"]),
                 ),
             }
         ),
@@ -1541,9 +1491,7 @@ def _write_valid_phase_gate(
         provenance.write_text("{}\n", encoding="utf-8")
         train_config = tmp_path / f"{difficulty}-train-config.yaml"
         train_config_payload = stage211_phase_train_config_contract(phase)
-        train_config_payload["ctc_teacher_online_model_path"] = str(
-            nano_teacher_dir.resolve()
-        )
+        train_config_payload["ctc_teacher_online_model_path"] = str(nano_teacher_dir.resolve())
         save_yaml(train_config, train_config_payload)
         completion = checkpoint if difficulty == "long" else tmp_path / f"{difficulty}.pt"
         if completion != checkpoint:
@@ -1700,8 +1648,7 @@ def _write_valid_phase_gate(
                 "nano_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
                 "nano_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
                 "total_samples": sum(
-                    int(expected["samples"])
-                    for expected in STAGE211_PUBLIC_BENCHMARKS.values()
+                    int(expected["samples"]) for expected in STAGE211_PUBLIC_BENCHMARKS.values()
                 ),
                 "results": baseline_results,
             }
@@ -1772,9 +1719,7 @@ def _write_valid_phase_gate(
                 **shared_source,
                 "role": "candidate",
                 "step": int(STAGE211_AUDIO_CURRICULUM["long"]["steps"]),
-                "checkpoint_step": int(
-                    STAGE211_AUDIO_CURRICULUM["long"]["steps"]
-                ),
+                "checkpoint_step": int(STAGE211_AUDIO_CURRICULUM["long"]["steps"]),
                 "checkpoint_path": str(checkpoint.resolve()),
                 "checkpoint_sha256": sha256_file(checkpoint),
             }
@@ -1789,32 +1734,18 @@ def _write_valid_phase_gate(
                 "schema_version": 1,
                 "pipeline": "stage211",
                 "artifact": (
-                    "logits_alignment_gate"
-                    if phase == "logits"
-                    else "hidden_alignment_gate"
+                    "logits_alignment_gate" if phase == "logits" else "hidden_alignment_gate"
                 ),
                 "phase": phase,
-                "baseline_checkpoint_path": str(
-                    phase_init_checkpoint.resolve()
-                ),
-                "baseline_checkpoint_sha256": sha256_file(
-                    phase_init_checkpoint
-                ),
+                "baseline_checkpoint_path": str(phase_init_checkpoint.resolve()),
+                "baseline_checkpoint_sha256": sha256_file(phase_init_checkpoint),
                 "checkpoint_path": str(checkpoint.resolve()),
                 "checkpoint_sha256": sha256_file(checkpoint),
                 "gate_passed": True,
-                "baseline_report_path": str(
-                    alignment_baseline_source.resolve()
-                ),
-                "baseline_report_sha256": sha256_file(
-                    alignment_baseline_source
-                ),
-                "candidate_report_path": str(
-                    alignment_candidate_source.resolve()
-                ),
-                "candidate_report_sha256": sha256_file(
-                    alignment_candidate_source
-                ),
+                "baseline_report_path": str(alignment_baseline_source.resolve()),
+                "baseline_report_sha256": sha256_file(alignment_baseline_source),
+                "candidate_report_path": str(alignment_candidate_source.resolve()),
+                "candidate_report_sha256": sha256_file(alignment_candidate_source),
                 "baseline_eval_provenance": alignment_provenance,
                 "candidate_eval_provenance": alignment_provenance,
             }
@@ -1840,20 +1771,12 @@ def _write_valid_phase_gate(
                     "path": str(alignment_report.resolve()),
                     "sha256": sha256_file(alignment_report),
                     "artifact": (
-                        "logits_alignment_gate"
-                        if phase == "logits"
-                        else "hidden_alignment_gate"
+                        "logits_alignment_gate" if phase == "logits" else "hidden_alignment_gate"
                     ),
                 },
-                "nano_public_baseline_receipt_path": str(
-                    baseline_receipt.resolve()
-                ),
-                "nano_public_baseline_receipt_sha256": sha256_file(
-                    baseline_receipt
-                ),
-                "nano_public_baseline_checkpoint_sha256": sha256_file(
-                    nano_teacher_checkpoint
-                ),
+                "nano_public_baseline_receipt_path": str(baseline_receipt.resolve()),
+                "nano_public_baseline_receipt_sha256": sha256_file(baseline_receipt),
+                "nano_public_baseline_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
                 "full_data_coverage": {
                     "phase": phase,
                     "complete": True,
@@ -1905,13 +1828,9 @@ def test_stage211_promotion_receipt_binds_checkpoint_and_gate_hashes(
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     gate_payload = json.loads(gate_report.read_text(encoding="utf-8"))
     nano_checkpoint = Path(
-        gate_payload["full_data_coverage"]["segments"][0][
-            "nano_teacher_checkpoint_path"
-        ]
+        gate_payload["full_data_coverage"]["segments"][0]["nano_teacher_checkpoint_path"]
     )
-    assert receipt["nano_teacher_checkpoint_sha256"] == sha256_file(
-        nano_checkpoint
-    )
+    assert receipt["nano_teacher_checkpoint_sha256"] == sha256_file(nano_checkpoint)
 
     validated = stage211._validate_promotion_receipt(
         receipt_path=receipt_path,
@@ -2054,9 +1973,7 @@ def test_stage211_phase_gate_rejects_mutated_alignment_source(
         checkpoint=checkpoint,
     )
     gate = json.loads(gate_report.read_text(encoding="utf-8"))
-    alignment = json.loads(
-        Path(gate["alignment_report"]["path"]).read_text(encoding="utf-8")
-    )
+    alignment = json.loads(Path(gate["alignment_report"]["path"]).read_text(encoding="utf-8"))
     Path(alignment["candidate_report_path"]).write_text(
         "mutated\n",
         encoding="utf-8",
@@ -2215,9 +2132,7 @@ def test_stage211_phase_gate_rejects_public_baseline_from_other_nano(
         result["report_sha256"] = sha256_file(report_path)
     receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
     gate["nano_public_baseline_receipt_sha256"] = sha256_file(receipt_path)
-    gate["nano_public_baseline_checkpoint_sha256"] = sha256_file(
-        alternate_checkpoint
-    )
+    gate["nano_public_baseline_checkpoint_sha256"] = sha256_file(alternate_checkpoint)
     gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
 
     with pytest.raises(
@@ -2249,9 +2164,7 @@ def test_stage211_phase_gate_rejects_mixed_nano_teachers(
     medium = report["full_data_coverage"]["segments"][1]
     train_config = Path(medium["train_config_path"])
     train_config_payload = stage211_phase_train_config_contract("mixer")
-    train_config_payload["ctc_teacher_online_model_path"] = str(
-        alternate_dir.resolve()
-    )
+    train_config_payload["ctc_teacher_online_model_path"] = str(alternate_dir.resolve())
     save_yaml(train_config, train_config_payload)
     medium["train_config_sha256"] = sha256_file(train_config)
     medium["nano_teacher_checkpoint_path"] = str(alternate_checkpoint.resolve())
@@ -2306,9 +2219,9 @@ def test_stage211_phase_gate_rejects_partial_runtime_epoch(
         checkpoint=checkpoint,
     )
     report = json.loads(gate_report.read_text(encoding="utf-8"))
-    report["full_data_coverage"]["segments"][0]["runtime_epoch_coverage"][
-        "records"
-    ][0]["completed_epoch_batch_count"] -= 1
+    report["full_data_coverage"]["segments"][0]["runtime_epoch_coverage"]["records"][0][
+        "completed_epoch_batch_count"
+    ] -= 1
     gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="runtime epoch 1 completion mismatch"):
@@ -2340,4 +2253,50 @@ def test_stage211_phase_gate_rejects_frozen_path_change(
             gate_report,
             expected_phase="mixer",
             checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_preserves_a_strict_failed_decision(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    alignment_path = Path(report["alignment_report"]["path"])
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment["gate_passed"] = False
+    alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
+    report["alignment_report"]["sha256"] = sha256_file(alignment_path)
+    report["alignment_gate_passed"] = False
+    report["gate_passed"] = False
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    validated = stage211.validate_stage211_phase_gate_report(
+        gate_report,
+        expected_phase="mixer",
+        checkpoint_path=checkpoint,
+        require_passed=False,
+    )
+    assert validated["gate_passed"] is False
+
+    with pytest.raises(ValueError, match="does not record a passing decision"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+    report["gate_passed"] = True
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="decision is inconsistent"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+            require_passed=False,
         )

@@ -56,27 +56,18 @@ STAGE211_PUBLIC_BENCHMARKS: dict[str, dict[str, str | int]] = {
     "wenetspeech_test_net": {"language": "zh", "metric": "cer", "samples": 24_774},
 }
 DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT = (
-    Path.home()
-    / "rwkvasr_eval"
-    / "stage211_public_full"
-    / "nano_2512"
-    / "provenance_receipt.json"
+    Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512" / "provenance_receipt.json"
 )
 STAGE211_AUDIO_TOTAL_ROWS = sum(int(row["rows"]) for row in STAGE211_AUDIO_CURRICULUM.values())
-STAGE211_AUDIO_TOTAL_HOURS = sum(
-    float(row["hours"]) for row in STAGE211_AUDIO_CURRICULUM.values()
-)
+STAGE211_AUDIO_TOTAL_HOURS = sum(float(row["hours"]) for row in STAGE211_AUDIO_CURRICULUM.values())
 STAGE211_AUDIO_TOTAL_ROW_EXPOSURES = STAGE211_AUDIO_TOTAL_ROWS * STAGE211_FULL_DATA_EPOCHS
-STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES = (
-    STAGE211_AUDIO_TOTAL_HOURS * STAGE211_FULL_DATA_EPOCHS
-)
+STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES = STAGE211_AUDIO_TOTAL_HOURS * STAGE211_FULL_DATA_EPOCHS
 STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES = sum(
     int(row["tail_padding_samples_per_epoch"]) * STAGE211_FULL_DATA_EPOCHS
     for row in STAGE211_AUDIO_CURRICULUM.values()
 )
 STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES = (
-    STAGE211_AUDIO_TOTAL_ROW_EXPOSURES
-    + STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+    STAGE211_AUDIO_TOTAL_ROW_EXPOSURES + STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
 )
 _STAGE211_COMMON_PHASE_TRAIN_CONFIG: dict[str, Any] = {
     "vocab_size": 60_515,
@@ -225,8 +216,7 @@ def stage211_phase_train_config_contract(phase: str) -> dict[str, Any]:
         raise ValueError(f"Unsupported Stage211 phase objective: {phase!r}") from error
     contract = {**_STAGE211_COMMON_PHASE_TRAIN_CONFIG, **phase_values}
     return {
-        key: list(value) if isinstance(value, list) else value
-        for key, value in contract.items()
+        key: list(value) if isinstance(value, list) else value for key, value in contract.items()
     }
 
 
@@ -249,14 +239,10 @@ def validate_stage211_phase_train_config(
 def resolve_stage211_nano_teacher_checkpoint(train_config: dict[str, Any]) -> Path:
     model_dir_value = train_config.get("ctc_teacher_online_model_path")
     if not isinstance(model_dir_value, (str, Path)) or not str(model_dir_value).strip():
-        raise ValueError(
-            "Stage211 train config lacks ctc_teacher_online_model_path."
-        )
+        raise ValueError("Stage211 train config lacks ctc_teacher_online_model_path.")
     checkpoint_path = Path(model_dir_value).expanduser().resolve() / "model.pt"
     if not checkpoint_path.is_file() or checkpoint_path.stat().st_size <= 0:
-        raise ValueError(
-            f"Stage211 Nano teacher checkpoint is missing or empty: {checkpoint_path}"
-        )
+        raise ValueError(f"Stage211 Nano teacher checkpoint is missing or empty: {checkpoint_path}")
     return checkpoint_path
 
 
@@ -312,12 +298,9 @@ def validate_stage211_nano_public_baseline_receipt(
         label="Stage211 Nano public-baseline provenance receipt",
     )
     if expected_receipt_sha256 is not None and (
-        len(expected_receipt_sha256) != 64
-        or sha256_file(receipt_path) != expected_receipt_sha256
+        len(expected_receipt_sha256) != 64 or sha256_file(receipt_path) != expected_receipt_sha256
     ):
-        raise ValueError(
-            f"Stage211 Nano public-baseline receipt SHA-256 mismatch: {receipt_path}"
-        )
+        raise ValueError(f"Stage211 Nano public-baseline receipt SHA-256 mismatch: {receipt_path}")
     expected_fields = {
         "schema_version": STAGE211_NANO_PUBLIC_BASELINE_SCHEMA_VERSION,
         "pipeline": "stage211",
@@ -350,8 +333,7 @@ def validate_stage211_nano_public_baseline_receipt(
             "Stage211 Nano public baseline and online teacher checkpoint SHA-256 differ."
         )
     expected_total_samples = sum(
-        int(expected["samples"])
-        for expected in STAGE211_PUBLIC_BENCHMARKS.values()
+        int(expected["samples"]) for expected in STAGE211_PUBLIC_BENCHMARKS.values()
     )
     if int(receipt.get("total_samples", -1)) != expected_total_samples:
         raise ValueError("Stage211 Nano public-baseline sample total mismatch.")
@@ -360,14 +342,10 @@ def validate_stage211_nano_public_baseline_receipt(
     if not isinstance(raw_results, list):
         raise ValueError("Stage211 Nano public-baseline results must be a list.")
     by_dataset = {
-        str(result.get("dataset")): result
-        for result in raw_results
-        if isinstance(result, dict)
+        str(result.get("dataset")): result for result in raw_results if isinstance(result, dict)
     }
     if set(by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
-        raise ValueError(
-            "Stage211 Nano public-baseline dataset set is incomplete or unexpected."
-        )
+        raise ValueError("Stage211 Nano public-baseline dataset set is incomplete or unexpected.")
 
     embedded_checkpoint_reports = 0
     for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
@@ -380,9 +358,7 @@ def validate_stage211_nano_public_baseline_receipt(
             "normalized_reference_mismatch_count": 0,
         }
         if any(result.get(key) != value for key, value in expected_result.items()):
-            raise ValueError(
-                f"Stage211 Nano public-baseline metadata mismatch for {dataset}."
-            )
+            raise ValueError(f"Stage211 Nano public-baseline metadata mismatch for {dataset}.")
         report_path = _validate_bound_file(
             result,
             path_key="report_path",
@@ -414,44 +390,22 @@ def validate_stage211_nano_public_baseline_receipt(
             "requested_limit": None,
             "sample_count": expected["samples"],
         }
-        if any(
-            inference_report.get(key) != value
-            for key, value in expected_report_fields.items()
-        ):
-            raise ValueError(
-                f"Stage211 {dataset} Nano inference report contract mismatch."
-            )
+        if any(inference_report.get(key) != value for key, value in expected_report_fields.items()):
+            raise ValueError(f"Stage211 {dataset} Nano inference report contract mismatch.")
         if Path(str(inference_report.get("manifest_path") or "")).resolve() != manifest_path:
-            raise ValueError(
-                f"Stage211 {dataset} Nano inference report manifest path mismatch."
-            )
-        if (
-            Path(str(inference_report.get("predictions_path") or "")).resolve()
-            != prediction_path
-        ):
-            raise ValueError(
-                f"Stage211 {dataset} Nano inference report prediction path mismatch."
-            )
+            raise ValueError(f"Stage211 {dataset} Nano inference report manifest path mismatch.")
+        if Path(str(inference_report.get("predictions_path") or "")).resolve() != prediction_path:
+            raise ValueError(f"Stage211 {dataset} Nano inference report prediction path mismatch.")
         if _report_nano_checkpoint_path(inference_report) != nano_checkpoint:
-            raise ValueError(
-                f"Stage211 {dataset} Nano inference report model path mismatch."
-            )
+            raise ValueError(f"Stage211 {dataset} Nano inference report model path mismatch.")
         embedded_path = inference_report.get("model_checkpoint_path")
         embedded_sha256 = inference_report.get("model_checkpoint_sha256")
-        report_embeds_checkpoint = (
-            embedded_path is not None and embedded_sha256 is not None
-        )
-        if (
-            result.get("report_embeds_checkpoint_sha256")
-            is not report_embeds_checkpoint
-        ):
-            raise ValueError(
-                f"Stage211 {dataset} Nano inference report identity flag mismatch."
-            )
+        report_embeds_checkpoint = embedded_path is not None and embedded_sha256 is not None
+        if result.get("report_embeds_checkpoint_sha256") is not report_embeds_checkpoint:
+            raise ValueError(f"Stage211 {dataset} Nano inference report identity flag mismatch.")
         if embedded_path is not None or embedded_sha256 is not None:
             if (
-                Path(str(embedded_path or "")).expanduser().resolve()
-                != nano_checkpoint
+                Path(str(embedded_path or "")).expanduser().resolve() != nano_checkpoint
                 or embedded_sha256 != nano_checkpoint_sha256
             ):
                 raise ValueError(
@@ -466,20 +420,14 @@ def validate_stage211_nano_public_baseline_receipt(
         raise ValueError(
             "Stage211 Nano public baseline mixes legacy and embedded checkpoint identity."
         )
-    if (
-        provenance_mode == "embedded_checkpoint_sha256"
-        and embedded_checkpoint_reports != len(STAGE211_PUBLIC_BENCHMARKS)
+    if provenance_mode == "embedded_checkpoint_sha256" and embedded_checkpoint_reports != len(
+        STAGE211_PUBLIC_BENCHMARKS
     ):
-        raise ValueError(
-            "Stage211 Nano public baseline lacks embedded checkpoint identity."
-        )
-    if (
-        provenance_mode == "legacy_report_attestation"
-        and embedded_checkpoint_reports == len(STAGE211_PUBLIC_BENCHMARKS)
+        raise ValueError("Stage211 Nano public baseline lacks embedded checkpoint identity.")
+    if provenance_mode == "legacy_report_attestation" and embedded_checkpoint_reports == len(
+        STAGE211_PUBLIC_BENCHMARKS
     ):
-        raise ValueError(
-            "Stage211 Nano public baseline incorrectly uses legacy provenance mode."
-        )
+        raise ValueError("Stage211 Nano public baseline incorrectly uses legacy provenance mode.")
 
     if public_benchmark is not None:
         benchmark_results = public_benchmark.get("results")
@@ -491,20 +439,16 @@ def validate_stage211_nano_public_baseline_receipt(
             if isinstance(result, dict)
         }
         if set(benchmark_by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
-            raise ValueError(
-                "Stage211 public benchmark dataset set is incomplete or unexpected."
-            )
+            raise ValueError("Stage211 public benchmark dataset set is incomplete or unexpected.")
         for dataset in STAGE211_PUBLIC_BENCHMARKS:
             provenance = by_dataset[dataset]
             benchmark = benchmark_by_dataset[dataset]
             for prefix in ("manifest", "nano_prediction"):
                 path_key = f"{prefix}_path"
                 sha256_key = f"{prefix}_sha256"
-                if (
-                    Path(str(benchmark.get(path_key) or "")).resolve()
-                    != Path(str(provenance.get(path_key) or "")).resolve()
-                    or benchmark.get(sha256_key) != provenance.get(sha256_key)
-                ):
+                if Path(str(benchmark.get(path_key) or "")).resolve() != Path(
+                    str(provenance.get(path_key) or "")
+                ).resolve() or benchmark.get(sha256_key) != provenance.get(sha256_key):
                     raise ValueError(
                         f"Stage211 {dataset} {prefix} differs from the Nano "
                         "public-baseline provenance receipt."
@@ -540,9 +484,7 @@ def _validate_stage211_alignment_eval_provenance(
     total_samples = 0
     for index, raw_part in enumerate(raw_parts):
         if not isinstance(raw_part, dict):
-            raise ValueError(
-                f"Stage211 {label} fixed-eval part {index} is invalid."
-            )
+            raise ValueError(f"Stage211 {label} fixed-eval part {index} is invalid.")
         _validate_bound_file(
             raw_part,
             path_key="path",
@@ -551,9 +493,7 @@ def _validate_stage211_alignment_eval_provenance(
         )
         num_samples = int(raw_part.get("num_samples", -1))
         if num_samples <= 0:
-            raise ValueError(
-                f"Stage211 {label} fixed-eval part {index} sample count is invalid."
-            )
+            raise ValueError(f"Stage211 {label} fixed-eval part {index} sample count is invalid.")
         total_samples += num_samples
         fingerprint.append((str(raw_part["sha256"]), num_samples))
     if total_samples != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES:
@@ -584,29 +524,20 @@ def _validate_stage211_alignment_source_report(
         "eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
     }
     if any(report.get(key) != value for key, value in expected.items()):
-        raise ValueError(
-            f"Stage211 {phase} {role} alignment source binding mismatch."
-        )
+        raise ValueError(f"Stage211 {phase} {role} alignment source binding mismatch.")
     logical_step = int(report.get("step", -1))
     checkpoint_step = int(report.get("checkpoint_step", -1))
     if role == "baseline":
         if logical_step != 0 or checkpoint_step < 0:
-            raise ValueError(
-                "Stage211 alignment baseline source has invalid step metadata."
-            )
+            raise ValueError("Stage211 alignment baseline source has invalid step metadata.")
     else:
         if logical_step <= 0 or checkpoint_step != logical_step:
-            raise ValueError(
-                "Stage211 alignment candidate source has invalid step metadata."
-            )
+            raise ValueError("Stage211 alignment candidate source has invalid step metadata.")
     pair_eval_id = str(report.get("pair_eval_id") or "")
-    if (
-        len(pair_eval_id) != 64
-        or any(character not in "0123456789abcdef" for character in pair_eval_id)
+    if len(pair_eval_id) != 64 or any(
+        character not in "0123456789abcdef" for character in pair_eval_id
     ):
-        raise ValueError(
-            f"Stage211 {phase} {role} alignment source pair ID is invalid."
-        )
+        raise ValueError(f"Stage211 {phase} {role} alignment source pair ID is invalid.")
     for prefix, label in (
         ("train_config", "train config"),
         ("model_config", "model config"),
@@ -621,9 +552,7 @@ def _validate_stage211_alignment_source_report(
     train_config = load_yaml(Path(str(report["train_config_path"])).resolve())
     validate_stage211_phase_train_config(train_config, phase=phase)
     if report.get("nano_checkpoint_sha256") != nano_teacher_checkpoint_sha256:
-        raise ValueError(
-            f"Stage211 {phase} {role} alignment teacher checkpoint mismatch."
-        )
+        raise ValueError(f"Stage211 {phase} {role} alignment teacher checkpoint mismatch.")
     feature_seed = report.get("feature_seed")
     provenance = report.get("eval_provenance")
     if (
@@ -631,9 +560,7 @@ def _validate_stage211_alignment_source_report(
         or not isinstance(provenance, dict)
         or provenance.get("feature_seed") != feature_seed
     ):
-        raise ValueError(
-            f"Stage211 {phase} {role} alignment fixed feature seed mismatch."
-        )
+        raise ValueError(f"Stage211 {phase} {role} alignment fixed feature seed mismatch.")
     fingerprint = _validate_stage211_alignment_eval_provenance(
         provenance,
         label=f"{phase} {role} alignment source",
@@ -663,29 +590,20 @@ def validate_stage211_runtime_epoch_coverage(
         raise ValueError(f"Stage211 {label} runtime epoch coverage is incomplete.")
     records = coverage.get("records")
     if not isinstance(records, list) or len(records) != int(epochs):
-        raise ValueError(
-            f"Stage211 {label} runtime epoch coverage record count mismatch."
-        )
+        raise ValueError(f"Stage211 {label} runtime epoch coverage record count mismatch.")
     by_epoch = {
-        int(record.get("epoch", -1)): record
-        for record in records
-        if isinstance(record, dict)
+        int(record.get("epoch", -1)): record for record in records if isinstance(record, dict)
     }
     if set(by_epoch) != set(range(1, int(epochs) + 1)):
-        raise ValueError(
-            f"Stage211 {label} runtime epoch coverage epoch set mismatch."
-        )
+        raise ValueError(f"Stage211 {label} runtime epoch coverage epoch set mismatch.")
     for epoch in range(1, int(epochs) + 1):
         record = by_epoch[epoch]
         if (
             int(record.get("step", -1)) != epoch * int(steps_per_epoch)
             or int(record.get("epoch_batch_offset", -1)) != 0
-            or int(record.get("completed_epoch_batch_count", -1))
-            != int(steps_per_epoch)
+            or int(record.get("completed_epoch_batch_count", -1)) != int(steps_per_epoch)
         ):
-            raise ValueError(
-                f"Stage211 {label} runtime epoch {epoch} completion mismatch."
-            )
+            raise ValueError(f"Stage211 {label} runtime epoch {epoch} completion mismatch.")
         _validate_bound_file(
             record,
             path_key="checkpoint_path",
@@ -703,9 +621,7 @@ def _validate_parameter_delta_audit(
 ) -> None:
     audit = segment.get("parameter_delta_audit")
     if not isinstance(audit, dict):
-        raise ValueError(
-            f"Stage211 {phase}/{difficulty} lacks a checkpoint parameter-delta audit."
-        )
+        raise ValueError(f"Stage211 {phase}/{difficulty} lacks a checkpoint parameter-delta audit.")
     expected = {
         "schema_version": 1,
         "policy": "stage211_timemixer_and_input_projection_only",
@@ -731,9 +647,7 @@ def _validate_parameter_delta_audit(
         or allowed_unchanged_tensors < 0
         or frozen_unchanged_tensors <= 0
         or (
-            allowed_changed_tensors
-            + allowed_unchanged_tensors
-            + frozen_unchanged_tensors
+            allowed_changed_tensors + allowed_unchanged_tensors + frozen_unchanged_tensors
             != initial_tensor_count
         )
     ):
@@ -762,10 +676,7 @@ def validate_stage211_full_data_coverage(
     total_hours = float(coverage.get("total_hours", float("nan")))
     if not math.isfinite(total_hours) or abs(total_hours - STAGE211_AUDIO_TOTAL_HOURS) > 0.002:
         raise ValueError("Stage211 full-data coverage hour total mismatch.")
-    if (
-        int(coverage.get("total_row_exposures", -1))
-        != STAGE211_AUDIO_TOTAL_ROW_EXPOSURES
-    ):
+    if int(coverage.get("total_row_exposures", -1)) != STAGE211_AUDIO_TOTAL_ROW_EXPOSURES:
         raise ValueError("Stage211 full-data row-exposure total mismatch.")
     if (
         int(coverage.get("total_tail_padding_sample_exposures", -1))
@@ -777,9 +688,7 @@ def validate_stage211_full_data_coverage(
         != STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
     ):
         raise ValueError("Stage211 full-data executed-sample exposure total mismatch.")
-    total_hour_exposures = float(
-        coverage.get("total_hour_exposures", float("nan"))
-    )
+    total_hour_exposures = float(coverage.get("total_hour_exposures", float("nan")))
     if (
         not math.isfinite(total_hour_exposures)
         or abs(total_hour_exposures - STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES) > 0.005
@@ -790,9 +699,7 @@ def validate_stage211_full_data_coverage(
     if not isinstance(segments, list):
         raise ValueError("Stage211 full-data coverage segments must be a list.")
     by_difficulty = {
-        str(segment.get("difficulty")): segment
-        for segment in segments
-        if isinstance(segment, dict)
+        str(segment.get("difficulty")): segment for segment in segments if isinstance(segment, dict)
     }
     if set(by_difficulty) != set(STAGE211_AUDIO_CURRICULUM):
         raise ValueError(
@@ -838,35 +745,22 @@ def validate_stage211_full_data_coverage(
             int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS
         ):
             raise ValueError(f"Stage211 {phase}/{difficulty} row exposures mismatch.")
-        if int(segment.get("steps_per_epoch", -1)) != int(
-            expected["steps_per_epoch"]
-        ):
+        if int(segment.get("steps_per_epoch", -1)) != int(expected["steps_per_epoch"]):
             raise ValueError(f"Stage211 {phase}/{difficulty} per-epoch steps mismatch.")
         if int(segment.get("steps", -1)) != int(expected["steps"]):
             raise ValueError(f"Stage211 {phase}/{difficulty} step count mismatch.")
-        tail_padding_samples_per_epoch = int(
-            expected["tail_padding_samples_per_epoch"]
-        )
-        if (
-            int(segment.get("tail_padding_samples_per_epoch", -1))
-            != tail_padding_samples_per_epoch
-        ):
-            raise ValueError(
-                f"Stage211 {phase}/{difficulty} tail-padding count mismatch."
-            )
+        tail_padding_samples_per_epoch = int(expected["tail_padding_samples_per_epoch"])
+        if int(segment.get("tail_padding_samples_per_epoch", -1)) != tail_padding_samples_per_epoch:
+            raise ValueError(f"Stage211 {phase}/{difficulty} tail-padding count mismatch.")
         if int(segment.get("tail_padding_sample_exposures", -1)) != (
             tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
         ):
-            raise ValueError(
-                f"Stage211 {phase}/{difficulty} tail-padding exposure mismatch."
-            )
+            raise ValueError(f"Stage211 {phase}/{difficulty} tail-padding exposure mismatch.")
         if int(segment.get("executed_sample_exposures", -1)) != (
             int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS
             + tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
         ):
-            raise ValueError(
-                f"Stage211 {phase}/{difficulty} executed-sample exposure mismatch."
-            )
+            raise ValueError(f"Stage211 {phase}/{difficulty} executed-sample exposure mismatch.")
         hours = float(segment.get("hours", float("nan")))
         if not math.isfinite(hours) or abs(hours - float(expected["hours"])) > 0.002:
             raise ValueError(f"Stage211 {phase}/{difficulty} hour count mismatch.")
@@ -887,9 +781,7 @@ def validate_stage211_full_data_coverage(
             receipt_path,
             label=f"Stage211 {phase}/{difficulty} coverage receipt",
         )
-        if segment.get("runtime_epoch_coverage") != receipt.get(
-            "runtime_epoch_coverage"
-        ):
+        if segment.get("runtime_epoch_coverage") != receipt.get("runtime_epoch_coverage"):
             raise ValueError(
                 f"Stage211 {phase}/{difficulty} runtime epoch coverage differs "
                 "from its coverage receipt."
@@ -945,9 +837,7 @@ def validate_stage211_full_data_coverage(
                 )
         train_config = load_yaml(train_config_path)
         validate_stage211_phase_train_config(train_config, phase=phase)
-        configured_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(
-            train_config
-        )
+        configured_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(train_config)
         if configured_teacher_checkpoint != teacher_checkpoint:
             raise ValueError(
                 f"Stage211 {phase}/{difficulty} Nano teacher checkpoint differs "
@@ -998,9 +888,7 @@ def validate_stage211_public_benchmark(public_benchmark: Any) -> dict[str, Any]:
     if not isinstance(results, list):
         raise ValueError("Stage211 public benchmark results must be a list.")
     by_dataset = {
-        str(result.get("dataset")): result
-        for result in results
-        if isinstance(result, dict)
+        str(result.get("dataset")): result for result in results if isinstance(result, dict)
     }
     if set(by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
         raise ValueError("Stage211 public benchmark dataset set is incomplete or unexpected.")
@@ -1048,6 +936,7 @@ def validate_stage211_phase_gate_report(
     *,
     expected_phase: str,
     checkpoint_path: str | Path,
+    require_passed: bool = True,
 ) -> dict[str, Any]:
     gate_report_path = Path(gate_report_path).resolve()
     checkpoint_path = Path(checkpoint_path).resolve()
@@ -1064,7 +953,10 @@ def validate_stage211_phase_gate_report(
                 f"Stage211 phase gate {key} mismatch: "
                 f"expected={expected!r} actual={report.get(key)!r}"
             )
-    if report.get("gate_passed") is not True:
+    gate_passed = report.get("gate_passed")
+    if not isinstance(gate_passed, bool):
+        raise ValueError("Stage211 phase gate report lacks a boolean decision.")
+    if require_passed and not gate_passed:
         raise ValueError("Stage211 phase gate report does not record a passing decision.")
     recorded_checkpoint = Path(str(report.get("checkpoint_path") or "")).resolve()
     if recorded_checkpoint != checkpoint_path:
@@ -1084,24 +976,17 @@ def validate_stage211_phase_gate_report(
         (
             segment
             for segment in phase_segments
-            if isinstance(segment, dict)
-            and str(segment.get("difficulty") or "") == "easy"
+            if isinstance(segment, dict) and str(segment.get("difficulty") or "") == "easy"
         ),
         None,
     )
     if easy_segment is None:
         raise ValueError("Stage211 phase gate lacks the easy initialization segment.")
-    phase_init_checkpoint = Path(
-        str(easy_segment.get("init_checkpoint_path") or "")
-    ).resolve()
-    if (
-        not phase_init_checkpoint.is_file()
-        or sha256_file(phase_init_checkpoint)
-        != easy_segment.get("init_checkpoint_sha256")
-    ):
-        raise ValueError(
-            "Stage211 phase initialization checkpoint is missing or changed."
-        )
+    phase_init_checkpoint = Path(str(easy_segment.get("init_checkpoint_path") or "")).resolve()
+    if not phase_init_checkpoint.is_file() or sha256_file(
+        phase_init_checkpoint
+    ) != easy_segment.get("init_checkpoint_sha256"):
+        raise ValueError("Stage211 phase initialization checkpoint is missing or changed.")
     benchmark = validate_stage211_public_benchmark(report.get("public_benchmark"))
     teacher_sha256_values = {
         str(segment.get("nano_teacher_checkpoint_sha256") or "")
@@ -1109,9 +994,7 @@ def validate_stage211_phase_gate_report(
         if isinstance(segment, dict)
     }
     if len(teacher_sha256_values) != 1:
-        raise ValueError(
-            "Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256."
-        )
+        raise ValueError("Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256.")
     nano_teacher_checkpoint_sha256 = next(iter(teacher_sha256_values))
     baseline_receipt_path = _validate_bound_file(
         report,
@@ -1121,18 +1004,14 @@ def validate_stage211_phase_gate_report(
     )
     baseline_receipt = validate_stage211_nano_public_baseline_receipt(
         baseline_receipt_path,
-        expected_receipt_sha256=str(
-            report["nano_public_baseline_receipt_sha256"]
-        ),
+        expected_receipt_sha256=str(report["nano_public_baseline_receipt_sha256"]),
         expected_nano_checkpoint_sha256=nano_teacher_checkpoint_sha256,
         public_benchmark=benchmark,
     )
     if report.get("nano_public_baseline_checkpoint_sha256") != baseline_receipt.get(
         "nano_checkpoint_sha256"
     ):
-        raise ValueError(
-            "Stage211 phase gate Nano public-baseline checkpoint binding mismatch."
-        )
+        raise ValueError("Stage211 phase gate Nano public-baseline checkpoint binding mismatch.")
     alignment_record = report.get("alignment_report")
     if not isinstance(alignment_record, dict):
         raise ValueError("Stage211 phase gate lacks an alignment report binding.")
@@ -1147,58 +1026,45 @@ def validate_stage211_phase_gate_report(
         label=f"Stage211 {expected_phase} alignment report",
     )
     expected_alignment_artifact = (
-        "logits_alignment_gate"
-        if expected_phase == "logits"
-        else "hidden_alignment_gate"
+        "logits_alignment_gate" if expected_phase == "logits" else "hidden_alignment_gate"
     )
+    alignment_gate_passed = report.get("alignment_gate_passed")
+    if not isinstance(alignment_gate_passed, bool):
+        raise ValueError("Stage211 phase gate lacks a boolean alignment decision.")
     expected_alignment_fields = {
         "schema_version": 1,
         "pipeline": "stage211",
         "artifact": expected_alignment_artifact,
         "phase": expected_phase,
-        "gate_passed": True,
+        "gate_passed": alignment_gate_passed,
         "baseline_checkpoint_path": str(phase_init_checkpoint),
-        "baseline_checkpoint_sha256": sha256_file(
-            phase_init_checkpoint
-        ),
+        "baseline_checkpoint_sha256": sha256_file(phase_init_checkpoint),
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": sha256_file(checkpoint_path),
     }
-    if any(
-        alignment_report.get(key) != value
-        for key, value in expected_alignment_fields.items()
-    ):
-        raise ValueError(
-            f"Stage211 {expected_phase} alignment report contract mismatch."
-        )
+    if any(alignment_report.get(key) != value for key, value in expected_alignment_fields.items()):
+        raise ValueError(f"Stage211 {expected_phase} alignment report contract mismatch.")
     alignment_source_paths: dict[str, Path] = {}
     for prefix in ("baseline_report", "candidate_report"):
         alignment_source_paths[prefix] = _validate_bound_file(
             alignment_report,
             path_key=f"{prefix}_path",
             sha256_key=f"{prefix}_sha256",
-            label=(
-                f"Stage211 {expected_phase} alignment "
-                f"{prefix.replace('_', ' ')}"
-            ),
+            label=(f"Stage211 {expected_phase} alignment {prefix.replace('_', ' ')}"),
         )
-    baseline_source, baseline_source_fingerprint = (
-        _validate_stage211_alignment_source_report(
-            alignment_source_paths["baseline_report"],
-            phase=expected_phase,
-            role="baseline",
-            checkpoint_path=phase_init_checkpoint,
-            nano_teacher_checkpoint_sha256=nano_teacher_checkpoint_sha256,
-        )
+    baseline_source, baseline_source_fingerprint = _validate_stage211_alignment_source_report(
+        alignment_source_paths["baseline_report"],
+        phase=expected_phase,
+        role="baseline",
+        checkpoint_path=phase_init_checkpoint,
+        nano_teacher_checkpoint_sha256=nano_teacher_checkpoint_sha256,
     )
-    candidate_source, candidate_source_fingerprint = (
-        _validate_stage211_alignment_source_report(
-            alignment_source_paths["candidate_report"],
-            phase=expected_phase,
-            role="candidate",
-            checkpoint_path=checkpoint_path,
-            nano_teacher_checkpoint_sha256=nano_teacher_checkpoint_sha256,
-        )
+    candidate_source, candidate_source_fingerprint = _validate_stage211_alignment_source_report(
+        alignment_source_paths["candidate_report"],
+        phase=expected_phase,
+        role="candidate",
+        checkpoint_path=checkpoint_path,
+        nano_teacher_checkpoint_sha256=nano_teacher_checkpoint_sha256,
     )
     pair_shared_fields = (
         "pair_eval_id",
@@ -1210,28 +1076,17 @@ def validate_stage211_phase_gate_report(
         "nano_checkpoint_sha256",
         "feature_seed",
     )
-    if any(
-        baseline_source.get(key) != candidate_source.get(key)
-        for key in pair_shared_fields
+    if any(baseline_source.get(key) != candidate_source.get(key) for key in pair_shared_fields):
+        raise ValueError(f"Stage211 {expected_phase} alignment sources are not one eval pair.")
+    if Path(str(baseline_source.get("train_config_path") or "")).resolve() != Path(
+        str(easy_segment.get("train_config_path") or "")
+    ).resolve() or baseline_source.get("train_config_sha256") != easy_segment.get(
+        "train_config_sha256"
     ):
+        raise ValueError(f"Stage211 {expected_phase} alignment pair train config mismatch.")
+    if baseline_source.get("eval_provenance") != candidate_source.get("eval_provenance"):
         raise ValueError(
-            f"Stage211 {expected_phase} alignment sources are not one eval pair."
-        )
-    if (
-        Path(str(baseline_source.get("train_config_path") or "")).resolve()
-        != Path(str(easy_segment.get("train_config_path") or "")).resolve()
-        or baseline_source.get("train_config_sha256")
-        != easy_segment.get("train_config_sha256")
-    ):
-        raise ValueError(
-            f"Stage211 {expected_phase} alignment pair train config mismatch."
-        )
-    if baseline_source.get("eval_provenance") != candidate_source.get(
-        "eval_provenance"
-    ):
-        raise ValueError(
-            f"Stage211 {expected_phase} alignment sources use different "
-            "fixed-eval provenance."
+            f"Stage211 {expected_phase} alignment sources use different fixed-eval provenance."
         )
     baseline_fingerprint = _validate_stage211_alignment_eval_provenance(
         alignment_report.get("baseline_eval_provenance"),
@@ -1242,9 +1097,7 @@ def validate_stage211_phase_gate_report(
         label=f"{expected_phase} alignment candidate",
     )
     if baseline_fingerprint != candidate_fingerprint:
-        raise ValueError(
-            f"Stage211 {expected_phase} alignment reports use different eval samples."
-        )
+        raise ValueError(f"Stage211 {expected_phase} alignment reports use different eval samples.")
     if (
         baseline_source_fingerprint != baseline_fingerprint
         or candidate_source_fingerprint != candidate_fingerprint
@@ -1253,16 +1106,10 @@ def validate_stage211_phase_gate_report(
         or candidate_source.get("eval_provenance")
         != alignment_report.get("candidate_eval_provenance")
     ):
-        raise ValueError(
-            f"Stage211 {expected_phase} alignment source provenance mismatch."
-        )
+        raise ValueError(f"Stage211 {expected_phase} alignment source provenance mismatch.")
     if expected_phase == "logits":
-        baseline_feature_seed = alignment_report[
-            "baseline_eval_provenance"
-        ].get("feature_seed")
-        candidate_feature_seed = alignment_report[
-            "candidate_eval_provenance"
-        ].get("feature_seed")
+        baseline_feature_seed = alignment_report["baseline_eval_provenance"].get("feature_seed")
+        candidate_feature_seed = alignment_report["candidate_eval_provenance"].get("feature_seed")
         if (
             not isinstance(baseline_feature_seed, int)
             or baseline_feature_seed < 0
@@ -1273,23 +1120,21 @@ def validate_stage211_phase_gate_report(
                 "non-negative fixed feature seed."
             )
     if alignment_record.get("artifact") != expected_alignment_artifact:
-        raise ValueError(
-            f"Stage211 {expected_phase} alignment report binding mismatch."
-        )
-    if report.get("alignment_gate_passed") is not True:
-        raise ValueError(
-            f"Stage211 {expected_phase} alignment gate did not pass."
-        )
+        raise ValueError(f"Stage211 {expected_phase} alignment report binding mismatch.")
+    public_progress_gate_passed = report.get("public_progress_gate_passed")
+    if not isinstance(public_progress_gate_passed, bool):
+        raise ValueError("Stage211 phase gate lacks a boolean public-progress decision.")
     if expected_phase in {"mixer", "block"}:
-        if report.get("public_progress_gate_passed") is not True:
-            raise ValueError(
-                f"Stage211 {expected_phase} public progress gate did not pass."
-            )
+        expected_gate_passed = alignment_gate_passed and public_progress_gate_passed
+        if require_passed and not public_progress_gate_passed:
+            raise ValueError(f"Stage211 {expected_phase} public progress gate did not pass.")
     elif expected_phase == "logits":
-        if benchmark.get("all_datasets_pass") is not True:
-            raise ValueError(
-                "Stage211 logits phase must pass the every-dataset Nano WER/CER gate."
-            )
+        datasets_passed = benchmark.get("all_datasets_pass") is True
+        expected_gate_passed = alignment_gate_passed and datasets_passed
+        if require_passed and not datasets_passed:
+            raise ValueError("Stage211 logits phase must pass the every-dataset Nano WER/CER gate.")
     else:
         raise ValueError(f"Stage211 phase {expected_phase!r} cannot promote.")
+    if gate_passed != expected_gate_passed:
+        raise ValueError("Stage211 phase gate decision is inconsistent with its sub-gates.")
     return report
