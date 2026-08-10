@@ -190,8 +190,19 @@ def _social_inventory(
     part = _part(root / "social.jsonl", rows=2, source="social_videos_mp3")
     manifest = root / "manifest.json"
     _manifest(manifest, parts=[part], eval_split=eval_split)
+    source_inventory = root / "source_inventory.json"
+    source_inventory.write_text("{}\n", encoding="utf-8")
     materialized = root / "materialized.json"
-    materialized.write_text("{}\n", encoding="utf-8")
+    materialized.write_text(
+        json.dumps(
+            {
+                "source_inventory_path": str(source_inventory),
+                "source_inventory_sha256": _sha256(source_inventory),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     fingerprint_part = root / "fingerprints.jsonl"
     fingerprint_part.write_text("{}\n" * 2, encoding="utf-8")
     fingerprint_receipt = root / "fingerprints.receipt.json"
@@ -261,6 +272,71 @@ def _social_inventory(
     return path
 
 
+def _usb_proofs(tmp_path: Path, *, social_inventory: Path) -> tuple[Path, Path]:
+    archive = tmp_path / "new_video.tar"
+    archive.write_bytes(b"archive")
+    pending = sorted(combined.EXPECTED_USB_PENDING_NATURAL_ADMISSION)
+    coverage = tmp_path / "usb_coverage.json"
+    coverage.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "usb_top_level_coverage",
+                "classification_complete": True,
+                "training_coverage_complete": False,
+                "top_level_entry_count": 27,
+                "pending_natural_admission": pending,
+                "evidence": {
+                    "archived_social": {
+                        "archive_path": str(archive),
+                        "archive_size_bytes": archive.stat().st_size,
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    social = json.loads(social_inventory.read_text(encoding="utf-8"))
+    materialized = json.loads(
+        Path(social["materialized_inventory_path"]).read_text(encoding="utf-8")
+    )
+    overlap = tmp_path / "archived_overlap.json"
+    overlap.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "archived_social_overlap",
+                "complete": True,
+                "training_ready": False,
+                "archive_path": str(archive),
+                "archive_size_bytes": archive.stat().st_size,
+                "archive_sha256": _sha256(archive),
+                "archive_audio_members": 1,
+                "archive_audio_bytes": archive.stat().st_size,
+                "source_inventory_path": materialized["source_inventory_path"],
+                "source_inventory_sha256": materialized["source_inventory_sha256"],
+                "usb_top_level_coverage_receipt_path": str(coverage),
+                "usb_top_level_coverage_receipt_sha256": _sha256(coverage),
+                "comparison_mode": (
+                    "exact_member_bytes_sha256_against_existing_social_path"
+                ),
+                "exact_duplicate_members": 1,
+                "unique_members": 0,
+                "all_members_exact_existing_social_duplicates": True,
+                "archive_excluded_from_training_as_duplicate": True,
+                "requires_unique_member_vad_pipeline": False,
+                "global_acoustic_near_duplicate_complete": False,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return coverage, overlap
+
+
 def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -> None:
     _, _, eval_split, fixed_binding = _fixed_eval(tmp_path)
     base = _base_inventory(
@@ -273,11 +349,14 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
         eval_split=eval_split,
         fixed_binding=fixed_binding,
     )
+    coverage, overlap = _usb_proofs(tmp_path, social_inventory=social)
     output = tmp_path / "combined"
 
     result = combined.build_combined_inventory(
         base_inventory_path=base,
         social_inventory_path=social,
+        usb_coverage_receipt_path=coverage,
+        archived_social_overlap_receipt_path=overlap,
         output_root=output,
     )
     assert result["schema_version"] == 2
@@ -287,6 +366,10 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
     assert result["language"] == ["en", "zh"]
     assert result["cross_pool_dedupe"]["content_fingerprint_complete"] is False
     assert result["cross_pool_dedupe"]["social_normalized_pcm_exact_complete"] is True
+    assert result["cross_pool_dedupe"][
+        "archived_social_exact_duplicate_exclusion_complete"
+    ] is True
+    assert result["usb_natural_audio_resolution"]["unresolved_entries"] == []
     assert result["cross_pool_dedupe"]["near_duplicate_complete"] is False
     manifest = load_webdataset_bucket_manifest(result["bucket_manifest_path"])
     assert sum(bucket.num_samples for bucket in manifest.splits["train"]) == 7
@@ -308,6 +391,8 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
         combined.build_combined_inventory(
             base_inventory_path=base,
             social_inventory_path=social,
+            usb_coverage_receipt_path=coverage,
+            archived_social_overlap_receipt_path=overlap,
             output_root=output,
         )
         == result
@@ -326,10 +411,13 @@ def test_combined_inventory_rejects_changed_component(tmp_path: Path) -> None:
         eval_split=eval_split,
         fixed_binding=fixed_binding,
     )
+    coverage, overlap = _usb_proofs(tmp_path, social_inventory=social)
     output = tmp_path / "combined"
     combined.build_combined_inventory(
         base_inventory_path=base,
         social_inventory_path=social,
+        usb_coverage_receipt_path=coverage,
+        archived_social_overlap_receipt_path=overlap,
         output_root=output,
     )
     social.write_text(social.read_text(encoding="utf-8") + " ", encoding="utf-8")

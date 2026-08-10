@@ -29,6 +29,16 @@ STAGE211_BASE_SUPPLEMENTAL_SOURCES = {
     "vctk",
 }
 STAGE211_SUPPLEMENTAL_SOURCES = STAGE211_BASE_SUPPLEMENTAL_SOURCES
+STAGE211_USB_PENDING_NATURAL_ADMISSION = {
+    "LLaSO-Align",
+    "MLCommons",
+    "clean_vocals",
+    "new_video.tar",
+    "videos",
+    "videos_bilibili5",
+    "videos_bilibili6",
+    "videos_bilibili7",
+}
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -170,6 +180,109 @@ def _validate_combined_component_inventories(
     return base, social, social_sources
 
 
+def _validate_combined_usb_coverage(
+    inventory: dict[str, Any],
+    *,
+    social: dict[str, Any],
+) -> None:
+    usb_record = inventory.get("usb_top_level_coverage")
+    overlap_record = inventory.get("archived_social_exclusion")
+    resolution = inventory.get("usb_natural_audio_resolution")
+    if (
+        not isinstance(usb_record, dict)
+        or not isinstance(overlap_record, dict)
+        or not isinstance(resolution, dict)
+    ):
+        raise ValueError("Stage211 combined inventory lacks USB-wide coverage proof.")
+    usb_path = _bound_file(
+        usb_record,
+        path_key="receipt_path",
+        sha256_key="receipt_sha256",
+        label="Stage211 USB top-level coverage receipt",
+        verify_sha256=True,
+    )
+    usb = _load_json(usb_path, label="Stage211 USB top-level coverage receipt")
+    if (
+        usb.get("schema_version") != 1
+        or usb.get("pipeline") != "stage211"
+        or usb.get("artifact") != "usb_top_level_coverage"
+        or usb.get("classification_complete") is not True
+        or usb.get("training_coverage_complete") is not False
+        or set(usb.get("pending_natural_admission") or [])
+        != STAGE211_USB_PENDING_NATURAL_ADMISSION
+        or usb_record.get("classification_complete") is not True
+        or int(usb_record.get("top_level_entry_count", -1))
+        != int(usb.get("top_level_entry_count", -2))
+        or set(usb_record.get("pending_natural_admission") or [])
+        != STAGE211_USB_PENDING_NATURAL_ADMISSION
+    ):
+        raise ValueError("Stage211 USB top-level coverage proof changed.")
+    overlap_path = _bound_file(
+        overlap_record,
+        path_key="receipt_path",
+        sha256_key="receipt_sha256",
+        label="Stage211 archived-social overlap receipt",
+        verify_sha256=True,
+    )
+    overlap = _load_json(overlap_path, label="Stage211 archived-social overlap receipt")
+    if (
+        overlap.get("schema_version") != 1
+        or overlap.get("pipeline") != "stage211"
+        or overlap.get("artifact") != "archived_social_overlap"
+        or overlap.get("complete") is not True
+        or overlap.get("comparison_mode")
+        != "exact_member_bytes_sha256_against_existing_social_path"
+        or overlap.get("all_members_exact_existing_social_duplicates") is not True
+        or overlap.get("archive_excluded_from_training_as_duplicate") is not True
+        or overlap.get("requires_unique_member_vad_pipeline") is not False
+        or int(overlap.get("unique_members", -1)) != 0
+        or int(overlap.get("archive_audio_members", -1)) <= 0
+        or int(overlap.get("exact_duplicate_members", -1))
+        != int(overlap.get("archive_audio_members", -2))
+        or overlap.get("usb_top_level_coverage_receipt_path") != str(usb_path)
+        or overlap.get("usb_top_level_coverage_receipt_sha256") != _sha256_file(usb_path)
+    ):
+        raise ValueError("Stage211 archived-social exact-duplicate proof changed.")
+    materialized_path = Path(str(social.get("materialized_inventory_path") or "")).resolve()
+    materialized = _load_json(
+        materialized_path,
+        label="Stage211 social materialized inventory",
+    )
+    if (
+        _sha256_file(materialized_path) != social.get("materialized_inventory_sha256")
+        or overlap.get("source_inventory_path")
+        != materialized.get("source_inventory_path")
+        or overlap.get("source_inventory_sha256")
+        != materialized.get("source_inventory_sha256")
+        or overlap_record.get("archive_path") != overlap.get("archive_path")
+        or overlap_record.get("archive_sha256") != overlap.get("archive_sha256")
+        or int(overlap_record.get("audio_members", -1))
+        != int(overlap.get("archive_audio_members", -2))
+        or int(overlap_record.get("audio_bytes", -1))
+        != int(overlap.get("archive_audio_bytes", -2))
+        or int(overlap_record.get("exact_duplicate_members", -1))
+        != int(overlap.get("exact_duplicate_members", -2))
+        or overlap_record.get("all_members_exact_existing_social_duplicates") is not True
+        or int(overlap_record.get("unique_members", -1)) != 0
+    ):
+        raise ValueError("Stage211 archived-social exclusion binding changed.")
+    expected_resolution = {
+        "complete": True,
+        "admitted_by_base_natural": ["LLaSO-Align", "MLCommons"],
+        "admitted_by_social_vad": [
+            "clean_vocals",
+            "videos",
+            "videos_bilibili5",
+            "videos_bilibili6",
+            "videos_bilibili7",
+        ],
+        "exact_duplicate_excluded": ["new_video.tar"],
+        "unresolved_entries": [],
+    }
+    if resolution != expected_resolution:
+        raise ValueError("Stage211 USB natural-audio resolution is incomplete.")
+
+
 def validate_stage211_supplemental_inventory(
     inventory_path: str | Path,
     *,
@@ -231,6 +344,7 @@ def validate_stage211_supplemental_inventory(
                 verify_part_sha256=verify_part_sha256,
             )
         )
+        _validate_combined_usb_coverage(inventory, social=component_social)
     expected_sources = (
         STAGE211_BASE_SUPPLEMENTAL_SOURCES | social_sources
         if combined
@@ -294,6 +408,9 @@ def validate_stage211_supplemental_inventory(
     if combined and (
         cross_pool.get("social_normalized_pcm_exact_complete") is not True
         or cross_pool.get("social_public_overlap_mode") != "normalized_pcm_exact"
+        or cross_pool.get("archived_social_exact_duplicate_exclusion_complete") is not True
+        or cross_pool.get("usb_top_level_classification_complete") is not True
+        or cross_pool.get("usb_unresolved_natural_entries") != []
         or cross_pool.get("near_duplicate_complete") is not False
     ):
         raise ValueError("Stage211 combined social dedupe disclosure is invalid.")

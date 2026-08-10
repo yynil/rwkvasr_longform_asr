@@ -620,9 +620,17 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
     expected_exclusions = {"llaso_gigaspeech", "llaso_librispeech"}
     exclusions = set(cross_pool.get("known_overlap_exclusions") or [])
     if (
-        cross_pool.get("mode") != "source_identity_plus_known_corpus_exclusion"
+        inventory.get("schema_version") != 2
+        or inventory.get("artifact") != "stage211_supplemental_combined_inventory"
+        or cross_pool.get("mode") != "source_identity_plus_known_corpus_exclusion"
         or cross_pool.get("source_sets_disjoint") is not True
         or cross_pool.get("content_fingerprint_complete") is not False
+        or cross_pool.get("social_normalized_pcm_exact_complete") is not True
+        or cross_pool.get("social_public_overlap_mode") != "normalized_pcm_exact"
+        or cross_pool.get("archived_social_exact_duplicate_exclusion_complete") is not True
+        or cross_pool.get("usb_top_level_classification_complete") is not True
+        or cross_pool.get("usb_unresolved_natural_entries") != []
+        or cross_pool.get("near_duplicate_complete") is not False
         or exclusions != expected_exclusions
     ):
         raise ValueError("Stage211 supplemental cross-pool dedupe contract mismatch.")
@@ -643,6 +651,49 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
     stage179_hours = float(stage179.get("total_unique_hours", float("nan")))
     if stage179_rows <= 0 or not math.isfinite(stage179_hours) or stage179_hours <= 0.0:
         raise ValueError("Stage211 supplemental Stage179 coverage binding is invalid.")
+    components = inventory.get("component_inventories")
+    if not isinstance(components, dict) or set(components) != {"base_natural", "social_vad"}:
+        raise ValueError("Stage211 supplemental component inventory proof is incomplete.")
+    usb_record = inventory.get("usb_top_level_coverage")
+    overlap_record = inventory.get("archived_social_exclusion")
+    resolution = inventory.get("usb_natural_audio_resolution")
+    if (
+        not isinstance(usb_record, dict)
+        or not isinstance(overlap_record, dict)
+        or not isinstance(resolution, dict)
+        or resolution.get("complete") is not True
+        or resolution.get("unresolved_entries") != []
+        or resolution.get("exact_duplicate_excluded") != ["new_video.tar"]
+    ):
+        raise ValueError("Stage211 supplemental USB-wide resolution proof is incomplete.")
+    usb_path = Path(str(usb_record.get("receipt_path") or "")).resolve()
+    overlap_path = Path(str(overlap_record.get("receipt_path") or "")).resolve()
+    if (
+        not usb_path.is_file()
+        or sha256_file(usb_path) != usb_record.get("receipt_sha256")
+        or not overlap_path.is_file()
+        or sha256_file(overlap_path) != overlap_record.get("receipt_sha256")
+    ):
+        raise ValueError("Stage211 supplemental USB-wide receipt binding changed.")
+    usb = _load_json(usb_path, label="Stage211 USB top-level coverage receipt")
+    overlap = _load_json(overlap_path, label="Stage211 archived-social overlap receipt")
+    if (
+        usb.get("artifact") != "usb_top_level_coverage"
+        or usb.get("classification_complete") is not True
+        or overlap.get("artifact") != "archived_social_overlap"
+        or overlap.get("complete") is not True
+        or overlap.get("all_members_exact_existing_social_duplicates") is not True
+        or overlap.get("archive_excluded_from_training_as_duplicate") is not True
+        or int(overlap.get("unique_members", -1)) != 0
+        or int(overlap.get("archive_audio_members", -1)) <= 0
+        or int(overlap.get("exact_duplicate_members", -1))
+        != int(overlap.get("archive_audio_members", -2))
+        or overlap_record.get("archive_sha256") != overlap.get("archive_sha256")
+        or int(overlap_record.get("audio_members", -1))
+        != int(overlap.get("archive_audio_members", -2))
+        or int(overlap_record.get("unique_members", -1)) != 0
+    ):
+        raise ValueError("Stage211 archived-social all-member exclusion proof changed.")
     return {
         "inventory_schema_version": int(inventory.get("schema_version", -1)),
         "inventory_artifact": str(inventory.get("artifact") or ""),
@@ -659,8 +710,19 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
             cross_pool.get("social_normalized_pcm_exact_complete", False)
         ),
         "social_public_overlap_mode": cross_pool.get("social_public_overlap_mode"),
+        "archived_social_exact_duplicate_exclusion_complete": True,
+        "archived_social_overlap_receipt_path": str(overlap_path),
+        "archived_social_overlap_receipt_sha256": sha256_file(overlap_path),
+        "archived_social_archive_sha256": overlap["archive_sha256"],
+        "archived_social_audio_members": int(overlap["archive_audio_members"]),
+        "archived_social_unique_members": 0,
+        "usb_top_level_classification_complete": True,
+        "usb_top_level_coverage_receipt_path": str(usb_path),
+        "usb_top_level_coverage_receipt_sha256": sha256_file(usb_path),
+        "usb_natural_audio_resolution_complete": True,
+        "usb_unresolved_natural_entries": [],
         "near_duplicate_complete": cross_pool.get("near_duplicate_complete"),
-        "component_inventories": inventory.get("component_inventories", {}),
+        "component_inventories": components,
     }
 
 
@@ -1059,6 +1121,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"`{str(report['supplemental_dedupe_proof']['social_normalized_pcm_exact_complete']).lower()}`/"
         f"`{report['supplemental_dedupe_proof']['social_public_overlap_mode']}`, "
         "acoustic near-duplicate coverage: `false`",
+        "",
+        "USB-wide natural-audio resolution: `true`, archived social exact duplicate "
+        f"exclusion: `{str(report['supplemental_dedupe_proof']['archived_social_exact_duplicate_exclusion_complete']).lower()}` "
+        f"({int(report['supplemental_dedupe_proof']['archived_social_audio_members'])} members), "
+        "unresolved entries: `0`",
         "",
         "CTC label normalization: `ctc`, tokenizer: `sensevoice_tiktoken`, "
         f"unknown tokens: `{int(report['ctc_label_proof']['ctc_unk_tokens'])}`, "

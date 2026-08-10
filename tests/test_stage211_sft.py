@@ -648,14 +648,51 @@ def _write_stepwise_inputs(
         "nano_public_baseline_receipt_sha256": sha256_file(nano_baseline_receipt),
         "nano_public_baseline_checkpoint_sha256": nano_teacher_sha256,
     }
+    usb_coverage_receipt = tmp_path / "usb-coverage.json"
+    usb_coverage_receipt.write_text(
+        json.dumps(
+            {
+                "artifact": "usb_top_level_coverage",
+                "classification_complete": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    archived_social_overlap = tmp_path / "archived-social-overlap.json"
+    archived_social_overlap.write_text(
+        json.dumps(
+            {
+                "artifact": "archived_social_overlap",
+                "complete": True,
+                "archive_sha256": "a" * 64,
+                "archive_audio_members": 10,
+                "exact_duplicate_members": 10,
+                "unique_members": 0,
+                "all_members_exact_existing_social_duplicates": True,
+                "archive_excluded_from_training_as_duplicate": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     supplemental_inventory = tmp_path / "supplemental-inventory.json"
     supplemental_inventory.write_text(
         json.dumps(
             {
+                "schema_version": 2,
+                "artifact": "stage211_supplemental_combined_inventory",
+                "component_inventories": {"base_natural": {}, "social_vad": {}},
                 "cross_pool_dedupe": {
                     "mode": "source_identity_plus_known_corpus_exclusion",
                     "content_fingerprint_complete": False,
                     "source_sets_disjoint": True,
+                    "social_normalized_pcm_exact_complete": True,
+                    "social_public_overlap_mode": "normalized_pcm_exact",
+                    "archived_social_exact_duplicate_exclusion_complete": True,
+                    "usb_top_level_classification_complete": True,
+                    "usb_unresolved_natural_entries": [],
+                    "near_duplicate_complete": False,
                     "known_overlap_exclusions": [
                         "llaso_gigaspeech",
                         "llaso_librispeech",
@@ -667,7 +704,23 @@ def _write_stepwise_inputs(
                         "total_unique_rows": 62_072_225,
                         "total_unique_hours": 118_465.16068055555,
                     },
-                }
+                },
+                "usb_top_level_coverage": {
+                    "receipt_path": str(usb_coverage_receipt),
+                    "receipt_sha256": sha256_file(usb_coverage_receipt),
+                },
+                "archived_social_exclusion": {
+                    "receipt_path": str(archived_social_overlap),
+                    "receipt_sha256": sha256_file(archived_social_overlap),
+                    "archive_sha256": "a" * 64,
+                    "audio_members": 10,
+                    "unique_members": 0,
+                },
+                "usb_natural_audio_resolution": {
+                    "complete": True,
+                    "exact_duplicate_excluded": ["new_video.tar"],
+                    "unresolved_entries": [],
+                },
             }
         )
         + "\n",
@@ -1275,6 +1328,14 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "llaso_gigaspeech",
         "llaso_librispeech",
     ]
+    assert report["supplemental_dedupe_proof"][
+        "archived_social_exact_duplicate_exclusion_complete"
+    ] is True
+    assert report["supplemental_dedupe_proof"]["archived_social_unique_members"] == 0
+    assert report["supplemental_dedupe_proof"][
+        "usb_natural_audio_resolution_complete"
+    ] is True
+    assert report["supplemental_dedupe_proof"]["usb_unresolved_natural_entries"] == []
     assert report["all_stage_public_metrics_complete"] is True
     assert report["public_metric_stage_order"] == [
         "calibration",
@@ -1325,6 +1386,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")
     assert "Public metric definition proof" in output_markdown.read_text(encoding="utf-8")
     assert "Supplemental cross-pool dedupe" in output_markdown.read_text(
+        encoding="utf-8"
+    )
+    assert "USB-wide natural-audio resolution" in output_markdown.read_text(
         encoding="utf-8"
     )
     sft_finalizer._validate_final_report(

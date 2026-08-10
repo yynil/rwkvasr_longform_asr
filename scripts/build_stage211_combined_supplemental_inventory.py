@@ -27,9 +27,27 @@ DEFAULT_BASE_INVENTORY = (
 DEFAULT_SOCIAL_INVENTORY = (
     Path.home() / "rwkvasr_data/stage211_social_vad_filtered_v1/filtered_inventory.json"
 )
+DEFAULT_USB_COVERAGE_RECEIPT = (
+    Path.home()
+    / "rwkvasr_data/stage211_usb_top_level_coverage_v1/coverage_receipt.json"
+)
+DEFAULT_ARCHIVED_SOCIAL_OVERLAP_RECEIPT = (
+    Path.home()
+    / "rwkvasr_data/stage211_archived_social_overlap_v1/overlap_receipt.json"
+)
 DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_data/stage211_supplemental_combined_v2"
 COMBINED_ARTIFACT = "stage211_supplemental_combined_inventory"
 SCHEMA_VERSION = 2
+EXPECTED_USB_PENDING_NATURAL_ADMISSION = {
+    "LLaSO-Align",
+    "MLCommons",
+    "clean_vocals",
+    "new_video.tar",
+    "videos",
+    "videos_bilibili5",
+    "videos_bilibili6",
+    "videos_bilibili7",
+}
 
 
 def _sha256(path: Path, *, chunk_size: int = 8 << 20) -> str:
@@ -117,6 +135,85 @@ def _merged_source_totals(
     return {**base_values, **social_values}
 
 
+def _validate_usb_coverage_and_archive_exclusion(
+    *,
+    usb_coverage_receipt_path: Path,
+    archived_social_overlap_receipt_path: Path,
+    social: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    usb_coverage_receipt_path = usb_coverage_receipt_path.expanduser().resolve()
+    archived_social_overlap_receipt_path = (
+        archived_social_overlap_receipt_path.expanduser().resolve()
+    )
+    usb = _load_json(
+        usb_coverage_receipt_path,
+        label="Stage211 USB top-level coverage receipt",
+    )
+    if (
+        usb.get("schema_version") != 1
+        or usb.get("pipeline") != "stage211"
+        or usb.get("artifact") != "usb_top_level_coverage"
+        or usb.get("classification_complete") is not True
+        or usb.get("training_coverage_complete") is not False
+        or set(usb.get("pending_natural_admission") or [])
+        != EXPECTED_USB_PENDING_NATURAL_ADMISSION
+    ):
+        raise ValueError("Stage211 USB top-level coverage proof changed.")
+    overlap = _load_json(
+        archived_social_overlap_receipt_path,
+        label="Stage211 archived-social overlap receipt",
+    )
+    expected_overlap = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "archived_social_overlap",
+        "complete": True,
+        "training_ready": False,
+        "comparison_mode": "exact_member_bytes_sha256_against_existing_social_path",
+        "unique_members": 0,
+        "all_members_exact_existing_social_duplicates": True,
+        "archive_excluded_from_training_as_duplicate": True,
+        "requires_unique_member_vad_pipeline": False,
+        "global_acoustic_near_duplicate_complete": False,
+    }
+    if any(overlap.get(key) != value for key, value in expected_overlap.items()):
+        raise ValueError("Stage211 archived-social exact-duplicate proof is incomplete.")
+    if (
+        int(overlap.get("archive_audio_members", -1)) <= 0
+        or int(overlap.get("exact_duplicate_members", -1))
+        != int(overlap["archive_audio_members"])
+        or len(str(overlap.get("archive_sha256") or "")) != 64
+        or overlap.get("usb_top_level_coverage_receipt_path")
+        != str(usb_coverage_receipt_path)
+        or overlap.get("usb_top_level_coverage_receipt_sha256")
+        != _sha256(usb_coverage_receipt_path)
+    ):
+        raise ValueError("Stage211 archived-social member coverage proof changed.")
+    archived_evidence = usb.get("evidence", {}).get("archived_social", {})
+    if (
+        overlap.get("archive_path") != archived_evidence.get("archive_path")
+        or int(overlap.get("archive_size_bytes", -1))
+        != int(archived_evidence.get("archive_size_bytes", -2))
+    ):
+        raise ValueError("Stage211 archived-social tar differs from the USB coverage proof.")
+    materialized_path = Path(str(social.get("materialized_inventory_path") or "")).resolve()
+    materialized = _load_json(
+        materialized_path,
+        label="Stage211 social materialized inventory",
+    )
+    if (
+        _sha256(materialized_path) != social.get("materialized_inventory_sha256")
+        or overlap.get("source_inventory_path")
+        != materialized.get("source_inventory_path")
+        or overlap.get("source_inventory_sha256")
+        != materialized.get("source_inventory_sha256")
+    ):
+        raise ValueError(
+            "Stage211 archived-social overlap proof uses another social source inventory."
+        )
+    return usb, overlap
+
+
 def _write_atomic_directory(
     *,
     output_root: Path,
@@ -150,6 +247,8 @@ def build_combined_inventory(
     *,
     base_inventory_path: Path,
     social_inventory_path: Path,
+    usb_coverage_receipt_path: Path,
+    archived_social_overlap_receipt_path: Path,
     output_root: Path,
 ) -> dict[str, Any]:
     started = time.time()
@@ -182,6 +281,15 @@ def build_combined_inventory(
         verify_part_sha256=True,
     )
     social = social_validated["inventory"]
+    usb_coverage, archived_social_overlap = _validate_usb_coverage_and_archive_exclusion(
+        usb_coverage_receipt_path=usb_coverage_receipt_path,
+        archived_social_overlap_receipt_path=archived_social_overlap_receipt_path,
+        social=social,
+    )
+    usb_coverage_receipt_path = usb_coverage_receipt_path.expanduser().resolve()
+    archived_social_overlap_receipt_path = (
+        archived_social_overlap_receipt_path.expanduser().resolve()
+    )
 
     base_manifest_path = Path(base_validated["bucket_manifest_path"])
     social_manifest_path = Path(social_validated["bucket_manifest_path"])
@@ -282,6 +390,39 @@ def build_combined_inventory(
                 "near_duplicate_complete": False,
             },
         },
+        "usb_top_level_coverage": {
+            "receipt_path": str(usb_coverage_receipt_path),
+            "receipt_sha256": _sha256(usb_coverage_receipt_path),
+            "classification_complete": True,
+            "top_level_entry_count": int(usb_coverage["top_level_entry_count"]),
+            "pending_natural_admission": sorted(EXPECTED_USB_PENDING_NATURAL_ADMISSION),
+        },
+        "archived_social_exclusion": {
+            "receipt_path": str(archived_social_overlap_receipt_path),
+            "receipt_sha256": _sha256(archived_social_overlap_receipt_path),
+            "archive_path": archived_social_overlap["archive_path"],
+            "archive_sha256": archived_social_overlap["archive_sha256"],
+            "audio_members": int(archived_social_overlap["archive_audio_members"]),
+            "audio_bytes": int(archived_social_overlap["archive_audio_bytes"]),
+            "exact_duplicate_members": int(
+                archived_social_overlap["exact_duplicate_members"]
+            ),
+            "all_members_exact_existing_social_duplicates": True,
+            "unique_members": 0,
+        },
+        "usb_natural_audio_resolution": {
+            "complete": True,
+            "admitted_by_base_natural": ["LLaSO-Align", "MLCommons"],
+            "admitted_by_social_vad": [
+                "clean_vocals",
+                "videos",
+                "videos_bilibili5",
+                "videos_bilibili6",
+                "videos_bilibili7",
+            ],
+            "exact_duplicate_excluded": ["new_video.tar"],
+            "unresolved_entries": [],
+        },
         "cross_pool_dedupe": {
             "mode": "source_identity_plus_known_corpus_exclusion",
             "content_fingerprint_complete": False,
@@ -291,6 +432,9 @@ def build_combined_inventory(
             "known_overlap_exclusions": ["llaso_gigaspeech", "llaso_librispeech"],
             "social_normalized_pcm_exact_complete": True,
             "social_public_overlap_mode": "normalized_pcm_exact",
+            "archived_social_exact_duplicate_exclusion_complete": True,
+            "usb_top_level_classification_complete": True,
+            "usb_unresolved_natural_entries": [],
             "near_duplicate_complete": False,
         },
         "excluded_sources": {
@@ -352,6 +496,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--base-inventory", type=Path, default=DEFAULT_BASE_INVENTORY)
     parser.add_argument("--social-inventory", type=Path, default=DEFAULT_SOCIAL_INVENTORY)
+    parser.add_argument(
+        "--usb-coverage-receipt",
+        type=Path,
+        default=DEFAULT_USB_COVERAGE_RECEIPT,
+    )
+    parser.add_argument(
+        "--archived-social-overlap-receipt",
+        type=Path,
+        default=DEFAULT_ARCHIVED_SOCIAL_OVERLAP_RECEIPT,
+    )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     return parser.parse_args()
 
@@ -361,6 +515,8 @@ def main() -> int:
     result = build_combined_inventory(
         base_inventory_path=args.base_inventory,
         social_inventory_path=args.social_inventory,
+        usb_coverage_receipt_path=args.usb_coverage_receipt,
+        archived_social_overlap_receipt_path=args.archived_social_overlap_receipt,
         output_root=args.output_root,
     )
     print(
