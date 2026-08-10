@@ -981,6 +981,20 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["checkpoint_chain_passed"] is True
     assert report["nano_teacher_chain_passed"] is True
     assert report["supplemental_inventory_chain_passed"] is True
+    assert report["all_stage_public_metrics_complete"] is True
+    assert report["public_metric_stage_order"] == [
+        "calibration",
+        "mixer",
+        "block",
+        "logits",
+        "sft",
+    ]
+    assert len(report["english_wer_datasets"]) == 3
+    assert len(report["chinese_cer_datasets"]) == 2
+    assert all(
+        list(row["stages"]) == report["public_metric_stage_order"]
+        for row in report["dataset_results"]
+    )
     assert report["public_overlap_chain_passed"] is True
     assert report["public_overlap_receipt_sha256"] == sha256_file(
         tmp_path / "public-overlap-receipt.json"

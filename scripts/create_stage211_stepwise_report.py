@@ -724,6 +724,20 @@ def build_stepwise_report(
                 "stages": stage_values,
             }
         )
+    english_wer_datasets = [
+        row["dataset"]
+        for row in dataset_results
+        if row["language"] == "en" and row["metric"] == "wer"
+    ]
+    chinese_cer_datasets = [
+        row["dataset"]
+        for row in dataset_results
+        if row["language"] == "zh" and row["metric"] == "cer"
+    ]
+    if len(english_wer_datasets) != 3 or len(chinese_cer_datasets) != 2:
+        raise ValueError("Stage211 final report lacks the required English WER/Chinese CER split.")
+    if any(tuple(row["stages"]) != STAGE_ORDER for row in dataset_results):
+        raise ValueError("Stage211 final report lacks a complete ordered public-metric stage map.")
 
     stage_records = [
         _stage_record(
@@ -804,6 +818,10 @@ def build_stepwise_report(
         "total_public_eval_samples_per_stage": sum(
             int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
         ),
+        "public_metric_stage_order": list(STAGE_ORDER),
+        "all_stage_public_metrics_complete": True,
+        "english_wer_datasets": english_wer_datasets,
+        "chinese_cer_datasets": chinese_cer_datasets,
         "checkpoint_chain": chain,
         "stages": stage_records,
         "coverage_results": coverage_results,

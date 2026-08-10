@@ -3924,6 +3924,9 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert ".checkpoint_chain_passed == true" in script
     assert ".nano_teacher_chain_passed == true" in script
     assert ".supplemental_inventory_chain_passed == true" in script
+    assert ".all_stage_public_metrics_complete == true" in script
+    assert 'select(.language == "en" and .metric == "wer")' in script
+    assert 'select(.language == "zh" and .metric == "cer")' in script
     assert '.strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"]' in script
     assert '.requested_alignment_stage_order == ["rwkv_layer", "block", "logits", "sft"]' in script
     assert "post_mixer" in script
@@ -3950,7 +3953,7 @@ def _run_stage211_continuation_watcher_fixture(
     uv = fake_bin / "uv"
     uv.write_text(
         "#!/usr/bin/env bash\n"
-        'if [[ "${UV_MODE}" != success ]]; then exit 42; fi\n'
+        'if [[ "${UV_MODE}" == failure ]]; then exit 42; fi\n'
         "output_json=\n"
         "output_markdown=\n"
         "while (($#)); do\n"
@@ -3961,7 +3964,13 @@ def _run_stage211_continuation_watcher_fixture(
         "  esac\n"
         "done\n"
         'mkdir -p "$(dirname "${output_json}")"\n'
-        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],"dataset_results":[1,2,3,4,5]}\' >"${output_json}"\n'
+        'if [[ "${UV_MODE}" == malformed_metrics ]]; then\n'
+        '  dataset_proof=\'"public_metric_stage_order":["calibration","mixer","block","logits","sft"],"all_stage_public_metrics_complete":true,"english_wer_datasets":["en1","en2","en3"],"chinese_cer_datasets":["zh1","zh2"],"dataset_results":[1,2,3,4,5]\'\n'
+        "else\n"
+        '  stages=\'{"calibration":{},"mixer":{},"block":{},"logits":{},"sft":{}}\'\n'
+        '  dataset_proof=\'"public_metric_stage_order":["calibration","mixer","block","logits","sft"],"all_stage_public_metrics_complete":true,"english_wer_datasets":["en1","en2","en3"],"chinese_cer_datasets":["zh1","zh2"],"dataset_results":[{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'}]\'\n'
+        "fi\n"
+        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],\'"${dataset_proof}"\'}\' >"${output_json}"\n'
         "printf '%s\\n' '# stepwise' >\"${output_markdown}\"\n",
         encoding="utf-8",
     )
@@ -4025,5 +4034,19 @@ def test_stage211_continuation_watcher_restarts_after_stepwise_failure(
 
     assert result.returncode == 0, result.stderr
     assert "stepwise proof is missing or invalid" in result.stdout
+    assert "START_STAGE=full" in result.stdout
+    assert "new-session" in tmux_calls
+
+
+def test_stage211_continuation_watcher_rejects_placeholder_bilingual_metrics(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="malformed_metrics",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "final Stage211 stepwise proof failed validation" in result.stdout
     assert "START_STAGE=full" in result.stdout
     assert "new-session" in tmux_calls
