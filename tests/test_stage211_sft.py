@@ -924,6 +924,42 @@ def _write_stepwise_inputs(
         encoding="utf-8",
     )
     reports["initialization"] = initialization_receipt
+    metric_tokenizer_source = tmp_path / "metric-tokenizer.py"
+    metric_tokenizer_source.write_text("# unicode metric tokenizer\n", encoding="utf-8")
+    metric_correction_receipt = tmp_path / "unicode-metric-correction.json"
+    metric_correction_receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "unicode_wer_metric_correction",
+                "complete": True,
+                "tokenizer_contract": "unicode_alnum_words_basic_cjk_chars_v1",
+                "tokenizer_source_path": str(metric_tokenizer_source.resolve()),
+                "tokenizer_source_sha256": sha256_file(metric_tokenizer_source),
+                "calibration_reuse_receipt_path": str(calibration_receipt.resolve()),
+                "calibration_reuse_receipt_sha256": sha256_file(calibration_receipt),
+                "initialization_receipt_path": str(initialization_receipt.resolve()),
+                "initialization_receipt_sha256": sha256_file(initialization_receipt),
+                "installed_files": [
+                    {
+                        "label": "calibration_reuse_receipt",
+                        "path": str(calibration_receipt.resolve()),
+                        "sha256": sha256_file(calibration_receipt),
+                    },
+                    {
+                        "label": "initialization_receipt",
+                        "path": str(initialization_receipt.resolve()),
+                        "sha256": sha256_file(initialization_receipt),
+                    },
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    reports["metric_tokenizer_source"] = metric_tokenizer_source
+    reports["metric_correction"] = metric_correction_receipt
     return checkpoints, reports
 
 
@@ -1126,6 +1162,11 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "validate_stage211_phase_gate_report",
         validate_phase,
     )
+    monkeypatch.setattr(
+        stepwise_report,
+        "DEFAULT_TOKENIZER_SOURCE",
+        reports["metric_tokenizer_source"],
+    )
     sft_payload = json.loads(reports["sft"].read_text(encoding="utf-8"))
     monkeypatch.setattr(
         stepwise_report,
@@ -1156,6 +1197,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         sft_final_report_path=reports["sft"],
         output_json=output_json,
         output_markdown=output_markdown,
+        public_metric_correction_receipt_path=reports["metric_correction"],
     )
 
     assert report["strict_stage_order"] == [
@@ -1184,6 +1226,14 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["ctc_label_proof"]["text_normalization"] == "ctc"
     assert report["ctc_label_proof"]["ctc_unk_tokens"] == 0
     assert report["ctc_label_proof"]["ctc_suppress_non_pronunciation_tokens"] is True
+    assert report["public_metric_definition_chain_passed"] is True
+    assert report["public_metric_correction_receipt_sha256"] == sha256_file(
+        reports["metric_correction"]
+    )
+    assert (
+        report["public_metric_tokenizer_source_sha256"]
+        == sha256_file(reports["metric_tokenizer_source"])
+    )
     assert report["ctc_label_proof"]["language_counts"] == {
         "en": 222_040,
         "zh": 63_262,
@@ -1241,6 +1291,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "Training Coverage" in output_markdown.read_text(encoding="utf-8")
     assert "Full Data Segment Proof" in output_markdown.read_text(encoding="utf-8")
     assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")
+    assert "Public metric definition proof" in output_markdown.read_text(encoding="utf-8")
     sft_finalizer._validate_final_report(
         reports["sft"],
         checkpoint=checkpoints["sft"],
@@ -1249,6 +1300,21 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert (
         report["nano_public_baseline_checkpoint_sha256"] == report["nano_teacher_checkpoint_sha256"]
     )
+
+    tokenizer_source = reports["metric_tokenizer_source"]
+    tokenizer_text = tokenizer_source.read_text(encoding="utf-8")
+    tokenizer_source.write_text(tokenizer_text + "# changed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="tokenizer source changed"):
+        stepwise_report.build_stepwise_report(
+            initialization_receipt_path=reports["initialization"],
+            calibration_receipt_path=reports["calibration"],
+            mixer_gate_path=reports["mixer"],
+            block_gate_path=reports["block"],
+            logits_gate_path=reports["logits"],
+            sft_final_report_path=reports["sft"],
+            public_metric_correction_receipt_path=reports["metric_correction"],
+        )
+    tokenizer_source.write_text(tokenizer_text, encoding="utf-8")
 
     sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
     original_mixer_gate_sha256 = sft["mixer_phase_gate_sha256"]
@@ -1262,6 +1328,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
             block_gate_path=reports["block"],
             logits_gate_path=reports["logits"],
             sft_final_report_path=reports["sft"],
+            public_metric_correction_receipt_path=reports["metric_correction"],
         )
     sft["mixer_phase_gate_sha256"] = original_mixer_gate_sha256
     reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
@@ -1281,6 +1348,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
             block_gate_path=reports["block"],
             logits_gate_path=reports["logits"],
             sft_final_report_path=reports["sft"],
+            public_metric_correction_receipt_path=reports["metric_correction"],
         )
     block["nano_public_baseline_checkpoint_sha256"] = original_baseline_sha256
     reports["block"].write_text(json.dumps(block) + "\n", encoding="utf-8")
@@ -1298,6 +1366,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
             block_gate_path=reports["block"],
             logits_gate_path=reports["logits"],
             sft_final_report_path=reports["sft"],
+            public_metric_correction_receipt_path=reports["metric_correction"],
         )
     with pytest.raises(ValueError, match="every-dataset Nano"):
         sft_finalizer._validate_final_report(
@@ -1323,6 +1392,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
             block_gate_path=reports["block"],
             logits_gate_path=reports["logits"],
             sft_final_report_path=reports["sft"],
+            public_metric_correction_receipt_path=reports["metric_correction"],
         )
     block["full_data_coverage"]["segments"][0]["nano_teacher_checkpoint_sha256"] = (
         original_teacher_sha256
@@ -1345,6 +1415,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
             block_gate_path=reports["block"],
             logits_gate_path=reports["logits"],
             sft_final_report_path=reports["sft"],
+            public_metric_correction_receipt_path=reports["metric_correction"],
         )
 
 

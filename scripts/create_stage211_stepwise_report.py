@@ -21,6 +21,11 @@ from rwkvasr.eval.stage211_initialization import (
 )
 
 try:
+    from scripts.install_stage211_unicode_metric_correction import (
+        DEFAULT_CORRECTION_RECEIPT,
+        DEFAULT_TOKENIZER_SOURCE,
+        validate_completed_correction,
+    )
     from scripts.run_stage211_labeled_sft import (
         LABELED_EXPECTED,
         _validate_completion as _validate_sft_completion,
@@ -33,6 +38,11 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
+    from install_stage211_unicode_metric_correction import (
+        DEFAULT_CORRECTION_RECEIPT,
+        DEFAULT_TOKENIZER_SOURCE,
+        validate_completed_correction,
+    )
     from run_stage211_labeled_sft import (
         LABELED_EXPECTED,
         _validate_completion as _validate_sft_completion,
@@ -607,6 +617,7 @@ def build_stepwise_report(
     block_gate_path: Path,
     logits_gate_path: Path,
     sft_final_report_path: Path,
+    public_metric_correction_receipt_path: Path = DEFAULT_CORRECTION_RECEIPT,
 ) -> dict[str, Any]:
     initialization_receipt_path = initialization_receipt_path.expanduser().resolve()
     calibration_receipt_path = calibration_receipt_path.expanduser().resolve()
@@ -614,6 +625,9 @@ def build_stepwise_report(
     block_gate_path = block_gate_path.expanduser().resolve()
     logits_gate_path = logits_gate_path.expanduser().resolve()
     sft_final_report_path = sft_final_report_path.expanduser().resolve()
+    public_metric_correction_receipt_path = (
+        public_metric_correction_receipt_path.expanduser().resolve()
+    )
 
     calibration, calibration_checkpoint = _validate_calibration_receipt(calibration_receipt_path)
     phase_reports: dict[str, dict[str, Any]] = {}
@@ -658,6 +672,14 @@ def build_stepwise_report(
         expected_calibration_checkpoint=calibration_checkpoint,
         expected_nano_checkpoint_sha256=nano_teacher_checkpoint_sha256,
     )
+    metric_correction = validate_completed_correction(
+        public_metric_correction_receipt_path,
+        tokenizer_source=DEFAULT_TOKENIZER_SOURCE,
+        expected_calibration_reuse_receipt=calibration_receipt_path,
+        expected_initialization_receipt=initialization_receipt_path,
+    )
+    if metric_correction is None:
+        raise ValueError("Stage211 Unicode metric-correction receipt is missing.")
     global_dedup_bindings = {
         (
             str(phase_reports[phase].get("global_dedup_manifest_path") or ""),
@@ -899,6 +921,17 @@ def build_stepwise_report(
         "nano_initialization_chain_passed": True,
         "ctc_label_normalization_chain_passed": True,
         "ctc_label_proof": ctc_label_proof,
+        "public_metric_definition_chain_passed": True,
+        "public_metric_correction_receipt_path": str(
+            public_metric_correction_receipt_path
+        ),
+        "public_metric_correction_receipt_sha256": sha256_file(
+            public_metric_correction_receipt_path
+        ),
+        "public_metric_tokenizer_contract": metric_correction["tokenizer_contract"],
+        "public_metric_tokenizer_source_sha256": metric_correction[
+            "tokenizer_source_sha256"
+        ],
         "initialization_receipt_path": str(initialization_receipt_path),
         "initialization_receipt_sha256": sha256_file(initialization_receipt_path),
         "initialization_proof": {
@@ -950,6 +983,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"Nano initialization proof: `{report['initialization_receipt_sha256']}`",
         "",
         f"Nano public baseline provenance: `{report['nano_public_baseline_receipt_sha256']}`",
+        "",
+        "Public metric definition proof: "
+        f"`{report['public_metric_correction_receipt_sha256']}` "
+        f"(`{report['public_metric_tokenizer_contract']}`, tokenizer "
+        f"`{report['public_metric_tokenizer_source_sha256']}`)",
         "",
         f"Supplemental inventory: `{report['supplemental_inventory_sha256']}`",
         "",
@@ -1055,6 +1093,7 @@ def create_stepwise_report(
     sft_final_report_path: Path,
     output_json: Path,
     output_markdown: Path,
+    public_metric_correction_receipt_path: Path = DEFAULT_CORRECTION_RECEIPT,
 ) -> dict[str, Any]:
     report = build_stepwise_report(
         initialization_receipt_path=initialization_receipt_path,
@@ -1063,6 +1102,7 @@ def create_stepwise_report(
         block_gate_path=block_gate_path,
         logits_gate_path=logits_gate_path,
         sft_final_report_path=sft_final_report_path,
+        public_metric_correction_receipt_path=public_metric_correction_receipt_path,
     )
     rendered_json = json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
     rendered_markdown = render_markdown(report)
@@ -1088,6 +1128,11 @@ def main() -> int:
         "--calibration-reuse-receipt",
         type=Path,
         default=DEFAULT_CALIBRATION_RECEIPT,
+    )
+    parser.add_argument(
+        "--public-metric-correction-receipt",
+        type=Path,
+        default=DEFAULT_CORRECTION_RECEIPT,
     )
     parser.add_argument(
         "--mixer-phase-gate",
@@ -1144,6 +1189,9 @@ def main() -> int:
         sft_final_report_path=args.sft_final_report,
         output_json=args.output_json,
         output_markdown=args.output_markdown,
+        public_metric_correction_receipt_path=(
+            args.public_metric_correction_receipt
+        ),
     )
     print(
         f"stepwise_report={args.output_json.resolve()} "

@@ -43,10 +43,12 @@ else:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TOKENIZER_SOURCE = REPO_ROOT / "src" / "rwkvasr" / "eval" / "text_metrics.py"
 DEFAULT_NANO_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
 DEFAULT_CALIBRATION_ROOT = Path.home() / "rwkvasr_eval" / "stage211_calibration_selected_full"
 DEFAULT_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
 DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_metric_unicode_v1"
+DEFAULT_CORRECTION_RECEIPT = DEFAULT_OUTPUT_ROOT / "correction_receipt.json"
 DEFAULT_PRIOR_INSTALL_RECEIPT = (
     Path.home() / "rwkvasr_eval" / "stage211_public_clean_v1" / "canonical_install_receipt.json"
 )
@@ -108,10 +110,12 @@ def _affected_paths(
     }
 
 
-def _validate_completed_correction(
+def validate_completed_correction(
     receipt_path: Path,
     *,
     tokenizer_source: Path,
+    expected_calibration_reuse_receipt: Path | None = None,
+    expected_initialization_receipt: Path | None = None,
 ) -> dict[str, Any] | None:
     if not receipt_path.is_file():
         return None
@@ -134,12 +138,41 @@ def _validate_completed_correction(
     installed = receipt.get("installed_files")
     if not isinstance(installed, list) or not installed:
         raise ValueError("Stage211 Unicode metric correction has no installed files.")
+    installed_by_label: dict[str, dict[str, Any]] = {}
     for record in installed:
         if not isinstance(record, dict):
             raise ValueError("Stage211 Unicode metric installed-file record is invalid.")
+        label = str(record.get("label") or "")
+        if not label or label in installed_by_label:
+            raise ValueError("Stage211 Unicode metric installed-file labels are invalid.")
         path = Path(str(record.get("path") or "")).resolve()
         if not path.is_file() or record.get("sha256") != sha256_file(path):
             raise ValueError(f"Stage211 corrected metric artifact changed: {path}")
+        installed_by_label[label] = record
+    for label, stem, expected_path in (
+        (
+            "calibration_reuse_receipt",
+            "calibration_reuse_receipt",
+            expected_calibration_reuse_receipt,
+        ),
+        (
+            "initialization_receipt",
+            "initialization_receipt",
+            expected_initialization_receipt,
+        ),
+    ):
+        record = installed_by_label.get(label)
+        if record is None:
+            raise ValueError(f"Stage211 Unicode metric correction lacks {label}.")
+        bound_path = Path(str(receipt.get(f"{stem}_path") or "")).resolve()
+        bound_sha256 = str(receipt.get(f"{stem}_sha256") or "")
+        if (
+            bound_path != Path(str(record["path"])).resolve()
+            or bound_sha256 != record["sha256"]
+        ):
+            raise ValueError(f"Stage211 Unicode metric {label} binding mismatch.")
+        if expected_path is not None and bound_path != expected_path.expanduser().resolve():
+            raise ValueError(f"Stage211 Unicode metric correction binds another {label}.")
     return receipt
 
 
@@ -324,8 +357,8 @@ def install_correction(
 ) -> dict[str, Any]:
     output_root = output_root.expanduser().resolve()
     receipt_path = output_root / "correction_receipt.json"
-    tokenizer_source = REPO_ROOT / "src" / "rwkvasr" / "eval" / "text_metrics.py"
-    completed = _validate_completed_correction(
+    tokenizer_source = DEFAULT_TOKENIZER_SOURCE
+    completed = validate_completed_correction(
         receipt_path,
         tokenizer_source=tokenizer_source,
     )
@@ -454,7 +487,7 @@ def install_correction(
                 ),
             }
             _atomic_write(receipt_path, _render_json(receipt))
-            return _validate_completed_correction(
+            return validate_completed_correction(
                 receipt_path,
                 tokenizer_source=tokenizer_source,
             ) or receipt
