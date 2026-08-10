@@ -2570,6 +2570,474 @@ def _write_public_overlap_fixture(tmp_path: Path) -> tuple[Path, Path]:
     return receipt, clean_manifest
 
 
+_ALIGNMENT_LAYER_IDS = tuple(range(70))
+_ALIGNMENT_CELLS = (
+    "easy_en",
+    "easy_zh",
+    "medium_en",
+    "medium_zh",
+    "hard_en",
+    "hard_zh",
+    "long_zh",
+)
+_ALIGNMENT_PHASE_COMPONENTS = {
+    "mixer": ("mixer",),
+    "block": ("mixer", "ffn", "block"),
+    "logits": ("mixer", "ffn", "block"),
+}
+
+
+def _alignment_layers(*, candidate: bool) -> dict[str, dict[str, float]]:
+    return {
+        str(layer_id): {
+            "loss": 0.5 if candidate else 1.0,
+            "cosine": 0.8 if candidate else 0.5,
+            "rms_ratio": 1.0,
+        }
+        for layer_id in _ALIGNMENT_LAYER_IDS
+    }
+
+
+def _alignment_fixed_component_summary() -> dict[str, object]:
+    weak_row = {
+        "baseline_loss": 1.0,
+        "candidate_loss": 0.5,
+        "relative_loss_reduction": 0.5,
+        "baseline_cosine": 0.5,
+        "candidate_cosine": 0.8,
+    }
+    return {
+        "baseline_mean_loss": 1.0,
+        "candidate_mean_loss": 0.5,
+        "relative_loss_reduction": 0.5,
+        "baseline_mean_cosine": 0.5,
+        "candidate_mean_cosine": 0.8,
+        "baseline_mean_rms_ratio": 1.0,
+        "candidate_mean_rms_ratio": 1.0,
+        "loss_improved_layers": 70,
+        "cosine_improved_layers": 70,
+        "weak_bands": {
+            "10-19": dict(weak_row),
+            "20-29": dict(weak_row),
+        },
+    }
+
+
+def _alignment_stratified_component_summary() -> dict[str, object]:
+    weak_row = {
+        "baseline_loss": 1.0,
+        "candidate_loss": 0.5,
+        "relative_loss_reduction": 0.5,
+        "baseline_cosine": 0.5,
+        "candidate_cosine": 0.8,
+    }
+    layer_row = {
+        "baseline_loss": 1.0,
+        "candidate_loss": 0.5,
+        "relative_loss_reduction": 0.5,
+        "baseline_cosine": 0.5,
+        "candidate_cosine": 0.8,
+        "baseline_rms_ratio": 1.0,
+        "candidate_rms_ratio": 1.0,
+    }
+    cell_row = {
+        "baseline_loss": 1.0,
+        "candidate_loss": 0.5,
+        "relative_change_pct": -50.0,
+        "baseline_cosine": 0.5,
+        "candidate_cosine": 0.8,
+        "layers_loss_improved": 70,
+        "layers_cosine_improved": 70,
+    }
+    return {
+        "baseline_mean_loss": 1.0,
+        "candidate_mean_loss": 0.5,
+        "baseline_mean_cosine": 0.5,
+        "candidate_mean_cosine": 0.8,
+        "loss_improved_layers": 70,
+        "cosine_improved_layers": 70,
+        "layers": {str(layer_id): dict(layer_row) for layer_id in _ALIGNMENT_LAYER_IDS},
+        "weak_bands": {
+            "10-19": dict(weak_row),
+            "20-29": dict(weak_row),
+        },
+        "cells": {cell_name: dict(cell_row) for cell_name in _ALIGNMENT_CELLS},
+    }
+
+
+def _alignment_logits_metrics(
+    *,
+    candidate: bool,
+    matched_utterances: int,
+) -> dict[str, float]:
+    return {
+        "full_kl": 0.8 if candidate else 1.0,
+        "conditional_nonblank_kl": 0.8 if candidate else 1.0,
+        "conditional_nonblank_hard_ce": 0.8 if candidate else 1.0,
+        "blank_binary_kl": 0.8 if candidate else 1.0,
+        "selected_top1_agreement": 0.7 if candidate else 0.5,
+        "all_top1_agreement": 0.7 if candidate else 0.5,
+        "active_top1_agreement": 0.7 if candidate else 0.5,
+        "blank_prob_mae": 0.1 if candidate else 0.2,
+        "teacher_nonblank_rate": 0.2,
+        "student_nonblank_rate": 0.2 if candidate else 0.16,
+        "nonblank_rate_ratio": 1.0 if candidate else 0.8,
+        "teacher_nonblank_to_blank_rate": 0.1 if candidate else 0.2,
+        "teacher_blank_to_nonblank_rate": 0.1 if candidate else 0.2,
+        "ctc_token_error_rate": 0.2 if candidate else 0.4,
+        "ctc_token_insertion_rate": 0.05,
+        "ctc_token_deletion_rate": 0.1 if candidate else 0.2,
+        "ctc_token_substitution_rate": 0.05 if candidate else 0.15,
+        "collapsed_length_ratio": 1.0 if candidate else 0.8,
+        "sequence_exact_rate": 0.5 if candidate else 0.4,
+        "mean_frame_delta": 0.0,
+        "selected_frames": float(matched_utterances * 10),
+        "all_frames": float(matched_utterances * 20),
+        "teacher_tokens": float(matched_utterances * 2),
+        "student_tokens": float(matched_utterances * 2),
+        "matched_utterances": float(matched_utterances),
+        "missing_utterances": 0.0,
+    }
+
+
+def _alignment_logits_checks() -> dict[str, bool]:
+    return {
+        "full_kl_materially_improved": True,
+        "conditional_nonblank_kl_materially_improved": True,
+        "conditional_nonblank_hard_ce_not_worse": True,
+        "blank_binary_kl_not_worse": True,
+        "blank_probability_mae_not_worse": True,
+        "selected_top1_improved": True,
+        "all_top1_improved": True,
+        "active_top1_improved": True,
+        "ctc_token_error_rate_improved": True,
+        "ctc_token_deletion_rate_not_worse": True,
+        "sequence_exact_rate_not_worse": True,
+        "nonblank_rate_ratio_in_range": True,
+        "nonblank_rate_ratio_not_farther": True,
+        "collapsed_length_ratio_in_range": True,
+        "collapsed_length_ratio_not_farther": True,
+        "complete_exact_coverage": True,
+    }
+
+
+def _write_alignment_evidence_fixture(
+    tmp_path: Path,
+    *,
+    phase: str,
+    baseline_checkpoint: Path,
+    checkpoint: Path,
+    train_config: Path,
+    nano_checkpoint: Path,
+) -> Path:
+    components = _ALIGNMENT_PHASE_COMPONENTS[phase]
+    alignment_manifest = tmp_path / f"{phase}-alignment-manifest.json"
+    alignment_part = tmp_path / f"{phase}-alignment-part.jsonl"
+    alignment_model_config = tmp_path / f"{phase}-alignment-model.yaml"
+    alignment_manifest.write_text("{}\n", encoding="utf-8")
+    alignment_part.write_text("{}\n", encoding="utf-8")
+    alignment_model_config.write_text("{}\n", encoding="utf-8")
+    alignment_provenance = {
+        "schema_version": 1,
+        "split": "eval",
+        "requested_samples": 256,
+        "feature_seed": 0,
+        "bucket_manifest_path": str(alignment_manifest.resolve()),
+        "bucket_manifest_sha256": sha256_file(alignment_manifest),
+        "split_samples": 256,
+        "parts": [
+            {
+                "path": str(alignment_part.resolve()),
+                "sha256": sha256_file(alignment_part),
+                "num_samples": 256,
+            }
+        ],
+    }
+    shared_source = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "alignment_checkpoint_eval",
+        "phase": phase,
+        "pair_eval_id": "a" * 64,
+        "train_config_path": str(train_config.resolve()),
+        "train_config_sha256": sha256_file(train_config),
+        "model_config_path": str(alignment_model_config.resolve()),
+        "model_config_sha256": sha256_file(alignment_model_config),
+        "nano_checkpoint_path": str(nano_checkpoint.resolve()),
+        "nano_checkpoint_sha256": sha256_file(nano_checkpoint),
+        "feature_seed": 0,
+        "eval_samples": 256,
+        "eval_provenance": alignment_provenance,
+    }
+    source_paths: dict[str, Path] = {}
+    for role, source_checkpoint, candidate in (
+        ("baseline", baseline_checkpoint, False),
+        ("candidate", checkpoint, True),
+    ):
+        source = {
+            **shared_source,
+            "role": role,
+            "step": 105 if candidate else 0,
+            "checkpoint_step": 105 if candidate else 0,
+            "checkpoint_path": str(source_checkpoint.resolve()),
+            "checkpoint_sha256": sha256_file(source_checkpoint),
+            "eval_loss": 0.5 if candidate else 1.0,
+            "layer_components": {
+                component: _alignment_layers(candidate=candidate) for component in components
+            },
+        }
+        if phase in {"block", "logits"}:
+            source["decoder_hidden_metrics"] = {"loss": 0.5 if candidate else 1.0}
+        if phase == "logits":
+            source["logit_metrics"] = _alignment_logits_metrics(
+                candidate=candidate,
+                matched_utterances=256,
+            )
+        source_path = tmp_path / f"{phase}-alignment-{role}.json"
+        source_path.write_text(json.dumps(source) + "\n", encoding="utf-8")
+        source_paths[role] = source_path
+
+    receipt = tmp_path / f"{phase}-stratified-receipt.json"
+    receipt.write_text("{}\n", encoding="utf-8")
+    report_bindings: dict[str, dict[str, dict[str, str]]] = {}
+    cell_manifests: dict[str, Path] = {}
+    for cell_name in _ALIGNMENT_CELLS:
+        manifest = tmp_path / f"{phase}-{cell_name}-manifest.json"
+        manifest.write_text("{}\n", encoding="utf-8")
+        cell_manifests[cell_name] = manifest
+        report_bindings[cell_name] = {}
+        for role in ("baseline", "candidate"):
+            report_path = tmp_path / f"{phase}-{cell_name}-{role}.json"
+            report_path.write_text("{}\n", encoding="utf-8")
+            report_bindings[cell_name][role] = {
+                "path": str(report_path.resolve()),
+                "sha256": sha256_file(report_path),
+            }
+    checkpoint_records = {
+        "baseline": {
+            "path": str(baseline_checkpoint.resolve()),
+            "sha256": sha256_file(baseline_checkpoint),
+        },
+        "candidate": {
+            "path": str(checkpoint.resolve()),
+            "sha256": sha256_file(checkpoint),
+        },
+    }
+    stratified_components = {
+        component: _alignment_stratified_component_summary() for component in components
+    }
+    if phase == "logits":
+        cell_results = {
+            cell_name: {
+                "samples": 256,
+                "manifest_path": str(cell_manifests[cell_name].resolve()),
+                "manifest_sha256": sha256_file(cell_manifests[cell_name]),
+                "baseline_metrics": _alignment_logits_metrics(
+                    candidate=False,
+                    matched_utterances=256,
+                ),
+                "candidate_metrics": _alignment_logits_metrics(
+                    candidate=True,
+                    matched_utterances=256,
+                ),
+            }
+            for cell_name in _ALIGNMENT_CELLS
+        }
+        decoder_cells = {
+            cell_name: {
+                "baseline_loss": 1.0,
+                "candidate_loss": 0.5,
+                "relative_change_pct": -50.0,
+            }
+            for cell_name in _ALIGNMENT_CELLS
+        }
+        stratified_summary = {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "stratified_logits_eval_summary",
+            "phase": "logits",
+            "receipt_path": str(receipt.resolve()),
+            "receipt_sha256": sha256_file(receipt),
+            "checkpoints": checkpoint_records,
+            "cells": cell_results,
+            "macro": {
+                "cells": 7,
+                "samples": 1792,
+                "baseline_metrics": _alignment_logits_metrics(
+                    candidate=False,
+                    matched_utterances=1792,
+                ),
+                "candidate_metrics": _alignment_logits_metrics(
+                    candidate=True,
+                    matched_utterances=1792,
+                ),
+                "full_kl_relative_reduction": 0.2,
+                "conditional_nonblank_kl_relative_reduction": 0.2,
+            },
+            "hidden_component_summaries": stratified_components,
+            "decoder_hidden": {
+                "cells": 7,
+                "baseline_loss": 1.0,
+                "candidate_loss": 0.5,
+                "relative_change_pct": -50.0,
+                "cell_results": decoder_cells,
+            },
+            "reports": report_bindings,
+        }
+    else:
+        primary = stratified_components[phase]
+        cell_results = {
+            cell_name: {
+                "samples": 256,
+                "manifest_path": str(cell_manifests[cell_name].resolve()),
+                "manifest_sha256": sha256_file(cell_manifests[cell_name]),
+                "baseline_loss": 1.0,
+                "candidate_loss": 0.5,
+                "relative_change_pct": -50.0,
+                "layers_loss_improved": 70,
+                "layers_cosine_improved": 70,
+            }
+            for cell_name in _ALIGNMENT_CELLS
+        }
+        stratified_summary = {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "stratified_hidden_eval_summary",
+            "phase": phase,
+            "receipt_path": str(receipt.resolve()),
+            "receipt_sha256": sha256_file(receipt),
+            "checkpoints": checkpoint_records,
+            "cells": cell_results,
+            "macro": {
+                "cells": 7,
+                "samples": 1792,
+                "baseline_loss": 1.0,
+                "candidate_loss": 0.5,
+                "relative_change_pct": -50.0,
+            },
+            "layer_summary": {
+                key: primary[key]
+                for key in (
+                    "loss_improved_layers",
+                    "cosine_improved_layers",
+                    "weak_bands",
+                    "layers",
+                )
+            },
+            "component_summaries": stratified_components,
+            "decoder_hidden": (
+                {
+                    "cells": 7,
+                    "baseline_loss": 1.0,
+                    "candidate_loss": 0.5,
+                }
+                if phase == "block"
+                else None
+            ),
+            "reports": report_bindings,
+        }
+    stratified_path = tmp_path / f"{phase}-stratified-summary.json"
+    stratified_path.write_text(
+        json.dumps(stratified_summary) + "\n",
+        encoding="utf-8",
+    )
+
+    fixed_components = {component: _alignment_fixed_component_summary() for component in components}
+    alignment = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": ("logits_alignment_gate" if phase == "logits" else "hidden_alignment_gate"),
+        "phase": phase,
+        "baseline_checkpoint_path": str(baseline_checkpoint.resolve()),
+        "baseline_checkpoint_sha256": sha256_file(baseline_checkpoint),
+        "checkpoint_path": str(checkpoint.resolve()),
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "gate_passed": True,
+        "legacy_gate_passed": True,
+        "stratified_gate_passed": True,
+        "stratified_summary_path": str(stratified_path.resolve()),
+        "stratified_summary_sha256": sha256_file(stratified_path),
+        "stratified_summary": stratified_summary,
+        "baseline_report_path": str(source_paths["baseline"].resolve()),
+        "baseline_report_sha256": sha256_file(source_paths["baseline"]),
+        "candidate_report_path": str(source_paths["candidate"].resolve()),
+        "candidate_report_sha256": sha256_file(source_paths["candidate"]),
+        "baseline_eval_provenance": alignment_provenance,
+        "candidate_eval_provenance": alignment_provenance,
+    }
+    if phase == "logits":
+        checks = _alignment_logits_checks()
+        retention_checks = {
+            component: {
+                "mean_loss_retained": True,
+                "mean_cosine_retained": True,
+                "weak_band_loss_retained": True,
+                "weak_band_cosine_retained": True,
+            }
+            for component in components
+        }
+        alignment.update(
+            {
+                "selected_logits_gate_passed": True,
+                "stratified_checks": {
+                    **checks,
+                    "hard_and_long_cells_improved": True,
+                    "cell_token_error_regression_bounded": True,
+                    "mixer_hidden_retained": True,
+                    "ffn_hidden_retained": True,
+                    "block_hidden_retained": True,
+                    "decoder_hidden_retained": True,
+                    "complete_stratified_coverage": True,
+                },
+                "thresholds": {
+                    "minimum_kl_relative_reduction": 0.05,
+                    "ratio_min": 0.9,
+                    "ratio_max": 1.1,
+                    "max_cell_token_error_regression": 0.03,
+                    "max_hidden_loss_regression": 0.1,
+                    "max_hidden_cosine_regression": 0.01,
+                    "tolerance": 1.0e-12,
+                },
+                "checks": checks,
+                "hidden_component_summaries": fixed_components,
+                "hidden_retention_checks": retention_checks,
+                "hidden_retention_passed": True,
+                "decoder_hidden_retention": {
+                    "baseline_loss": 1.0,
+                    "candidate_loss": 0.5,
+                    "relative_change": -0.5,
+                    "retained": True,
+                },
+                "baseline_metrics": _alignment_logits_metrics(
+                    candidate=False,
+                    matched_utterances=256,
+                ),
+                "candidate_metrics": _alignment_logits_metrics(
+                    candidate=True,
+                    matched_utterances=256,
+                ),
+                "full_kl_relative_reduction": 0.2,
+                "conditional_nonblank_kl_relative_reduction": 0.2,
+            }
+        )
+    else:
+        alignment.update(
+            {
+                "baseline_eval_loss": 1.0,
+                "candidate_eval_loss": 0.5,
+                "layer_summary": fixed_components[phase],
+                "component_summaries": fixed_components,
+                "component_gate_passed": True,
+                "decoder_hidden": (
+                    {"baseline_loss": 1.0, "candidate_loss": 0.5} if phase == "block" else None
+                ),
+            }
+        )
+    alignment_path = tmp_path / f"{phase}-alignment.json"
+    alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
+    return alignment_path
+
+
 def _write_valid_phase_gate(
     tmp_path: Path,
     *,
@@ -2780,102 +3248,15 @@ def _write_valid_phase_gate(
         + "\n",
         encoding="utf-8",
     )
-    alignment_baseline_source = tmp_path / f"{phase}-alignment-baseline.yaml"
-    alignment_candidate_source = tmp_path / f"{phase}-alignment-candidate.yaml"
-    alignment_manifest = tmp_path / f"{phase}-alignment-manifest.json"
-    alignment_part = tmp_path / f"{phase}-alignment-part.jsonl"
-    alignment_model_config = tmp_path / f"{phase}-alignment-model.yaml"
-    alignment_manifest.write_text("{}\n", encoding="utf-8")
-    alignment_part.write_text("{}\n", encoding="utf-8")
-    alignment_model_config.write_text("{}\n", encoding="utf-8")
-    alignment_provenance = {
-        "schema_version": 1,
-        "split": "eval",
-        "requested_samples": 256,
-        "feature_seed": 0,
-        "bucket_manifest_path": str(alignment_manifest.resolve()),
-        "bucket_manifest_sha256": sha256_file(alignment_manifest),
-        "split_samples": 256,
-        "parts": [
-            {
-                "path": str(alignment_part.resolve()),
-                "sha256": sha256_file(alignment_part),
-                "num_samples": 256,
-            }
-        ],
-    }
     phase_init_checkpoint = Path(segments[0]["init_checkpoint_path"])
     alignment_train_config = Path(segments[0]["train_config_path"])
-    pair_eval_id = "a" * 64
-    shared_source = {
-        "schema_version": 1,
-        "pipeline": "stage211",
-        "artifact": "alignment_checkpoint_eval",
-        "phase": phase,
-        "pair_eval_id": pair_eval_id,
-        "train_config_path": str(alignment_train_config.resolve()),
-        "train_config_sha256": sha256_file(alignment_train_config),
-        "model_config_path": str(alignment_model_config.resolve()),
-        "model_config_sha256": sha256_file(alignment_model_config),
-        "nano_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
-        "nano_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
-        "feature_seed": 0,
-        "eval_samples": 256,
-        "eval_provenance": alignment_provenance,
-    }
-    alignment_baseline_source.write_text(
-        json.dumps(
-            {
-                **shared_source,
-                "role": "baseline",
-                "step": 0,
-                "checkpoint_step": 0,
-                "checkpoint_path": str(phase_init_checkpoint.resolve()),
-                "checkpoint_sha256": sha256_file(phase_init_checkpoint),
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    alignment_candidate_source.write_text(
-        json.dumps(
-            {
-                **shared_source,
-                "role": "candidate",
-                "step": int(STAGE211_AUDIO_CURRICULUM["long"]["steps"]),
-                "checkpoint_step": int(STAGE211_AUDIO_CURRICULUM["long"]["steps"]),
-                "checkpoint_path": str(checkpoint.resolve()),
-                "checkpoint_sha256": sha256_file(checkpoint),
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    alignment_report = tmp_path / f"{phase}-alignment.json"
-    alignment_report.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "pipeline": "stage211",
-                "artifact": (
-                    "logits_alignment_gate" if phase == "logits" else "hidden_alignment_gate"
-                ),
-                "phase": phase,
-                "baseline_checkpoint_path": str(phase_init_checkpoint.resolve()),
-                "baseline_checkpoint_sha256": sha256_file(phase_init_checkpoint),
-                "checkpoint_path": str(checkpoint.resolve()),
-                "checkpoint_sha256": sha256_file(checkpoint),
-                "gate_passed": True,
-                "baseline_report_path": str(alignment_baseline_source.resolve()),
-                "baseline_report_sha256": sha256_file(alignment_baseline_source),
-                "candidate_report_path": str(alignment_candidate_source.resolve()),
-                "candidate_report_sha256": sha256_file(alignment_candidate_source),
-                "baseline_eval_provenance": alignment_provenance,
-                "candidate_eval_provenance": alignment_provenance,
-            }
-        )
-        + "\n",
-        encoding="utf-8",
+    alignment_report = _write_alignment_evidence_fixture(
+        tmp_path,
+        phase=phase,
+        baseline_checkpoint=phase_init_checkpoint,
+        checkpoint=checkpoint,
+        train_config=alignment_train_config,
+        nano_checkpoint=nano_teacher_checkpoint,
     )
 
     smoke_dir = tmp_path / f"{phase}-full-profile-smoke"
@@ -2971,6 +3352,14 @@ def _write_failed_phase_gate(gate_report: Path) -> Path:
     report = json.loads(gate_report.read_text(encoding="utf-8"))
     alignment_path = Path(report["alignment_report"]["path"])
     alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    summary_path = Path(alignment["stratified_summary_path"])
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["cells"]["easy_en"]["candidate_loss"] = 1.2
+    summary["cells"]["easy_en"]["relative_change_pct"] = 20.0
+    summary_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    alignment["stratified_summary"] = summary
+    alignment["stratified_summary_sha256"] = sha256_file(summary_path)
+    alignment["stratified_gate_passed"] = False
     alignment["gate_passed"] = False
     alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
     report["alignment_report"]["sha256"] = sha256_file(alignment_path)
@@ -2979,6 +3368,17 @@ def _write_failed_phase_gate(gate_report: Path) -> Path:
     failed_gate = gate_report.with_name("failed_phase_gate.json")
     failed_gate.write_text(json.dumps(report) + "\n", encoding="utf-8")
     return failed_gate
+
+
+def _rewrite_phase_alignment(
+    gate_report: Path,
+    alignment: dict[str, object],
+) -> None:
+    phase_gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    alignment_path = Path(phase_gate["alignment_report"]["path"])
+    alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
+    phase_gate["alignment_report"]["sha256"] = sha256_file(alignment_path)
+    gate_report.write_text(json.dumps(phase_gate) + "\n", encoding="utf-8")
 
 
 def _write_retention_correction(
@@ -3235,9 +3635,26 @@ def _write_corrected_phase_gate(
             "checkpoint_sha256": sha256_file(checkpoint),
             "candidate_report_path": str(candidate_source_path.resolve()),
             "candidate_report_sha256": sha256_file(candidate_source_path),
+            "stratified_gate_passed": True,
             "gate_passed": True,
         }
     )
+    failed_summary_path = Path(alignment["stratified_summary_path"])
+    corrected_summary = json.loads(failed_summary_path.read_text(encoding="utf-8"))
+    corrected_summary["checkpoints"]["candidate"] = {
+        "path": str(checkpoint.resolve()),
+        "sha256": sha256_file(checkpoint),
+    }
+    corrected_summary["cells"]["easy_en"]["candidate_loss"] = 0.5
+    corrected_summary["cells"]["easy_en"]["relative_change_pct"] = -50.0
+    corrected_summary_path = tmp_path / "corrected-stratified-summary.json"
+    corrected_summary_path.write_text(
+        json.dumps(corrected_summary) + "\n",
+        encoding="utf-8",
+    )
+    alignment["stratified_summary_path"] = str(corrected_summary_path.resolve())
+    alignment["stratified_summary_sha256"] = sha256_file(corrected_summary_path)
+    alignment["stratified_summary"] = corrected_summary
     alignment_path = tmp_path / "corrected-alignment-gate.json"
     alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
     report.update(
@@ -3676,6 +4093,90 @@ def test_stage211_phase_gate_rejects_mutated_alignment_source(
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_block_phase_gate_replays_three_component_evidence(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="block",
+        checkpoint=checkpoint,
+    )
+
+    validated = validate_stage211_phase_gate_report(
+        gate_report,
+        expected_phase="block",
+        checkpoint_path=checkpoint,
+    )
+    assert validated["gate_passed"] is True
+
+    phase_gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    alignment_path = Path(phase_gate["alignment_report"]["path"])
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    candidate_path = Path(alignment["candidate_report_path"])
+    candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    candidate["layer_components"].pop("ffn")
+    candidate_path.write_text(json.dumps(candidate) + "\n", encoding="utf-8")
+    alignment["candidate_report_sha256"] = sha256_file(candidate_path)
+    _rewrite_phase_alignment(gate_report, alignment)
+
+    with pytest.raises(ValueError, match="exactly 70 ffn layers"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="block",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_logits_phase_gate_rejects_missing_hidden_retention_schema(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="logits",
+        checkpoint=checkpoint,
+    )
+    phase_gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    alignment_path = Path(phase_gate["alignment_report"]["path"])
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment.pop("hidden_retention_passed")
+    _rewrite_phase_alignment(gate_report, alignment)
+
+    with pytest.raises(ValueError, match="hidden_retention_passed"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="logits",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_logits_phase_gate_replays_stratified_hidden_retention(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="logits",
+        checkpoint=checkpoint,
+    )
+    phase_gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    alignment_path = Path(phase_gate["alignment_report"]["path"])
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment["stratified_checks"]["ffn_hidden_retained"] = False
+    _rewrite_phase_alignment(gate_report, alignment)
+
+    with pytest.raises(ValueError, match="ffn_hidden_retained"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="logits",
             checkpoint_path=checkpoint,
         )
 
@@ -4134,15 +4635,7 @@ def test_stage211_phase_gate_preserves_a_strict_failed_decision(
         phase="mixer",
         checkpoint=checkpoint,
     )
-    report = json.loads(gate_report.read_text(encoding="utf-8"))
-    alignment_path = Path(report["alignment_report"]["path"])
-    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
-    alignment["gate_passed"] = False
-    alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
-    report["alignment_report"]["sha256"] = sha256_file(alignment_path)
-    report["alignment_gate_passed"] = False
-    report["gate_passed"] = False
-    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    gate_report = _write_failed_phase_gate(gate_report)
 
     validated = stage211.validate_stage211_phase_gate_report(
         gate_report,
@@ -4159,6 +4652,7 @@ def test_stage211_phase_gate_preserves_a_strict_failed_decision(
             checkpoint_path=checkpoint,
         )
 
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
     report["gate_passed"] = True
     gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="decision is inconsistent"):

@@ -32,6 +32,73 @@ STAGE211_POST_COVERAGE_CORRECTION_LRS = {
 }
 STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES = 256
 STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT = "alignment_checkpoint_eval"
+_STAGE211_ALIGNMENT_LAYER_IDS = tuple(range(70))
+_STAGE211_ALIGNMENT_LAYER_KEYS = {str(index) for index in _STAGE211_ALIGNMENT_LAYER_IDS}
+_STAGE211_ALIGNMENT_WEAK_BANDS = {
+    "10-19": tuple(range(10, 20)),
+    "20-29": tuple(range(20, 30)),
+}
+_STAGE211_ALIGNMENT_STRATIFIED_CELLS = {
+    "easy_en",
+    "easy_zh",
+    "medium_en",
+    "medium_zh",
+    "hard_en",
+    "hard_zh",
+    "long_zh",
+}
+_STAGE211_ALIGNMENT_STRATIFIED_SAMPLES = STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES * len(
+    _STAGE211_ALIGNMENT_STRATIFIED_CELLS
+)
+_STAGE211_ALIGNMENT_PHASE_COMPONENTS = {
+    "mixer": ("mixer",),
+    "block": ("mixer", "ffn", "block"),
+    "logits": ("mixer", "ffn", "block"),
+}
+_STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS = 68
+_STAGE211_ALIGNMENT_MAX_CELL_REGRESSION_PCT = 10.0
+_STAGE211_LOGITS_MIN_KL_RELATIVE_REDUCTION = 0.05
+_STAGE211_LOGITS_RATIO_MIN = 0.90
+_STAGE211_LOGITS_RATIO_MAX = 1.10
+_STAGE211_LOGITS_MAX_CELL_TOKEN_ERROR_REGRESSION = 0.03
+_STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION = 0.10
+_STAGE211_LOGITS_MAX_HIDDEN_COSINE_REGRESSION = 0.01
+_STAGE211_ALIGNMENT_TOLERANCE = 1.0e-12
+_STAGE211_LOGITS_REQUIRED_METRICS = (
+    "full_kl",
+    "conditional_nonblank_kl",
+    "conditional_nonblank_hard_ce",
+    "blank_binary_kl",
+    "selected_top1_agreement",
+    "all_top1_agreement",
+    "active_top1_agreement",
+    "blank_prob_mae",
+    "teacher_nonblank_rate",
+    "student_nonblank_rate",
+    "nonblank_rate_ratio",
+    "teacher_nonblank_to_blank_rate",
+    "teacher_blank_to_nonblank_rate",
+    "ctc_token_error_rate",
+    "ctc_token_insertion_rate",
+    "ctc_token_deletion_rate",
+    "ctc_token_substitution_rate",
+    "collapsed_length_ratio",
+    "sequence_exact_rate",
+    "mean_frame_delta",
+    "selected_frames",
+    "all_frames",
+    "teacher_tokens",
+    "student_tokens",
+    "matched_utterances",
+    "missing_utterances",
+)
+_STAGE211_LOGITS_IDENTICAL_TEACHER_METRICS = (
+    "teacher_nonblank_rate",
+    "selected_frames",
+    "all_frames",
+    "teacher_tokens",
+    "matched_utterances",
+)
 STAGE211_ALLOWED_OPERATOR_KEY_MARKERS = (".time_mixer.", ".input_proj.")
 DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST = (
     Path.home()
@@ -1105,6 +1172,222 @@ def _validate_stage211_alignment_eval_provenance(
     return tuple(fingerprint)
 
 
+def _stage211_alignment_float(value: Any, *, label: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Stage211 {label} is not numeric.") from error
+    if not math.isfinite(result):
+        raise ValueError(f"Stage211 {label} is not finite.")
+    return result
+
+
+def _stage211_alignment_component_layers(
+    report: dict[str, Any],
+    *,
+    phase: str,
+    role: str,
+    component: str,
+) -> dict[str, dict[str, Any]]:
+    raw_components = report.get("layer_components") or report.get("layer_component_metrics")
+    if not isinstance(raw_components, dict):
+        raise ValueError(f"Stage211 {phase} {role} alignment source lacks layer components.")
+    raw_layers = raw_components.get(component)
+    if not isinstance(raw_layers, dict) or set(raw_layers) != _STAGE211_ALIGNMENT_LAYER_KEYS:
+        raise ValueError(
+            f"Stage211 {phase} {role} alignment source must contain exactly 70 {component} layers."
+        )
+    for layer_id, metrics in raw_layers.items():
+        if not isinstance(metrics, dict):
+            raise ValueError(f"Stage211 {phase} {role} {component} layer {layer_id} is invalid.")
+        for metric in ("loss", "cosine", "rms_ratio"):
+            _stage211_alignment_float(
+                metrics.get(metric),
+                label=f"{phase} {role} {component} layer {layer_id} {metric}",
+            )
+    return raw_layers
+
+
+def _stage211_alignment_mean(
+    layers: dict[str, dict[str, Any]],
+    metric: str,
+    layer_ids: tuple[int, ...],
+) -> float:
+    return sum(float(layers[str(layer_id)][metric]) for layer_id in layer_ids) / len(layer_ids)
+
+
+def _stage211_alignment_component_summary(
+    baseline: dict[str, dict[str, Any]],
+    candidate: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    baseline_loss = _stage211_alignment_mean(baseline, "loss", _STAGE211_ALIGNMENT_LAYER_IDS)
+    candidate_loss = _stage211_alignment_mean(candidate, "loss", _STAGE211_ALIGNMENT_LAYER_IDS)
+    summary: dict[str, Any] = {
+        "baseline_mean_loss": baseline_loss,
+        "candidate_mean_loss": candidate_loss,
+        "relative_loss_reduction": (baseline_loss - candidate_loss) / max(baseline_loss, 1.0e-12),
+        "baseline_mean_cosine": _stage211_alignment_mean(
+            baseline, "cosine", _STAGE211_ALIGNMENT_LAYER_IDS
+        ),
+        "candidate_mean_cosine": _stage211_alignment_mean(
+            candidate, "cosine", _STAGE211_ALIGNMENT_LAYER_IDS
+        ),
+        "baseline_mean_rms_ratio": _stage211_alignment_mean(
+            baseline, "rms_ratio", _STAGE211_ALIGNMENT_LAYER_IDS
+        ),
+        "candidate_mean_rms_ratio": _stage211_alignment_mean(
+            candidate, "rms_ratio", _STAGE211_ALIGNMENT_LAYER_IDS
+        ),
+        "loss_improved_layers": sum(
+            float(candidate[str(layer_id)]["loss"]) < float(baseline[str(layer_id)]["loss"])
+            for layer_id in _STAGE211_ALIGNMENT_LAYER_IDS
+        ),
+        "cosine_improved_layers": sum(
+            float(candidate[str(layer_id)]["cosine"]) > float(baseline[str(layer_id)]["cosine"])
+            for layer_id in _STAGE211_ALIGNMENT_LAYER_IDS
+        ),
+        "weak_bands": {},
+    }
+    for band_name, layer_ids in _STAGE211_ALIGNMENT_WEAK_BANDS.items():
+        band_baseline_loss = _stage211_alignment_mean(baseline, "loss", layer_ids)
+        band_candidate_loss = _stage211_alignment_mean(candidate, "loss", layer_ids)
+        summary["weak_bands"][band_name] = {
+            "baseline_loss": band_baseline_loss,
+            "candidate_loss": band_candidate_loss,
+            "relative_loss_reduction": (band_baseline_loss - band_candidate_loss)
+            / max(band_baseline_loss, 1.0e-12),
+            "baseline_cosine": _stage211_alignment_mean(baseline, "cosine", layer_ids),
+            "candidate_cosine": _stage211_alignment_mean(candidate, "cosine", layer_ids),
+        }
+    return summary
+
+
+def _stage211_fixed_component_gate_passed(summary: dict[str, Any]) -> bool:
+    return (
+        float(summary["candidate_mean_loss"]) < float(summary["baseline_mean_loss"])
+        and float(summary["candidate_mean_cosine"]) > float(summary["baseline_mean_cosine"])
+        and int(summary["loss_improved_layers"]) >= _STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS
+        and int(summary["cosine_improved_layers"]) >= _STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS
+        and all(
+            float(row["candidate_loss"]) < float(row["baseline_loss"])
+            and float(row["candidate_cosine"]) > float(row["baseline_cosine"])
+            for row in summary["weak_bands"].values()
+        )
+    )
+
+
+def _validate_stage211_replayed_value(
+    actual: Any,
+    expected: Any,
+    *,
+    label: str,
+) -> None:
+    if isinstance(expected, bool) or expected is None or isinstance(expected, str):
+        if actual != expected or type(actual) is not type(expected):
+            raise ValueError(f"Stage211 {label} does not match replayed evidence.")
+        return
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict) or set(actual) != set(expected):
+            raise ValueError(f"Stage211 {label} field coverage mismatch.")
+        for key, value in expected.items():
+            _validate_stage211_replayed_value(actual[key], value, label=f"{label}.{key}")
+        return
+    if isinstance(expected, (list, tuple)):
+        if not isinstance(actual, (list, tuple)) or len(actual) != len(expected):
+            raise ValueError(f"Stage211 {label} sequence mismatch.")
+        for index, value in enumerate(expected):
+            _validate_stage211_replayed_value(actual[index], value, label=f"{label}[{index}]")
+        return
+    if isinstance(expected, (int, float)):
+        actual_value = _stage211_alignment_float(actual, label=label)
+        if isinstance(expected, int) and not isinstance(expected, bool):
+            if isinstance(actual, bool) or actual_value != float(expected):
+                raise ValueError(f"Stage211 {label} does not match replayed evidence.")
+        elif not math.isclose(
+            actual_value,
+            float(expected),
+            rel_tol=0.0,
+            abs_tol=_STAGE211_ALIGNMENT_TOLERANCE,
+        ):
+            raise ValueError(f"Stage211 {label} does not match replayed evidence.")
+        return
+    if actual != expected:
+        raise ValueError(f"Stage211 {label} does not match replayed evidence.")
+
+
+def _validate_stage211_logits_metrics(
+    raw_metrics: Any,
+    *,
+    label: str,
+    expected_matched: int,
+) -> dict[str, float]:
+    if not isinstance(raw_metrics, dict):
+        raise ValueError(f"Stage211 {label} lacks CTC logit metrics.")
+    metrics = {
+        name: _stage211_alignment_float(raw_metrics.get(name), label=f"{label} logit metric {name}")
+        for name in _STAGE211_LOGITS_REQUIRED_METRICS
+    }
+    if (
+        metrics["selected_frames"] <= 0.0
+        or metrics["all_frames"] <= 0.0
+        or metrics["teacher_tokens"] <= 0.0
+        or metrics["matched_utterances"] != float(expected_matched)
+        or metrics["missing_utterances"] != 0.0
+        or metrics["mean_frame_delta"] != 0.0
+    ):
+        raise ValueError(f"Stage211 {label} CTC logit coverage is incomplete.")
+    return metrics
+
+
+def _stage211_logits_metric_checks(
+    baseline: dict[str, float],
+    candidate: dict[str, float],
+) -> tuple[dict[str, bool], float, float]:
+    full_kl_reduction = (baseline["full_kl"] - candidate["full_kl"]) / max(
+        abs(baseline["full_kl"]), 1.0e-12
+    )
+    conditional_kl_reduction = (
+        baseline["conditional_nonblank_kl"] - candidate["conditional_nonblank_kl"]
+    ) / max(abs(baseline["conditional_nonblank_kl"]), 1.0e-12)
+    tolerance = _STAGE211_ALIGNMENT_TOLERANCE
+    checks = {
+        "full_kl_materially_improved": full_kl_reduction
+        >= _STAGE211_LOGITS_MIN_KL_RELATIVE_REDUCTION,
+        "conditional_nonblank_kl_materially_improved": conditional_kl_reduction
+        >= _STAGE211_LOGITS_MIN_KL_RELATIVE_REDUCTION,
+        "conditional_nonblank_hard_ce_not_worse": candidate["conditional_nonblank_hard_ce"]
+        <= baseline["conditional_nonblank_hard_ce"] + tolerance,
+        "blank_binary_kl_not_worse": candidate["blank_binary_kl"]
+        <= baseline["blank_binary_kl"] + tolerance,
+        "blank_probability_mae_not_worse": candidate["blank_prob_mae"]
+        <= baseline["blank_prob_mae"] + tolerance,
+        "selected_top1_improved": candidate["selected_top1_agreement"]
+        > baseline["selected_top1_agreement"] + tolerance,
+        "all_top1_improved": candidate["all_top1_agreement"]
+        > baseline["all_top1_agreement"] + tolerance,
+        "active_top1_improved": candidate["active_top1_agreement"]
+        > baseline["active_top1_agreement"] + tolerance,
+        "ctc_token_error_rate_improved": candidate["ctc_token_error_rate"]
+        < baseline["ctc_token_error_rate"] - tolerance,
+        "ctc_token_deletion_rate_not_worse": candidate["ctc_token_deletion_rate"]
+        <= baseline["ctc_token_deletion_rate"] + tolerance,
+        "sequence_exact_rate_not_worse": candidate["sequence_exact_rate"]
+        >= baseline["sequence_exact_rate"] - tolerance,
+        "nonblank_rate_ratio_in_range": _STAGE211_LOGITS_RATIO_MIN
+        <= candidate["nonblank_rate_ratio"]
+        <= _STAGE211_LOGITS_RATIO_MAX,
+        "nonblank_rate_ratio_not_farther": abs(candidate["nonblank_rate_ratio"] - 1.0)
+        <= abs(baseline["nonblank_rate_ratio"] - 1.0) + tolerance,
+        "collapsed_length_ratio_in_range": _STAGE211_LOGITS_RATIO_MIN
+        <= candidate["collapsed_length_ratio"]
+        <= _STAGE211_LOGITS_RATIO_MAX,
+        "collapsed_length_ratio_not_farther": abs(candidate["collapsed_length_ratio"] - 1.0)
+        <= abs(baseline["collapsed_length_ratio"] - 1.0) + tolerance,
+        "complete_exact_coverage": True,
+    }
+    return checks, full_kl_reduction, conditional_kl_reduction
+
+
 def _validate_stage211_alignment_source_report(
     path: Path,
     *,
@@ -1169,7 +1452,635 @@ def _validate_stage211_alignment_source_report(
         provenance,
         label=f"{phase} {role} alignment source",
     )
+    try:
+        required_components = _STAGE211_ALIGNMENT_PHASE_COMPONENTS[phase]
+    except KeyError as error:
+        raise ValueError(f"Unsupported Stage211 alignment phase: {phase!r}.") from error
+    for component in required_components:
+        _stage211_alignment_component_layers(
+            report,
+            phase=phase,
+            role=role,
+            component=component,
+        )
+    _stage211_alignment_float(report.get("eval_loss"), label=f"{phase} {role} fixed eval loss")
+    if phase in {"block", "logits"}:
+        decoder_hidden = report.get("decoder_hidden_metrics")
+        if not isinstance(decoder_hidden, dict):
+            raise ValueError(
+                f"Stage211 {phase} {role} alignment source lacks decoder hidden metrics."
+            )
+        _stage211_alignment_float(
+            decoder_hidden.get("loss"),
+            label=f"{phase} {role} decoder hidden loss",
+        )
+    if phase == "logits":
+        _validate_stage211_logits_metrics(
+            report.get("logit_metrics"),
+            label=f"{phase} {role} alignment source",
+            expected_matched=STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        )
     return report, fingerprint
+
+
+def _validate_stage211_stratified_component_summary(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"Stage211 {label} component summary is missing.")
+    for key in (
+        "baseline_mean_loss",
+        "candidate_mean_loss",
+        "baseline_mean_cosine",
+        "candidate_mean_cosine",
+    ):
+        _stage211_alignment_float(value.get(key), label=f"{label} {key}")
+    for key in ("loss_improved_layers", "cosine_improved_layers"):
+        count = int(value.get(key, -1))
+        if not 0 <= count <= len(_STAGE211_ALIGNMENT_LAYER_IDS):
+            raise ValueError(f"Stage211 {label} {key} is invalid.")
+    layers = value.get("layers")
+    if not isinstance(layers, dict) or set(layers) != _STAGE211_ALIGNMENT_LAYER_KEYS:
+        raise ValueError(f"Stage211 {label} lacks exact 70-layer macro coverage.")
+    for layer_id, row in layers.items():
+        if not isinstance(row, dict):
+            raise ValueError(f"Stage211 {label} layer {layer_id} is invalid.")
+        for key in (
+            "baseline_loss",
+            "candidate_loss",
+            "baseline_cosine",
+            "candidate_cosine",
+            "baseline_rms_ratio",
+            "candidate_rms_ratio",
+        ):
+            _stage211_alignment_float(row.get(key), label=f"{label} layer {layer_id} {key}")
+    weak_bands = value.get("weak_bands")
+    if not isinstance(weak_bands, dict) or set(weak_bands) != set(_STAGE211_ALIGNMENT_WEAK_BANDS):
+        raise ValueError(f"Stage211 {label} weak-band coverage mismatch.")
+    for band_name, row in weak_bands.items():
+        if not isinstance(row, dict):
+            raise ValueError(f"Stage211 {label} weak band {band_name} is invalid.")
+        for key in (
+            "baseline_loss",
+            "candidate_loss",
+            "baseline_cosine",
+            "candidate_cosine",
+        ):
+            _stage211_alignment_float(row.get(key), label=f"{label} weak band {band_name} {key}")
+    cells = value.get("cells")
+    if not isinstance(cells, dict) or set(cells) != _STAGE211_ALIGNMENT_STRATIFIED_CELLS:
+        raise ValueError(f"Stage211 {label} seven-cell coverage mismatch.")
+    for cell_name, row in cells.items():
+        if not isinstance(row, dict):
+            raise ValueError(f"Stage211 {label} cell {cell_name} is invalid.")
+        for key in (
+            "baseline_loss",
+            "candidate_loss",
+            "relative_change_pct",
+            "baseline_cosine",
+            "candidate_cosine",
+        ):
+            _stage211_alignment_float(row.get(key), label=f"{label} cell {cell_name} {key}")
+        for key in ("layers_loss_improved", "layers_cosine_improved"):
+            count = int(row.get(key, -1))
+            if not 0 <= count <= len(_STAGE211_ALIGNMENT_LAYER_IDS):
+                raise ValueError(f"Stage211 {label} cell {cell_name} {key} is invalid.")
+    return value
+
+
+def _validate_stage211_stratified_report_bindings(
+    summary: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    reports = summary.get("reports")
+    if not isinstance(reports, dict) or set(reports) != _STAGE211_ALIGNMENT_STRATIFIED_CELLS:
+        raise ValueError(f"Stage211 {label} report coverage mismatch.")
+    for cell_name, roles in reports.items():
+        if not isinstance(roles, dict) or set(roles) != {"baseline", "candidate"}:
+            raise ValueError(f"Stage211 {label} report roles mismatch: {cell_name}.")
+        for role, binding in roles.items():
+            if not isinstance(binding, dict):
+                raise ValueError(f"Stage211 {label} report binding is invalid: {cell_name}/{role}.")
+            _validate_bound_file(
+                binding,
+                path_key="path",
+                sha256_key="sha256",
+                label=f"Stage211 {label} report {cell_name}/{role}",
+            )
+
+
+def _validate_stage211_stratified_summary_binding(
+    alignment_report: dict[str, Any],
+    *,
+    phase: str,
+    baseline_checkpoint_path: Path,
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    summary_path = _validate_bound_file(
+        alignment_report,
+        path_key="stratified_summary_path",
+        sha256_key="stratified_summary_sha256",
+        label=f"Stage211 {phase} stratified summary",
+    )
+    summary = _load_json_object(summary_path, label=f"Stage211 {phase} stratified summary")
+    _validate_stage211_replayed_value(
+        alignment_report.get("stratified_summary"),
+        summary,
+        label=f"{phase} embedded stratified summary",
+    )
+    expected_artifact = (
+        "stratified_logits_eval_summary" if phase == "logits" else "stratified_hidden_eval_summary"
+    )
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": expected_artifact,
+        "phase": phase,
+    }
+    if any(summary.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"Stage211 {phase} stratified summary binding mismatch.")
+    _validate_bound_file(
+        summary,
+        path_key="receipt_path",
+        sha256_key="receipt_sha256",
+        label=f"Stage211 {phase} stratified receipt",
+    )
+    checkpoints = summary.get("checkpoints")
+    if not isinstance(checkpoints, dict) or set(checkpoints) != {"baseline", "candidate"}:
+        raise ValueError(f"Stage211 {phase} stratified checkpoint coverage mismatch.")
+    for role, expected_path in (
+        ("baseline", baseline_checkpoint_path),
+        ("candidate", checkpoint_path),
+    ):
+        record = checkpoints[role]
+        if not isinstance(record, dict):
+            raise ValueError(f"Stage211 {phase} stratified {role} checkpoint is invalid.")
+        bound_path = Path(str(record.get("path") or "")).expanduser().resolve()
+        if (
+            bound_path != expected_path
+            or not bound_path.is_file()
+            or record.get("sha256") != sha256_file(bound_path)
+        ):
+            raise ValueError(f"Stage211 {phase} stratified {role} checkpoint binding mismatch.")
+    cells = summary.get("cells")
+    if not isinstance(cells, dict) or set(cells) != _STAGE211_ALIGNMENT_STRATIFIED_CELLS:
+        raise ValueError(f"Stage211 {phase} stratified cell coverage mismatch.")
+    for cell_name, cell in cells.items():
+        if not isinstance(cell, dict) or int(cell.get("samples", -1)) != (
+            STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
+        ):
+            raise ValueError(f"Stage211 {phase} stratified cell is invalid: {cell_name}.")
+        _validate_bound_file(
+            cell,
+            path_key="manifest_path",
+            sha256_key="manifest_sha256",
+            label=f"Stage211 {phase} stratified manifest {cell_name}",
+        )
+    _validate_stage211_stratified_report_bindings(summary, label=f"{phase} stratified")
+    required_components = _STAGE211_ALIGNMENT_PHASE_COMPONENTS[phase]
+    if phase == "logits":
+        for cell_name, cell in cells.items():
+            for role in ("baseline", "candidate"):
+                _validate_stage211_logits_metrics(
+                    cell.get(f"{role}_metrics"),
+                    label=f"logits stratified {cell_name}/{role}",
+                    expected_matched=STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+                )
+        macro = summary.get("macro")
+        if (
+            not isinstance(macro, dict)
+            or int(macro.get("cells", -1)) != len(_STAGE211_ALIGNMENT_STRATIFIED_CELLS)
+            or int(macro.get("samples", -1)) != _STAGE211_ALIGNMENT_STRATIFIED_SAMPLES
+        ):
+            raise ValueError("Stage211 logits stratified macro coverage mismatch.")
+        for role in ("baseline", "candidate"):
+            _validate_stage211_logits_metrics(
+                macro.get(f"{role}_metrics"),
+                label=f"logits stratified macro/{role}",
+                expected_matched=_STAGE211_ALIGNMENT_STRATIFIED_SAMPLES,
+            )
+        component_summaries = summary.get("hidden_component_summaries")
+        if not isinstance(component_summaries, dict) or set(component_summaries) != set(
+            required_components
+        ):
+            raise ValueError("Stage211 logits stratified hidden-component coverage mismatch.")
+        for component in required_components:
+            _validate_stage211_stratified_component_summary(
+                component_summaries[component],
+                label=f"logits stratified {component}",
+            )
+        decoder = summary.get("decoder_hidden")
+        if not isinstance(decoder, dict) or int(decoder.get("cells", -1)) != len(
+            _STAGE211_ALIGNMENT_STRATIFIED_CELLS
+        ):
+            raise ValueError("Stage211 logits stratified decoder hidden is invalid.")
+        for key in ("baseline_loss", "candidate_loss", "relative_change_pct"):
+            _stage211_alignment_float(decoder.get(key), label=f"logits stratified decoder {key}")
+        decoder_cells = decoder.get("cell_results")
+        if (
+            not isinstance(decoder_cells, dict)
+            or set(decoder_cells) != _STAGE211_ALIGNMENT_STRATIFIED_CELLS
+        ):
+            raise ValueError("Stage211 logits stratified decoder cell coverage mismatch.")
+        for cell_name, row in decoder_cells.items():
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"Stage211 logits stratified decoder cell is invalid: {cell_name}."
+                )
+            for key in ("baseline_loss", "candidate_loss", "relative_change_pct"):
+                _stage211_alignment_float(
+                    row.get(key),
+                    label=f"logits stratified decoder {cell_name} {key}",
+                )
+        return summary
+
+    for cell_name, cell in cells.items():
+        for key in ("baseline_loss", "candidate_loss", "relative_change_pct"):
+            _stage211_alignment_float(cell.get(key), label=f"{phase} stratified {cell_name} {key}")
+        for key in ("layers_loss_improved", "layers_cosine_improved"):
+            count = int(cell.get(key, -1))
+            if not 0 <= count <= len(_STAGE211_ALIGNMENT_LAYER_IDS):
+                raise ValueError(f"Stage211 {phase} stratified {cell_name} {key} is invalid.")
+    macro = summary.get("macro")
+    if (
+        not isinstance(macro, dict)
+        or int(macro.get("cells", -1)) != len(_STAGE211_ALIGNMENT_STRATIFIED_CELLS)
+        or int(macro.get("samples", -1)) != _STAGE211_ALIGNMENT_STRATIFIED_SAMPLES
+    ):
+        raise ValueError(f"Stage211 {phase} stratified macro coverage mismatch.")
+    for key in ("baseline_loss", "candidate_loss", "relative_change_pct"):
+        _stage211_alignment_float(macro.get(key), label=f"{phase} stratified macro {key}")
+    component_summaries = summary.get("component_summaries")
+    if not isinstance(component_summaries, dict) or set(component_summaries) != set(
+        required_components
+    ):
+        raise ValueError(f"Stage211 {phase} stratified component coverage mismatch.")
+    for component in required_components:
+        _validate_stage211_stratified_component_summary(
+            component_summaries[component],
+            label=f"{phase} stratified {component}",
+        )
+    layer_summary = summary.get("layer_summary")
+    if not isinstance(layer_summary, dict):
+        raise ValueError(f"Stage211 {phase} stratified layer summary is missing.")
+    primary = component_summaries[phase]
+    expected_layer_summary = {
+        key: primary[key]
+        for key in (
+            "loss_improved_layers",
+            "cosine_improved_layers",
+            "weak_bands",
+            "layers",
+        )
+    }
+    _validate_stage211_replayed_value(
+        layer_summary,
+        expected_layer_summary,
+        label=f"{phase} stratified primary layer summary",
+    )
+    decoder = summary.get("decoder_hidden")
+    if phase == "block":
+        if not isinstance(decoder, dict) or int(decoder.get("cells", -1)) != len(
+            _STAGE211_ALIGNMENT_STRATIFIED_CELLS
+        ):
+            raise ValueError("Stage211 block stratified decoder hidden is invalid.")
+        for key in ("baseline_loss", "candidate_loss"):
+            _stage211_alignment_float(decoder.get(key), label=f"block stratified decoder {key}")
+    elif decoder is not None:
+        raise ValueError("Stage211 mixer stratified summary unexpectedly has decoder hidden.")
+    return summary
+
+
+def _stage211_stratified_component_gate_passed(component: dict[str, Any]) -> bool:
+    cells = component["cells"]
+    return (
+        float(component["candidate_mean_loss"]) < float(component["baseline_mean_loss"])
+        and float(component["candidate_mean_cosine"]) > float(component["baseline_mean_cosine"])
+        and int(component["loss_improved_layers"]) >= _STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS
+        and int(component["cosine_improved_layers"]) >= _STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS
+        and all(
+            float(cells[cell_name]["candidate_loss"]) < float(cells[cell_name]["baseline_loss"])
+            and int(cells[cell_name]["layers_loss_improved"])
+            >= _STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS
+            and int(cells[cell_name]["layers_cosine_improved"])
+            >= _STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS
+            for cell_name in ("hard_en", "hard_zh")
+        )
+        and all(
+            float(cell["relative_change_pct"]) <= _STAGE211_ALIGNMENT_MAX_CELL_REGRESSION_PCT
+            for cell in cells.values()
+        )
+        and all(
+            float(row["candidate_loss"]) < float(row["baseline_loss"])
+            and float(row["candidate_cosine"]) > float(row["baseline_cosine"])
+            for row in component["weak_bands"].values()
+        )
+    )
+
+
+def _stage211_hidden_stratified_gate_passed(summary: dict[str, Any], *, phase: str) -> bool:
+    cells = summary["cells"]
+    layer_summary = summary["layer_summary"]
+    decoder_passed = True
+    if phase == "block":
+        decoder = summary["decoder_hidden"]
+        decoder_passed = float(decoder["candidate_loss"]) < float(decoder["baseline_loss"])
+    return (
+        float(summary["macro"]["candidate_loss"]) < float(summary["macro"]["baseline_loss"])
+        and int(layer_summary["loss_improved_layers"]) >= _STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS
+        and int(layer_summary["cosine_improved_layers"]) >= _STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS
+        and all(
+            float(cells[cell_name]["candidate_loss"]) < float(cells[cell_name]["baseline_loss"])
+            and int(cells[cell_name]["layers_loss_improved"]) == len(_STAGE211_ALIGNMENT_LAYER_IDS)
+            and int(cells[cell_name]["layers_cosine_improved"])
+            == len(_STAGE211_ALIGNMENT_LAYER_IDS)
+            for cell_name in ("hard_en", "hard_zh")
+        )
+        and float(cells["long_zh"]["candidate_loss"]) < float(cells["long_zh"]["baseline_loss"])
+        and all(
+            float(cell["relative_change_pct"]) <= _STAGE211_ALIGNMENT_MAX_CELL_REGRESSION_PCT
+            for cell in cells.values()
+        )
+        and all(
+            float(row["candidate_loss"]) < float(row["baseline_loss"])
+            and float(row["candidate_cosine"]) > float(row["baseline_cosine"])
+            for row in layer_summary["weak_bands"].values()
+        )
+        and decoder_passed
+        and all(
+            _stage211_stratified_component_gate_passed(component)
+            for component in summary["component_summaries"].values()
+        )
+    )
+
+
+def _stage211_hidden_retention_checks(summary: dict[str, Any]) -> dict[str, bool]:
+    tolerance = _STAGE211_ALIGNMENT_TOLERANCE
+    return {
+        "mean_loss_retained": float(summary["candidate_mean_loss"])
+        <= float(summary["baseline_mean_loss"])
+        * (1.0 + _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION)
+        + tolerance,
+        "mean_cosine_retained": float(summary["candidate_mean_cosine"])
+        >= float(summary["baseline_mean_cosine"])
+        - _STAGE211_LOGITS_MAX_HIDDEN_COSINE_REGRESSION
+        - tolerance,
+        "weak_band_loss_retained": all(
+            float(row["candidate_loss"])
+            <= float(row["baseline_loss"]) * (1.0 + _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION)
+            + tolerance
+            for row in summary["weak_bands"].values()
+        ),
+        "weak_band_cosine_retained": all(
+            float(row["candidate_cosine"])
+            >= float(row["baseline_cosine"])
+            - _STAGE211_LOGITS_MAX_HIDDEN_COSINE_REGRESSION
+            - tolerance
+            for row in summary["weak_bands"].values()
+        ),
+    }
+
+
+def _stage211_logits_stratified_gate(
+    summary: dict[str, Any],
+) -> tuple[bool, dict[str, bool]]:
+    baseline = _validate_stage211_logits_metrics(
+        summary["macro"]["baseline_metrics"],
+        label="logits stratified macro/baseline replay",
+        expected_matched=_STAGE211_ALIGNMENT_STRATIFIED_SAMPLES,
+    )
+    candidate = _validate_stage211_logits_metrics(
+        summary["macro"]["candidate_metrics"],
+        label="logits stratified macro/candidate replay",
+        expected_matched=_STAGE211_ALIGNMENT_STRATIFIED_SAMPLES,
+    )
+    checks, _, _ = _stage211_logits_metric_checks(baseline, candidate)
+    hard_and_long_improved = all(
+        float(summary["cells"][cell_name]["candidate_metrics"][metric])
+        < float(summary["cells"][cell_name]["baseline_metrics"][metric])
+        for cell_name in ("hard_en", "hard_zh", "long_zh")
+        for metric in (
+            "full_kl",
+            "conditional_nonblank_kl",
+            "ctc_token_error_rate",
+        )
+    )
+    bounded_cell_token_regression = all(
+        float(cell["candidate_metrics"]["ctc_token_error_rate"])
+        <= float(cell["baseline_metrics"]["ctc_token_error_rate"])
+        + _STAGE211_LOGITS_MAX_CELL_TOKEN_ERROR_REGRESSION
+        for cell in summary["cells"].values()
+    )
+    component_retention: dict[str, bool] = {}
+    for component_name, component in summary["hidden_component_summaries"].items():
+        macro_and_weak_retained = all(_stage211_hidden_retention_checks(component).values())
+        cells_retained = all(
+            float(row["candidate_loss"])
+            <= float(row["baseline_loss"]) * (1.0 + _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION)
+            + _STAGE211_ALIGNMENT_TOLERANCE
+            and float(row["candidate_cosine"])
+            >= float(row["baseline_cosine"])
+            - _STAGE211_LOGITS_MAX_HIDDEN_COSINE_REGRESSION
+            - _STAGE211_ALIGNMENT_TOLERANCE
+            for row in component["cells"].values()
+        )
+        component_retention[f"{component_name}_hidden_retained"] = (
+            macro_and_weak_retained and cells_retained
+        )
+    decoder = summary["decoder_hidden"]
+    decoder_retained = float(decoder["candidate_loss"]) <= float(decoder["baseline_loss"]) * (
+        1.0 + _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION
+    ) + _STAGE211_ALIGNMENT_TOLERANCE and all(
+        float(row["candidate_loss"])
+        <= float(row["baseline_loss"]) * (1.0 + _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION)
+        + _STAGE211_ALIGNMENT_TOLERANCE
+        for row in decoder["cell_results"].values()
+    )
+    replayed_checks = {
+        **checks,
+        "hard_and_long_cells_improved": hard_and_long_improved,
+        "cell_token_error_regression_bounded": bounded_cell_token_regression,
+        **component_retention,
+        "decoder_hidden_retained": decoder_retained,
+        "complete_stratified_coverage": True,
+    }
+    return all(replayed_checks.values()), replayed_checks
+
+
+def _validate_stage211_alignment_gate_replay(
+    alignment_report: dict[str, Any],
+    *,
+    phase: str,
+    baseline_source: dict[str, Any],
+    candidate_source: dict[str, Any],
+    baseline_checkpoint_path: Path,
+    checkpoint_path: Path,
+) -> bool:
+    required_components = _STAGE211_ALIGNMENT_PHASE_COMPONENTS[phase]
+    component_summaries = {
+        component: _stage211_alignment_component_summary(
+            _stage211_alignment_component_layers(
+                baseline_source,
+                phase=phase,
+                role="baseline",
+                component=component,
+            ),
+            _stage211_alignment_component_layers(
+                candidate_source,
+                phase=phase,
+                role="candidate",
+                component=component,
+            ),
+        )
+        for component in required_components
+    }
+    stratified_summary = _validate_stage211_stratified_summary_binding(
+        alignment_report,
+        phase=phase,
+        baseline_checkpoint_path=baseline_checkpoint_path,
+        checkpoint_path=checkpoint_path,
+    )
+    if phase in {"mixer", "block"}:
+        primary = component_summaries[phase]
+        component_gate_passed = all(
+            _stage211_fixed_component_gate_passed(component)
+            for component in component_summaries.values()
+        )
+        baseline_eval_loss = _stage211_alignment_float(
+            baseline_source.get("eval_loss"), label=f"{phase} baseline eval loss replay"
+        )
+        candidate_eval_loss = _stage211_alignment_float(
+            candidate_source.get("eval_loss"), label=f"{phase} candidate eval loss replay"
+        )
+        decoder_hidden = None
+        decoder_gate_passed = True
+        if phase == "block":
+            baseline_decoder_loss = float(baseline_source["decoder_hidden_metrics"]["loss"])
+            candidate_decoder_loss = float(candidate_source["decoder_hidden_metrics"]["loss"])
+            decoder_hidden = {
+                "baseline_loss": baseline_decoder_loss,
+                "candidate_loss": candidate_decoder_loss,
+            }
+            decoder_gate_passed = candidate_decoder_loss < baseline_decoder_loss
+        legacy_gate_passed = (
+            candidate_eval_loss < baseline_eval_loss
+            and float(primary["candidate_mean_loss"]) < float(primary["baseline_mean_loss"])
+            and float(primary["candidate_mean_cosine"]) > float(primary["baseline_mean_cosine"])
+            and int(primary["loss_improved_layers"]) == len(_STAGE211_ALIGNMENT_LAYER_IDS)
+            and int(primary["cosine_improved_layers"]) == len(_STAGE211_ALIGNMENT_LAYER_IDS)
+            and all(
+                float(row["candidate_loss"]) < float(row["baseline_loss"])
+                and float(row["candidate_cosine"]) > float(row["baseline_cosine"])
+                for row in primary["weak_bands"].values()
+            )
+            and decoder_gate_passed
+            and component_gate_passed
+        )
+        stratified_gate_passed = _stage211_hidden_stratified_gate_passed(
+            stratified_summary, phase=phase
+        )
+        expected_gate_passed = stratified_gate_passed and (
+            component_gate_passed if phase == "block" else True
+        )
+        replayed = {
+            "legacy_gate_passed": legacy_gate_passed,
+            "stratified_gate_passed": stratified_gate_passed,
+            "baseline_eval_loss": baseline_eval_loss,
+            "candidate_eval_loss": candidate_eval_loss,
+            "layer_summary": primary,
+            "component_summaries": component_summaries,
+            "component_gate_passed": component_gate_passed,
+            "decoder_hidden": decoder_hidden,
+            "gate_passed": expected_gate_passed,
+        }
+        for key, value in replayed.items():
+            _validate_stage211_replayed_value(
+                alignment_report.get(key), value, label=f"{phase} alignment {key}"
+            )
+        return expected_gate_passed
+
+    baseline_metrics = _validate_stage211_logits_metrics(
+        baseline_source.get("logit_metrics"),
+        label="logits baseline replay",
+        expected_matched=STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+    )
+    candidate_metrics = _validate_stage211_logits_metrics(
+        candidate_source.get("logit_metrics"),
+        label="logits candidate replay",
+        expected_matched=STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+    )
+    for metric in _STAGE211_LOGITS_IDENTICAL_TEACHER_METRICS:
+        if not math.isclose(
+            baseline_metrics[metric],
+            candidate_metrics[metric],
+            rel_tol=0.0,
+            abs_tol=_STAGE211_ALIGNMENT_TOLERANCE,
+        ):
+            raise ValueError(
+                f"Stage211 logits teacher metric changed between pair reports: {metric}."
+            )
+    checks, full_kl_reduction, conditional_kl_reduction = _stage211_logits_metric_checks(
+        baseline_metrics, candidate_metrics
+    )
+    hidden_retention_checks = {
+        component: _stage211_hidden_retention_checks(summary)
+        for component, summary in component_summaries.items()
+    }
+    baseline_decoder_loss = float(baseline_source["decoder_hidden_metrics"]["loss"])
+    candidate_decoder_loss = float(candidate_source["decoder_hidden_metrics"]["loss"])
+    decoder_retained = (
+        candidate_decoder_loss
+        <= baseline_decoder_loss * (1.0 + _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION)
+        + _STAGE211_ALIGNMENT_TOLERANCE
+    )
+    decoder_hidden_retention = {
+        "baseline_loss": baseline_decoder_loss,
+        "candidate_loss": candidate_decoder_loss,
+        "relative_change": (candidate_decoder_loss - baseline_decoder_loss)
+        / max(baseline_decoder_loss, 1.0e-12),
+        "retained": decoder_retained,
+    }
+    hidden_retention_passed = (
+        all(all(component_checks.values()) for component_checks in hidden_retention_checks.values())
+        and decoder_retained
+    )
+    legacy_gate_passed = all(checks.values())
+    stratified_gate_passed, stratified_checks = _stage211_logits_stratified_gate(stratified_summary)
+    selected_logits_gate_passed = stratified_gate_passed
+    expected_gate_passed = selected_logits_gate_passed and hidden_retention_passed
+    replayed = {
+        "legacy_gate_passed": legacy_gate_passed,
+        "selected_logits_gate_passed": selected_logits_gate_passed,
+        "stratified_gate_passed": stratified_gate_passed,
+        "stratified_checks": stratified_checks,
+        "thresholds": {
+            "minimum_kl_relative_reduction": _STAGE211_LOGITS_MIN_KL_RELATIVE_REDUCTION,
+            "ratio_min": _STAGE211_LOGITS_RATIO_MIN,
+            "ratio_max": _STAGE211_LOGITS_RATIO_MAX,
+            "max_cell_token_error_regression": (_STAGE211_LOGITS_MAX_CELL_TOKEN_ERROR_REGRESSION),
+            "max_hidden_loss_regression": _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION,
+            "max_hidden_cosine_regression": (_STAGE211_LOGITS_MAX_HIDDEN_COSINE_REGRESSION),
+            "tolerance": _STAGE211_ALIGNMENT_TOLERANCE,
+        },
+        "checks": checks,
+        "hidden_component_summaries": component_summaries,
+        "hidden_retention_checks": hidden_retention_checks,
+        "hidden_retention_passed": hidden_retention_passed,
+        "decoder_hidden_retention": decoder_hidden_retention,
+        "baseline_metrics": baseline_metrics,
+        "candidate_metrics": candidate_metrics,
+        "full_kl_relative_reduction": full_kl_reduction,
+        "conditional_nonblank_kl_relative_reduction": conditional_kl_reduction,
+        "gate_passed": expected_gate_passed,
+    }
+    for key, value in replayed.items():
+        _validate_stage211_replayed_value(
+            alignment_report.get(key), value, label=f"logits alignment {key}"
+        )
+    return expected_gate_passed
 
 
 def validate_stage211_runtime_epoch_coverage(
@@ -1341,9 +2252,7 @@ def build_stage211_full_data_coverage(
         else 0
     )
     supplemental_executed_exposures = (
-        int(supplemental_segment.get("executed_sample_exposures", 0))
-        if supplemental_segment
-        else 0
+        int(supplemental_segment.get("executed_sample_exposures", 0)) if supplemental_segment else 0
     )
     coverage: dict[str, Any] = {
         "phase": phase,
@@ -1360,19 +2269,13 @@ def build_stage211_full_data_coverage(
         ),
         "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS + supplemental_rows,
         "total_hours": STAGE211_AUDIO_TOTAL_HOURS + supplemental_hours,
-        "total_row_exposures": (
-            STAGE211_AUDIO_TOTAL_ROW_EXPOSURES + supplemental_row_exposures
-        ),
-        "total_hour_exposures": (
-            STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES + supplemental_hour_exposures
-        ),
+        "total_row_exposures": (STAGE211_AUDIO_TOTAL_ROW_EXPOSURES + supplemental_row_exposures),
+        "total_hour_exposures": (STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES + supplemental_hour_exposures),
         "total_tail_padding_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
-            + supplemental_tail_exposures
+            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES + supplemental_tail_exposures
         ),
         "total_executed_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
-            + supplemental_executed_exposures
+            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES + supplemental_executed_exposures
         ),
         "segments": segments,
         "final_checkpoint_path": str(checkpoint_path),
@@ -1508,8 +2411,7 @@ def _validate_stage211_correction_train_config(
     configured_phase = config.get("stage211_post_coverage_correction_phase", "mixer")
     if configured_phase != phase:
         raise ValueError(
-            f"Stage211 {phase} correction train config phase mismatch: "
-            f"actual={configured_phase!r}"
+            f"Stage211 {phase} correction train config phase mismatch: actual={configured_phase!r}"
         )
     contract = stage211_phase_train_config_contract(phase)
     contract["lr"] = stage211_post_coverage_correction_lr(phase)
@@ -1665,9 +2567,7 @@ def _validate_stage211_post_coverage_corrections(
             "webdataset_skip_decode_errors": False,
         }
         if any(correction.get(key) != value for key, value in expected_fields.items()):
-            raise ValueError(
-                f"Stage211 {phase} correction round {round_index} contract mismatch."
-            )
+            raise ValueError(f"Stage211 {phase} correction round {round_index} contract mismatch.")
         rows = int(correction.get("rows", -1))
         steps_per_epoch = int(correction.get("steps_per_epoch", -1))
         tail_padding = int(correction.get("tail_padding_samples_per_epoch", -1))
@@ -1684,9 +2584,7 @@ def _validate_stage211_post_coverage_corrections(
             or int(correction.get("executed_sample_exposures", -1)) != rows + tail_padding
             or abs(float(correction.get("hour_exposures", float("nan"))) - hours) > 1e-9
         ):
-            raise ValueError(
-                f"Stage211 {phase} correction round {round_index} exposure mismatch."
-            )
+            raise ValueError(f"Stage211 {phase} correction round {round_index} exposure mismatch.")
         receipt_path = _validate_bound_file(
             correction,
             path_key="receipt_path",
@@ -1785,9 +2683,7 @@ def _validate_stage211_post_coverage_corrections(
         if admission_coverage.get("segments") != original_segments:
             raise ValueError(f"Stage211 {phase} correction rewrites original coverage segments.")
         if admission_coverage.get("supplemental_natural") != supplemental_segment:
-            raise ValueError(
-                f"Stage211 {phase} correction rewrites supplemental coverage."
-            )
+            raise ValueError(f"Stage211 {phase} correction rewrites supplemental coverage.")
         prior_corrections = admission_coverage.get("post_coverage_corrections", [])
         if prior_corrections != validated:
             raise ValueError(
@@ -1949,25 +2845,21 @@ def _validate_stage211_supplemental_coverage_segment(
         )
     if Path(str(segment["bucket_manifest_path"])).resolve() != Path(
         str(profile["bucket_manifest_path"])
-    ).resolve() or str(segment["bucket_manifest_sha256"]) != str(
-        profile["bucket_manifest_sha256"]
-    ):
+    ).resolve() or str(segment["bucket_manifest_sha256"]) != str(profile["bucket_manifest_sha256"]):
         raise ValueError("Stage211 supplemental segment does not bind its inventory manifest.")
     if str(segment.get("init_checkpoint_sha256") or "") != preceding_checkpoint_sha256:
         raise ValueError("Stage211 supplemental segment does not initialize from Long.")
-    if (
-        str(segment.get("nano_teacher_checkpoint_sha256") or "")
-        != nano_teacher_checkpoint_sha256
-    ):
+    if str(segment.get("nano_teacher_checkpoint_sha256") or "") != nano_teacher_checkpoint_sha256:
         raise ValueError("Stage211 supplemental segment uses another Nano teacher.")
     train_config_path = Path(str(segment["train_config_path"])).resolve()
     train_config = load_yaml(train_config_path)
     validate_stage211_phase_train_config(train_config, phase=phase)
     if int(train_config.get("max_steps", -1)) != int(profile["steps"]):
         raise ValueError("Stage211 supplemental train config step contract mismatch.")
-    if Path(str(train_config.get("webdataset_bucket_manifest_path") or "")).resolve() != Path(
-        str(profile["bucket_manifest_path"])
-    ).resolve():
+    if (
+        Path(str(train_config.get("webdataset_bucket_manifest_path") or "")).resolve()
+        != Path(str(profile["bucket_manifest_path"])).resolve()
+    ):
         raise ValueError("Stage211 supplemental train config manifest mismatch.")
     configured_teacher = resolve_stage211_nano_teacher_checkpoint(train_config)
     if sha256_file(configured_teacher) != nano_teacher_checkpoint_sha256:
@@ -2009,13 +2901,9 @@ def validate_stage211_full_data_coverage(
                 float(actual) if isinstance(expected, float) else int(actual)
             )
         except (TypeError, ValueError) as error:
-            raise ValueError(
-                f"Stage211 original full-data coverage {key} mismatch."
-            ) from error
+            raise ValueError(f"Stage211 original full-data coverage {key} mismatch.") from error
         if isinstance(expected, float):
-            if not math.isclose(
-                float(actual_number), expected, rel_tol=0.0, abs_tol=0.005
-            ):
+            if not math.isclose(float(actual_number), expected, rel_tol=0.0, abs_tol=0.005):
                 raise ValueError(f"Stage211 original full-data coverage {key} mismatch.")
         elif int(actual_number) != expected:
             raise ValueError(f"Stage211 original full-data coverage {key} mismatch.")
@@ -2025,8 +2913,7 @@ def validate_stage211_full_data_coverage(
         raise ValueError("Stage211 full-data coverage segments must be a list.")
     expected_difficulties = tuple(STAGE211_AUDIO_CURRICULUM)
     actual_difficulties = tuple(
-        str(segment.get("difficulty")) if isinstance(segment, dict) else ""
-        for segment in segments
+        str(segment.get("difficulty")) if isinstance(segment, dict) else "" for segment in segments
     )
     if actual_difficulties != expected_difficulties:
         raise ValueError(
@@ -2191,27 +3078,21 @@ def validate_stage211_full_data_coverage(
             )
         previous_checkpoint_sha256 = str(segment["completion_checkpoint_sha256"])
 
-    supplemental_segment, supplemental_profile = (
-        _validate_stage211_supplemental_coverage_segment(
-            coverage.get("supplemental_natural"),
-            phase=phase,
-            preceding_checkpoint_sha256=str(previous_checkpoint_sha256 or ""),
-            nano_teacher_checkpoint_sha256=str(nano_teacher_checkpoint_sha256 or ""),
-        )
+    supplemental_segment, supplemental_profile = _validate_stage211_supplemental_coverage_segment(
+        coverage.get("supplemental_natural"),
+        phase=phase,
+        preceding_checkpoint_sha256=str(previous_checkpoint_sha256 or ""),
+        nano_teacher_checkpoint_sha256=str(nano_teacher_checkpoint_sha256 or ""),
     )
-    previous_checkpoint_sha256 = str(
-        supplemental_segment["completion_checkpoint_sha256"]
-    )
+    previous_checkpoint_sha256 = str(supplemental_segment["completion_checkpoint_sha256"])
     expected_combined_totals: dict[str, int | float] = {
         "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS + int(supplemental_profile["rows"]),
         "total_hours": STAGE211_AUDIO_TOTAL_HOURS + float(supplemental_profile["hours"]),
         "total_row_exposures": (
-            STAGE211_AUDIO_TOTAL_ROW_EXPOSURES
-            + int(supplemental_profile["row_exposures"])
+            STAGE211_AUDIO_TOTAL_ROW_EXPOSURES + int(supplemental_profile["row_exposures"])
         ),
         "total_hour_exposures": (
-            STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES
-            + float(supplemental_profile["hour_exposures"])
+            STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES + float(supplemental_profile["hour_exposures"])
         ),
         "total_tail_padding_sample_exposures": (
             STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
@@ -2227,13 +3108,9 @@ def validate_stage211_full_data_coverage(
         try:
             actual_number = float(actual) if isinstance(expected, float) else int(actual)
         except (TypeError, ValueError) as error:
-            raise ValueError(
-                f"Stage211 combined full-data coverage {key} mismatch."
-            ) from error
+            raise ValueError(f"Stage211 combined full-data coverage {key} mismatch.") from error
         if isinstance(expected, float):
-            if not math.isclose(
-                float(actual_number), expected, rel_tol=0.0, abs_tol=0.005
-            ):
+            if not math.isclose(float(actual_number), expected, rel_tol=0.0, abs_tol=0.005):
                 raise ValueError(f"Stage211 combined full-data coverage {key} mismatch.")
         elif int(actual_number) != expected:
             raise ValueError(f"Stage211 combined full-data coverage {key} mismatch.")
@@ -2566,6 +3443,18 @@ def validate_stage211_phase_gate_report(
                 "Stage211 logits alignment reports require the same "
                 "non-negative fixed feature seed."
             )
+    replayed_alignment_gate_passed = _validate_stage211_alignment_gate_replay(
+        alignment_report,
+        phase=expected_phase,
+        baseline_source=baseline_source,
+        candidate_source=candidate_source,
+        baseline_checkpoint_path=phase_init_checkpoint,
+        checkpoint_path=checkpoint_path,
+    )
+    if replayed_alignment_gate_passed != alignment_gate_passed:
+        raise ValueError(
+            f"Stage211 {expected_phase} alignment decision does not match replayed evidence."
+        )
     if alignment_record.get("artifact") != expected_alignment_artifact:
         raise ValueError(f"Stage211 {expected_phase} alignment report binding mismatch.")
     public_progress_gate_passed = report.get("public_progress_gate_passed")
