@@ -2759,3 +2759,18 @@ def test_stage211_phase_gate_preserves_a_strict_failed_decision(
             checkpoint_path=checkpoint,
             require_passed=False,
         )
+
+
+def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
+    script = (
+        REPO_ROOT / "scripts" / "watch_stage211_strict_continuation.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'POLL_SECONDS="${POLL_SECONDS:-3600}"' in script
+    assert 'while tmux has-session -t "${SUPERVISOR_SESSION}"' in script
+    assert 'sleep "${POLL_SECONDS}"' in script
+    assert 'START_STAGE="${start_stage}"' in script
+    assert "REUSE_COMPLETED_CALIBRATION_EVAL=1" in script
+    assert "stage211_choose_start_stage" in script
+    assert "post_mixer" in script
+    assert "tmux kill-session" not in script
