@@ -337,6 +337,7 @@ def validate_retention_replay(
     source_counts: dict[str, Counter[str]] = defaultdict(Counter)
     bucket_counts: dict[str, Counter[int]] = defaultdict(Counter)
     frame_ranges: dict[str, list[int]] = {}
+    total_frames = 0
     for part_path, (manifest_bucket, manifest_count, source_label) in manifest_parts.items():
         record = receipt_parts[part_path]
         if (
@@ -401,6 +402,7 @@ def validate_retention_replay(
                 ):
                     raise ValueError(f"Replay deterministic score mismatch for key={key}")
                 actual_strata[(cell, source_dataset, bucket_id)] += 1
+                total_frames += num_frames
                 cell_counts[cell] += 1
                 language_counts[language] += 1
                 source_counts[cell][source_dataset] += 1
@@ -417,6 +419,11 @@ def validate_retention_replay(
 
     if len(selected_keys) != train_samples:
         raise ValueError("Replay globally unique row count mismatch.")
+    if (
+        int(receipt.get("total_frames", -1)) != total_frames
+        or abs(float(receipt.get("total_hours", -1.0)) - total_frames / 100.0 / 3600.0) > 1e-9
+    ):
+        raise ValueError("Replay total frame/hour exposure mismatch.")
     if receipt.get("selected_keys_sha256") != _keys_sha256(selected_keys):
         raise ValueError("Replay selected-key digest mismatch.")
     selected_row_records.sort()

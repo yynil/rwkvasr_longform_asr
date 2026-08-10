@@ -188,6 +188,8 @@ def test_build_stage211_retention_replay_is_balanced_and_immutable(
     assert receipt["language_counts"] == {"en": 20, "zh": 39}
     assert receipt["manifest_train_samples"] == 59
     assert receipt["manifest_eval_samples"] == len(fixed)
+    assert receipt["total_frames"] > 0
+    assert receipt["total_hours"] == pytest.approx(receipt["total_frames"] / 100.0 / 3600.0)
     assert receipt["selection"]["realized_cell_targets"] == {
         **{cell: int(target) for cell, target in targets.items() if target is not None},
         "long_zh": expected_long,

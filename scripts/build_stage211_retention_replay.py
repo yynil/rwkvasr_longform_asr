@@ -879,6 +879,8 @@ def build_retention_replay(
         "quotas": _nested_counts(quotas),
         "samples": len(selected),
         "unique_keys": len(selected),
+        "total_frames": sum(candidate.num_frames for candidate in selected),
+        "total_hours": (sum(candidate.num_frames for candidate in selected) / 100.0 / 3600.0),
         "selected_keys_sha256": _keys_sha256([candidate.key for candidate in selected]),
         "selected_rows_sha256": hashlib.sha256(
             "\n".join(selected_key_records).encode("utf-8") + b"\n"
