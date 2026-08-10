@@ -780,6 +780,10 @@ def build_retention_replay(
         "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "retention_replay_manifest",
+        "builder": {
+            "path": str(Path(__file__).resolve()),
+            "sha256": sha256_file(Path(__file__).resolve()),
+        },
         "contract": {
             "admission": "post_original_easy_medium_hard_long_coverage_only",
             "architecture": "BiRWKV_TimeMixer_unchanged",

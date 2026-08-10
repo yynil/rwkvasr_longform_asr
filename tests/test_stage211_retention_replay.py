@@ -181,6 +181,7 @@ def test_build_stage211_retention_replay_is_balanced_and_immutable(
     expected_long = 19
     assert receipt["samples"] == 59
     assert receipt["unique_keys"] == receipt["samples"]
+    assert len(receipt["builder"]["sha256"]) == 64
     assert receipt["cells"]["long_zh"]["samples"] == expected_long
     assert receipt["language_counts"] == {"en": 20, "zh": 39}
     assert receipt["manifest_train_samples"] == 59
