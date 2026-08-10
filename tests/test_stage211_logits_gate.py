@@ -107,6 +107,8 @@ def _write_report(
     metrics: dict[str, float],
     checkpoint: Path,
     feature_seed: int = 0,
+    component_overrides: dict[str, tuple[float, float]] | None = None,
+    decoder_loss: float = 1.0,
 ) -> Path:
     role = "baseline" if step == 0 else "candidate"
     train_config = path.parent / "pair-train.yaml"
@@ -116,6 +118,26 @@ def _write_report(
         train_config.write_text("{}\n", encoding="utf-8")
         model_config.write_text("{}\n", encoding="utf-8")
         nano_checkpoint.write_bytes(b"nano")
+    component_metrics = {
+        "mixer": (1.0, 0.8),
+        "ffn": (1.0, 0.8),
+        "block": (1.0, 0.8),
+    }
+    component_metrics.update(component_overrides or {})
+    layer_components = {
+        component_name: {
+            str(layer_id): {
+                "loss": component_loss,
+                "cosine": component_cosine,
+                "rms_ratio": 1.0,
+            }
+            for layer_id in range(70)
+        }
+        for component_name, (
+            component_loss,
+            component_cosine,
+        ) in component_metrics.items()
+    }
     save_yaml(
         path,
         {
@@ -144,6 +166,8 @@ def _write_report(
                 feature_seed=feature_seed,
             ),
             "logit_metrics": metrics,
+            "layer_components": layer_components,
+            "decoder_hidden_metrics": {"loss": decoder_loss},
         },
     )
     return path
@@ -207,6 +231,70 @@ def test_stage211_logits_gate_requires_distribution_and_decode_improvement(
 
     assert rejected["gate_passed"] is False
     assert rejected["checks"]["full_kl_materially_improved"] is False
+
+
+def test_stage211_logits_gate_rejects_hidden_or_decoder_regression(
+    tmp_path: Path,
+) -> None:
+    eval_part = tmp_path / "fixed_eval.jsonl"
+    eval_part.write_text('{"utt_id": "u1"}\n', encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    baseline_checkpoint = tmp_path / "init.pt"
+    baseline_checkpoint.write_bytes(b"initial")
+    checkpoint = tmp_path / "step-105.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    baseline = _write_report(
+        tmp_path / "baseline.yaml",
+        step=0,
+        manifest=manifest,
+        part=eval_part,
+        metrics=_baseline_metrics(),
+        checkpoint=baseline_checkpoint,
+    )
+    hidden_regression = _write_report(
+        tmp_path / "hidden-regression.yaml",
+        step=105,
+        manifest=manifest,
+        part=eval_part,
+        metrics=_candidate_metrics(),
+        checkpoint=checkpoint,
+        component_overrides={"ffn": (1.2, 0.8)},
+    )
+
+    rejected = logits_gate.build_gate(
+        baseline_report_path=baseline,
+        candidate_report_path=hidden_regression,
+        baseline_checkpoint_path=baseline_checkpoint,
+        checkpoint_path=checkpoint,
+    )
+
+    assert rejected["selected_logits_gate_passed"] is True
+    assert rejected["hidden_retention_passed"] is False
+    assert rejected["hidden_retention_checks"]["ffn"][
+        "mean_loss_retained"
+    ] is False
+    assert rejected["gate_passed"] is False
+
+    decoder_regression = _write_report(
+        tmp_path / "decoder-regression.yaml",
+        step=105,
+        manifest=manifest,
+        part=eval_part,
+        metrics=_candidate_metrics(),
+        checkpoint=checkpoint,
+        decoder_loss=1.2,
+    )
+    rejected = logits_gate.build_gate(
+        baseline_report_path=baseline,
+        candidate_report_path=decoder_regression,
+        baseline_checkpoint_path=baseline_checkpoint,
+        checkpoint_path=checkpoint,
+    )
+
+    assert rejected["decoder_hidden_retention"]["retained"] is False
+    assert rejected["hidden_retention_passed"] is False
+    assert rejected["gate_passed"] is False
 
 
 def test_stage211_logits_gate_requires_identical_fixed_audio(

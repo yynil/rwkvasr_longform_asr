@@ -14,8 +14,11 @@ try:
         FIXED_EVAL_SAMPLES,
         STRATIFIED_CELLS,
         STRATIFIED_EVAL_SAMPLES,
+        WEAK_BANDS,
+        _component_layers,
         _eval_part_fingerprint,
         _pair_shared_binding,
+        _summary,
         _validated_pair_report,
     )
 except ModuleNotFoundError as error:
@@ -25,8 +28,11 @@ except ModuleNotFoundError as error:
         FIXED_EVAL_SAMPLES,
         STRATIFIED_CELLS,
         STRATIFIED_EVAL_SAMPLES,
+        WEAK_BANDS,
+        _component_layers,
         _eval_part_fingerprint,
         _pair_shared_binding,
+        _summary,
         _validated_pair_report,
     )
 
@@ -36,6 +42,9 @@ RATIO_MIN = 0.90
 RATIO_MAX = 1.10
 TOLERANCE = 1.0e-12
 MAX_CELL_TOKEN_ERROR_REGRESSION = 0.03
+HIDDEN_COMPONENTS = ("mixer", "ffn", "block")
+MAX_HIDDEN_LOSS_REGRESSION = 0.10
+MAX_HIDDEN_COSINE_REGRESSION = 0.01
 REQUIRED_METRICS = (
     "full_kl",
     "conditional_nonblank_kl",
@@ -355,6 +364,88 @@ def _stratified_gate_passed(summary: dict[str, Any]) -> tuple[bool, dict[str, bo
     return all(representative_checks.values()), representative_checks
 
 
+def _hidden_retention_checks(summary: dict[str, Any]) -> dict[str, bool]:
+    required_scalars = (
+        "baseline_mean_loss",
+        "candidate_mean_loss",
+        "baseline_mean_cosine",
+        "candidate_mean_cosine",
+    )
+    if not all(
+        math.isfinite(float(summary.get(key, float("nan"))))
+        for key in required_scalars
+    ):
+        raise ValueError("Stage211 logits hidden-component summary is not finite.")
+    weak_bands = summary.get("weak_bands")
+    if not isinstance(weak_bands, dict) or set(weak_bands) != set(WEAK_BANDS):
+        raise ValueError(
+            "Stage211 logits hidden-component weak-band coverage mismatch."
+        )
+    for band_name, row in weak_bands.items():
+        if not isinstance(row, dict) or not all(
+            math.isfinite(float(row.get(key, float("nan"))))
+            for key in (
+                "baseline_loss",
+                "candidate_loss",
+                "baseline_cosine",
+                "candidate_cosine",
+            )
+        ):
+            raise ValueError(
+                "Stage211 logits hidden-component weak band is not finite: "
+                f"{band_name}."
+            )
+    return {
+        "mean_loss_retained": float(summary["candidate_mean_loss"])
+        <= float(summary["baseline_mean_loss"])
+        * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
+        + TOLERANCE,
+        "mean_cosine_retained": float(summary["candidate_mean_cosine"])
+        >= float(summary["baseline_mean_cosine"])
+        - MAX_HIDDEN_COSINE_REGRESSION
+        - TOLERANCE,
+        "weak_band_loss_retained": all(
+            float(row["candidate_loss"])
+            <= float(row["baseline_loss"])
+            * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
+            + TOLERANCE
+            for row in weak_bands.values()
+        ),
+        "weak_band_cosine_retained": all(
+            float(row["candidate_cosine"])
+            >= float(row["baseline_cosine"])
+            - MAX_HIDDEN_COSINE_REGRESSION
+            - TOLERANCE
+            for row in weak_bands.values()
+        ),
+    }
+
+
+def _decoder_hidden_retention(
+    baseline_report: dict[str, Any],
+    candidate_report: dict[str, Any],
+) -> dict[str, Any]:
+    baseline_metrics = baseline_report.get("decoder_hidden_metrics") or {}
+    candidate_metrics = candidate_report.get("decoder_hidden_metrics") or {}
+    baseline_loss = float(baseline_metrics.get("loss", float("nan")))
+    candidate_loss = float(candidate_metrics.get("loss", float("nan")))
+    if not all(math.isfinite(value) for value in (baseline_loss, candidate_loss)):
+        raise ValueError(
+            "Stage211 logits gate requires finite decoder-hidden loss in both reports."
+        )
+    retained = (
+        candidate_loss
+        <= baseline_loss * (1.0 + MAX_HIDDEN_LOSS_REGRESSION) + TOLERANCE
+    )
+    return {
+        "baseline_loss": baseline_loss,
+        "candidate_loss": candidate_loss,
+        "relative_change": (candidate_loss - baseline_loss)
+        / max(baseline_loss, 1.0e-12),
+        "retained": retained,
+    }
+
+
 def build_gate(
     *,
     baseline_report_path: Path,
@@ -427,6 +518,33 @@ def build_gate(
         baseline_metrics,
         candidate_metrics,
     )
+    hidden_component_summaries = {
+        component_name: _summary(
+            _component_layers(
+                baseline_report,
+                phase="logits",
+                component_name=component_name,
+            ),
+            _component_layers(
+                candidate_report,
+                phase="logits",
+                component_name=component_name,
+            ),
+        )
+        for component_name in HIDDEN_COMPONENTS
+    }
+    hidden_retention_checks = {
+        component_name: _hidden_retention_checks(summary)
+        for component_name, summary in hidden_component_summaries.items()
+    }
+    decoder_hidden_retention = _decoder_hidden_retention(
+        baseline_report,
+        candidate_report,
+    )
+    hidden_retention_passed = all(
+        all(component_checks.values())
+        for component_checks in hidden_retention_checks.values()
+    ) and bool(decoder_hidden_retention["retained"])
     legacy_gate_passed = all(checks.values())
     stratified_summary = None
     stratified_gate_passed = None
@@ -441,11 +559,12 @@ def build_gate(
         stratified_gate_passed, stratified_checks = _stratified_gate_passed(
             stratified_summary
         )
-    gate_passed = (
+    selected_logits_gate_passed = (
         bool(stratified_gate_passed)
         if stratified_gate_passed is not None
         else legacy_gate_passed
     )
+    gate_passed = selected_logits_gate_passed and hidden_retention_passed
     return {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -457,6 +576,7 @@ def build_gate(
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "gate_passed": gate_passed,
         "legacy_gate_passed": legacy_gate_passed,
+        "selected_logits_gate_passed": selected_logits_gate_passed,
         "stratified_gate_passed": stratified_gate_passed,
         "stratified_checks": stratified_checks,
         "stratified_summary_path": (
@@ -477,9 +597,15 @@ def build_gate(
             "max_cell_token_error_regression": (
                 MAX_CELL_TOKEN_ERROR_REGRESSION
             ),
+            "max_hidden_loss_regression": MAX_HIDDEN_LOSS_REGRESSION,
+            "max_hidden_cosine_regression": MAX_HIDDEN_COSINE_REGRESSION,
             "tolerance": TOLERANCE,
         },
         "checks": checks,
+        "hidden_component_summaries": hidden_component_summaries,
+        "hidden_retention_checks": hidden_retention_checks,
+        "hidden_retention_passed": hidden_retention_passed,
+        "decoder_hidden_retention": decoder_hidden_retention,
         "baseline_report_path": str(baseline_report_path),
         "baseline_report_sha256": sha256_file(baseline_report_path),
         "candidate_report_path": str(candidate_report_path),

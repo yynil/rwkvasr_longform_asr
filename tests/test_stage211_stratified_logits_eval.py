@@ -86,6 +86,7 @@ def _write_report(
     part: Path,
     metrics: dict[str, float],
     pair_id: str,
+    component_overrides: dict[str, tuple[float, float]] | None = None,
 ) -> Path:
     train_config = path.parent / "pair-train.yaml"
     model_config = path.parent / "pair-model.yaml"
@@ -96,6 +97,26 @@ def _write_report(
         nano_checkpoint.write_bytes(b"nano")
     step = 0 if role == "baseline" else 105
     checkpoint_step = 17 if role == "baseline" else 105
+    component_metrics = {
+        "mixer": (1.0, 0.8),
+        "ffn": (1.0, 0.8),
+        "block": (1.0, 0.8),
+    }
+    component_metrics.update(component_overrides or {})
+    layer_components = {
+        component_name: {
+            str(layer_id): {
+                "loss": component_loss,
+                "cosine": component_cosine,
+                "rms_ratio": 1.0,
+            }
+            for layer_id in range(70)
+        }
+        for component_name, (
+            component_loss,
+            component_cosine,
+        ) in component_metrics.items()
+    }
     report: dict[str, Any] = {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -133,6 +154,8 @@ def _write_report(
             ],
         },
         "logit_metrics": metrics,
+        "layer_components": layer_components,
+        "decoder_hidden_metrics": {"loss": 1.0},
     }
     path.write_text(json.dumps(report) + "\n", encoding="utf-8")
     return path
@@ -236,6 +259,29 @@ def test_stage211_stratified_logits_summary_governs_gate(tmp_path: Path) -> None
     assert gate["stratified_gate_passed"] is True
     assert gate["gate_passed"] is True
     assert all(gate["stratified_checks"].values())
+
+    regressed_candidate = _write_report(
+        tmp_path / "legacy-regressed-candidate.json",
+        role="candidate",
+        checkpoint=checkpoint,
+        manifest=legacy_manifest,
+        part=legacy_part,
+        metrics=weak_metrics,
+        pair_id="a" * 64,
+        component_overrides={"ffn": (1.2, 0.8)},
+    )
+    rejected = logits_gate.build_gate(
+        baseline_report_path=legacy_baseline,
+        candidate_report_path=regressed_candidate,
+        baseline_checkpoint_path=baseline_checkpoint,
+        checkpoint_path=checkpoint,
+        stratified_summary_path=summary_path,
+    )
+
+    assert rejected["stratified_gate_passed"] is True
+    assert rejected["selected_logits_gate_passed"] is True
+    assert rejected["hidden_retention_passed"] is False
+    assert rejected["gate_passed"] is False
 
     bound_report = eval_dir / "hard_en_candidate.json"
     bound_report.write_text('{"mutated": true}\n', encoding="utf-8")

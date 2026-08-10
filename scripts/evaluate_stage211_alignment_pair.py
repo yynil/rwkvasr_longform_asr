@@ -125,6 +125,7 @@ def _validate_report_metrics(
     phase_components = {
         "mixer": ("mixer",),
         "block": ("mixer", "ffn", "block"),
+        "logits": ("mixer", "ffn", "block"),
     }
     for component_name in phase_components.get(phase, ()):
         component = layer_components.get(component_name)
@@ -143,11 +144,11 @@ def _validate_report_metrics(
                         f"Stage211 {phase} {component_name} layer {layer_id} "
                         f"metric {name} is not finite."
                     )
-    if phase == "block":
+    if phase in {"block", "logits"}:
         decoder_loss = float(decoder_hidden_metrics.get("loss", float("nan")))
         if not math.isfinite(decoder_loss):
             raise RuntimeError(
-                "Stage211 block pair eval lacks finite decoder-hidden loss."
+                f"Stage211 {phase} pair eval lacks finite decoder-hidden loss."
             )
     if phase == "logits":
         for name in LOGIT_REQUIRED_METRICS:

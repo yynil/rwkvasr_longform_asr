@@ -123,6 +123,46 @@ def test_stage211_pair_metric_validation_requires_complete_outputs() -> None:
             decoder_hidden_metrics={},
         )
 
+    logits = {name: 1.0 for name in pair_eval.LOGIT_REQUIRED_METRICS}
+    logits.update(
+        {
+            "matched_utterances": 256.0,
+            "missing_utterances": 0.0,
+            "mean_frame_delta": 0.0,
+        }
+    )
+    pair_eval._validate_report_metrics(
+        phase="logits",
+        eval_samples=256,
+        layer_components={
+            "mixer": layers,
+            "ffn": layers,
+            "block": layers,
+        },
+        logit_metrics=logits,
+        decoder_hidden_metrics={"loss": 0.2},
+    )
+    with pytest.raises(RuntimeError, match="ffn did not cover exactly 70 layers"):
+        pair_eval._validate_report_metrics(
+            phase="logits",
+            eval_samples=256,
+            layer_components={"mixer": layers, "block": layers},
+            logit_metrics=logits,
+            decoder_hidden_metrics={"loss": 0.2},
+        )
+    with pytest.raises(RuntimeError, match="decoder-hidden loss"):
+        pair_eval._validate_report_metrics(
+            phase="logits",
+            eval_samples=256,
+            layer_components={
+                "mixer": layers,
+                "ffn": layers,
+                "block": layers,
+            },
+            logit_metrics=logits,
+            decoder_hidden_metrics={},
+        )
+
 
 def test_offline_online_teacher_enables_requested_hidden_outputs(
     monkeypatch: pytest.MonkeyPatch,
