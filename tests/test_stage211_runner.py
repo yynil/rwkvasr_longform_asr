@@ -1525,7 +1525,15 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
     assert config["freeze_ctc_decoder"] is True
     assert config["freeze_ctc_head"] is True
     assert config["funasr_nano_ctc_init_checkpoint_path"] is None
-    assert config["ctc_teacher_online_layer_ffn_loss_weight"] == 0.0
+    expected_ffn_weight = {
+        "mixer": 0.0,
+        "block": 0.25,
+        "logits": 0.10,
+        "sft": 0.05,
+    }[phase_name]
+    assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(
+        expected_ffn_weight
+    )
     assert config["step_eval_cache_batches"] is True
     assert config["step_eval_feature_seed"] == 0
     if phase_name == "sft":
@@ -1555,6 +1563,7 @@ def test_stage211_mixer_phase_has_only_teacher_forced_mixer_objective(
     assert config["lr"] == pytest.approx(3.0e-6)
     assert config["ctc_teacher_online_layer_input_mode"] == "teacher_forced"
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(1.0)
+    assert config["ctc_teacher_online_layer_ffn_loss_weight"] == 0.0
     assert config["ctc_teacher_online_layer_block_loss_weight"] == 0.0
     assert config["ctc_teacher_online_encoder_loss_weight"] == 0.0
     assert config["ctc_teacher_online_decoder_hidden_loss_weight"] == 0.0
@@ -1572,6 +1581,7 @@ def test_stage211_block_phase_chains_stacked_block_without_logits(
     assert config["lr"] == pytest.approx(2.0e-6)
     assert config["ctc_teacher_online_layer_input_mode"] == "stacked"
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(0.25)
+    assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(0.25)
     assert config["ctc_teacher_online_layer_block_loss_weight"] == pytest.approx(1.0)
     assert config["ctc_teacher_online_encoder_loss_weight"] == pytest.approx(0.5)
     assert config["ctc_teacher_online_decoder_hidden_loss_weight"] == pytest.approx(0.5)
@@ -1589,6 +1599,7 @@ def test_stage211_logits_phase_enables_outputs_after_hidden_anchors(
     assert config["lr"] == pytest.approx(3.0e-7)
     assert config["ctc_teacher_online_layer_input_mode"] == "stacked"
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(0.10)
+    assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(0.10)
     assert config["ctc_teacher_online_layer_block_loss_weight"] == pytest.approx(0.25)
     assert config["ctc_teacher_online_blank_loss_weight"] == pytest.approx(0.25)
     assert config["ctc_teacher_online_conditional_nonblank_loss_weight"] == pytest.approx(1.0)
@@ -1618,6 +1629,7 @@ def test_stage211_sft_phase_uses_labels_after_logits_with_low_teacher_anchors(
     assert config["ctc_teacher_online_blank_loss_weight"] == pytest.approx(0.05)
     assert config["ctc_teacher_online_conditional_nonblank_loss_weight"] == pytest.approx(0.10)
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(0.05)
+    assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(0.05)
     assert config["ctc_teacher_online_layer_block_loss_weight"] == pytest.approx(0.10)
     assert config["ctc_teacher_online_encoder_loss_weight"] == pytest.approx(0.10)
     assert config["ctc_teacher_online_decoder_hidden_loss_weight"] == pytest.approx(0.10)

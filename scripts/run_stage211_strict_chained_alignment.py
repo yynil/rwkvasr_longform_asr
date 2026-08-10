@@ -100,6 +100,7 @@ class AlignmentPhase:
     input_mode: str
     ctc_weight: float
     mixer_weight: float
+    ffn_weight: float
     block_weight: float
     encoder_weight: float
     decoder_hidden_weight: float
@@ -121,6 +122,7 @@ PHASES: dict[str, AlignmentPhase] = {
         input_mode="teacher_forced",
         ctc_weight=0.0,
         mixer_weight=1.0,
+        ffn_weight=0.0,
         block_weight=0.0,
         encoder_weight=0.0,
         decoder_hidden_weight=0.0,
@@ -140,6 +142,7 @@ PHASES: dict[str, AlignmentPhase] = {
         input_mode="stacked",
         ctc_weight=0.0,
         mixer_weight=0.25,
+        ffn_weight=0.25,
         block_weight=1.0,
         encoder_weight=0.5,
         decoder_hidden_weight=0.5,
@@ -159,6 +162,7 @@ PHASES: dict[str, AlignmentPhase] = {
         input_mode="stacked",
         ctc_weight=0.0,
         mixer_weight=0.10,
+        ffn_weight=0.10,
         block_weight=0.25,
         encoder_weight=0.25,
         decoder_hidden_weight=0.25,
@@ -178,6 +182,7 @@ PHASES: dict[str, AlignmentPhase] = {
         input_mode="stacked",
         ctc_weight=1.0,
         mixer_weight=0.05,
+        ffn_weight=0.05,
         block_weight=0.10,
         encoder_weight=0.10,
         decoder_hidden_weight=0.10,
@@ -909,7 +914,7 @@ def _config(
             "ctc_teacher_online_encoder_loss_weight": float(phase.encoder_weight),
             "ctc_teacher_online_decoder_hidden_loss_weight": float(phase.decoder_hidden_weight),
             "ctc_teacher_online_layer_mixer_loss_weight": float(phase.mixer_weight),
-            "ctc_teacher_online_layer_ffn_loss_weight": 0.0,
+            "ctc_teacher_online_layer_ffn_loss_weight": float(phase.ffn_weight),
             "ctc_teacher_online_layer_block_loss_weight": float(phase.block_weight),
             "ctc_teacher_online_layer_sample_count": int(phase.layer_sample_count),
             "ctc_teacher_online_layer_boundary_ids": (
