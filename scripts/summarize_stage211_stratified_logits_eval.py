@@ -9,16 +9,24 @@ from typing import Any
 
 try:
     from scripts.create_stage211_logits_alignment_gate import (
+        HIDDEN_COMPONENTS,
         IDENTICAL_TEACHER_METRICS,
         REQUIRED_METRICS,
+    )
+    from scripts.create_stage211_hidden_alignment_gate import _component_layers
+    from scripts.summarize_stage211_stratified_hidden_eval import (
+        _component_summary,
     )
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
     from create_stage211_logits_alignment_gate import (
+        HIDDEN_COMPONENTS,
         IDENTICAL_TEACHER_METRICS,
         REQUIRED_METRICS,
     )
+    from create_stage211_hidden_alignment_gate import _component_layers
+    from summarize_stage211_stratified_hidden_eval import _component_summary
 
 
 ROLES = ("baseline", "candidate")
@@ -133,6 +141,46 @@ def _aggregate_metrics(
     }
 
 
+def _validated_hidden_components(
+    report: dict[str, Any],
+    *,
+    report_path: Path,
+) -> dict[str, dict[str, dict[str, float]]]:
+    validated: dict[str, dict[str, dict[str, float]]] = {}
+    for component_name in HIDDEN_COMPONENTS:
+        layers = _component_layers(
+            report,
+            phase="logits",
+            component_name=component_name,
+        )
+        for layer_id, metrics in layers.items():
+            if not isinstance(metrics, dict) or not all(
+                math.isfinite(float(metrics.get(name, float("nan"))))
+                for name in ("loss", "cosine", "rms_ratio")
+            ):
+                raise ValueError(
+                    "Stage211 stratified logits hidden metric is invalid: "
+                    f"{report_path}/{component_name}/{layer_id}."
+                )
+        validated[component_name] = layers
+    return validated
+
+
+def _validated_decoder_hidden_loss(
+    report: dict[str, Any],
+    *,
+    report_path: Path,
+) -> float:
+    metrics = report.get("decoder_hidden_metrics") or {}
+    loss = float(metrics.get("loss", float("nan")))
+    if not math.isfinite(loss):
+        raise ValueError(
+            "Stage211 stratified logits report lacks finite decoder-hidden loss: "
+            f"{report_path}."
+        )
+    return loss
+
+
 def summarize(
     *,
     receipt_path: Path,
@@ -160,6 +208,9 @@ def summarize(
     }
     cell_results: dict[str, dict[str, Any]] = {}
     report_bindings: dict[str, dict[str, Any]] = {}
+    components_by_cell: dict[str, dict[str, Any]] = {}
+    decoder_losses: dict[str, list[float]] = {role: [] for role in ROLES}
+    decoder_by_cell: dict[str, dict[str, float]] = {}
     for cell_name, cell in sorted(cells.items()):
         if not isinstance(cell, dict):
             raise ValueError(f"Invalid Stage211 stratified logits cell: {cell_name}")
@@ -176,6 +227,8 @@ def summarize(
             )
         cell_metrics: dict[str, dict[str, float]] = {}
         cell_reports: dict[str, dict[str, Any]] = {}
+        components_by_role: dict[str, Any] = {}
+        decoder_by_role: dict[str, float] = {}
         report_bindings[cell_name] = {}
         pair_ids: set[str] = set()
         for role in ROLES:
@@ -196,6 +249,15 @@ def summarize(
             )
             cell_metrics[role] = metrics
             metrics_by_role[role].append(metrics)
+            components_by_role[role] = _validated_hidden_components(
+                report,
+                report_path=report_path,
+            )
+            decoder_by_role[role] = _validated_decoder_hidden_loss(
+                report,
+                report_path=report_path,
+            )
+            decoder_losses[role].append(decoder_by_role[role])
             checkpoint_bindings[role].add(
                 (
                     str(report.get("checkpoint_path") or ""),
@@ -220,6 +282,17 @@ def summarize(
                 )
         baseline = cell_metrics["baseline"]
         candidate = cell_metrics["candidate"]
+        components_by_cell[cell_name] = components_by_role
+        decoder_by_cell[cell_name] = {
+            "baseline_loss": decoder_by_role["baseline"],
+            "candidate_loss": decoder_by_role["candidate"],
+            "relative_change_pct": 100.0
+            * (
+                decoder_by_role["candidate"]
+                / max(decoder_by_role["baseline"], 1.0e-12)
+                - 1.0
+            ),
+        }
         cell_results[cell_name] = {
             "samples": samples,
             "manifest_path": str(manifest_path),
@@ -259,6 +332,19 @@ def summarize(
         }
     macro_baseline = _aggregate_metrics(metrics_by_role["baseline"])
     macro_candidate = _aggregate_metrics(metrics_by_role["candidate"])
+    hidden_component_summaries = {
+        component_name: _component_summary(
+            component_name=component_name,
+            components_by_cell=components_by_cell,
+        )
+        for component_name in HIDDEN_COMPONENTS
+    }
+    baseline_decoder_loss = sum(decoder_losses["baseline"]) / len(
+        decoder_losses["baseline"]
+    )
+    candidate_decoder_loss = sum(decoder_losses["candidate"]) / len(
+        decoder_losses["candidate"]
+    )
     summary = {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -282,6 +368,18 @@ def summarize(
                 - macro_candidate["conditional_nonblank_kl"]
             )
             / max(abs(macro_baseline["conditional_nonblank_kl"]), 1.0e-12),
+        },
+        "hidden_component_summaries": hidden_component_summaries,
+        "decoder_hidden": {
+            "cells": len(decoder_by_cell),
+            "baseline_loss": baseline_decoder_loss,
+            "candidate_loss": candidate_decoder_loss,
+            "relative_change_pct": 100.0
+            * (
+                candidate_decoder_loss / max(baseline_decoder_loss, 1.0e-12)
+                - 1.0
+            ),
+            "cell_results": decoder_by_cell,
         },
         "reports": report_bindings,
     }

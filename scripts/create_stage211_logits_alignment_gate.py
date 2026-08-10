@@ -20,6 +20,7 @@ try:
         _pair_shared_binding,
         _summary,
         _validated_pair_report,
+        _validate_stratified_component_summary,
     )
 except ModuleNotFoundError as error:
     if error.name != "scripts":
@@ -34,6 +35,7 @@ except ModuleNotFoundError as error:
         _pair_shared_binding,
         _summary,
         _validated_pair_report,
+        _validate_stratified_component_summary,
     )
 
 
@@ -275,6 +277,46 @@ def _validated_stratified_summary(
             label=f"macro/{role}",
             expected_matched=STRATIFIED_EVAL_SAMPLES,
         )
+    hidden_component_summaries = summary.get("hidden_component_summaries")
+    if not isinstance(hidden_component_summaries, dict) or set(
+        hidden_component_summaries
+    ) != set(HIDDEN_COMPONENTS):
+        raise ValueError(
+            "Stage211 stratified logits hidden-component coverage mismatch."
+        )
+    for component_name in HIDDEN_COMPONENTS:
+        _validate_stratified_component_summary(
+            hidden_component_summaries[component_name],
+            component_name=component_name,
+        )
+    decoder_hidden = summary.get("decoder_hidden")
+    if (
+        not isinstance(decoder_hidden, dict)
+        or int(decoder_hidden.get("cells", -1)) != len(STRATIFIED_CELLS)
+        or not all(
+            math.isfinite(float(decoder_hidden.get(key, float("nan"))))
+            for key in ("baseline_loss", "candidate_loss", "relative_change_pct")
+        )
+    ):
+        raise ValueError(
+            "Stage211 stratified logits decoder-hidden summary is invalid."
+        )
+    decoder_cells = decoder_hidden.get("cell_results")
+    if not isinstance(decoder_cells, dict) or set(decoder_cells) != set(
+        STRATIFIED_CELLS
+    ):
+        raise ValueError(
+            "Stage211 stratified logits decoder-hidden cell coverage mismatch."
+        )
+    for cell_name, row in decoder_cells.items():
+        if not isinstance(row, dict) or not all(
+            math.isfinite(float(row.get(key, float("nan"))))
+            for key in ("baseline_loss", "candidate_loss", "relative_change_pct")
+        ):
+            raise ValueError(
+                "Stage211 stratified logits decoder-hidden cell is invalid: "
+                f"{cell_name}."
+            )
     report_bindings = summary.get("reports")
     if not isinstance(report_bindings, dict) or set(report_bindings) != set(
         STRATIFIED_CELLS
@@ -355,10 +397,46 @@ def _stratified_gate_passed(summary: dict[str, Any]) -> tuple[bool, dict[str, bo
         + MAX_CELL_TOKEN_ERROR_REGRESSION
         for cell in cells.values()
     )
+    component_retention: dict[str, bool] = {}
+    for component_name in HIDDEN_COMPONENTS:
+        component = summary["hidden_component_summaries"][component_name]
+        macro_and_weak_retained = all(
+            _hidden_retention_checks(component).values()
+        )
+        cells_retained = all(
+            float(row["candidate_loss"])
+            <= float(row["baseline_loss"])
+            * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
+            + TOLERANCE
+            and float(row["candidate_cosine"])
+            >= float(row["baseline_cosine"])
+            - MAX_HIDDEN_COSINE_REGRESSION
+            - TOLERANCE
+            for row in component["cells"].values()
+        )
+        component_retention[f"{component_name}_hidden_retained"] = (
+            macro_and_weak_retained and cells_retained
+        )
+    decoder_hidden = summary["decoder_hidden"]
+    decoder_hidden_retained = (
+        float(decoder_hidden["candidate_loss"])
+        <= float(decoder_hidden["baseline_loss"])
+        * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
+        + TOLERANCE
+        and all(
+            float(row["candidate_loss"])
+            <= float(row["baseline_loss"])
+            * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
+            + TOLERANCE
+            for row in decoder_hidden["cell_results"].values()
+        )
+    )
     representative_checks = {
         **checks,
         "hard_and_long_cells_improved": hard_cells_improved,
         "cell_token_error_regression_bounded": bounded_cell_token_regression,
+        **component_retention,
+        "decoder_hidden_retained": decoder_hidden_retained,
         "complete_stratified_coverage": True,
     }
     return all(representative_checks.values()), representative_checks

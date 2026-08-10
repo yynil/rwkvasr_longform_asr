@@ -222,6 +222,16 @@ def test_stage211_stratified_logits_summary_governs_gate(tmp_path: Path) -> None
         0.20
     )
     assert summary["macro"]["baseline_metrics"]["matched_utterances"] == 1792
+    assert set(summary["hidden_component_summaries"]) == {
+        "mixer",
+        "ffn",
+        "block",
+    }
+    assert summary["hidden_component_summaries"]["ffn"][
+        "baseline_mean_loss"
+    ] == pytest.approx(1.0)
+    assert summary["decoder_hidden"]["cells"] == 7
+    assert summary["decoder_hidden"]["candidate_loss"] == pytest.approx(1.0)
 
     legacy_manifest = tmp_path / "legacy-manifest.json"
     legacy_part = tmp_path / "legacy-part.jsonl"
@@ -281,6 +291,37 @@ def test_stage211_stratified_logits_summary_governs_gate(tmp_path: Path) -> None
     assert rejected["stratified_gate_passed"] is True
     assert rejected["selected_logits_gate_passed"] is True
     assert rejected["hidden_retention_passed"] is False
+    assert rejected["gate_passed"] is False
+
+    hard_en_candidate = eval_dir / "hard_en_candidate.json"
+    hard_en_index = logits_gate.STRATIFIED_CELLS.index("hard_en")
+    _write_report(
+        hard_en_candidate,
+        role="candidate",
+        checkpoint=checkpoint,
+        manifest=tmp_path / "manifest_hard_en.json",
+        part=tmp_path / "part_hard_en.jsonl",
+        metrics=_candidate_metrics(),
+        pair_id=f"{hard_en_index + 1:064x}",
+        component_overrides={"ffn": (1.2, 0.8)},
+    )
+    regressed_summary_path = tmp_path / "regressed-summary.json"
+    summarizer.summarize(
+        receipt_path=receipt,
+        eval_dir=eval_dir,
+        output_path=regressed_summary_path,
+    )
+    rejected = logits_gate.build_gate(
+        baseline_report_path=legacy_baseline,
+        candidate_report_path=legacy_candidate,
+        baseline_checkpoint_path=baseline_checkpoint,
+        checkpoint_path=checkpoint,
+        stratified_summary_path=regressed_summary_path,
+    )
+
+    assert rejected["hidden_retention_passed"] is True
+    assert rejected["stratified_checks"]["ffn_hidden_retained"] is False
+    assert rejected["stratified_gate_passed"] is False
     assert rejected["gate_passed"] is False
 
     bound_report = eval_dir / "hard_en_candidate.json"
