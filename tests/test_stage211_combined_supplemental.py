@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,6 +25,69 @@ combined = importlib.import_module("scripts.build_stage211_combined_supplemental
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_postmaterialization_pipeline_waits_for_materialized_inventory(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    call_log = tmp_path / "calls.log"
+    materialized_inventory = tmp_path / "materialized.json"
+    _write_executable(fake_bin / "tmux", "#!/usr/bin/env bash\nexit 1\n")
+    _write_executable(
+        fake_bin / "sleep",
+        "#!/usr/bin/env bash\n"
+        "printf 'sleep\\n' >>\"${CALL_LOG}\"\n"
+        "printf '{}\\n' >\"${MATERIALIZED_INVENTORY}\"\n",
+    )
+    _write_executable(
+        fake_bin / "uv",
+        '#!/usr/bin/env bash\nprintf \'uv %s\\n\' "$*" >>"${CALL_LOG}"\n',
+    )
+    base_inventory = tmp_path / "base.json"
+    usb_receipt = tmp_path / "usb.json"
+    archived_receipt = tmp_path / "archived.json"
+    for path in (base_inventory, usb_receipt, archived_receipt):
+        path.write_text("{}\n", encoding="utf-8")
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CALL_LOG": str(call_log),
+        "POLL_SECONDS": "1",
+        "MATERIALIZED_INVENTORY": str(materialized_inventory),
+        "BASE_INVENTORY": str(base_inventory),
+        "USB_COVERAGE_RECEIPT": str(usb_receipt),
+        "ARCHIVED_SOCIAL_OVERLAP_RECEIPT": str(archived_receipt),
+        "BASE_PUBLIC_OVERLAP_ROOT": str(tmp_path / "base-overlap"),
+        "FILTERED_ROOT": str(tmp_path / "filtered"),
+        "COMBINED_ROOT": str(tmp_path / "combined"),
+    }
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/build_stage211_social_combined_postmaterialization.sh")],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    wait_index = calls.index("sleep")
+    filter_index = next(
+        index for index, call in enumerate(calls) if "filter_stage211_social_pcm_overlap.py" in call
+    )
+    assert wait_index > 0
+    assert filter_index > wait_index
+    assert calls[0].startswith("uv run python scripts/audit_stage211_base_public_pcm_overlap.py")
+    assert "social materialized inventory unavailable" in result.stdout
 
 
 @pytest.fixture(autouse=True)
@@ -77,9 +142,7 @@ def _fixed_eval(tmp_path: Path) -> tuple[Path, Path, dict[str, object], dict[str
         "rows": 256,
         "manifest_path": str(manifest),
         "manifest_sha256": _sha256(manifest),
-        "parts": [
-            {"path": str(part), "sha256": _sha256(part), "num_samples": 256}
-        ],
+        "parts": [{"path": str(part), "sha256": _sha256(part), "num_samples": 256}],
     }
     return part, manifest, split, binding
 
@@ -104,9 +167,7 @@ def _manifest(
                         "buckets": [
                             {
                                 "bucket_id": 1,
-                                "num_samples": sum(
-                                    int(part["num_samples"]) for part in parts
-                                ),
+                                "num_samples": sum(int(part["num_samples"]) for part in parts),
                                 "parts": parts,
                             }
                         ],
@@ -136,9 +197,7 @@ def _base_inventory(
     _manifest(manifest, parts=parts, eval_split=eval_split)
     stage179 = root / "stage179.json"
     stage179.write_text("{}\n", encoding="utf-8")
-    hours_by_source = {
-        source: 1.0 / 3600.0 for source in STAGE211_BASE_SUPPLEMENTAL_SOURCES
-    }
+    hours_by_source = {source: 1.0 / 3600.0 for source in STAGE211_BASE_SUPPLEMENTAL_SOURCES}
     inventory = {
         "schema_version": 1,
         "artifact": "stage211_supplemental_natural_inventory",
@@ -152,9 +211,7 @@ def _base_inventory(
         "layout_errors": [],
         "selected_rows": 5,
         "selected_hours": sum(hours_by_source.values()),
-        "selected_counts_by_source": {
-            source: 1 for source in STAGE211_BASE_SUPPLEMENTAL_SOURCES
-        },
+        "selected_counts_by_source": {source: 1 for source in STAGE211_BASE_SUPPLEMENTAL_SOURCES},
         "selected_hours_by_source": hours_by_source,
         "dedupe": {
             "algorithm": "blake2b16(corpus + NUL + source_identity)",
@@ -328,9 +385,7 @@ def _usb_proofs(tmp_path: Path, *, social_inventory: Path) -> tuple[Path, Path]:
                 "source_inventory_sha256": materialized["source_inventory_sha256"],
                 "usb_top_level_coverage_receipt_path": str(coverage),
                 "usb_top_level_coverage_receipt_sha256": _sha256(coverage),
-                "comparison_mode": (
-                    "exact_member_bytes_sha256_against_existing_social_path"
-                ),
+                "comparison_mode": ("exact_member_bytes_sha256_against_existing_social_path"),
                 "exact_duplicate_members": 1,
                 "unique_members": 0,
                 "all_members_exact_existing_social_duplicates": True,
@@ -407,14 +462,10 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
     assert result["storage_kinds"] == ["parquet", "tar", "zip"]
     assert result["language"] == ["en", "zh"]
     assert result["cross_pool_dedupe"]["content_fingerprint_complete"] is False
-    assert result["cross_pool_dedupe"][
-        "base_public_overlap_normalized_pcm_exact_complete"
-    ] is True
+    assert result["cross_pool_dedupe"]["base_public_overlap_normalized_pcm_exact_complete"] is True
     assert result["cross_pool_dedupe"]["base_public_overlap_rows"] == 0
     assert result["cross_pool_dedupe"]["social_normalized_pcm_exact_complete"] is True
-    assert result["cross_pool_dedupe"][
-        "archived_social_exact_duplicate_exclusion_complete"
-    ] is True
+    assert result["cross_pool_dedupe"]["archived_social_exact_duplicate_exclusion_complete"] is True
     assert result["usb_natural_audio_resolution"]["unresolved_entries"] == []
     assert result["cross_pool_dedupe"]["near_duplicate_complete"] is False
     manifest = load_webdataset_bucket_manifest(result["bucket_manifest_path"])

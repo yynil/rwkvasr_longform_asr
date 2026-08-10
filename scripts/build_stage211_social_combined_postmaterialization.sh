@@ -16,6 +16,16 @@ POLL_SECONDS="${POLL_SECONDS:-3600}"
 
 cd "${REPO_ROOT}"
 
+wait_for_artifact() {
+  local label="$1"
+  local path="$2"
+  while [[ ! -s "${path}" ]]; do
+    printf 'Stage211 %s unavailable; waiting %ss: %s\n' \
+      "${label}" "${POLL_SECONDS}" "${path}"
+    sleep "${POLL_SECONDS}"
+  done
+}
+
 while tmux has-session -t "${ARCHIVED_SOCIAL_OVERLAP_SESSION}" 2>/dev/null; do
   sleep "${POLL_SECONDS}"
 done
@@ -27,15 +37,15 @@ if [[ ! -s "${ARCHIVED_SOCIAL_OVERLAP_RECEIPT}" ]]; then
   echo "Stage211 archived-social overlap receipt is unavailable: ${ARCHIVED_SOCIAL_OVERLAP_RECEIPT}" >&2
   exit 1
 fi
-while [[ ! -s "${BASE_INVENTORY}" ]]; do
-  sleep "${POLL_SECONDS}"
-done
+wait_for_artifact "base supplemental inventory" "${BASE_INVENTORY}"
 
 env CUDA_VISIBLE_DEVICES='' uv run python \
   scripts/audit_stage211_base_public_pcm_overlap.py \
   --base-inventory "${BASE_INVENTORY}" \
   --output-root "${BASE_PUBLIC_OVERLAP_ROOT}" \
   all
+
+wait_for_artifact "social materialized inventory" "${MATERIALIZED_INVENTORY}"
 
 env CUDA_VISIBLE_DEVICES='' uv run python \
   scripts/filter_stage211_social_pcm_overlap.py \
