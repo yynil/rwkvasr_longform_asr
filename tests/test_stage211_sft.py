@@ -726,6 +726,97 @@ def _write_stepwise_inputs(
         encoding="utf-8",
     )
     reports["sft"] = sft_report
+    initialization_support: dict[str, Path] = {}
+    for name, payload in (
+        ("calibration-provenance", b"{}\n"),
+        ("stage210-checkpoint", b"stage210"),
+        ("stage210-train-config", b"{}\n"),
+        ("stage210-log", b"init\n"),
+        ("loader-rwkv-asr-ctc", b"loader-a\n"),
+        ("loader-sensevoice-rwkv", b"loader-b\n"),
+    ):
+        path = tmp_path / name
+        path.write_bytes(payload)
+        initialization_support[name] = path
+    initialization_receipt = tmp_path / "nano-initialization-receipt.json"
+    initialization_receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "nano_initialization_proof",
+                "complete": True,
+                "calibration_reuse_receipt_path": str(calibration_receipt.resolve()),
+                "calibration_reuse_receipt_sha256": sha256_file(calibration_receipt),
+                "calibration_selection_report_path": str(support["selection"].resolve()),
+                "calibration_selection_report_sha256": sha256_file(support["selection"]),
+                "calibration_checkpoint_path": str(checkpoints["calibration"].resolve()),
+                "calibration_checkpoint_sha256": sha256_file(checkpoints["calibration"]),
+                "calibration_provenance_path": str(
+                    initialization_support["calibration-provenance"].resolve()
+                ),
+                "calibration_provenance_sha256": sha256_file(
+                    initialization_support["calibration-provenance"]
+                ),
+                "stage210_checkpoint_path": str(
+                    initialization_support["stage210-checkpoint"].resolve()
+                ),
+                "stage210_checkpoint_sha256": sha256_file(
+                    initialization_support["stage210-checkpoint"]
+                ),
+                "stage210_train_config_path": str(
+                    initialization_support["stage210-train-config"].resolve()
+                ),
+                "stage210_train_config_sha256": sha256_file(
+                    initialization_support["stage210-train-config"]
+                ),
+                "stage210_log_path": str(initialization_support["stage210-log"].resolve()),
+                "stage210_log_sha256": sha256_file(initialization_support["stage210-log"]),
+                "nano_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
+                "nano_checkpoint_sha256": nano_teacher_sha256,
+                "loader_source_bindings": [
+                    {"path": str(path.resolve()), "sha256": sha256_file(path)}
+                    for path in (
+                        initialization_support["loader-rwkv-asr-ctc"],
+                        initialization_support["loader-sensevoice-rwkv"],
+                    )
+                ],
+                "runtime_load_report": {
+                    "qkv_mapped_to_both_directions": True,
+                    "qkv_projection_scale_mode": "rwkv_norm",
+                    "encoder_layers": 70,
+                    "rwkv_encoder_loaded_tensors": 1125,
+                    "expected_non_attention_mlp_norm_tensors": 564,
+                    "expected_bidirectional_qkvo_and_input_projection_tensors": 561,
+                    "first_layer_reconstruction_errors": {"q": 0.05, "k": 0.04, "v": 0.03},
+                    "ctc_decoder_layers": 5,
+                    "ctc_decoder_loaded_tensors": 84,
+                    "ctc_head_loaded_rows": 60515,
+                    "ctc_head_ignored_rows": [60514],
+                },
+                "freeze_report": {
+                    "freeze_encoder_except_time_mixer": True,
+                    "freeze_ctc_decoder": True,
+                    "freeze_ctc_head": True,
+                    "frozen_tensors": 650,
+                    "trainable_params": 189378560,
+                },
+                "frozen_tensor_audit": {
+                    "complete": True,
+                    "non_attention_mlp_norm_tensors": 564,
+                    "ctc_decoder_tensors": 84,
+                    "ctc_head_teacher_rows": 60515,
+                    "ctc_head_project_rows": 60516,
+                    "mismatched_tensors": 0,
+                    "mismatched_head_rows": 0,
+                    "mismatch_examples": [],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    reports["initialization"] = initialization_receipt
     return checkpoints, reports
 
 
@@ -950,6 +1041,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     output_markdown = tmp_path / "stepwise.md"
 
     report = stepwise_report.create_stepwise_report(
+        initialization_receipt_path=reports["initialization"],
         calibration_receipt_path=reports["calibration"],
         mixer_gate_path=reports["mixer"],
         block_gate_path=reports["block"],
@@ -979,6 +1071,10 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "sft": "sft",
     }
     assert report["checkpoint_chain_passed"] is True
+    assert report["nano_initialization_chain_passed"] is True
+    assert report["initialization_receipt_sha256"] == sha256_file(
+        reports["initialization"]
+    )
     assert report["nano_teacher_chain_passed"] is True
     assert report["supplemental_inventory_chain_passed"] is True
     assert report["all_stage_public_metrics_complete"] is True
@@ -1040,6 +1136,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="selected Mixer gate"):
         stepwise_report.build_stepwise_report(
+            initialization_receipt_path=reports["initialization"],
             calibration_receipt_path=reports["calibration"],
             mixer_gate_path=reports["mixer"],
             block_gate_path=reports["block"],
@@ -1058,6 +1155,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="public-baseline provenance chain mismatch"):
         stepwise_report.build_stepwise_report(
+            initialization_receipt_path=reports["initialization"],
             calibration_receipt_path=reports["calibration"],
             mixer_gate_path=reports["mixer"],
             block_gate_path=reports["block"],
@@ -1074,6 +1172,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="every-dataset Nano"):
         stepwise_report.build_stepwise_report(
+            initialization_receipt_path=reports["initialization"],
             calibration_receipt_path=reports["calibration"],
             mixer_gate_path=reports["mixer"],
             block_gate_path=reports["block"],
@@ -1098,6 +1197,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Nano teacher checkpoint SHA-256 chain mismatch"):
         stepwise_report.build_stepwise_report(
+            initialization_receipt_path=reports["initialization"],
             calibration_receipt_path=reports["calibration"],
             mixer_gate_path=reports["mixer"],
             block_gate_path=reports["block"],
@@ -1119,6 +1219,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
 
     with pytest.raises(ValueError, match="checkpoint chain mismatch"):
         stepwise_report.build_stepwise_report(
+            initialization_receipt_path=reports["initialization"],
             calibration_receipt_path=reports["calibration"],
             mixer_gate_path=reports["mixer"],
             block_gate_path=reports["block"],

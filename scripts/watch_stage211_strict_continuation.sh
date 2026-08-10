@@ -25,6 +25,7 @@ FINAL_REPORT="${PHASE_GATE_ROOT}/sft/stage211_complete.json"
 FINAL_STEPWISE_REPORT="${PHASE_GATE_ROOT}/sft/stage211_stepwise_results.json"
 FINAL_STEPWISE_MARKDOWN="${PHASE_GATE_ROOT}/sft/stage211_stepwise_results.md"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${HOME}/rwkvasr_eval/stage211_calibration_selected_full/public/reuse_receipt.json}"
+INITIALIZATION_RECEIPT="${INITIALIZATION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_initialization/nano_initialization_receipt.json}"
 
 stage211_log() {
   mkdir -p "$(dirname "${WATCH_LOG}")"
@@ -78,6 +79,7 @@ stage211_final_proof_valid() {
   if ! (
     cd "${REPO_ROOT}"
     uv run python "${REPO_ROOT}/scripts/create_stage211_stepwise_report.py" \
+      --initialization-receipt "${INITIALIZATION_RECEIPT}" \
       --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
       --sft-final-report "${FINAL_REPORT}" \
       --output-json "${FINAL_STEPWISE_REPORT}" \
@@ -89,7 +91,7 @@ stage211_final_proof_valid() {
 
   if ! stage211_json_matches \
     "${FINAL_STEPWISE_REPORT}" \
-    '.pipeline == "stage211" and .artifact == "stepwise_final_results" and .complete == true and .gate_passed == true and .strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"] and .requested_alignment_stage_order == ["rwkv_layer", "block", "logits", "sft"] and .checkpoint_chain_passed == true and .nano_teacher_chain_passed == true and .nano_public_baseline_provenance_passed == true and .supplemental_inventory_chain_passed == true and (.coverage_results | length) == 4 and ([.coverage_results[] | select(.stage == "mixer" or .stage == "block" or .stage == "logits")] | length) == 3 and ([.coverage_results[] | select(.stage == "mixer" or .stage == "block" or .stage == "logits") | (.training_segments | length == 5 and all(.[]; .epochs == 3))] | all) and .public_metric_stage_order == ["calibration", "mixer", "block", "logits", "sft"] and .all_stage_public_metrics_complete == true and (.english_wer_datasets | length) == 3 and (.chinese_cer_datasets | length) == 2 and (.dataset_results | length) == 5 and ([.dataset_results[] | select(.language == "en" and .metric == "wer")] | length) == 3 and ([.dataset_results[] | select(.language == "zh" and .metric == "cer")] | length) == 2 and ([.dataset_results[] | (.stages | length == 5 and has("calibration") and has("mixer") and has("block") and has("logits") and has("sft"))] | all)'; then
+    '.pipeline == "stage211" and .artifact == "stepwise_final_results" and .complete == true and .gate_passed == true and .strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"] and .requested_alignment_stage_order == ["rwkv_layer", "block", "logits", "sft"] and .checkpoint_chain_passed == true and .nano_initialization_chain_passed == true and .nano_teacher_chain_passed == true and .nano_public_baseline_provenance_passed == true and .supplemental_inventory_chain_passed == true and (.coverage_results | length) == 4 and ([.coverage_results[] | select(.stage == "mixer" or .stage == "block" or .stage == "logits")] | length) == 3 and ([.coverage_results[] | select(.stage == "mixer" or .stage == "block" or .stage == "logits") | (.training_segments | length == 5 and all(.[]; .epochs == 3))] | all) and .public_metric_stage_order == ["calibration", "mixer", "block", "logits", "sft"] and .all_stage_public_metrics_complete == true and (.english_wer_datasets | length) == 3 and (.chinese_cer_datasets | length) == 2 and (.dataset_results | length) == 5 and ([.dataset_results[] | select(.language == "en" and .metric == "wer")] | length) == 3 and ([.dataset_results[] | select(.language == "zh" and .metric == "cer")] | length) == 2 and ([.dataset_results[] | (.stages | length == 5 and has("calibration") and has("mixer") and has("block") and has("logits") and has("sft"))] | all)'; then
     stage211_log "final Stage211 stepwise proof failed validation"
     return 1
   fi

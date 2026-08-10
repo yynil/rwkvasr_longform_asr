@@ -15,6 +15,10 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_public_benchmark,
     validate_stage211_public_overlap_binding,
 )
+from rwkvasr.eval.stage211_initialization import (
+    DEFAULT_STAGE211_INITIALIZATION_RECEIPT,
+    validate_stage211_initialization_receipt,
+)
 
 try:
     from scripts.run_stage211_labeled_sft import (
@@ -512,12 +516,14 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
 
 def build_stepwise_report(
     *,
+    initialization_receipt_path: Path,
     calibration_receipt_path: Path,
     mixer_gate_path: Path,
     block_gate_path: Path,
     logits_gate_path: Path,
     sft_final_report_path: Path,
 ) -> dict[str, Any]:
+    initialization_receipt_path = initialization_receipt_path.expanduser().resolve()
     calibration_receipt_path = calibration_receipt_path.expanduser().resolve()
     mixer_gate_path = mixer_gate_path.expanduser().resolve()
     block_gate_path = block_gate_path.expanduser().resolve()
@@ -562,6 +568,11 @@ def build_stepwise_report(
     if len(unique_teacher_sha256) != 1 or len(next(iter(unique_teacher_sha256), "")) != 64:
         raise ValueError("Stage211 A/B/C/D Nano teacher checkpoint SHA-256 chain mismatch.")
     nano_teacher_checkpoint_sha256 = next(iter(unique_teacher_sha256))
+    initialization = validate_stage211_initialization_receipt(
+        initialization_receipt_path,
+        expected_calibration_checkpoint=calibration_checkpoint,
+        expected_nano_checkpoint_sha256=nano_teacher_checkpoint_sha256,
+    )
     global_dedup_bindings = {
         (
             str(phase_reports[phase].get("global_dedup_manifest_path") or ""),
@@ -799,6 +810,16 @@ def build_stepwise_report(
         "requested_alignment_stage_order": list(REQUESTED_ALIGNMENT_STAGE_ORDER),
         "requested_to_internal_stage": dict(REQUESTED_TO_INTERNAL_STAGE),
         "checkpoint_chain_passed": True,
+        "nano_initialization_chain_passed": True,
+        "initialization_receipt_path": str(initialization_receipt_path),
+        "initialization_receipt_sha256": sha256_file(initialization_receipt_path),
+        "initialization_proof": {
+            "stage210_checkpoint_path": initialization["stage210_checkpoint_path"],
+            "stage210_checkpoint_sha256": initialization["stage210_checkpoint_sha256"],
+            "runtime_load_report": initialization["runtime_load_report"],
+            "freeze_report": initialization["freeze_report"],
+            "frozen_tensor_audit": initialization["frozen_tensor_audit"],
+        },
         "nano_teacher_chain_passed": True,
         "nano_teacher_checkpoint_sha256": nano_teacher_checkpoint_sha256,
         "nano_public_baseline_provenance_passed": True,
@@ -837,6 +858,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "Logits (C) -> Labeled CTC SFT (D)",
         "",
         f"Nano teacher SHA-256: `{report['nano_teacher_checkpoint_sha256']}`",
+        "",
+        f"Nano initialization proof: `{report['initialization_receipt_sha256']}`",
         "",
         f"Nano public baseline provenance: `{report['nano_public_baseline_receipt_sha256']}`",
         "",
@@ -932,6 +955,7 @@ def _write_immutable(path: Path, text: str, *, label: str) -> None:
 
 def create_stepwise_report(
     *,
+    initialization_receipt_path: Path,
     calibration_receipt_path: Path,
     mixer_gate_path: Path,
     block_gate_path: Path,
@@ -941,6 +965,7 @@ def create_stepwise_report(
     output_markdown: Path,
 ) -> dict[str, Any]:
     report = build_stepwise_report(
+        initialization_receipt_path=initialization_receipt_path,
         calibration_receipt_path=calibration_receipt_path,
         mixer_gate_path=mixer_gate_path,
         block_gate_path=block_gate_path,
@@ -961,6 +986,11 @@ def create_stepwise_report(
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=("Create the immutable calibration/A/B/C/D Stage211 WER/CER result report.")
+    )
+    parser.add_argument(
+        "--initialization-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_INITIALIZATION_RECEIPT,
     )
     parser.add_argument(
         "--calibration-reuse-receipt",
@@ -1014,6 +1044,7 @@ def main() -> int:
         sft_final_report_path=args.sft_final_report,
     )
     report = create_stepwise_report(
+        initialization_receipt_path=args.initialization_receipt,
         calibration_receipt_path=args.calibration_reuse_receipt,
         mixer_gate_path=mixer_phase_gate,
         block_gate_path=block_phase_gate,

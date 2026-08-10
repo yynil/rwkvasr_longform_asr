@@ -15,6 +15,7 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_public_benchmark,
     validate_stage211_public_overlap_binding,
 )
+from rwkvasr.eval.stage211_initialization import DEFAULT_STAGE211_INITIALIZATION_RECEIPT
 
 try:
     from scripts.create_stage211_stepwise_report import create_stepwise_report
@@ -539,6 +540,11 @@ def finalize_sft(args: argparse.Namespace) -> Path:
     if mixer_gate_path is None or block_gate_path is None or logits_gate_path is None:
         raise ValueError("Stage211 final report lacks a selected A/B/C gate.")
     create_stepwise_report(
+        initialization_receipt_path=getattr(
+            args,
+            "initialization_receipt",
+            DEFAULT_STAGE211_INITIALIZATION_RECEIPT,
+        ),
         calibration_receipt_path=args.calibration_reuse_receipt,
         mixer_gate_path=mixer_gate_path,
         block_gate_path=block_gate_path,
@@ -585,6 +591,11 @@ def main() -> int:
         "--nano-public-baseline-receipt",
         type=Path,
         default=None,
+    )
+    parser.add_argument(
+        "--initialization-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_INITIALIZATION_RECEIPT,
     )
     parser.add_argument(
         "--calibration-reuse-receipt",

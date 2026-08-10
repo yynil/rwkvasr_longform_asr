@@ -3974,6 +3974,7 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert "create_stage211_stepwise_report.py" in script
     assert "FINAL_STEPWISE_REPORT" in script
     assert ".checkpoint_chain_passed == true" in script
+    assert ".nano_initialization_chain_passed == true" in script
     assert ".nano_teacher_chain_passed == true" in script
     assert ".supplemental_inventory_chain_passed == true" in script
     assert ".all_stage_public_metrics_complete == true" in script
@@ -4022,7 +4023,7 @@ def _run_stage211_continuation_watcher_fixture(
         '  stages=\'{"calibration":{},"mixer":{},"block":{},"logits":{},"sft":{}}\'\n'
         '  dataset_proof=\'"public_metric_stage_order":["calibration","mixer","block","logits","sft"],"all_stage_public_metrics_complete":true,"english_wer_datasets":["en1","en2","en3"],"chinese_cer_datasets":["zh1","zh2"],"dataset_results":[{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'}]\'\n'
         "fi\n"
-        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],\'"${dataset_proof}"\'}\' >"${output_json}"\n'
+        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_initialization_chain_passed":true,"nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],\'"${dataset_proof}"\'}\' >"${output_json}"\n'
         "printf '%s\\n' '# stepwise' >\"${output_markdown}\"\n",
         encoding="utf-8",
     )

@@ -40,6 +40,7 @@ LOGITS_CORRECTION_GATE_ROOT="${LOGITS_CORRECTION_GATE_ROOT:-${PHASE_GATE_ROOT}/l
 LOGITS_SELECTION="${LOGITS_SELECTION:-${PHASE_GATE_ROOT}/logits_selected.json}"
 SUPPLEMENTAL_INVENTORY="${SUPPLEMENTAL_INVENTORY:-${HOME}/rwkvasr_data/stage211_supplemental_natural_v1/supplemental_inventory.json}"
 SUPPLEMENTAL_PROFILE_RECEIPT="${SUPPLEMENTAL_PROFILE_RECEIPT:-${HOME}/rwkvasr_data/stage211_supplemental_natural_v1/supplemental_profile_receipt.json}"
+INITIALIZATION_RECEIPT="${INITIALIZATION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_initialization/nano_initialization_receipt.json}"
 
 log() {
   printf '[stage211-abcd-bootstrap] %(%Y-%m-%d %H:%M:%S)T %s\n' -1 "$*"
@@ -165,6 +166,14 @@ validate_completed_calibration_eval() {
     --manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --output "${CALIBRATION_REUSE_RECEIPT}"
   log "calibration public reuse receipt=${CALIBRATION_REUSE_RECEIPT}"
+}
+
+ensure_initialization_receipt() {
+  log "validating Nano QKV/MLP/decoder/head initialization proof"
+  uv run python "${REPO_ROOT}/scripts/create_stage211_initialization_receipt.py" \
+    --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
+    --nano-checkpoint "${NANO_CHECKPOINT}" \
+    --output "${INITIALIZATION_RECEIPT}"
 }
 
 run_full_mixer_phase() {
@@ -312,6 +321,7 @@ run_labeled_sft_phase() {
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
     --phase-gate-root "${PHASE_GATE_ROOT}" \
+    --initialization-receipt "${INITIALIZATION_RECEIPT}" \
     --mixer-gate-selection "${MIXER_SELECTION}" \
     --block-gate-selection "${BLOCK_SELECTION}" \
     --logits-gate-selection "${LOGITS_SELECTION}" \
@@ -334,15 +344,19 @@ main() {
       else
         evaluate_calibration_checkpoint
       fi
+      ensure_initialization_receipt
       run_full_mixer_phase
       ;;
     post_mixer)
+      ensure_initialization_receipt
       run_mixer_retention_loop
       ;;
     block)
+      ensure_initialization_receipt
       run_mixer_retention_loop
       ;;
     logits)
+      ensure_initialization_receipt
       run_mixer_retention_loop
       run_full_block_phase
       run_full_logits_phase
@@ -350,6 +364,7 @@ main() {
       return
       ;;
     sft)
+      ensure_initialization_receipt
       run_mixer_retention_loop
       run_full_block_phase
       run_full_logits_phase
