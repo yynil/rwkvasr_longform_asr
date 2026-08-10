@@ -7,10 +7,12 @@ from typing import Any
 
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
+    DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
     STAGE211_NANO_PUBLIC_BASELINE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
     validate_stage211_nano_public_baseline_receipt,
+    validate_stage211_public_overlap_binding,
 )
 
 try:
@@ -21,17 +23,10 @@ except ModuleNotFoundError as error:
     from create_stage211_phase_gate import _jsonl_records
 
 
-DEFAULT_NANO_BASELINE_ROOT = (
-    Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
-)
-DEFAULT_NANO_CHECKPOINT = (
-    Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
-)
+DEFAULT_NANO_BASELINE_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
+DEFAULT_NANO_CHECKPOINT = Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
 DEFAULT_PUBLIC_MANIFEST_DIR = (
-    Path(__file__).resolve().parents[1]
-    / "artifacts"
-    / "eval_benchmarks"
-    / "manifests"
+    Path(__file__).resolve().parents[1] / "artifacts" / "eval_benchmarks" / "manifests"
 )
 
 
@@ -58,15 +53,12 @@ def build_nano_baseline_receipt(
     report_dir: Path,
     prediction_dir: Path,
     manifest_dir: Path,
+    public_overlap_receipt_path: Path = DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
 ) -> dict[str, Any]:
     nano_checkpoint_path = nano_checkpoint_path.expanduser().resolve()
-    if (
-        not nano_checkpoint_path.is_file()
-        or nano_checkpoint_path.stat().st_size <= 0
-    ):
+    if not nano_checkpoint_path.is_file() or nano_checkpoint_path.stat().st_size <= 0:
         raise ValueError(
-            f"Stage211 Nano baseline checkpoint is missing or empty: "
-            f"{nano_checkpoint_path}"
+            f"Stage211 Nano baseline checkpoint is missing or empty: {nano_checkpoint_path}"
         )
     if nano_checkpoint_path.name != "model.pt":
         raise ValueError("Stage211 Nano baseline checkpoint must be model.pt.")
@@ -74,14 +66,18 @@ def build_nano_baseline_receipt(
     report_dir = report_dir.expanduser().resolve()
     prediction_dir = prediction_dir.expanduser().resolve()
     manifest_dir = manifest_dir.expanduser().resolve()
+    public_overlap_receipt_path = public_overlap_receipt_path.expanduser().resolve()
+    public_overlap_binding = {
+        "receipt_path": str(public_overlap_receipt_path),
+        "receipt_sha256": sha256_file(public_overlap_receipt_path),
+    }
+    validate_stage211_public_overlap_binding(public_overlap_binding)
 
     results: list[dict[str, Any]] = []
     embedded_identity_count = 0
     for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
         report_path = (report_dir / f"{dataset}.json").resolve()
-        prediction_path = (
-            prediction_dir / f"{dataset}.ctc.jsonl"
-        ).resolve()
+        prediction_path = (prediction_dir / f"{dataset}.ctc.jsonl").resolve()
         manifest_path = (manifest_dir / f"{dataset}.jsonl").resolve()
         report = _load_json(
             report_path,
@@ -97,30 +93,18 @@ def build_nano_baseline_receipt(
             "sample_count": expected["samples"],
         }
         if any(report.get(key) != value for key, value in expected_report.items()):
-            raise ValueError(
-                f"Stage211 {dataset} Nano inference report contract mismatch."
-            )
+            raise ValueError(f"Stage211 {dataset} Nano inference report contract mismatch.")
         if Path(str(report.get("manifest_path") or "")).resolve() != manifest_path:
-            raise ValueError(
-                f"Stage211 {dataset} Nano inference report manifest path mismatch."
-            )
-        if (
-            Path(str(report.get("predictions_path") or "")).resolve()
-            != prediction_path
-        ):
-            raise ValueError(
-                f"Stage211 {dataset} Nano inference report prediction path mismatch."
-            )
+            raise ValueError(f"Stage211 {dataset} Nano inference report manifest path mismatch.")
+        if Path(str(report.get("predictions_path") or "")).resolve() != prediction_path:
+            raise ValueError(f"Stage211 {dataset} Nano inference report prediction path mismatch.")
         if _report_checkpoint_path(report) != nano_checkpoint_path:
-            raise ValueError(
-                f"Stage211 {dataset} Nano inference report model path mismatch."
-            )
+            raise ValueError(f"Stage211 {dataset} Nano inference report model path mismatch.")
         embedded_path = report.get("model_checkpoint_path")
         embedded_sha256 = report.get("model_checkpoint_sha256")
         if embedded_path is not None or embedded_sha256 is not None:
             if (
-                Path(str(embedded_path or "")).expanduser().resolve()
-                != nano_checkpoint_path
+                Path(str(embedded_path or "")).expanduser().resolve() != nano_checkpoint_path
                 or embedded_sha256 != nano_checkpoint_sha256
             ):
                 raise ValueError(
@@ -140,9 +124,8 @@ def build_nano_baseline_receipt(
             reference_keys=("ref_text", "reference", "text", "transcript"),
         )
         expected_samples = int(expected["samples"])
-        if (
-            len(manifest_records) != expected_samples
-            or set(prediction_records) != set(manifest_records)
+        if len(manifest_records) != expected_samples or set(prediction_records) != set(
+            manifest_records
         ):
             raise ValueError(
                 f"Stage211 {dataset} Nano baseline coverage mismatch: "
@@ -182,9 +165,7 @@ def build_nano_baseline_receipt(
         0,
         len(STAGE211_PUBLIC_BENCHMARKS),
     }:
-        raise ValueError(
-            "Stage211 Nano baseline mixes legacy and embedded checkpoint identity."
-        )
+        raise ValueError("Stage211 Nano baseline mixes legacy and embedded checkpoint identity.")
     provenance_mode = (
         "embedded_checkpoint_sha256"
         if embedded_identity_count == len(STAGE211_PUBLIC_BENCHMARKS)
@@ -198,9 +179,9 @@ def build_nano_baseline_receipt(
         "provenance_mode": provenance_mode,
         "nano_checkpoint_path": str(nano_checkpoint_path),
         "nano_checkpoint_sha256": nano_checkpoint_sha256,
+        "public_overlap": public_overlap_binding,
         "total_samples": sum(
-            int(expected["samples"])
-            for expected in STAGE211_PUBLIC_BENCHMARKS.values()
+            int(expected["samples"]) for expected in STAGE211_PUBLIC_BENCHMARKS.values()
         ),
         "results": results,
     }
@@ -209,9 +190,7 @@ def build_nano_baseline_receipt(
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
     rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
     if path.is_file() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(
-            f"Refusing to overwrite a different Nano baseline receipt: {path}"
-        )
+        raise ValueError(f"Refusing to overwrite a different Nano baseline receipt: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(rendered, encoding="utf-8")
 
@@ -219,8 +198,7 @@ def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Create the immutable Stage211 Nano direct-CTC public-baseline "
-            "provenance receipt."
+            "Create the immutable Stage211 Nano direct-CTC public-baseline provenance receipt."
         )
     )
     parser.add_argument(
@@ -248,6 +226,11 @@ def main() -> int:
         type=Path,
         default=DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
     )
+    parser.add_argument(
+        "--public-overlap-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
+    )
     args = parser.parse_args()
 
     receipt = build_nano_baseline_receipt(
@@ -255,6 +238,7 @@ def main() -> int:
         report_dir=args.report_dir,
         prediction_dir=args.prediction_dir,
         manifest_dir=args.manifest_dir,
+        public_overlap_receipt_path=args.public_overlap_receipt,
     )
     output_path = args.output.expanduser().resolve()
     _write_immutable_json(output_path, receipt)

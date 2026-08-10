@@ -58,7 +58,7 @@ validate_nano_predictions() {
   local datasets=(
     "librispeech_test_clean:2620"
     "librispeech_test_other:2939"
-    "commonvoice_en_test:16396"
+    "commonvoice_en_test:14922"
     "aishell1_test:7176"
     "wenetspeech_test_net:24774"
   )

@@ -11,6 +11,7 @@ from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
     DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
     DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
+    DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
@@ -22,6 +23,7 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_loaded_manifest_receipt,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
+    validate_stage211_public_overlap_binding,
 )
 
 try:
@@ -372,6 +374,7 @@ def build_phase_gate(
     post_coverage_correction_receipt_paths: list[Path] | None = None,
     baseline_public_comparison_report_path: Path | None = None,
     nano_public_baseline_receipt_path: Path = (DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT),
+    public_overlap_receipt_path: Path = DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
 ) -> dict[str, Any]:
     checkpoint_path = checkpoint_path.resolve()
     if not checkpoint_path.is_file():
@@ -506,6 +509,15 @@ def build_phase_gate(
         raise ValueError(f"Stage211 {phase} requires an independent alignment gate report.")
 
     benchmark = _enrich_public_benchmark(public_report, manifest_dir=manifest_dir.resolve())
+    public_overlap_receipt_path = public_overlap_receipt_path.expanduser().resolve()
+    public_overlap_binding = {
+        "receipt_path": str(public_overlap_receipt_path),
+        "receipt_sha256": sha256_file(public_overlap_receipt_path),
+    }
+    validate_stage211_public_overlap_binding(
+        public_overlap_binding,
+        public_benchmark=benchmark,
+    )
     teacher_sha256_values = {
         str(segment.get("nano_teacher_checkpoint_sha256") or "") for segment in coverage
     }
@@ -584,6 +596,7 @@ def build_phase_gate(
         ),
         "public_comparison_report_path": str(public_comparison_report_path),
         "public_comparison_report_sha256": sha256_file(public_comparison_report_path),
+        "public_overlap": public_overlap_binding,
         "nano_public_baseline_receipt_path": str(nano_public_baseline_receipt_path),
         "nano_public_baseline_receipt_sha256": sha256_file(nano_public_baseline_receipt_path),
         "nano_public_baseline_checkpoint_sha256": nano_public_baseline["nano_checkpoint_sha256"],
@@ -634,6 +647,11 @@ def main() -> int:
         type=Path,
         default=DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
     )
+    parser.add_argument(
+        "--public-overlap-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -650,6 +668,7 @@ def main() -> int:
         alignment_report_path=args.alignment_report,
         baseline_public_comparison_report_path=(args.baseline_public_comparison_report),
         nano_public_baseline_receipt_path=args.nano_public_baseline_receipt,
+        public_overlap_receipt_path=args.public_overlap_receipt,
     )
     output_path = args.output.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)

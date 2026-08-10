@@ -11,6 +11,7 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
     validate_stage211_public_benchmark,
+    validate_stage211_public_overlap_binding,
 )
 
 try:
@@ -126,9 +127,13 @@ def _validate_calibration_receipt(path: Path) -> tuple[dict[str, Any], Path]:
             sha_key=sha_key,
             label=f"Stage211 calibration {label}",
         )
-    validate_stage211_public_benchmark(
+    benchmark = validate_stage211_public_benchmark(
         receipt.get("public_benchmark"),
         require_metric_source_recomputed=True,
+    )
+    validate_stage211_public_overlap_binding(
+        receipt.get("public_overlap"),
+        public_benchmark=benchmark,
     )
     return receipt, checkpoint
 
@@ -174,6 +179,10 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
     )
     if benchmark.get("all_datasets_pass") is not True:
         raise ValueError("Stage211 SFT did not pass the every-dataset Nano WER/CER gate.")
+    validate_stage211_public_overlap_binding(
+        report.get("public_overlap"),
+        public_benchmark=benchmark,
+    )
     for path_key, sha_key, label in (
         ("sft_completion_path", "sft_completion_sha256", "completion report"),
         (
@@ -244,6 +253,8 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
         "nano_checkpoint_sha256"
     ):
         raise ValueError("Stage211 SFT Nano public-baseline checkpoint binding mismatch.")
+    if baseline_receipt.get("public_overlap") != report.get("public_overlap"):
+        raise ValueError("Stage211 SFT and Nano baseline overlap bindings differ.")
     return report, checkpoint
 
 
@@ -496,6 +507,23 @@ def build_stepwise_report(
     )
     if nano_public_baseline_checkpoint_sha256 != baseline_receipt["nano_checkpoint_sha256"]:
         raise ValueError("Stage211 Nano public-baseline checkpoint binding mismatch.")
+    overlap_bindings = {
+        (
+            str(report.get("public_overlap", {}).get("receipt_path") or ""),
+            str(report.get("public_overlap", {}).get("receipt_sha256") or ""),
+        )
+        for report in (
+            calibration,
+            phase_reports["mixer"],
+            phase_reports["block"],
+            phase_reports["logits"],
+            sft,
+            baseline_receipt,
+        )
+    }
+    if len(overlap_bindings) != 1 or not next(iter(overlap_bindings))[0]:
+        raise ValueError("Stage211 Calibration/A/B/C/D public-overlap chain mismatch.")
+    public_overlap_receipt_path, public_overlap_receipt_sha256 = next(iter(overlap_bindings))
 
     checkpoints = {
         "calibration": calibration_checkpoint,
@@ -639,6 +667,9 @@ def build_stepwise_report(
         "nano_public_baseline_receipt_path": nano_public_baseline_receipt_path,
         "nano_public_baseline_receipt_sha256": (nano_public_baseline_receipt_sha256),
         "nano_public_baseline_checkpoint_sha256": (nano_public_baseline_checkpoint_sha256),
+        "public_overlap_chain_passed": True,
+        "public_overlap_receipt_path": public_overlap_receipt_path,
+        "public_overlap_receipt_sha256": public_overlap_receipt_sha256,
         "global_dedup_manifest_path": global_dedup_manifest_path,
         "global_dedup_manifest_sha256": global_dedup_manifest_sha256,
         "loaded_manifest_receipt_path": loaded_manifest_receipt_path,

@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.eval.stage211_gate import (
+    DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
     validate_stage211_public_benchmark,
+    validate_stage211_public_overlap_binding,
 )
 
 try:
@@ -201,6 +203,10 @@ def _validate_final_report(
     )
     if benchmark.get("all_datasets_pass") is not True:
         raise ValueError("Stage211D did not pass the every-dataset Nano WER/CER gate.")
+    validate_stage211_public_overlap_binding(
+        report.get("public_overlap"),
+        public_benchmark=benchmark,
+    )
     progress = report.get("public_progress")
     if (
         not isinstance(progress, dict)
@@ -276,6 +282,29 @@ def _validate_final_report(
         "nano_checkpoint_sha256"
     ):
         raise ValueError("Stage211 final report Nano public-baseline checkpoint binding mismatch.")
+    if baseline_receipt.get("public_overlap") != report.get("public_overlap"):
+        raise ValueError("Stage211 final report and Nano baseline overlap bindings differ.")
+    labeled_coverage = report.get("labeled_data_coverage")
+    if not isinstance(labeled_coverage, dict):
+        raise ValueError("Stage211 final report lacks labeled-data coverage.")
+    logits_gate_path = Path(str(report.get("logits_phase_gate_path") or "")).resolve()
+    logits_gate = validate_stage211_phase_gate_report(
+        logits_gate_path,
+        expected_phase="logits",
+        checkpoint_path=Path(str(labeled_coverage["init_checkpoint_path"])).resolve(),
+    )
+    if logits_gate.get("public_overlap") != report.get("public_overlap"):
+        raise ValueError("Stage211 final report and Logits overlap bindings differ.")
+    mixer_gate_path = Path(str(report.get("mixer_phase_gate_path") or "")).resolve()
+    mixer_gate = validate_stage211_phase_gate_report(
+        mixer_gate_path,
+        expected_phase="mixer",
+        checkpoint_path=Path(
+            str(_load_json(mixer_gate_path, label="Mixer gate")["checkpoint_path"])
+        ),
+    )
+    if mixer_gate.get("public_overlap") != report.get("public_overlap"):
+        raise ValueError("Stage211 final report and Mixer overlap bindings differ.")
     return report
 
 
@@ -349,6 +378,19 @@ def finalize_sft(args: argparse.Namespace) -> Path:
         candidate_report,
         manifest_dir=manifest_dir,
     )
+    public_overlap_receipt_path = (
+        Path(getattr(args, "public_overlap_receipt", DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT))
+        .expanduser()
+        .resolve()
+    )
+    public_overlap_binding = {
+        "receipt_path": str(public_overlap_receipt_path),
+        "receipt_sha256": sha256_file(public_overlap_receipt_path),
+    }
+    validate_stage211_public_overlap_binding(
+        public_overlap_binding,
+        public_benchmark=candidate_benchmark,
+    )
     nano_public_baseline_receipt_path = (
         args.nano_public_baseline_receipt.expanduser().resolve()
         if args.nano_public_baseline_receipt is not None
@@ -401,6 +443,7 @@ def finalize_sft(args: argparse.Namespace) -> Path:
         "nano_public_baseline_receipt_path": str(nano_public_baseline_receipt_path),
         "nano_public_baseline_receipt_sha256": sha256_file(nano_public_baseline_receipt_path),
         "nano_public_baseline_checkpoint_sha256": nano_public_baseline["nano_checkpoint_sha256"],
+        "public_overlap": public_overlap_binding,
         "baseline_public_comparison_report_path": str(baseline_report_path),
         "baseline_public_comparison_report_sha256": sha256_file(baseline_report_path),
         "public_comparison_report_path": str(comparison_json),
@@ -486,6 +529,11 @@ def main() -> int:
             / "public"
             / "reuse_receipt.json"
         ),
+    )
+    parser.add_argument(
+        "--public-overlap-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
     )
     parser.add_argument("--phase-gate-root", type=Path, default=None)
     parser.add_argument("--mixer-gate-selection", type=Path, default=None)

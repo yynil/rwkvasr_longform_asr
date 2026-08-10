@@ -36,8 +36,21 @@ DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT = (
     / "stage211_full_curriculum"
     / "stage211_loaded_manifest_chain_receipt.json"
 )
+DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT = (
+    Path.home()
+    / "rwkvasr_data"
+    / "stage211_full_curriculum"
+    / "public_train_overlap_v1"
+    / "receipt.json"
+)
 STAGE211_LOADED_MANIFEST_RECEIPT_SHA256 = (
     "af7c38a72fd714148390de5dea7d4d32a062a78ed1e25143928e0c3db88561c1"
+)
+STAGE211_PUBLIC_OVERLAP_RECEIPT_SHA256 = (
+    "af6a0034efe6d231649966337d29aadf43b33d658c0e479e48f0ce1fae8da6b4"
+)
+STAGE211_CLEAN_COMMONVOICE_MANIFEST_SHA256 = (
+    "4cf4f3e171f888660b140e187d4848c9f0d26d77b9ed166d7f3e0e25c699e21b"
 )
 STAGE211_GLOBAL_DEDUP_MANIFEST_SHA256 = (
     "9228d24a8befe24d0e35debd63070f24a6a6313bf318308452e95656dd6708ba"
@@ -83,7 +96,7 @@ STAGE211_PUBLIC_BENCHMARKS: dict[str, dict[str, str | int]] = {
     "aishell1_test": {"language": "zh", "metric": "cer", "samples": 7_176},
     "librispeech_test_clean": {"language": "en", "metric": "wer", "samples": 2_620},
     "librispeech_test_other": {"language": "en", "metric": "wer", "samples": 2_939},
-    "commonvoice_en_test": {"language": "en", "metric": "wer", "samples": 16_396},
+    "commonvoice_en_test": {"language": "en", "metric": "wer", "samples": 14_922},
     "wenetspeech_test_net": {"language": "zh", "metric": "cer", "samples": 24_774},
 }
 DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT = (
@@ -756,6 +769,96 @@ def _report_nano_checkpoint_path(report: dict[str, Any]) -> Path:
     return model_path if model_path.name == "model.pt" else model_path / "model.pt"
 
 
+def validate_stage211_public_overlap_binding(
+    binding: Any,
+    *,
+    public_benchmark: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(binding, dict):
+        raise ValueError("Stage211 artifact lacks the public/train overlap binding.")
+    receipt_path = _validate_bound_file(
+        binding,
+        path_key="receipt_path",
+        sha256_key="receipt_sha256",
+        label="Stage211 public/train overlap receipt",
+    )
+    receipt_sha256 = str(binding["receipt_sha256"])
+    production_receipt = (
+        receipt_path == DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT.expanduser().resolve()
+    )
+    if production_receipt and receipt_sha256 != STAGE211_PUBLIC_OVERLAP_RECEIPT_SHA256:
+        raise ValueError("Stage211 production public/train overlap receipt changed.")
+
+    # Imported lazily because the overlap module reuses Stage211 gate helpers.
+    from rwkvasr.eval.stage211_public_overlap import (
+        validate_stage211_public_overlap_receipt,
+    )
+
+    overlap = validate_stage211_public_overlap_receipt(receipt_path)
+    coverage = overlap.get("coverage")
+    outputs = overlap.get("outputs")
+    if not isinstance(coverage, dict) or not isinstance(outputs, dict):
+        raise ValueError("Stage211 public/train overlap receipt lacks coverage outputs.")
+    clean_rows = int(coverage.get("clean_public_rows", -1))
+    excluded_rows = int(coverage.get("excluded_public_rows", -1))
+    public_rows = int(coverage.get("public_rows", -1))
+    exact_rows = int(coverage.get("exact_byte_identical_training_rows", -1))
+    candidate_rows = int(coverage.get("candidate_training_rows", -1))
+    if (
+        clean_rows != 14_922
+        or excluded_rows < 0
+        or public_rows != clean_rows + excluded_rows
+        or exact_rows != candidate_rows
+        or exact_rows < excluded_rows
+    ):
+        raise ValueError("Stage211 public/train overlap coverage is inconsistent.")
+    if production_receipt:
+        expected_coverage = {
+            "candidate_training_rows": 1_474,
+            "clean_public_rows": 14_922,
+            "exact_byte_identical_training_rows": 1_474,
+            "excluded_public_rows": 1_474,
+            "public_rows": 16_396,
+            "stage178_english_rows": 63_625,
+        }
+        if any(int(coverage.get(key, -1)) != value for key, value in expected_coverage.items()):
+            raise ValueError("Stage211 public/train overlap production coverage changed.")
+    clean_manifest = outputs.get("clean_manifest")
+    exclusions = outputs.get("exclusions")
+    if not isinstance(clean_manifest, dict) or not isinstance(exclusions, dict):
+        raise ValueError("Stage211 public/train overlap receipt lacks clean/exclusion outputs.")
+    if int(clean_manifest.get("rows", -1)) != 14_922:
+        raise ValueError("Stage211 clean Common Voice manifest contract changed.")
+    if production_receipt and (
+        clean_manifest.get("sha256") != STAGE211_CLEAN_COMMONVOICE_MANIFEST_SHA256
+        or int(exclusions.get("rows", -1)) != 1_474
+    ):
+        raise ValueError("Stage211 Common Voice exclusion coverage changed.")
+
+    if public_benchmark is not None:
+        raw_results = public_benchmark.get("results")
+        if not isinstance(raw_results, list):
+            raise ValueError("Stage211 public benchmark lacks results for overlap validation.")
+        commonvoice = next(
+            (
+                result
+                for result in raw_results
+                if isinstance(result, dict) and result.get("dataset") == "commonvoice_en_test"
+            ),
+            None,
+        )
+        if not isinstance(commonvoice, dict):
+            raise ValueError("Stage211 public benchmark lacks Common Voice.")
+        if (
+            int(commonvoice.get("sample_count", -1)) != 14_922
+            or commonvoice.get("manifest_sha256") != clean_manifest["sha256"]
+        ):
+            raise ValueError(
+                "Stage211 public benchmark does not use the audited clean Common Voice subset."
+            )
+    return overlap
+
+
 def validate_stage211_nano_public_baseline_receipt(
     receipt_path: str | Path,
     *,
@@ -808,6 +911,8 @@ def validate_stage211_nano_public_baseline_receipt(
     )
     if int(receipt.get("total_samples", -1)) != expected_total_samples:
         raise ValueError("Stage211 Nano public-baseline sample total mismatch.")
+    overlap = validate_stage211_public_overlap_binding(receipt.get("public_overlap"))
+    clean_commonvoice = overlap["outputs"]["clean_manifest"]
 
     raw_results = receipt.get("results")
     if not isinstance(raw_results, list):
@@ -848,6 +953,13 @@ def validate_stage211_nano_public_baseline_receipt(
             sha256_key="nano_prediction_sha256",
             label=f"Stage211 {dataset} Nano prediction",
         )
+        if dataset == "commonvoice_en_test" and (
+            result.get("manifest_sha256") != clean_commonvoice["sha256"]
+            or int(result.get("sample_count", -1)) != int(clean_commonvoice["rows"])
+        ):
+            raise ValueError(
+                "Stage211 Nano baseline does not use the audited clean Common Voice subset."
+            )
         inference_report = _load_json_object(
             report_path,
             label=f"Stage211 {dataset} Nano inference report",
@@ -2039,6 +2151,10 @@ def validate_stage211_phase_gate_report(
     benchmark = validate_stage211_public_benchmark(
         report.get("public_benchmark"),
         require_metric_source_recomputed=True,
+    )
+    validate_stage211_public_overlap_binding(
+        report.get("public_overlap"),
+        public_benchmark=benchmark,
     )
     teacher_sha256_values = {
         str(segment.get("nano_teacher_checkpoint_sha256") or "")

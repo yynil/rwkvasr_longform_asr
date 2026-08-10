@@ -7,7 +7,12 @@ import math
 from pathlib import Path
 from typing import Any
 
-from rwkvasr.eval.stage211_gate import STAGE211_PUBLIC_BENCHMARKS, sha256_file
+from rwkvasr.eval.stage211_gate import (
+    DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
+    STAGE211_PUBLIC_BENCHMARKS,
+    sha256_file,
+    validate_stage211_public_overlap_binding,
+)
 
 if __package__:
     from scripts.create_stage211_phase_gate import _enrich_public_benchmark
@@ -51,6 +56,7 @@ def build_reuse_receipt(
     comparison_report_path: Path,
     metrics_path: Path,
     manifest_dir: Path,
+    public_overlap_receipt_path: Path = DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
 ) -> dict[str, Any]:
     selection_report_path = selection_report_path.resolve()
     comparison_report_path = comparison_report_path.resolve()
@@ -96,6 +102,15 @@ def build_reuse_receipt(
     benchmark = _enrich_public_benchmark(
         comparison,
         manifest_dir=manifest_dir,
+    )
+    public_overlap_receipt_path = public_overlap_receipt_path.expanduser().resolve()
+    public_overlap_binding = {
+        "receipt_path": str(public_overlap_receipt_path),
+        "receipt_sha256": sha256_file(public_overlap_receipt_path),
+    }
+    validate_stage211_public_overlap_binding(
+        public_overlap_binding,
+        public_benchmark=benchmark,
     )
 
     metrics = _load_json(metrics_path, label="Stage211 calibration public metrics")
@@ -152,6 +167,7 @@ def build_reuse_receipt(
         "metrics_sha256": sha256_file(metrics_path),
         "comparison_report_path": str(comparison_report_path),
         "comparison_report_sha256": sha256_file(comparison_report_path),
+        "public_overlap": public_overlap_binding,
         "public_benchmark": benchmark,
     }
 
@@ -167,6 +183,11 @@ def main() -> int:
     parser.add_argument("--comparison-report", type=Path, required=True)
     parser.add_argument("--metrics", type=Path, required=True)
     parser.add_argument("--manifest-dir", type=Path, required=True)
+    parser.add_argument(
+        "--public-overlap-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -175,6 +196,7 @@ def main() -> int:
         comparison_report_path=args.comparison_report,
         metrics_path=args.metrics,
         manifest_dir=args.manifest_dir,
+        public_overlap_receipt_path=args.public_overlap_receipt,
     )
     output_path = args.output.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)

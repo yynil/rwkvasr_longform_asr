@@ -695,6 +695,11 @@ def test_stage211_calibration_eval_reuse_binds_checkpoint_and_complete_metrics(
             "results": benchmark_results,
         },
     )
+    monkeypatch.setattr(
+        stage211_calibration_eval,
+        "validate_stage211_public_overlap_binding",
+        lambda binding, *, public_benchmark: {},
+    )
 
     receipt = stage211_calibration_eval.build_reuse_receipt(
         selection_report_path=selection_path,
@@ -1912,6 +1917,91 @@ def test_stage211_loaded_manifest_receipt_rejects_runtime_manifest_rewrite(
         )
 
 
+def _write_public_overlap_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    clean_rows = [
+        {"utt_id": f"clean-{index:05d}", "text": "clean"}
+        for index in range(int(STAGE211_PUBLIC_BENCHMARKS["commonvoice_en_test"]["samples"]))
+    ]
+    leaked_id = "leaked-test-audio"
+    original_manifest = tmp_path / "commonvoice-full-contaminated.jsonl"
+    clean_manifest = tmp_path / "commonvoice-clean.jsonl"
+    candidate_rows = tmp_path / "commonvoice-overlap-candidates.jsonl"
+    exclusions = tmp_path / "commonvoice-exclusions.jsonl"
+    original_manifest.write_text(
+        "".join(json.dumps(row) + "\n" for row in [*clean_rows, {"utt_id": leaked_id}]),
+        encoding="utf-8",
+    )
+    clean_manifest.write_text(
+        "".join(json.dumps(row) + "\n" for row in clean_rows),
+        encoding="utf-8",
+    )
+    candidate_rows.write_text(
+        json.dumps({"byte_identical_public_ids": [leaked_id]}) + "\n",
+        encoding="utf-8",
+    )
+    exclusions.write_text(
+        json.dumps({"public_utt_id": leaked_id}) + "\n",
+        encoding="utf-8",
+    )
+    source_files = {}
+    for name in ("test.tsv", "converter.py", "stage178.jsonl"):
+        source = tmp_path / name
+        source.write_text("fixture\n", encoding="utf-8")
+        source_files[name] = source
+    receipt = tmp_path / "public-overlap-receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "artifact": "stage211_public_train_overlap_audit",
+                "audio_hash_algorithm": "sha256_exact_encoded_mp3_bytes",
+                "complete": True,
+                "coverage": {
+                    "candidate_training_rows": 1,
+                    "clean_public_rows": len(clean_rows),
+                    "exact_byte_identical_training_rows": 1,
+                    "excluded_public_rows": 1,
+                    "public_rows": len(clean_rows) + 1,
+                    "stage178_english_rows": 1,
+                },
+                "dataset": "commonvoice_en_test",
+                "outputs": {
+                    "candidate_rows": {
+                        "path": str(candidate_rows.resolve()),
+                        "rows": 1,
+                        "sha256": sha256_file(candidate_rows),
+                    },
+                    "clean_manifest": {
+                        "path": str(clean_manifest.resolve()),
+                        "rows": len(clean_rows),
+                        "sha256": sha256_file(clean_manifest),
+                    },
+                    "exclusions": {
+                        "path": str(exclusions.resolve()),
+                        "rows": 1,
+                        "sha256": sha256_file(exclusions),
+                    },
+                },
+                "pipeline": "stage211",
+                "schema_version": 1,
+                "source_bindings": {
+                    "commonvoice_test_tsv_path": str(source_files["test.tsv"].resolve()),
+                    "commonvoice_test_tsv_sha256": sha256_file(source_files["test.tsv"]),
+                    "converter_source_path": str(source_files["converter.py"].resolve()),
+                    "converter_source_sha256": sha256_file(source_files["converter.py"]),
+                    "loaded_manifest": None,
+                    "public_manifest_path": str(original_manifest.resolve()),
+                    "public_manifest_sha256": sha256_file(original_manifest),
+                    "stage178_index_path": str(source_files["stage178.jsonl"].resolve()),
+                    "stage178_index_sha256": sha256_file(source_files["stage178.jsonl"]),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return receipt, clean_manifest
+
+
 def _write_valid_phase_gate(
     tmp_path: Path,
     *,
@@ -1919,6 +2009,7 @@ def _write_valid_phase_gate(
     checkpoint: Path,
 ) -> Path:
     loaded_manifest_receipt, runtime_manifests = _write_loaded_manifest_fixture(tmp_path)
+    public_overlap_receipt, clean_commonvoice_manifest = _write_public_overlap_fixture(tmp_path)
     segments = []
     nano_teacher_dir = tmp_path / "nano-teacher"
     nano_teacher_dir.mkdir()
@@ -2008,11 +2099,17 @@ def _write_valid_phase_gate(
 
     public_results = []
     for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
-        manifest = tmp_path / f"{dataset}.jsonl"
+        manifest = (
+            clean_commonvoice_manifest
+            if dataset == "commonvoice_en_test"
+            else tmp_path / f"{dataset}.jsonl"
+        )
         nano = tmp_path / f"{dataset}.nano.jsonl"
         student = tmp_path / f"{dataset}.student.jsonl"
-        for path in (manifest, nano, student):
+        for path in (nano, student):
             path.write_text("{}\n", encoding="utf-8")
+        if dataset != "commonvoice_en_test":
+            manifest.write_text("{}\n", encoding="utf-8")
         public_results.append(
             {
                 "dataset": dataset,
@@ -2089,6 +2186,10 @@ def _write_valid_phase_gate(
                 "provenance_mode": "legacy_report_attestation",
                 "nano_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
                 "nano_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
+                "public_overlap": {
+                    "receipt_path": str(public_overlap_receipt.resolve()),
+                    "receipt_sha256": sha256_file(public_overlap_receipt),
+                },
                 "total_samples": sum(
                     int(expected["samples"]) for expected in STAGE211_PUBLIC_BENCHMARKS.values()
                 ),
@@ -2265,6 +2366,10 @@ def _write_valid_phase_gate(
                 "nano_public_baseline_receipt_path": str(baseline_receipt.resolve()),
                 "nano_public_baseline_receipt_sha256": sha256_file(baseline_receipt),
                 "nano_public_baseline_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
+                "public_overlap": {
+                    "receipt_path": str(public_overlap_receipt.resolve()),
+                    "receipt_sha256": sha256_file(public_overlap_receipt),
+                },
                 "full_data_coverage": {
                     "phase": phase,
                     "complete": True,
@@ -3092,6 +3197,56 @@ def test_stage211_nano_baseline_receipt_rejects_mutated_inference_report(
 
     with pytest.raises(ValueError, match="inference report contract mismatch"):
         validate_stage211_nano_public_baseline_receipt(receipt_path)
+
+
+def test_stage211_phase_gate_rejects_missing_public_overlap_binding(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    gate.pop("public_overlap")
+    gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lacks the public/train overlap binding"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_clean_public_manifest(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    overlap_receipt = json.loads(
+        Path(gate["public_overlap"]["receipt_path"]).read_text(encoding="utf-8")
+    )
+    clean_manifest = Path(overlap_receipt["outputs"]["clean_manifest"]["path"])
+    clean_manifest.write_text(
+        clean_manifest.read_text(encoding="utf-8") + '{"utt_id":"injected"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="manifest SHA-256 mismatch"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
 
 
 def test_stage211_phase_gate_rejects_nano_baseline_prediction_substitution(

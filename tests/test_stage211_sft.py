@@ -423,6 +423,7 @@ def _write_nano_baseline_receipt(
     *,
     nano_checkpoint: Path,
     benchmark: dict[str, object],
+    public_overlap: dict[str, str] | None = None,
 ) -> Path:
     results = []
     for raw_result in benchmark["results"]:
@@ -475,6 +476,7 @@ def _write_nano_baseline_receipt(
                 "provenance_mode": "legacy_report_attestation",
                 "nano_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_checkpoint_sha256": sha256_file(nano_checkpoint),
+                **({"public_overlap": public_overlap} if public_overlap is not None else {}),
                 "total_samples": sum(
                     int(expected["samples"]) for expected in STAGE211_PUBLIC_BENCHMARKS.values()
                 ),
@@ -495,6 +497,12 @@ def _write_stepwise_inputs(
     nano_teacher_checkpoint = nano_teacher_dir / "model.pt"
     nano_teacher_checkpoint.write_bytes(b"nano-teacher")
     nano_teacher_sha256 = sha256_file(nano_teacher_checkpoint)
+    public_overlap_receipt = tmp_path / "public-overlap-receipt.json"
+    public_overlap_receipt.write_text("{}\n", encoding="utf-8")
+    public_overlap = {
+        "receipt_path": str(public_overlap_receipt.resolve()),
+        "receipt_sha256": sha256_file(public_overlap_receipt),
+    }
     checkpoints = {
         stage: tmp_path / f"{stage}.pt"
         for stage in ("calibration", "mixer", "block", "logits", "sft")
@@ -525,6 +533,7 @@ def _write_stepwise_inputs(
         tmp_path,
         nano_checkpoint=nano_teacher_checkpoint,
         benchmark=calibration_benchmark,
+        public_overlap=public_overlap,
     )
     nano_baseline_binding = {
         "nano_public_baseline_receipt_path": str(nano_baseline_receipt.resolve()),
@@ -548,6 +557,7 @@ def _write_stepwise_inputs(
                 "comparison_report_sha256": sha256_file(support["calibration-comparison"]),
                 "metrics_path": str(support["calibration-metrics"].resolve()),
                 "metrics_sha256": sha256_file(support["calibration-metrics"]),
+                "public_overlap": public_overlap,
                 "public_benchmark": calibration_benchmark,
             }
         )
@@ -575,6 +585,7 @@ def _write_stepwise_inputs(
                         "marker_sha256": sha256_file(preflight_marker),
                     },
                     **nano_baseline_binding,
+                    "public_overlap": public_overlap,
                     "full_data_coverage": {
                         "total_unique_rows": 100,
                         "total_hours": 10.0,
@@ -642,6 +653,7 @@ def _write_stepwise_inputs(
                 "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
                 **nano_baseline_binding,
+                "public_overlap": public_overlap,
                 "mixer_phase_gate_path": str(reports["mixer"].resolve()),
                 "mixer_phase_gate_sha256": sha256_file(reports["mixer"]),
                 "mixer_gate_selection_path": None,
@@ -791,6 +803,31 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "validate_stage211_phase_gate_report",
         validate_phase,
     )
+    monkeypatch.setattr(
+        stepwise_report,
+        "validate_stage211_nano_public_baseline_receipt",
+        lambda path, **kwargs: json.loads(Path(path).read_text(encoding="utf-8")),
+    )
+    monkeypatch.setattr(
+        stepwise_report,
+        "validate_stage211_public_overlap_binding",
+        lambda binding, *, public_benchmark: {},
+    )
+    monkeypatch.setattr(
+        sft_finalizer,
+        "validate_stage211_nano_public_baseline_receipt",
+        lambda path, **kwargs: json.loads(Path(path).read_text(encoding="utf-8")),
+    )
+    monkeypatch.setattr(
+        sft_finalizer,
+        "validate_stage211_public_overlap_binding",
+        lambda binding, *, public_benchmark: {},
+    )
+    monkeypatch.setattr(
+        sft_finalizer,
+        "validate_stage211_phase_gate_report",
+        validate_phase,
+    )
     sft_payload = json.loads(reports["sft"].read_text(encoding="utf-8"))
     monkeypatch.setattr(
         stepwise_report,
@@ -843,6 +880,10 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     }
     assert report["checkpoint_chain_passed"] is True
     assert report["nano_teacher_chain_passed"] is True
+    assert report["public_overlap_chain_passed"] is True
+    assert report["public_overlap_receipt_sha256"] == sha256_file(
+        tmp_path / "public-overlap-receipt.json"
+    )
     assert report["nano_teacher_checkpoint_sha256"] == sha256_file(
         tmp_path / "nano-teacher" / "model.pt"
     )
