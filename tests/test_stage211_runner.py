@@ -2017,7 +2017,7 @@ def _write_valid_phase_gate(
     smoke_log_dir.mkdir(parents=True)
     smoke_checkpoint = smoke_dir / "step-2.pt"
     smoke_log = smoke_log_dir / f"{phase}_smoke_2steps.log"
-    smoke_checkpoint.write_bytes(b"smoke-step-2")
+    torch.save({"step": 2}, smoke_checkpoint)
     smoke_log.write_text(
         "[rwkvasr] Distributed init complete.\n"
         "[deepspeed-train] step=1 loss=0.8 peak_reserved=5.50GiB\n"
@@ -2673,6 +2673,65 @@ def test_stage211_phase_gate_rejects_mutated_preflight_smoke_log(
     )
 
     with pytest.raises(ValueError, match="smoke log SHA-256 mismatch"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_false_step2_smoke_checkpoint(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "long-complete.pt"
+    checkpoint.write_bytes(b"long-complete")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    marker_path = Path(report["preflight_smoke"]["marker_path"])
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    smoke_checkpoint = Path(marker["smoke_checkpoint_path"])
+    torch.save({"step": 3}, smoke_checkpoint)
+    marker["smoke_checkpoint_sha256"] = sha256_file(smoke_checkpoint)
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    report["preflight_smoke"]["marker_sha256"] = sha256_file(marker_path)
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkpoint is not step 2"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_smoke_sample_skipping(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "long-complete.pt"
+    checkpoint.write_bytes(b"long-complete")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    marker_path = Path(report["preflight_smoke"]["marker_path"])
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    smoke_log = Path(marker["smoke_log_path"])
+    smoke_log.write_text(
+        smoke_log.read_text(encoding="utf-8") + "skipped_samples=1\n",
+        encoding="utf-8",
+    )
+    marker["smoke_log_sha256"] = sha256_file(smoke_log)
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    report["preflight_smoke"]["marker_sha256"] = sha256_file(marker_path)
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="smoke log failed validation"):
         validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",

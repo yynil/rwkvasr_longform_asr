@@ -62,6 +62,8 @@ BAD_SMOKE_PATTERNS = (
     re.compile(r"\bloss=(?:nan|inf)\b", re.IGNORECASE),
     re.compile(r"\bonline_[a-z0-9_]*missing=[1-9][0-9]*\b"),
     re.compile(r"\bonline_[a-z0-9_]*frame_delta=[1-9][0-9]*\b"),
+    re.compile(r"\bdropped_tail(?:_samples)?=[1-9][0-9]*\b"),
+    re.compile(r"\bskipped_samples=[1-9][0-9]*\b"),
 )
 
 

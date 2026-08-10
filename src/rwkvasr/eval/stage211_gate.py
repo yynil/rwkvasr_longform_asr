@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from rwkvasr.config import load_yaml
 
 
@@ -318,7 +320,17 @@ def validate_stage211_full_profile_smoke_binding(
         sha256_key="smoke_checkpoint_sha256",
         label=f"Stage211 {phase} preflight smoke checkpoint",
     )
-    if checkpoint.name != "step-2.pt":
+    checkpoint_payload = torch.load(
+        checkpoint,
+        map_location="cpu",
+        mmap=True,
+        weights_only=True,
+    )
+    try:
+        checkpoint_step = int(checkpoint_payload.get("step", 0))
+    finally:
+        del checkpoint_payload
+    if checkpoint.name != "step-2.pt" or checkpoint_step != 2:
         raise ValueError(f"Stage211 {phase} preflight smoke checkpoint is not step 2.")
     log_path = _validate_bound_file(
         marker,
@@ -337,6 +349,8 @@ def validate_stage211_full_profile_smoke_binding(
         re.compile(r"\bloss=(?:nan|inf)\b", re.IGNORECASE),
         re.compile(r"\bonline_[a-z0-9_]*missing=[1-9][0-9]*\b"),
         re.compile(r"\bonline_[a-z0-9_]*frame_delta=[1-9][0-9]*\b"),
+        re.compile(r"\bdropped_tail(?:_samples)?=[1-9][0-9]*\b"),
+        re.compile(r"\bskipped_samples=[1-9][0-9]*\b"),
     )
     if "[deepspeed-train] step=2" not in log_text or any(
         pattern.search(log_text) is not None for pattern in rejected_patterns
