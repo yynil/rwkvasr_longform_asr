@@ -16,12 +16,7 @@ from rwkvasr.config import save_yaml
 from rwkvasr.eval.stage211_gate import (
     STAGE211_ALLOWED_OPERATOR_KEY_MARKERS,
     STAGE211_AUDIO_CURRICULUM,
-    STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES,
-    STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
-    STAGE211_AUDIO_TOTAL_HOURS,
-    STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
     STAGE211_AUDIO_TOTAL_ROWS,
-    STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES,
     STAGE211_AUDIO_TRAIN_PART_COUNTS,
     STAGE211_FULL_DATA_BATCH_SIZE,
     STAGE211_FULL_DATA_EPOCHS,
@@ -39,6 +34,11 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_loaded_manifest_receipt,
     validate_stage211_phase_gate_report,
     validate_stage211_phase_train_config,
+)
+from rwkvasr.eval.stage211_supplemental import (
+    STAGE211_SUPPLEMENTAL_DIFFICULTY,
+    STAGE211_SUPPLEMENTAL_SOURCES,
+    stage211_supplemental_profile,
 )
 
 
@@ -126,6 +126,66 @@ def test_stage211_full_phase_formal_progress_detection_is_fail_closed(
     assert stage211_full_phase._formal_phase_training_started(phase_root) is False
     training_log.write_text("[deepspeed-train] step=1 loss=0.9\n", encoding="utf-8")
     assert stage211_full_phase._formal_phase_training_started(phase_root) is True
+
+
+def test_stage211_legacy_curriculum_summary_migration_is_restart_safe(
+    tmp_path: Path,
+) -> None:
+    phase_root = tmp_path / "phase"
+    phase_root.mkdir()
+    summary = phase_root / "curriculum_complete.json"
+    legacy_payload = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "full_phase_curriculum",
+        "phase": "mixer",
+        "complete": True,
+        "full_data_coverage": {"segments": []},
+    }
+    summary.write_text(json.dumps(legacy_payload) + "\n", encoding="utf-8")
+
+    stage211_full_phase._migrate_legacy_curriculum_summary(
+        phase_root=phase_root,
+        phase="mixer",
+    )
+
+    archive = phase_root / "curriculum_complete.original_only.json"
+    migration = phase_root / "curriculum_complete.original_only.migration.json"
+    assert not summary.exists()
+    assert archive.is_file()
+    assert migration.is_file()
+
+    summary.write_bytes(archive.read_bytes())
+    stage211_full_phase._migrate_legacy_curriculum_summary(
+        phase_root=phase_root,
+        phase="mixer",
+    )
+    assert not summary.exists()
+    assert archive.is_file()
+
+
+def test_stage211_current_curriculum_summary_is_reused_immutably(tmp_path: Path) -> None:
+    phase_root = tmp_path / "phase"
+    phase_root.mkdir()
+    summary = phase_root / "curriculum_complete.json"
+    current_payload = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "full_phase_curriculum",
+        "phase": "mixer",
+        "complete": True,
+        "full_data_coverage": {"supplemental_natural": {"complete": True}},
+    }
+    stage211_full_phase._write_immutable_json(summary, current_payload)
+
+    stage211_full_phase._migrate_legacy_curriculum_summary(
+        phase_root=phase_root,
+        phase="mixer",
+    )
+    stage211_full_phase._write_immutable_json(summary, current_payload)
+
+    assert json.loads(summary.read_text(encoding="utf-8")) == current_payload
+    assert not (phase_root / "curriculum_complete.original_only.json").exists()
 
 
 def test_stage211_public_eval_shards_large_second_stage(
@@ -927,6 +987,9 @@ def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
         manifest = tmp_path / f"{difficulty}.json"
         manifest.write_text("{}\n", encoding="utf-8")
         manifests[difficulty] = manifest
+    supplemental_inventory, supplemental_profile = _write_supplemental_inventory_fixture(
+        tmp_path
+    )
     command = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "run_stage211_full_phase_curriculum.py"),
@@ -942,6 +1005,8 @@ def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
         str(tmp_path / "configs"),
         "--easy-manifest",
         str(manifests["easy"]),
+        "--supplemental-inventory",
+        str(supplemental_inventory),
         "--dry-run",
     ]
     for difficulty in ("medium", "hard", "long"):
@@ -956,10 +1021,14 @@ def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("[stage211-full-phase] command=") == 5
+    assert result.stdout.count("[stage211-full-phase] command=") == 6
     assert "--smoke" in result.stdout
     for difficulty, expected in STAGE211_AUDIO_CURRICULUM.items():
         assert f"/{difficulty}/step-{expected['steps']}.pt" in result.stdout
+    assert (
+        f"/{STAGE211_SUPPLEMENTAL_DIFFICULTY}/step-{supplemental_profile['steps']}.pt"
+        in result.stdout
+    )
 
 
 def test_stage211_reuses_completed_receipt_without_rehashing_bound_models(
@@ -1551,6 +1620,238 @@ def _write_runtime_epoch_coverage(
     }
 
 
+def _write_supplemental_inventory_fixture(
+    tmp_path: Path,
+) -> tuple[Path, dict[str, object]]:
+    root = tmp_path / "supplemental-inventory-fixture"
+    inventory_path = root / "supplemental_inventory.json"
+    if inventory_path.is_file():
+        return inventory_path, stage211_supplemental_profile(
+            inventory_path,
+            epochs=STAGE211_FULL_DATA_EPOCHS,
+            batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+            world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+            frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+        )
+
+    root.mkdir()
+    train_part = root / "train.jsonl"
+    train_part.write_text(
+        "".join(json.dumps({"key": f"supplemental-{index}"}) + "\n" for index in range(5)),
+        encoding="utf-8",
+    )
+    fixed_eval_part = root / "fixed_eval.jsonl"
+    fixed_eval_part.write_text("{}\n" * 256, encoding="utf-8")
+    fixed_eval_manifest = root / "fixed_eval_manifest.json"
+    fixed_eval_manifest.write_text("{}\n", encoding="utf-8")
+    stage179_manifest = root / "stage179_global_dedup.json"
+    stage179_manifest.write_text("{}\n", encoding="utf-8")
+    bucket_manifest = root / "manifest_stage211_fixed_eval.json"
+    bucket_manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "root": "/",
+                "source_length_index_path": str(train_part.resolve()),
+                "bucket_width": 80,
+                "entries_per_part": 5,
+                "splits": {
+                    "train": {
+                        "num_samples": 5,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": 5,
+                                "parts": [
+                                    {
+                                        "path": train_part.name,
+                                        "num_samples": 5,
+                                        "source_label": "supplemental_fixture",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    "eval": {
+                        "num_samples": 256,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": 256,
+                                "parts": [
+                                    {
+                                        "path": fixed_eval_part.name,
+                                        "num_samples": 256,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    source_seconds = 1.0
+    selected_hours_by_source = {
+        source: source_seconds / 3600.0 for source in STAGE211_SUPPLEMENTAL_SOURCES
+    }
+    inventory = {
+        "schema_version": 1,
+        "artifact": "stage211_supplemental_natural_inventory",
+        "complete": True,
+        "training_ready": True,
+        "hash_archives": True,
+        "require_production_layout": True,
+        "language": "en",
+        "uses_text_labels": False,
+        "storage_kinds": ["parquet", "zip"],
+        "layout_errors": [],
+        "selected_rows": 5,
+        "selected_hours": sum(selected_hours_by_source.values()),
+        "selected_counts_by_source": {
+            source: 1 for source in STAGE211_SUPPLEMENTAL_SOURCES
+        },
+        "selected_hours_by_source": selected_hours_by_source,
+        "dedupe": {
+            "algorithm": "blake2b16(corpus + NUL + source_identity)",
+            "accepted_unique_rows": 5,
+        },
+        "cross_pool_dedupe": {
+            "mode": "source_identity_plus_known_corpus_exclusion",
+            "content_fingerprint_complete": False,
+            "source_sets_disjoint": True,
+            "supplemental_sources": sorted(STAGE211_SUPPLEMENTAL_SOURCES),
+            "known_overlap_exclusions": ["llaso_gigaspeech", "llaso_librispeech"],
+            "stage179": {
+                "expected_source_set_match": True,
+                "manifest_path": str(stage179_manifest.resolve()),
+                "manifest_sha256": sha256_file(stage179_manifest),
+            },
+        },
+        "fixed_eval": {
+            "rows": 256,
+            "manifest_path": str(fixed_eval_manifest.resolve()),
+            "manifest_sha256": sha256_file(fixed_eval_manifest),
+            "parts": [
+                {
+                    "path": str(fixed_eval_part.resolve()),
+                    "sha256": sha256_file(fixed_eval_part),
+                    "num_samples": 256,
+                }
+            ],
+        },
+        "bucket_manifest_path": str(bucket_manifest.resolve()),
+        "bucket_manifest_sha256": sha256_file(bucket_manifest),
+        "part_records": [
+            {
+                "path": str(train_part.resolve()),
+                "num_samples": 5,
+                "size_bytes": train_part.stat().st_size,
+                "sha256": sha256_file(train_part),
+            }
+        ],
+        "archive_records": [{"status": "absent"}],
+    }
+    inventory_path.write_text(json.dumps(inventory) + "\n", encoding="utf-8")
+    return inventory_path, stage211_supplemental_profile(
+        inventory_path,
+        epochs=STAGE211_FULL_DATA_EPOCHS,
+        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+    )
+
+
+def _write_supplemental_coverage_fixture(
+    tmp_path: Path,
+    *,
+    phase: str,
+    init_checkpoint: Path,
+    completion_checkpoint: Path,
+    nano_teacher_dir: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    inventory_path, profile = _write_supplemental_inventory_fixture(tmp_path)
+    provenance = tmp_path / "supplemental-provenance.json"
+    provenance.write_text("{}\n", encoding="utf-8")
+    train_config = tmp_path / "supplemental-train-config.yaml"
+    train_config_payload = stage211_phase_train_config_contract(phase)
+    train_config_payload.update(
+        {
+            "ctc_teacher_online_model_path": str(nano_teacher_dir.resolve()),
+            "max_steps": int(profile["steps"]),
+            "webdataset_bucket_manifest_path": profile["bucket_manifest_path"],
+        }
+    )
+    save_yaml(train_config, train_config_payload)
+    runtime_epoch_coverage = _write_runtime_epoch_coverage(
+        tmp_path,
+        prefix=f"{phase}-{STAGE211_SUPPLEMENTAL_DIFFICULTY}",
+        epochs=STAGE211_FULL_DATA_EPOCHS,
+        steps_per_epoch=int(profile["steps_per_epoch"]),
+    )
+    nano_teacher_checkpoint = nano_teacher_dir / "model.pt"
+    segment: dict[str, object] = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "curriculum_coverage",
+        "phase": phase,
+        "difficulty": STAGE211_SUPPLEMENTAL_DIFFICULTY,
+        "complete": True,
+        "full_data_profile": True,
+        "epochs": STAGE211_FULL_DATA_EPOCHS,
+        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
+        "rows": profile["rows"],
+        "row_exposures": profile["row_exposures"],
+        "tail_padding_samples_per_epoch": profile["tail_padding_samples_per_epoch"],
+        "tail_padding_sample_exposures": profile["tail_padding_sample_exposures"],
+        "executed_sample_exposures": profile["executed_sample_exposures"],
+        "hours": profile["hours"],
+        "hour_exposures": profile["hour_exposures"],
+        "steps_per_epoch": profile["steps_per_epoch"],
+        "steps": profile["steps"],
+        "supplemental_inventory_path": str(inventory_path.resolve()),
+        "supplemental_inventory_sha256": sha256_file(inventory_path),
+        "provenance_path": str(provenance.resolve()),
+        "provenance_sha256": sha256_file(provenance),
+        "train_config_path": str(train_config.resolve()),
+        "train_config_sha256": sha256_file(train_config),
+        "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
+        "nano_teacher_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
+        "bucket_manifest_path": profile["bucket_manifest_path"],
+        "bucket_manifest_sha256": profile["bucket_manifest_sha256"],
+        "init_checkpoint_path": str(init_checkpoint.resolve()),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint),
+        "completion_checkpoint_path": str(completion_checkpoint.resolve()),
+        "completion_checkpoint_sha256": sha256_file(completion_checkpoint),
+        "runtime_epoch_coverage": runtime_epoch_coverage,
+        "parameter_delta_audit": {
+            "schema_version": 1,
+            "policy": "stage211_timemixer_and_input_projection_only",
+            "complete": True,
+            "allowed_key_markers": list(STAGE211_ALLOWED_OPERATOR_KEY_MARKERS),
+            "initial_tensor_count": 4,
+            "completion_tensor_count": 4,
+            "allowed_changed_tensors": 1,
+            "allowed_changed_numel": 1,
+            "allowed_unchanged_tensors": 1,
+            "frozen_unchanged_tensors": 2,
+            "forbidden_changed_tensors": 0,
+        },
+    }
+    receipt = tmp_path / "supplemental-receipt.json"
+    receipt.write_text(json.dumps(segment) + "\n", encoding="utf-8")
+    segment["receipt_path"] = str(receipt.resolve())
+    segment["receipt_sha256"] = sha256_file(receipt)
+    return segment, profile
+
+
 def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
     tmp_path: Path,
 ) -> None:
@@ -2029,9 +2330,8 @@ def _write_valid_phase_gate(
         train_config_payload = stage211_phase_train_config_contract(phase)
         train_config_payload["ctc_teacher_online_model_path"] = str(nano_teacher_dir.resolve())
         save_yaml(train_config, train_config_payload)
-        completion = checkpoint if difficulty == "long" else tmp_path / f"{difficulty}.pt"
-        if completion != checkpoint:
-            completion.write_bytes(f"checkpoint-{index}".encode())
+        completion = tmp_path / f"{difficulty}.pt"
+        completion.write_bytes(f"checkpoint-{index}".encode())
         runtime_epoch_coverage = _write_runtime_epoch_coverage(
             tmp_path,
             prefix=f"{phase}-{difficulty}",
@@ -2100,6 +2400,20 @@ def _write_valid_phase_gate(
         segment["receipt_sha256"] = sha256_file(receipt)
         segments.append(segment)
         previous_checkpoint = completion
+
+    supplemental_segment, _ = _write_supplemental_coverage_fixture(
+        tmp_path,
+        phase=phase,
+        init_checkpoint=previous_checkpoint,
+        completion_checkpoint=checkpoint,
+        nano_teacher_dir=nano_teacher_dir,
+    )
+    full_data_coverage = build_stage211_full_data_coverage(
+        phase=phase,
+        segments=segments,
+        supplemental_segment=supplemental_segment,
+        checkpoint_path=checkpoint,
+    )
 
     public_results = []
     for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
@@ -2374,23 +2688,7 @@ def _write_valid_phase_gate(
                     "receipt_path": str(public_overlap_receipt.resolve()),
                     "receipt_sha256": sha256_file(public_overlap_receipt),
                 },
-                "full_data_coverage": {
-                    "phase": phase,
-                    "complete": True,
-                    "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
-                    "total_hours": STAGE211_AUDIO_TOTAL_HOURS,
-                    "total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
-                    "total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
-                    "total_tail_padding_sample_exposures": (
-                        STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
-                    ),
-                    "total_executed_sample_exposures": (
-                        STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
-                    ),
-                    "segments": segments,
-                    "final_checkpoint_path": str(checkpoint.resolve()),
-                    "final_checkpoint_sha256": sha256_file(checkpoint),
-                },
+                "full_data_coverage": full_data_coverage,
                 "public_benchmark": {
                     "decode": "greedy_ctc",
                     "normalization": "ctc",
@@ -2693,9 +2991,11 @@ def _write_corrected_phase_gate(
         "artifact": "hidden_alignment_gate",
     }
     original_segments = report["full_data_coverage"]["segments"]
+    supplemental_segment = report["full_data_coverage"]["supplemental_natural"]
     report["full_data_coverage"] = build_stage211_full_data_coverage(
         phase="mixer",
         segments=original_segments,
+        supplemental_segment=supplemental_segment,
         checkpoint_path=checkpoint,
         post_coverage_corrections=[correction],
     )
@@ -3363,6 +3663,134 @@ def test_stage211_phase_gate_rejects_mixed_nano_teachers(
         )
 
 
+def test_stage211_phase_gate_rejects_missing_supplemental_coverage(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    del report["full_data_coverage"]["supplemental_natural"]
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lacks supplemental_natural"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_reordered_original_segments(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    segments = report["full_data_coverage"]["segments"]
+    segments[0], segments[1] = segments[1], segments[0]
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly ordered easy, medium, hard, and long"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_supplemental_checkpoint_chain_break(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    wrong_init = tmp_path / "wrong-long-completion.pt"
+    wrong_init.write_bytes(b"wrong-long-completion")
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    supplemental = report["full_data_coverage"]["supplemental_natural"]
+    supplemental["init_checkpoint_path"] = str(wrong_init.resolve())
+    supplemental["init_checkpoint_sha256"] = sha256_file(wrong_init)
+    receipt_path = Path(supplemental["receipt_path"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["init_checkpoint_path"] = supplemental["init_checkpoint_path"]
+    receipt["init_checkpoint_sha256"] = supplemental["init_checkpoint_sha256"]
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    supplemental["receipt_sha256"] = sha256_file(receipt_path)
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not initialize from Long"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_supplemental_inventory(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    inventory_path = Path(
+        report["full_data_coverage"]["supplemental_natural"][
+            "supplemental_inventory_path"
+        ]
+    )
+    inventory_path.write_text(
+        inventory_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="supplemental inventory SHA-256 mismatch"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_combined_coverage_total(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    report["full_data_coverage"]["total_unique_rows"] += 1
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="combined full-data coverage total_unique_rows"):
+        stage211.validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
 def test_stage211_phase_gate_rejects_decode_skipping_coverage(
     tmp_path: Path,
 ) -> None:
@@ -3495,7 +3923,9 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert "FINAL_STEPWISE_REPORT" in script
     assert ".checkpoint_chain_passed == true" in script
     assert ".nano_teacher_chain_passed == true" in script
+    assert ".supplemental_inventory_chain_passed == true" in script
     assert '.strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"]' in script
+    assert '.requested_alignment_stage_order == ["rwkv_layer", "block", "logits", "sft"]' in script
     assert "post_mixer" in script
     assert "tmux kill-session" not in script
 
@@ -3531,7 +3961,7 @@ def _run_stage211_continuation_watcher_fixture(
         "  esac\n"
         "done\n"
         'mkdir -p "$(dirname "${output_json}")"\n'
-        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"coverage_results":[1,2,3,4],"dataset_results":[1,2,3,4,5]}\' >"${output_json}"\n'
+        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],"dataset_results":[1,2,3,4,5]}\' >"${output_json}"\n'
         "printf '%s\\n' '# stepwise' >\"${output_markdown}\"\n",
         encoding="utf-8",
     )

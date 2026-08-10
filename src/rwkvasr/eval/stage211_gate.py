@@ -10,6 +10,10 @@ from typing import Any
 import torch
 
 from rwkvasr.config import load_yaml
+from rwkvasr.eval.stage211_supplemental import (
+    STAGE211_SUPPLEMENTAL_DIFFICULTY,
+    stage211_supplemental_profile,
+)
 
 
 STAGE211_PHASE_GATE_SCHEMA_VERSION = 1
@@ -1314,22 +1318,65 @@ def build_stage211_full_data_coverage(
     segments: list[dict[str, Any]],
     checkpoint_path: Path,
     post_coverage_corrections: list[dict[str, Any]] | None = None,
+    supplemental_segment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     checkpoint_path = checkpoint_path.expanduser().resolve()
     corrections = list(post_coverage_corrections or [])
+    supplemental_rows = int(supplemental_segment.get("rows", 0)) if supplemental_segment else 0
+    supplemental_hours = (
+        float(supplemental_segment.get("hours", 0.0)) if supplemental_segment else 0.0
+    )
+    supplemental_row_exposures = (
+        int(supplemental_segment.get("row_exposures", 0)) if supplemental_segment else 0
+    )
+    supplemental_hour_exposures = (
+        float(supplemental_segment.get("hour_exposures", 0.0)) if supplemental_segment else 0.0
+    )
+    supplemental_tail_exposures = (
+        int(supplemental_segment.get("tail_padding_sample_exposures", 0))
+        if supplemental_segment
+        else 0
+    )
+    supplemental_executed_exposures = (
+        int(supplemental_segment.get("executed_sample_exposures", 0))
+        if supplemental_segment
+        else 0
+    )
     coverage: dict[str, Any] = {
         "phase": phase,
         "complete": True,
-        "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
-        "total_hours": STAGE211_AUDIO_TOTAL_HOURS,
-        "total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
-        "total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
-        "total_tail_padding_sample_exposures": (STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES),
-        "total_executed_sample_exposures": (STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES),
+        "original_total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
+        "original_total_hours": STAGE211_AUDIO_TOTAL_HOURS,
+        "original_total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
+        "original_total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
+        "original_total_tail_padding_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+        ),
+        "original_total_executed_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
+        ),
+        "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS + supplemental_rows,
+        "total_hours": STAGE211_AUDIO_TOTAL_HOURS + supplemental_hours,
+        "total_row_exposures": (
+            STAGE211_AUDIO_TOTAL_ROW_EXPOSURES + supplemental_row_exposures
+        ),
+        "total_hour_exposures": (
+            STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES + supplemental_hour_exposures
+        ),
+        "total_tail_padding_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+            + supplemental_tail_exposures
+        ),
+        "total_executed_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
+            + supplemental_executed_exposures
+        ),
         "segments": segments,
         "final_checkpoint_path": str(checkpoint_path),
         "final_checkpoint_sha256": sha256_file(checkpoint_path),
     }
+    if supplemental_segment is not None:
+        coverage["supplemental_natural"] = supplemental_segment
     if corrections:
         coverage["post_coverage_corrections"] = corrections
         coverage["post_coverage_correction_exposure"] = stage211_post_coverage_correction_exposure(
@@ -1579,6 +1626,7 @@ def _validate_stage211_post_coverage_corrections(
     *,
     coverage: dict[str, Any],
     original_segments: list[dict[str, Any]],
+    supplemental_segment: dict[str, Any],
     original_completion_sha256: str,
     nano_teacher_checkpoint_sha256: str,
 ) -> tuple[list[dict[str, Any]], str]:
@@ -1733,6 +1781,10 @@ def _validate_stage211_post_coverage_corrections(
             raise ValueError(f"Stage211 {phase} correction admission coverage is missing.")
         if admission_coverage.get("segments") != original_segments:
             raise ValueError(f"Stage211 {phase} correction rewrites original coverage segments.")
+        if admission_coverage.get("supplemental_natural") != supplemental_segment:
+            raise ValueError(
+                f"Stage211 {phase} correction rewrites supplemental coverage."
+            )
         prior_corrections = admission_coverage.get("post_coverage_corrections", [])
         if prior_corrections != validated:
             raise ValueError(
@@ -1779,6 +1831,147 @@ def _validate_stage211_post_coverage_corrections(
     return validated, previous_checkpoint_sha256
 
 
+def _validate_stage211_supplemental_coverage_segment(
+    segment: Any,
+    *,
+    phase: str,
+    preceding_checkpoint_sha256: str,
+    nano_teacher_checkpoint_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(segment, dict):
+        raise ValueError("Stage211 full-data coverage lacks supplemental_natural.")
+    expected_fields = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "curriculum_coverage",
+        "phase": phase,
+        "difficulty": STAGE211_SUPPLEMENTAL_DIFFICULTY,
+        "complete": True,
+        "full_data_profile": True,
+        "epochs": STAGE211_FULL_DATA_EPOCHS,
+        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
+    }
+    if any(segment.get(key) != value for key, value in expected_fields.items()):
+        raise ValueError(f"Stage211 {phase}/supplemental_natural coverage is incomplete.")
+    inventory_path = _validate_bound_file(
+        segment,
+        path_key="supplemental_inventory_path",
+        sha256_key="supplemental_inventory_sha256",
+        label=f"Stage211 {phase} supplemental inventory",
+    )
+    profile = stage211_supplemental_profile(
+        inventory_path,
+        epochs=STAGE211_FULL_DATA_EPOCHS,
+        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+        require_training_ready=True,
+        verify_part_sha256=False,
+    )
+    expected_numbers = {
+        "rows": int(profile["rows"]),
+        "row_exposures": int(profile["row_exposures"]),
+        "steps_per_epoch": int(profile["steps_per_epoch"]),
+        "steps": int(profile["steps"]),
+        "tail_padding_samples_per_epoch": int(profile["tail_padding_samples_per_epoch"]),
+        "tail_padding_sample_exposures": int(profile["tail_padding_sample_exposures"]),
+        "executed_sample_exposures": int(profile["executed_sample_exposures"]),
+    }
+    if any(int(segment.get(key, -1)) != value for key, value in expected_numbers.items()):
+        raise ValueError(f"Stage211 {phase}/supplemental_natural exposure mismatch.")
+    for key in ("hours", "hour_exposures"):
+        actual = float(segment.get(key, float("nan")))
+        expected = float(profile[key])
+        if not math.isfinite(actual) or not math.isclose(
+            actual,
+            expected,
+            rel_tol=0.0,
+            abs_tol=0.005,
+        ):
+            raise ValueError(f"Stage211 {phase}/supplemental_natural {key} mismatch.")
+    validate_stage211_runtime_epoch_coverage(
+        segment.get("runtime_epoch_coverage"),
+        epochs=STAGE211_FULL_DATA_EPOCHS,
+        steps_per_epoch=int(profile["steps_per_epoch"]),
+        label=f"{phase}/supplemental_natural",
+    )
+    _validate_parameter_delta_audit(
+        segment,
+        phase=phase,
+        difficulty=STAGE211_SUPPLEMENTAL_DIFFICULTY,
+    )
+    receipt_path = _validate_bound_file(
+        segment,
+        path_key="receipt_path",
+        sha256_key="receipt_sha256",
+        label=f"Stage211 {phase} supplemental coverage receipt",
+    )
+    receipt = _load_json_object(
+        receipt_path,
+        label=f"Stage211 {phase} supplemental coverage receipt",
+    )
+    embedded = {
+        key: value
+        for key, value in segment.items()
+        if key not in {"receipt_path", "receipt_sha256"}
+    }
+    if receipt != embedded:
+        raise ValueError("Stage211 supplemental segment differs from its immutable receipt.")
+    for path_key, sha_key, label in (
+        ("provenance_path", "provenance_sha256", "provenance"),
+        ("train_config_path", "train_config_sha256", "train config"),
+        ("bucket_manifest_path", "bucket_manifest_sha256", "bucket manifest"),
+        ("init_checkpoint_path", "init_checkpoint_sha256", "initial checkpoint"),
+        (
+            "completion_checkpoint_path",
+            "completion_checkpoint_sha256",
+            "completion checkpoint",
+        ),
+        (
+            "nano_teacher_checkpoint_path",
+            "nano_teacher_checkpoint_sha256",
+            "Nano teacher checkpoint",
+        ),
+    ):
+        _validate_bound_file(
+            segment,
+            path_key=path_key,
+            sha256_key=sha_key,
+            label=f"Stage211 {phase} supplemental {label}",
+        )
+    if Path(str(segment["bucket_manifest_path"])).resolve() != Path(
+        str(profile["bucket_manifest_path"])
+    ).resolve() or str(segment["bucket_manifest_sha256"]) != str(
+        profile["bucket_manifest_sha256"]
+    ):
+        raise ValueError("Stage211 supplemental segment does not bind its inventory manifest.")
+    if str(segment.get("init_checkpoint_sha256") or "") != preceding_checkpoint_sha256:
+        raise ValueError("Stage211 supplemental segment does not initialize from Long.")
+    if (
+        str(segment.get("nano_teacher_checkpoint_sha256") or "")
+        != nano_teacher_checkpoint_sha256
+    ):
+        raise ValueError("Stage211 supplemental segment uses another Nano teacher.")
+    train_config_path = Path(str(segment["train_config_path"])).resolve()
+    train_config = load_yaml(train_config_path)
+    validate_stage211_phase_train_config(train_config, phase=phase)
+    if int(train_config.get("max_steps", -1)) != int(profile["steps"]):
+        raise ValueError("Stage211 supplemental train config step contract mismatch.")
+    if Path(str(train_config.get("webdataset_bucket_manifest_path") or "")).resolve() != Path(
+        str(profile["bucket_manifest_path"])
+    ).resolve():
+        raise ValueError("Stage211 supplemental train config manifest mismatch.")
+    configured_teacher = resolve_stage211_nano_teacher_checkpoint(train_config)
+    if sha256_file(configured_teacher) != nano_teacher_checkpoint_sha256:
+        raise ValueError("Stage211 supplemental train config Nano teacher mismatch.")
+    return dict(segment), profile
+
+
 def validate_stage211_full_data_coverage(
     coverage: Any,
     *,
@@ -1794,40 +1987,52 @@ def validate_stage211_full_data_coverage(
             "Stage211 full-data coverage phase mismatch: "
             f"expected={phase!r} actual={coverage.get('phase')!r}"
         )
-    if int(coverage.get("total_unique_rows", -1)) != STAGE211_AUDIO_TOTAL_ROWS:
-        raise ValueError("Stage211 full-data coverage row total mismatch.")
-    total_hours = float(coverage.get("total_hours", float("nan")))
-    if not math.isfinite(total_hours) or abs(total_hours - STAGE211_AUDIO_TOTAL_HOURS) > 0.002:
-        raise ValueError("Stage211 full-data coverage hour total mismatch.")
-    if int(coverage.get("total_row_exposures", -1)) != STAGE211_AUDIO_TOTAL_ROW_EXPOSURES:
-        raise ValueError("Stage211 full-data row-exposure total mismatch.")
-    if (
-        int(coverage.get("total_tail_padding_sample_exposures", -1))
-        != STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
-    ):
-        raise ValueError("Stage211 full-data tail-padding exposure total mismatch.")
-    if (
-        int(coverage.get("total_executed_sample_exposures", -1))
-        != STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
-    ):
-        raise ValueError("Stage211 full-data executed-sample exposure total mismatch.")
-    total_hour_exposures = float(coverage.get("total_hour_exposures", float("nan")))
-    if (
-        not math.isfinite(total_hour_exposures)
-        or abs(total_hour_exposures - STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES) > 0.005
-    ):
-        raise ValueError("Stage211 full-data hour-exposure total mismatch.")
+    expected_original_totals: dict[str, int | float] = {
+        "original_total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
+        "original_total_hours": STAGE211_AUDIO_TOTAL_HOURS,
+        "original_total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
+        "original_total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
+        "original_total_tail_padding_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+        ),
+        "original_total_executed_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
+        ),
+    }
+    for key, expected in expected_original_totals.items():
+        actual = coverage.get(key)
+        try:
+            actual_number: int | float = (
+                float(actual) if isinstance(expected, float) else int(actual)
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Stage211 original full-data coverage {key} mismatch."
+            ) from error
+        if isinstance(expected, float):
+            if not math.isclose(
+                float(actual_number), expected, rel_tol=0.0, abs_tol=0.005
+            ):
+                raise ValueError(f"Stage211 original full-data coverage {key} mismatch.")
+        elif int(actual_number) != expected:
+            raise ValueError(f"Stage211 original full-data coverage {key} mismatch.")
 
     segments = coverage.get("segments")
     if not isinstance(segments, list):
         raise ValueError("Stage211 full-data coverage segments must be a list.")
+    expected_difficulties = tuple(STAGE211_AUDIO_CURRICULUM)
+    actual_difficulties = tuple(
+        str(segment.get("difficulty")) if isinstance(segment, dict) else ""
+        for segment in segments
+    )
+    if actual_difficulties != expected_difficulties:
+        raise ValueError(
+            "Stage211 full-data coverage must contain exactly ordered "
+            "easy, medium, hard, and long segments."
+        )
     by_difficulty = {
         str(segment.get("difficulty")): segment for segment in segments if isinstance(segment, dict)
     }
-    if set(by_difficulty) != set(STAGE211_AUDIO_CURRICULUM):
-        raise ValueError(
-            "Stage211 full-data coverage must contain exactly easy, medium, hard, and long."
-        )
 
     previous_checkpoint_sha256: str | None = None
     nano_teacher_checkpoint_sha256: str | None = None
@@ -1983,10 +2188,58 @@ def validate_stage211_full_data_coverage(
             )
         previous_checkpoint_sha256 = str(segment["completion_checkpoint_sha256"])
 
+    supplemental_segment, supplemental_profile = (
+        _validate_stage211_supplemental_coverage_segment(
+            coverage.get("supplemental_natural"),
+            phase=phase,
+            preceding_checkpoint_sha256=str(previous_checkpoint_sha256 or ""),
+            nano_teacher_checkpoint_sha256=str(nano_teacher_checkpoint_sha256 or ""),
+        )
+    )
+    previous_checkpoint_sha256 = str(
+        supplemental_segment["completion_checkpoint_sha256"]
+    )
+    expected_combined_totals: dict[str, int | float] = {
+        "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS + int(supplemental_profile["rows"]),
+        "total_hours": STAGE211_AUDIO_TOTAL_HOURS + float(supplemental_profile["hours"]),
+        "total_row_exposures": (
+            STAGE211_AUDIO_TOTAL_ROW_EXPOSURES
+            + int(supplemental_profile["row_exposures"])
+        ),
+        "total_hour_exposures": (
+            STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES
+            + float(supplemental_profile["hour_exposures"])
+        ),
+        "total_tail_padding_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+            + int(supplemental_profile["tail_padding_sample_exposures"])
+        ),
+        "total_executed_sample_exposures": (
+            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
+            + int(supplemental_profile["executed_sample_exposures"])
+        ),
+    }
+    for key, expected in expected_combined_totals.items():
+        actual = coverage.get(key)
+        try:
+            actual_number = float(actual) if isinstance(expected, float) else int(actual)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Stage211 combined full-data coverage {key} mismatch."
+            ) from error
+        if isinstance(expected, float):
+            if not math.isclose(
+                float(actual_number), expected, rel_tol=0.0, abs_tol=0.005
+            ):
+                raise ValueError(f"Stage211 combined full-data coverage {key} mismatch.")
+        elif int(actual_number) != expected:
+            raise ValueError(f"Stage211 combined full-data coverage {key} mismatch.")
+
     corrections, previous_checkpoint_sha256 = _validate_stage211_post_coverage_corrections(
         coverage.get("post_coverage_corrections", []),
         coverage=coverage,
         original_segments=[by_difficulty[name] for name in STAGE211_AUDIO_CURRICULUM],
+        supplemental_segment=supplemental_segment,
         original_completion_sha256=str(previous_checkpoint_sha256 or ""),
         nano_teacher_checkpoint_sha256=str(nano_teacher_checkpoint_sha256 or ""),
     )

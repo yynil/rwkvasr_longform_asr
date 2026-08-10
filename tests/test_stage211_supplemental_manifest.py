@@ -56,6 +56,60 @@ def _write_zip(path: Path, members: dict[str, bytes]) -> None:
             archive.writestr(name, payload)
 
 
+def _write_provenance_fixtures(tmp_path: Path) -> tuple[Path, Path]:
+    eval_part = tmp_path / "fixed-eval.jsonl"
+    eval_part.write_text("{}\n" * builder.FIXED_EVAL_ROWS, encoding="utf-8")
+    fixed_eval_manifest = tmp_path / "fixed-eval-manifest.json"
+    fixed_eval_manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "root": "/",
+                "source_length_index_path": str(eval_part),
+                "splits": {
+                    "eval": {
+                        "num_samples": builder.FIXED_EVAL_ROWS,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": builder.FIXED_EVAL_ROWS,
+                                "parts": [
+                                    {
+                                        "path": str(eval_part),
+                                        "num_samples": builder.FIXED_EVAL_ROWS,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stage179_manifest = tmp_path / "stage179-global-dedup.json"
+    stage179_manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "total_unique_audio_rows": 10,
+                "total_unique_hours": 1.0,
+                "inputs": {
+                    "fixture": {
+                        "accepted_counts_by_source": {
+                            source: 1 for source in builder.EXPECTED_STAGE179_SOURCES
+                        }
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return fixed_eval_manifest, stage179_manifest
+
+
 def test_build_supplemental_manifest_deduplicates_and_excludes_eval_paths(
     tmp_path: Path,
 ) -> None:
@@ -93,6 +147,7 @@ def test_build_supplemental_manifest_deduplicates_and_excludes_eval_paths(
         },
     )
     output = tmp_path / "supplemental"
+    fixed_eval_manifest, stage179_manifest = _write_provenance_fixtures(tmp_path)
 
     inventory = builder.build_manifest(
         peoples_root=peoples,
@@ -102,6 +157,8 @@ def test_build_supplemental_manifest_deduplicates_and_excludes_eval_paths(
         entries_per_part=2,
         hash_archives=False,
         require_production_layout=False,
+        fixed_eval_manifest_path=fixed_eval_manifest,
+        stage179_global_dedup_manifest_path=stage179_manifest,
     )
 
     assert inventory["complete"] is True
@@ -119,6 +176,10 @@ def test_build_supplemental_manifest_deduplicates_and_excludes_eval_paths(
         output / "webdataset_buckets_audio_text/manifest.json"
     )
     assert sum(bucket.num_samples for bucket in manifest.splits["train"]) == 5
+    assert sum(bucket.num_samples for bucket in manifest.splits["eval"]) == 256
+    assert inventory["fixed_eval"]["rows"] == 256
+    assert inventory["cross_pool_dedupe"]["source_sets_disjoint"] is True
+    assert inventory["cross_pool_dedupe"]["content_fingerprint_complete"] is False
     rows = []
     for bucket in manifest.splits["train"]:
         for part in bucket.parts:
@@ -151,3 +212,14 @@ def test_zip_inventory_refuses_truncated_archive(tmp_path: Path) -> None:
 
     assert rows == []
     assert records[0]["status"] == "invalid"
+
+
+def test_supplemental_manifest_requires_fixed_eval_split(tmp_path: Path) -> None:
+    bad_manifest = tmp_path / "train-only.json"
+    bad_manifest.write_text(
+        json.dumps({"version": 1, "splits": {"train": {"num_samples": 1}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="fixed-eval manifest"):
+        builder._load_fixed_eval_split(bad_manifest)

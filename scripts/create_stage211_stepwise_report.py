@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 from rwkvasr.eval.stage211_gate import (
+    STAGE211_FULL_DATA_EPOCHS,
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
     validate_stage211_nano_public_baseline_receipt,
@@ -299,13 +301,18 @@ def _phase_nano_teacher_sha256(report: dict[str, Any]) -> str:
     segments = coverage.get("segments")
     if not isinstance(segments, list) or not segments:
         raise ValueError("Stage211 phase gate lacks Nano teacher coverage.")
+    supplemental = coverage.get("supplemental_natural")
+    if not isinstance(supplemental, dict):
+        raise ValueError("Stage211 phase gate lacks supplemental Nano teacher coverage.")
     values = {
         str(segment.get("nano_teacher_checkpoint_sha256") or "")
-        for segment in segments
+        for segment in [*segments, supplemental]
         if isinstance(segment, dict)
     }
     if len(values) != 1 or len(next(iter(values), "")) != 64:
-        raise ValueError("Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256.")
+        raise ValueError(
+            "Stage211 Nano teacher checkpoint SHA-256 chain mismatch within phase coverage."
+        )
     return next(iter(values))
 
 
@@ -390,6 +397,69 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
                 "steps": 0,
                 "executed_sample_exposures": 0,
             }
+        original_segments = coverage.get("segments")
+        supplemental_segment = coverage.get("supplemental_natural")
+        if not isinstance(original_segments, list) or not isinstance(
+            supplemental_segment, dict
+        ):
+            raise ValueError(f"Stage211 {stage} coverage segment proof is incomplete.")
+        training_segments = []
+        for segment in [*original_segments, supplemental_segment]:
+            if not isinstance(segment, dict):
+                raise ValueError(f"Stage211 {stage} contains an invalid coverage segment.")
+            segment_epochs = int(segment.get("epochs", -1))
+            if segment_epochs != STAGE211_FULL_DATA_EPOCHS:
+                raise ValueError(
+                    f"Stage211 {stage}/{segment.get('difficulty')} does not contain "
+                    f"{STAGE211_FULL_DATA_EPOCHS} epochs."
+                )
+            training_segments.append(
+                {
+                    "difficulty": str(segment["difficulty"]),
+                    "rows": int(segment["rows"]),
+                    "hours": float(segment["hours"]),
+                    "epochs": segment_epochs,
+                    "steps_per_epoch": int(segment["steps_per_epoch"]),
+                    "steps": int(segment["steps"]),
+                    "row_exposures": int(segment["row_exposures"]),
+                    "hour_exposures": float(segment["hour_exposures"]),
+                    "tail_padding_sample_exposures": int(
+                        segment["tail_padding_sample_exposures"]
+                    ),
+                    "executed_sample_exposures": int(
+                        segment["executed_sample_exposures"]
+                    ),
+                }
+            )
+        expected_integer_totals = {
+            "rows": unique_rows,
+            "row_exposures": row_exposures,
+            "tail_padding_sample_exposures": int(
+                coverage["total_tail_padding_sample_exposures"]
+            ),
+            "executed_sample_exposures": int(
+                coverage["total_executed_sample_exposures"]
+            ),
+        }
+        for key, expected in expected_integer_totals.items():
+            if sum(int(row[key]) for row in training_segments) != expected:
+                raise ValueError(
+                    f"Stage211 {stage} segment {key} total differs from combined coverage."
+                )
+        expected_float_totals = {
+            "hours": float(coverage["total_hours"]),
+            "hour_exposures": float(coverage["total_hour_exposures"]),
+        }
+        for key, expected in expected_float_totals.items():
+            if not math.isclose(
+                sum(float(row[key]) for row in training_segments),
+                expected,
+                rel_tol=0.0,
+                abs_tol=0.005,
+            ):
+                raise ValueError(
+                    f"Stage211 {stage} segment {key} total differs from combined coverage."
+                )
         correction_hour_exposures = float(correction.get("hour_exposures", 0.0))
         return {
             "stage": stage,
@@ -408,6 +478,15 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
             "effective_hour_exposures": (
                 float(coverage["total_hour_exposures"]) + correction_hour_exposures
             ),
+            "original_unique_rows": int(coverage["original_total_unique_rows"]),
+            "supplemental_unique_rows": int(supplemental_segment["rows"]),
+            "supplemental_inventory_path": str(
+                supplemental_segment["supplemental_inventory_path"]
+            ),
+            "supplemental_inventory_sha256": str(
+                supplemental_segment["supplemental_inventory_sha256"]
+            ),
+            "training_segments": training_segments,
         }
     if stage == "sft":
         epochs = int(coverage["epochs"])
@@ -505,6 +584,34 @@ def build_stepwise_report(
     loaded_manifest_receipt_path, loaded_manifest_receipt_sha256 = next(
         iter(loaded_manifest_bindings)
     )
+    supplemental_inventory_bindings = {
+        (
+            str(
+                phase_reports[phase]
+                .get("full_data_coverage", {})
+                .get("supplemental_natural", {})
+                .get("supplemental_inventory_path", "")
+            ),
+            str(
+                phase_reports[phase]
+                .get("full_data_coverage", {})
+                .get("supplemental_natural", {})
+                .get("supplemental_inventory_sha256", "")
+            ),
+        )
+        for phase in ("mixer", "block", "logits")
+    }
+    if len(supplemental_inventory_bindings) != 1:
+        raise ValueError("Stage211 A/B/C supplemental inventory provenance chain mismatch.")
+    supplemental_inventory_path, supplemental_inventory_sha256 = next(
+        iter(supplemental_inventory_bindings)
+    )
+    supplemental_inventory = Path(supplemental_inventory_path).expanduser().resolve()
+    if (
+        not supplemental_inventory.is_file()
+        or sha256_file(supplemental_inventory) != supplemental_inventory_sha256
+    ):
+        raise ValueError("Stage211 A/B/C supplemental inventory binding is invalid.")
     baseline_bindings = {
         _nano_public_baseline_binding(phase_reports[phase])
         for phase in ("mixer", "block", "logits")
@@ -691,6 +798,9 @@ def build_stepwise_report(
         "global_dedup_manifest_sha256": global_dedup_manifest_sha256,
         "loaded_manifest_receipt_path": loaded_manifest_receipt_path,
         "loaded_manifest_receipt_sha256": loaded_manifest_receipt_sha256,
+        "supplemental_inventory_chain_passed": True,
+        "supplemental_inventory_path": str(supplemental_inventory),
+        "supplemental_inventory_sha256": supplemental_inventory_sha256,
         "total_public_eval_samples_per_stage": sum(
             int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
         ),
@@ -711,6 +821,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"Nano teacher SHA-256: `{report['nano_teacher_checkpoint_sha256']}`",
         "",
         f"Nano public baseline provenance: `{report['nano_public_baseline_receipt_sha256']}`",
+        "",
+        f"Supplemental inventory: `{report['supplemental_inventory_sha256']}`",
         "",
         "| Dataset | Metric | Samples | Nano | Calibration | Layer A | Block B | "
         "Logits C | SFT D | Final gap |",
@@ -757,6 +869,23 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{int(coverage['epochs'])} | "
             f"{int(coverage['executed_sample_exposures']):,} | {correction} |"
         )
+    lines.extend(
+        (
+            "",
+            "## Full Data Segment Proof",
+            "",
+            "| Stage | Segment | Rows | Hours/epoch | Epochs | Steps | Row exposures |",
+            "|---|---|---:|---:|---:|---:|---:|",
+        )
+    )
+    for coverage in report["coverage_results"]:
+        for segment in coverage.get("training_segments", []):
+            lines.append(
+                f"| {coverage['label']} | `{segment['difficulty']}` | "
+                f"{int(segment['rows']):,} | {float(segment['hours']):,.3f} | "
+                f"{int(segment['epochs'])} | {int(segment['steps']):,} | "
+                f"{int(segment['row_exposures']):,} |"
+            )
     lines.extend(
         (
             "",

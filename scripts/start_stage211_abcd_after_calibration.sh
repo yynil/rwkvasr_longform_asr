@@ -38,6 +38,7 @@ BLOCK_SELECTION="${BLOCK_SELECTION:-${PHASE_GATE_ROOT}/block_selected.json}"
 LOGITS_CORRECTION_RUN_ROOT="${LOGITS_CORRECTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211c_logits_post_coverage_correction}"
 LOGITS_CORRECTION_GATE_ROOT="${LOGITS_CORRECTION_GATE_ROOT:-${PHASE_GATE_ROOT}/logits_correction}"
 LOGITS_SELECTION="${LOGITS_SELECTION:-${PHASE_GATE_ROOT}/logits_selected.json}"
+SUPPLEMENTAL_INVENTORY="${SUPPLEMENTAL_INVENTORY:-${HOME}/rwkvasr_data/stage211_supplemental_natural_v1/supplemental_inventory.json}"
 
 log() {
   printf '[stage211-abcd-bootstrap] %(%Y-%m-%d %H:%M:%S)T %s\n' -1 "$*"
@@ -166,7 +167,7 @@ validate_completed_calibration_eval() {
 }
 
 run_full_mixer_phase() {
-  local final_checkpoint_file="${FULL_OUTPUT_ROOT}/stage211a_mixer_full_data_3ep/final_checkpoint.txt"
+  local final_checkpoint_file="${FULL_OUTPUT_ROOT}/stage211a_mixer_full_data_3ep/final_checkpoint_with_supplemental.txt"
   log "starting strict Stage211A full-data controller"
   uv run python "${REPO_ROOT}/scripts/run_stage211_full_phase_curriculum.py" \
     --phase mixer \
@@ -176,6 +177,7 @@ run_full_mixer_phase() {
     --metadata-root "${METADATA_ROOT}" \
     --easy-manifest "${HOME}/rwkvasr_data/stage211_easy_source_grouped_buckets/manifest_stage211_fixed_eval.json" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
+    --supplemental-inventory "${SUPPLEMENTAL_INVENTORY}" \
     --master-port "${MASTER_PORT}" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211A full curriculum finished; starting strict retention/evaluation loop"
@@ -207,7 +209,7 @@ run_full_block_phase() {
   promotion_receipt="$(jq -er '.promotion_receipt_path' "${MIXER_SELECTION}")"
   local mixer_gate_dir
   mixer_gate_dir="$(jq -er '.gate_dir' "${MIXER_SELECTION}")"
-  local final_checkpoint_file="${FULL_OUTPUT_ROOT}/stage211b_block_full_data_3ep/final_checkpoint.txt"
+  local final_checkpoint_file="${FULL_OUTPUT_ROOT}/stage211b_block_full_data_3ep/final_checkpoint_with_supplemental.txt"
   log "starting strict Stage211B full-data controller"
   uv run python "${REPO_ROOT}/scripts/run_stage211_full_phase_curriculum.py" \
     --phase block \
@@ -218,6 +220,7 @@ run_full_block_phase() {
     --metadata-root "${METADATA_ROOT}" \
     --easy-manifest "${HOME}/rwkvasr_data/stage211_easy_source_grouped_buckets/manifest_stage211_fixed_eval.json" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
+    --supplemental-inventory "${SUPPLEMENTAL_INVENTORY}" \
     --master-port "$((MASTER_PORT + 1))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211B full curriculum finished; starting strict correction/evaluation loop"
@@ -244,7 +247,7 @@ run_full_logits_phase() {
   init_checkpoint="$(jq -er '.checkpoint_path' "${BLOCK_SELECTION}")"
   local promotion_receipt
   promotion_receipt="$(jq -er '.promotion_receipt_path' "${BLOCK_SELECTION}")"
-  local final_checkpoint_file="${FULL_OUTPUT_ROOT}/stage211c_logits_full_data_3ep/final_checkpoint.txt"
+  local final_checkpoint_file="${FULL_OUTPUT_ROOT}/stage211c_logits_full_data_3ep/final_checkpoint_with_supplemental.txt"
   log "starting strict Stage211C full-data controller"
   uv run python "${REPO_ROOT}/scripts/run_stage211_full_phase_curriculum.py" \
     --phase logits \
@@ -255,6 +258,7 @@ run_full_logits_phase() {
     --metadata-root "${METADATA_ROOT}" \
     --easy-manifest "${HOME}/rwkvasr_data/stage211_easy_source_grouped_buckets/manifest_stage211_fixed_eval.json" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
+    --supplemental-inventory "${SUPPLEMENTAL_INVENTORY}" \
     --master-port "$((MASTER_PORT + 2))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211C full curriculum finished; starting strict correction/evaluation loop"

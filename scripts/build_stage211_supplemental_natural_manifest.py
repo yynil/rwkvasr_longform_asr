@@ -19,9 +19,34 @@ from typing import Any, BinaryIO, Iterable, Iterator
 DEFAULT_PEOPLES_ROOT = Path("/media/usbhd/MLCommons/peoples_speech")
 DEFAULT_LLASO_ROOT = Path("/media/usbhd/LLaSO-Align")
 DEFAULT_OUTPUT = Path.home() / "rwkvasr_data/stage211_supplemental_natural_v1"
+DEFAULT_FIXED_EVAL_MANIFEST = (
+    Path.home()
+    / "rwkvasr_data/stage211_full_curriculum"
+    / "stage179c_hard_dedup_audio_only_online_ctc"
+    / "webdataset_buckets_audio_text/manifest_stage211_fixed_eval.json"
+)
+DEFAULT_STAGE179_GLOBAL_DEDUP_MANIFEST = Path(
+    "/media/usbhd/training_data/asr/curriculum/"
+    "stage22_stage21_soup_clean_repair_mix/stages/"
+    "stage179_usbhd_dedup_online_ctc_alignment/"
+    "stage179_usbhd_dedup_alignment_manifest.json"
+)
 DEFAULT_BUCKET_WIDTH = 80
 DEFAULT_ENTRIES_PER_PART = 100_000
 MIN_FRAMES = 20
+FIXED_EVAL_ROWS = 256
+EXPECTED_STAGE179_SOURCES = {
+    "aishell3",
+    "commonvoice_cn",
+    "commonvoice_en",
+    "cv22_en",
+    "cv22_zh",
+    "emilia_en",
+    "emilia_zh",
+    "gigaspeech",
+    "librispeech",
+    "wenetspeech",
+}
 EXPECTED_PEOPLE_TRAIN_FILES = {
     "peoples_speech_clean": 804,
     "peoples_speech_dirty": 3_140,
@@ -78,6 +103,93 @@ def _path_record(path: Path, *, hash_archives: bool) -> dict[str, Any]:
         "size_bytes": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
         "sha256": _sha256(path) if hash_archives else None,
+    }
+
+
+def _resolved_manifest_path(manifest_path: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return path.resolve()
+
+
+def _load_fixed_eval_split(manifest_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest_path = manifest_path.expanduser().resolve()
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    eval_split = raw.get("splits", {}).get("eval")
+    if not isinstance(eval_split, dict) or int(eval_split.get("num_samples", -1)) != FIXED_EVAL_ROWS:
+        raise ValueError(
+            f"Stage211 fixed-eval manifest must contain {FIXED_EVAL_ROWS} rows: {manifest_path}"
+        )
+    raw_buckets = eval_split.get("buckets")
+    if not isinstance(raw_buckets, list) or not raw_buckets:
+        raise ValueError(f"Stage211 fixed-eval manifest has no eval buckets: {manifest_path}")
+    buckets: list[dict[str, Any]] = []
+    part_records: list[dict[str, Any]] = []
+    counted_rows = 0
+    for raw_bucket in raw_buckets:
+        if not isinstance(raw_bucket, dict) or not isinstance(raw_bucket.get("parts"), list):
+            raise ValueError(f"Stage211 fixed-eval manifest has an invalid bucket: {manifest_path}")
+        parts: list[dict[str, Any]] = []
+        bucket_rows = 0
+        for raw_part in raw_bucket["parts"]:
+            if not isinstance(raw_part, dict):
+                raise ValueError(f"Stage211 fixed-eval manifest has an invalid part: {manifest_path}")
+            part_path = _resolved_manifest_path(manifest_path, str(raw_part.get("path") or ""))
+            rows = int(raw_part.get("num_samples", -1))
+            if not part_path.is_file() or rows <= 0:
+                raise ValueError(f"Stage211 fixed-eval part is unavailable or empty: {part_path}")
+            part = {**raw_part, "path": str(part_path)}
+            parts.append(part)
+            part_records.append(
+                {
+                    "path": str(part_path),
+                    "num_samples": rows,
+                    "size_bytes": part_path.stat().st_size,
+                    "sha256": _sha256(part_path),
+                }
+            )
+            bucket_rows += rows
+        if bucket_rows != int(raw_bucket.get("num_samples", -1)):
+            raise ValueError(f"Stage211 fixed-eval bucket row count mismatch: {manifest_path}")
+        counted_rows += bucket_rows
+        buckets.append({**raw_bucket, "parts": parts})
+    if counted_rows != FIXED_EVAL_ROWS:
+        raise ValueError(
+            f"Stage211 fixed-eval part rows mismatch: {counted_rows}/{FIXED_EVAL_ROWS}"
+        )
+    return (
+        {"num_samples": FIXED_EVAL_ROWS, "buckets": buckets},
+        {
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": _sha256(manifest_path),
+            "rows": FIXED_EVAL_ROWS,
+            "parts": part_records,
+        },
+    )
+
+
+def _load_stage179_source_binding(manifest_path: Path) -> dict[str, Any]:
+    manifest_path = manifest_path.expanduser().resolve()
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    inputs = raw.get("inputs")
+    if raw.get("version") != 1 or not isinstance(inputs, dict) or not inputs:
+        raise ValueError(f"Invalid Stage179 global-dedup manifest: {manifest_path}")
+    sources: set[str] = set()
+    for source_input in inputs.values():
+        if not isinstance(source_input, dict):
+            raise ValueError(f"Invalid Stage179 source input: {manifest_path}")
+        counts = source_input.get("accepted_counts_by_source")
+        if not isinstance(counts, dict):
+            raise ValueError(f"Stage179 source input lacks source counts: {manifest_path}")
+        sources.update(str(source) for source in counts)
+    return {
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": _sha256(manifest_path),
+        "total_unique_rows": int(raw.get("total_unique_audio_rows", -1)),
+        "total_unique_hours": float(raw.get("total_unique_hours", float("nan"))),
+        "sources": sorted(sources),
+        "expected_source_set_match": sources == EXPECTED_STAGE179_SOURCES,
     }
 
 
@@ -415,6 +527,8 @@ def build_manifest(
     entries_per_part: int,
     hash_archives: bool,
     require_production_layout: bool = True,
+    fixed_eval_manifest_path: Path = DEFAULT_FIXED_EVAL_MANIFEST,
+    stage179_global_dedup_manifest_path: Path = DEFAULT_STAGE179_GLOBAL_DEDUP_MANIFEST,
 ) -> dict[str, Any]:
     if output.exists():
         raise FileExistsError(f"Refusing to replace existing supplemental manifest: {output}")
@@ -435,6 +549,8 @@ def build_manifest(
     duplicate_counts: Counter[str] = Counter()
     seen: set[bytes] = set()
     started = time.time()
+    fixed_eval_split, fixed_eval_binding = _load_fixed_eval_split(fixed_eval_manifest_path)
+    stage179_binding = _load_stage179_source_binding(stage179_global_dedup_manifest_path)
 
     iterators = (
         _people_rows(
@@ -478,11 +594,14 @@ def build_manifest(
     manifest, part_records = writer.finalize(
         source_length_index_path=output / "supplemental_inventory.json"
     )
+    manifest["splits"]["eval"] = fixed_eval_split
     manifest_path = staging / "webdataset_buckets_audio_text/manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     layout_errors: list[str] = []
     if require_production_layout:
+        if not stage179_binding["expected_source_set_match"]:
+            layout_errors.append("Stage179 source set differs from the production contract")
         archive_status: Counter[tuple[str, str]] = Counter(
             (str(record.get("source")), str(record.get("status")))
             for record in archive_records
@@ -503,7 +622,20 @@ def build_manifest(
         for record in archive_records:
             if record.get("status") == "accepted" and hash_archives and not record.get("sha256"):
                 layout_errors.append(f"accepted archive has no SHA-256: {record.get('path')}")
-    training_ready = bool(hash_archives and require_production_layout and not layout_errors)
+    supplemental_sources = set(source_counts)
+    stage179_sources = set(stage179_binding["sources"])
+    source_sets_disjoint = supplemental_sources.isdisjoint(stage179_sources)
+    if require_production_layout and not source_sets_disjoint:
+        layout_errors.append(
+            "supplemental source labels overlap Stage179: "
+            + ",".join(sorted(supplemental_sources & stage179_sources))
+        )
+    training_ready = bool(
+        hash_archives
+        and require_production_layout
+        and not layout_errors
+        and source_sets_disjoint
+    )
     inventory = {
         "schema_version": 1,
         "artifact": "stage211_supplemental_natural_inventory",
@@ -515,6 +647,15 @@ def build_manifest(
         "language": "en",
         "uses_text_labels": False,
         "storage_kinds": ["parquet", "zip"],
+        "fixed_eval": fixed_eval_binding,
+        "cross_pool_dedupe": {
+            "mode": "source_identity_plus_known_corpus_exclusion",
+            "content_fingerprint_complete": False,
+            "stage179": stage179_binding,
+            "supplemental_sources": sorted(supplemental_sources),
+            "source_sets_disjoint": source_sets_disjoint,
+            "known_overlap_exclusions": ["llaso_gigaspeech", "llaso_librispeech"],
+        },
         "excluded_sources": {
             "llaso_librispeech": "already present in Stage179 and public-overlap risk",
             "llaso_gigaspeech": "already present in Stage179",
@@ -565,6 +706,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket-width", type=int, default=DEFAULT_BUCKET_WIDTH)
     parser.add_argument("--entries-per-part", type=int, default=DEFAULT_ENTRIES_PER_PART)
     parser.add_argument(
+        "--fixed-eval-manifest",
+        type=Path,
+        default=DEFAULT_FIXED_EVAL_MANIFEST,
+    )
+    parser.add_argument(
+        "--stage179-global-dedup-manifest",
+        type=Path,
+        default=DEFAULT_STAGE179_GLOBAL_DEDUP_MANIFEST,
+    )
+    parser.add_argument(
         "--hash-archives",
         action="store_true",
         help="Hash every source archive; required for training_ready=true.",
@@ -582,6 +733,8 @@ def main() -> None:
         entries_per_part=args.entries_per_part,
         hash_archives=args.hash_archives,
         require_production_layout=True,
+        fixed_eval_manifest_path=args.fixed_eval_manifest,
+        stage179_global_dedup_manifest_path=args.stage179_global_dedup_manifest,
     )
 
 

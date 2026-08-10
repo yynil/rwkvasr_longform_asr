@@ -28,6 +28,10 @@ from rwkvasr.eval.stage211_gate import (
 from rwkvasr.eval.stage211_runtime import (
     audit_stage211_runtime_epoch_coverage,
 )
+from rwkvasr.eval.stage211_supplemental import (
+    STAGE211_SUPPLEMENTAL_DIFFICULTY,
+    stage211_supplemental_profile,
+)
 
 
 def _checkpoint_step(path: Path) -> int:
@@ -136,8 +140,28 @@ def build_receipt(
     bucket_manifest_path: Path,
     init_checkpoint_path: Path,
     completion_checkpoint_path: Path,
+    supplemental_inventory_path: Path | None = None,
 ) -> dict[str, Any]:
-    expected = STAGE211_AUDIO_CURRICULUM[difficulty]
+    supplemental_profile: dict[str, Any] | None = None
+    if difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY:
+        if supplemental_inventory_path is None:
+            raise ValueError("Stage211 supplemental coverage requires its inventory.")
+        supplemental_profile = stage211_supplemental_profile(
+            supplemental_inventory_path,
+            epochs=STAGE211_FULL_DATA_EPOCHS,
+            batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+            world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+            frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+            require_training_ready=True,
+            verify_part_sha256=True,
+        )
+        expected = supplemental_profile
+    else:
+        if supplemental_inventory_path is not None:
+            raise ValueError(
+                "Stage211 supplemental inventory is valid only for supplemental_natural."
+            )
+        expected = STAGE211_AUDIO_CURRICULUM[difficulty]
     run_dir = run_dir.resolve()
     bucket_manifest_path = bucket_manifest_path.resolve()
     init_checkpoint_path = init_checkpoint_path.resolve()
@@ -151,6 +175,10 @@ def build_receipt(
         exists = path.is_dir() if label == "run directory" else path.is_file()
         if not exists:
             raise FileNotFoundError(f"Stage211 {difficulty} {label} is unavailable: {path}")
+    if supplemental_profile is not None and bucket_manifest_path != Path(
+        str(supplemental_profile["bucket_manifest_path"])
+    ).resolve():
+        raise ValueError("Stage211 supplemental receipt manifest differs from its inventory.")
 
     manifest = load_webdataset_bucket_manifest(bucket_manifest_path)
     rows = sum(bucket.num_samples for bucket in manifest.splits.get("train", ()))
@@ -236,7 +264,7 @@ def build_receipt(
         epochs=STAGE211_FULL_DATA_EPOCHS,
         steps_per_epoch=steps_per_epoch,
     )
-    return {
+    receipt = {
         "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "curriculum_coverage",
@@ -280,6 +308,14 @@ def build_receipt(
         "parameter_delta_audit": parameter_delta_audit,
         "runtime_epoch_coverage": runtime_epoch_coverage,
     }
+    if supplemental_profile is not None:
+        receipt["supplemental_inventory_path"] = str(
+            supplemental_profile["inventory_path"]
+        )
+        receipt["supplemental_inventory_sha256"] = str(
+            supplemental_profile["inventory_sha256"]
+        )
+    return receipt
 
 
 def main() -> int:
@@ -289,9 +325,10 @@ def main() -> int:
     parser.add_argument("--phase", choices=("mixer", "block", "logits"), required=True)
     parser.add_argument(
         "--difficulty",
-        choices=tuple(STAGE211_AUDIO_CURRICULUM),
+        choices=(*tuple(STAGE211_AUDIO_CURRICULUM), STAGE211_SUPPLEMENTAL_DIFFICULTY),
         required=True,
     )
+    parser.add_argument("--supplemental-inventory", type=Path, default=None)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--bucket-manifest", type=Path, required=True)
     parser.add_argument("--init-checkpoint", type=Path, required=True)
@@ -306,6 +343,7 @@ def main() -> int:
         bucket_manifest_path=args.bucket_manifest,
         init_checkpoint_path=args.init_checkpoint,
         completion_checkpoint_path=args.completion_checkpoint,
+        supplemental_inventory_path=args.supplemental_inventory,
     )
     output_path = args.output.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)

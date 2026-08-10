@@ -26,6 +26,11 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_phase_gate_report,
     validate_stage211_runtime_epoch_coverage,
 )
+from rwkvasr.eval.stage211_supplemental import (
+    DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
+    STAGE211_SUPPLEMENTAL_DIFFICULTY,
+    stage211_supplemental_profile,
+)
 
 try:
     from scripts.run_stage210n_full_easy_spike_tolerant_distill import (
@@ -70,6 +75,7 @@ VOLATILE_OUTPUT_ROOTS = tuple(Path(path).resolve() for path in ("/tmp", "/var/tm
 HARD_LAYER_IDS = (0, 11, 12, 17, 20, 49, 50, 69)
 PHASE_SEQUENCE = ("mixer", "block", "logits", "sft")
 CURRICULUM_SEQUENCE = tuple(STAGE211_AUDIO_CURRICULUM)
+ALL_CURRICULUM_DIFFICULTIES = (*CURRICULUM_SEQUENCE, STAGE211_SUPPLEMENTAL_DIFFICULTY)
 PROMOTION_RECEIPT_SCHEMA_VERSION = 1
 TRAIN_BATCH_SIZE = 12
 TRAIN_WORLD_SIZE = STAGE211_FULL_DATA_WORLD_SIZE
@@ -249,11 +255,18 @@ def _segments(
             raise ValueError("Stage211 SFT requires the estimated full labeled-epoch step count.")
         target_step = int(formal_steps)
     else:
-        target_step = int(
-            STAGE211_AUDIO_CURRICULUM[difficulty]["steps"]
-            if full_data_profile
-            else LEGACY_CURRICULUM_STEPS[difficulty]
-        )
+        if difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY:
+            if not full_data_profile or formal_steps is None or int(formal_steps) <= 0:
+                raise ValueError(
+                    "Stage211 supplemental natural audio requires its dynamic full-data steps."
+                )
+            target_step = int(formal_steps)
+        else:
+            target_step = int(
+                STAGE211_AUDIO_CURRICULUM[difficulty]["steps"]
+                if full_data_profile
+                else LEGACY_CURRICULUM_STEPS[difficulty]
+            )
     formal_name = (
         f"{phase.name}_full_{target_step}steps"
         if difficulty == "easy"
@@ -462,10 +475,15 @@ def _validate_curriculum_receipt(
         raise ValueError(f"Invalid Stage211 curriculum receipt: {receipt_path}") from error
     if not isinstance(receipt, dict):
         raise ValueError("Stage211 curriculum receipt must be a JSON object.")
-    target_index = CURRICULUM_SEQUENCE.index(target_difficulty)
-    if target_index <= 0:
+    if target_difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY:
+        expected_difficulty = CURRICULUM_SEQUENCE[-1]
+    else:
+        target_index = CURRICULUM_SEQUENCE.index(target_difficulty)
+        if target_index <= 0:
+            raise ValueError("Stage211 easy curriculum does not accept a predecessor receipt.")
+        expected_difficulty = CURRICULUM_SEQUENCE[target_index - 1]
+    if target_difficulty == "easy":
         raise ValueError("Stage211 easy curriculum does not accept a predecessor receipt.")
-    expected_difficulty = CURRICULUM_SEQUENCE[target_index - 1]
     expected_fields = {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -1132,8 +1150,17 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--config-dir", type=Path, default=DEFAULT_CONFIG_DIR)
     parser.add_argument("--bucket-manifest", type=Path, default=None)
-    parser.add_argument("--difficulty", choices=CURRICULUM_SEQUENCE, default=None)
+    parser.add_argument("--difficulty", choices=ALL_CURRICULUM_DIFFICULTIES, default=None)
     parser.add_argument("--curriculum-receipt", type=Path, default=None)
+    parser.add_argument(
+        "--supplemental-inventory",
+        type=Path,
+        default=None,
+        help=(
+            "Immutable supplemental-natural inventory; required only for "
+            f"--difficulty {STAGE211_SUPPLEMENTAL_DIFFICULTY}."
+        ),
+    )
     parser.add_argument("--full-data-profile", action="store_true")
     parser.add_argument("--labeled-webdataset-root", type=Path, default=None)
     parser.add_argument("--labeled-length-index", type=Path, default=None)
@@ -1163,6 +1190,14 @@ def main() -> int:
         difficulty = str(args.difficulty or "easy")
         if args.full_data_profile and args.difficulty is None:
             parser.error("--full-data-profile requires an explicit --difficulty")
+    is_supplemental = difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY
+    if is_supplemental and args.supplemental_inventory is None:
+        parser.error(
+            f"--difficulty {STAGE211_SUPPLEMENTAL_DIFFICULTY} requires "
+            "--supplemental-inventory"
+        )
+    if not is_supplemental and args.supplemental_inventory is not None:
+        parser.error("--supplemental-inventory is valid only for supplemental_natural")
     if args.skip_nano_weight_audit and not args.dry_run:
         parser.error("--skip-nano-weight-audit is allowed only with --dry-run")
     bucket_manifest = args.bucket_manifest
@@ -1190,6 +1225,47 @@ def main() -> int:
         formal_steps = int(labeled_data_audit["estimated_train_steps"])
     elif args.labeled_webdataset_root is not None or args.labeled_length_index is not None:
         parser.error("labeled data arguments are valid only for --phase sft")
+    elif is_supplemental:
+        supplemental_profile = stage211_supplemental_profile(
+            args.supplemental_inventory or DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
+            epochs=STAGE211_FULL_DATA_EPOCHS,
+            batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+            world_size=TRAIN_WORLD_SIZE,
+            frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+            require_training_ready=not args.dry_run,
+            verify_part_sha256=False,
+        )
+        if Path(str(supplemental_profile["bucket_manifest_path"])).resolve() != Path(
+            bucket_manifest
+        ).resolve():
+            raise ValueError(
+                "Stage211 supplemental inventory does not bind the requested bucket manifest."
+            )
+        formal_steps = int(supplemental_profile["steps"])
+        if not args.dry_run:
+            audio_data_audit = _audit_audio_bucket_storage(bucket_manifest)
+            audio_data_audit["supplemental_inventory_path"] = str(
+                supplemental_profile["inventory_path"]
+            )
+            audio_data_audit["supplemental_inventory_sha256"] = str(
+                supplemental_profile["inventory_sha256"]
+            )
+            audio_data_audit["supplemental_rows"] = int(supplemental_profile["rows"])
+            audio_data_audit["supplemental_hours"] = float(supplemental_profile["hours"])
+            audio_data_audit["supplemental_steps_per_epoch"] = int(
+                supplemental_profile["steps_per_epoch"]
+            )
+            audio_data_audit["supplemental_tail_padding_samples_per_epoch"] = int(
+                supplemental_profile["tail_padding_samples_per_epoch"]
+            )
+            if int(audio_data_audit["split_samples"].get("train", 0)) != int(
+                supplemental_profile["rows"]
+            ):
+                raise ValueError("Stage211 supplemental manifest train-row count mismatch.")
+            if int(audio_data_audit["split_samples"].get("eval", 0)) != (
+                FIXED_HIDDEN_EVAL_SAMPLES
+            ):
+                raise ValueError("Stage211 supplemental manifest fixed-eval count mismatch.")
     elif not args.dry_run:
         audio_data_audit = _audit_audio_bucket_storage(bucket_manifest)
         manifest = load_webdataset_bucket_manifest(bucket_manifest)
@@ -1389,6 +1465,16 @@ def main() -> int:
             f"steps={labeled_data_audit['estimated_train_steps']}",
             flush=True,
         )
+        if is_supplemental:
+            print(
+                "supplemental_audio_audit="
+                f"rows={audio_data_audit['supplemental_rows']} "
+                f"hours={audio_data_audit['supplemental_hours']:.6f} "
+                f"steps_per_epoch={audio_data_audit['supplemental_steps_per_epoch']} "
+                "inventory_sha256="
+                f"{audio_data_audit['supplemental_inventory_sha256']}",
+                flush=True,
+            )
     if audio_data_audit is not None:
         print(
             "audio_data_audit="

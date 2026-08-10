@@ -25,6 +25,7 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_phase_gate_report,
     validate_stage211_public_overlap_binding,
 )
+from rwkvasr.eval.stage211_supplemental import STAGE211_SUPPLEMENTAL_DIFFICULTY
 
 try:
     from scripts.compare_public_ctc_with_nano import compare_dataset
@@ -55,7 +56,11 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     return payload
 
 
-def _parse_coverage_receipts(values: list[Path], *, phase: str) -> list[dict[str, Any]]:
+def _parse_coverage_receipts(
+    values: list[Path],
+    *,
+    phase: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     receipts: dict[str, dict[str, Any]] = {}
     for path in values:
         resolved = path.resolve()
@@ -66,7 +71,8 @@ def _parse_coverage_receipts(values: list[Path], *, phase: str) -> list[dict[str
             or receipt.get("artifact") != "curriculum_coverage"
             or receipt.get("phase") != phase
             or receipt.get("complete") is not True
-            or difficulty not in STAGE211_AUDIO_CURRICULUM
+            or difficulty
+            not in {*STAGE211_AUDIO_CURRICULUM, STAGE211_SUPPLEMENTAL_DIFFICULTY}
         ):
             raise ValueError(f"Invalid Stage211 curriculum coverage receipt: {resolved}")
         if difficulty in receipts:
@@ -76,9 +82,16 @@ def _parse_coverage_receipts(values: list[Path], *, phase: str) -> list[dict[str
             "receipt_path": str(resolved),
             "receipt_sha256": sha256_file(resolved),
         }
-    if set(receipts) != set(STAGE211_AUDIO_CURRICULUM):
-        raise ValueError("Stage211 phase gate requires easy, medium, hard, and long receipts.")
-    return [receipts[difficulty] for difficulty in STAGE211_AUDIO_CURRICULUM]
+    required = {*STAGE211_AUDIO_CURRICULUM, STAGE211_SUPPLEMENTAL_DIFFICULTY}
+    if set(receipts) != required:
+        raise ValueError(
+            "Stage211 phase gate requires easy, medium, hard, long, and "
+            "supplemental_natural receipts."
+        )
+    return (
+        [receipts[difficulty] for difficulty in STAGE211_AUDIO_CURRICULUM],
+        receipts[STAGE211_SUPPLEMENTAL_DIFFICULTY],
+    )
 
 
 def _jsonl_records(
@@ -391,7 +404,10 @@ def build_phase_gate(
         raise ValueError("Stage211 public comparison checkpoint path mismatch.")
     if public_report.get("student_checkpoint_sha256") != sha256_file(checkpoint_path):
         raise ValueError("Stage211 public comparison checkpoint SHA-256 mismatch.")
-    coverage = _parse_coverage_receipts(coverage_receipt_paths, phase=phase)
+    coverage, supplemental_coverage = _parse_coverage_receipts(
+        coverage_receipt_paths,
+        phase=phase,
+    )
     correction_receipts = load_stage211_post_coverage_correction_receipts(
         list(post_coverage_correction_receipt_paths or []),
         phase=phase,
@@ -520,6 +536,9 @@ def build_phase_gate(
     teacher_sha256_values = {
         str(segment.get("nano_teacher_checkpoint_sha256") or "") for segment in coverage
     }
+    teacher_sha256_values.add(
+        str(supplemental_coverage.get("nano_teacher_checkpoint_sha256") or "")
+    )
     if len(teacher_sha256_values) != 1:
         raise ValueError(
             "Stage211 phase coverage does not bind one Nano teacher checkpoint SHA-256."
@@ -592,6 +611,7 @@ def build_phase_gate(
             segments=coverage,
             checkpoint_path=checkpoint_path,
             post_coverage_corrections=correction_receipts,
+            supplemental_segment=supplemental_coverage,
         ),
         "public_comparison_report_path": str(public_comparison_report_path),
         "public_comparison_report_sha256": sha256_file(public_comparison_report_path),

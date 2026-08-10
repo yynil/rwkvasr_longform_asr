@@ -60,7 +60,7 @@ stage211_choose_start_stage() {
     printf '%s\n' block
   elif stage211_json_matches \
     "${MIXER_COMPLETE}" \
-    '.pipeline == "stage211" and .artifact == "full_phase_curriculum" and .phase == "mixer" and .complete == true'; then
+    '.pipeline == "stage211" and .artifact == "full_phase_curriculum" and .phase == "mixer" and .complete == true and .full_data_coverage.supplemental_natural.complete == true and .full_data_coverage.supplemental_natural.epochs == 3'; then
     printf '%s\n' post_mixer
   else
     printf '%s\n' full
@@ -89,7 +89,7 @@ stage211_final_proof_valid() {
 
   stage211_json_matches \
     "${FINAL_STEPWISE_REPORT}" \
-    '.pipeline == "stage211" and .artifact == "stepwise_final_results" and .complete == true and .gate_passed == true and .strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"] and .checkpoint_chain_passed == true and .nano_teacher_chain_passed == true and .nano_public_baseline_provenance_passed == true and (.coverage_results | length) == 4 and (.dataset_results | length) == 5'
+    '.pipeline == "stage211" and .artifact == "stepwise_final_results" and .complete == true and .gate_passed == true and .strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"] and .requested_alignment_stage_order == ["rwkv_layer", "block", "logits", "sft"] and .checkpoint_chain_passed == true and .nano_teacher_chain_passed == true and .nano_public_baseline_provenance_passed == true and .supplemental_inventory_chain_passed == true and (.coverage_results | length) == 4 and ([.coverage_results[] | select(.stage == "mixer" or .stage == "block" or .stage == "logits")] | length) == 3 and ([.coverage_results[] | select(.stage == "mixer" or .stage == "block" or .stage == "logits") | (.training_segments | length == 5 and all(.[]; .epochs == 3))] | all) and (.dataset_results | length) == 5'
 }
 
 stage211_start_supervisor() {

@@ -117,6 +117,10 @@ def _resolve_curriculum(
         Path(str(by_difficulty[difficulty]["receipt_path"])).resolve()
         for difficulty in STAGE211_AUDIO_CURRICULUM
     ]
+    supplemental = coverage.get("supplemental_natural")
+    if not isinstance(supplemental, dict):
+        raise ValueError("Stage211 curriculum summary lacks supplemental_natural.")
+    receipt_paths.append(Path(str(supplemental["receipt_path"])).resolve())
     return coverage, checkpoint, receipt_paths
 
 
@@ -262,6 +266,7 @@ def finalize_phase(args: argparse.Namespace) -> Path:
             segments=segments,
             checkpoint_path=checkpoint,
             post_coverage_corrections=correction_receipts,
+            supplemental_segment=coverage.get("supplemental_natural"),
         )
         validate_stage211_full_data_coverage(
             coverage,

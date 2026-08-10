@@ -540,6 +540,8 @@ def _write_stepwise_inputs(
         "nano_public_baseline_receipt_sha256": sha256_file(nano_baseline_receipt),
         "nano_public_baseline_checkpoint_sha256": nano_teacher_sha256,
     }
+    supplemental_inventory = tmp_path / "supplemental-inventory.json"
+    supplemental_inventory.write_text("{}\n", encoding="utf-8")
 
     calibration_receipt = tmp_path / "calibration-reuse.json"
     calibration_receipt.write_text(
@@ -570,6 +572,39 @@ def _write_stepwise_inputs(
     for index, stage in enumerate(("mixer", "block", "logits"), start=1):
         preflight_marker = tmp_path / f"{stage}-preflight-smoke.json"
         preflight_marker.write_text("{}\n", encoding="utf-8")
+        training_segments = [
+            {
+                "difficulty": difficulty,
+                "rows": 20,
+                "hours": 2.0,
+                "epochs": 3,
+                "steps_per_epoch": 1,
+                "steps": 3,
+                "row_exposures": 60,
+                "hour_exposures": 6.0,
+                "tail_padding_sample_exposures": 1,
+                "executed_sample_exposures": 61,
+                "init_checkpoint_path": str(checkpoints[previous].resolve()),
+                "init_checkpoint_sha256": sha256_file(checkpoints[previous]),
+                "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
+            }
+            for difficulty in ("easy", "medium", "hard", "long")
+        ]
+        supplemental_segment = {
+            "difficulty": "supplemental_natural",
+            "rows": 20,
+            "hours": 2.0,
+            "epochs": 3,
+            "steps_per_epoch": 1,
+            "steps": 3,
+            "row_exposures": 60,
+            "hour_exposures": 6.0,
+            "tail_padding_sample_exposures": 1,
+            "executed_sample_exposures": 61,
+            "supplemental_inventory_path": str(supplemental_inventory.resolve()),
+            "supplemental_inventory_sha256": sha256_file(supplemental_inventory),
+            "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
+        }
         gate = tmp_path / f"{stage}-gate.json"
         gate.write_text(
             json.dumps(
@@ -587,18 +622,15 @@ def _write_stepwise_inputs(
                     **nano_baseline_binding,
                     "public_overlap": public_overlap,
                     "full_data_coverage": {
+                        "original_total_unique_rows": 80,
                         "total_unique_rows": 100,
                         "total_hours": 10.0,
                         "total_row_exposures": 300,
                         "total_hour_exposures": 30.0,
-                        "total_executed_sample_exposures": 304,
-                        "segments": [
-                            {
-                                "init_checkpoint_path": str(checkpoints[previous].resolve()),
-                                "init_checkpoint_sha256": sha256_file(checkpoints[previous]),
-                                "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
-                            }
-                        ],
+                        "total_tail_padding_sample_exposures": 5,
+                        "total_executed_sample_exposures": 305,
+                        "segments": training_segments,
+                        "supplemental_natural": supplemental_segment,
                     },
                     "public_benchmark": _bound_public_benchmark(
                         tmp_path,
@@ -948,6 +980,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     }
     assert report["checkpoint_chain_passed"] is True
     assert report["nano_teacher_chain_passed"] is True
+    assert report["supplemental_inventory_chain_passed"] is True
     assert report["public_overlap_chain_passed"] is True
     assert report["public_overlap_receipt_sha256"] == sha256_file(
         tmp_path / "public-overlap-receipt.json"
@@ -964,6 +997,8 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "sft",
     ]
     assert report["coverage_results"][0]["epochs"] == 3
+    assert report["coverage_results"][0]["supplemental_unique_rows"] == 20
+    assert len(report["coverage_results"][0]["training_segments"]) == 5
     assert report["coverage_results"][-1]["unique_or_train_rows"] == 80
     assert len(report["dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert report["stages"][-1]["checkpoint_sha256"] == sha256_file(checkpoints["sft"])
@@ -975,6 +1010,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "Layer A" in output_markdown.read_text(encoding="utf-8")
     assert "SFT D" in output_markdown.read_text(encoding="utf-8")
     assert "Training Coverage" in output_markdown.read_text(encoding="utf-8")
+    assert "Full Data Segment Proof" in output_markdown.read_text(encoding="utf-8")
     sft_finalizer._validate_final_report(
         reports["sft"],
         checkpoint=checkpoints["sft"],

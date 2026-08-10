@@ -13,18 +13,18 @@ import torch
 
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
-    STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES,
-    STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
-    STAGE211_AUDIO_TOTAL_HOURS,
-    STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
-    STAGE211_AUDIO_TOTAL_ROWS,
-    STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES,
     STAGE211_FULL_DATA_BATCH_SIZE,
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
+    build_stage211_full_data_coverage,
     sha256_file,
     validate_stage211_full_data_coverage,
+)
+from rwkvasr.eval.stage211_supplemental import (
+    DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
+    STAGE211_SUPPLEMENTAL_DIFFICULTY,
+    stage211_supplemental_profile,
 )
 
 
@@ -109,7 +109,7 @@ def _checkpoint_step(path: Path) -> int:
 def _formal_phase_training_started(phase_root: Path) -> bool:
     if any((phase_root / "receipts").glob("*.json")):
         return True
-    for difficulty in STAGE211_AUDIO_CURRICULUM:
+    for difficulty in (*STAGE211_AUDIO_CURRICULUM, STAGE211_SUPPLEMENTAL_DIFFICULTY):
         run_dir = phase_root / difficulty
         if _latest_step(run_dir) > 0 or (run_dir / "latest_checkpoint.yaml").exists():
             return True
@@ -182,6 +182,7 @@ def _runner_command(
     promotion_receipt: Path | None,
     smoke: bool,
     dry_run: bool,
+    supplemental_inventory: Path | None = None,
 ) -> list[str]:
     command = [
         str(PYTHON),
@@ -208,6 +209,8 @@ def _runner_command(
         command.extend(("--curriculum-receipt", str(curriculum_receipt)))
     if promotion_receipt is not None:
         command.extend(("--promotion-receipt", str(promotion_receipt)))
+    if supplemental_inventory is not None:
+        command.extend(("--supplemental-inventory", str(supplemental_inventory)))
     if smoke:
         command.append("--smoke")
     if dry_run:
@@ -224,8 +227,9 @@ def _receipt_command(
     init_checkpoint: Path,
     completion_checkpoint: Path,
     output: Path,
+    supplemental_inventory: Path | None = None,
 ) -> list[str]:
-    return [
+    command = [
         str(PYTHON),
         str(RECEIPT_CREATOR),
         "--phase",
@@ -243,6 +247,9 @@ def _receipt_command(
         "--output",
         str(output),
     ]
+    if supplemental_inventory is not None:
+        command.extend(("--supplemental-inventory", str(supplemental_inventory)))
+    return command
 
 
 def _resolve_initial_checkpoint(
@@ -334,6 +341,43 @@ def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
         raise ValueError(f"Refusing to overwrite a different Stage211 artifact: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(rendered, encoding="utf-8")
+
+
+def _migrate_legacy_curriculum_summary(*, phase_root: Path, phase: str) -> None:
+    summary_path = phase_root / "curriculum_complete.json"
+    archive_path = phase_root / "curriculum_complete.original_only.json"
+    migration_path = phase_root / "curriculum_complete.original_only.migration.json"
+    if summary_path.is_file():
+        summary = _load_json(
+            summary_path,
+            label="Stage211 existing curriculum summary",
+        )
+        coverage = summary.get("full_data_coverage")
+        if not isinstance(coverage, dict):
+            raise ValueError(f"Stage211 curriculum summary coverage is invalid: {summary_path}")
+        if "supplemental_natural" in coverage:
+            return
+        if archive_path.is_file():
+            if summary_path.read_bytes() != archive_path.read_bytes():
+                raise ValueError(
+                    "Stage211 legacy summary differs from its existing archive: "
+                    f"{summary_path}"
+                )
+            summary_path.unlink()
+        else:
+            summary_path.replace(archive_path)
+    if archive_path.is_file():
+        _write_immutable_json(
+            migration_path,
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "supplemental_summary_migration",
+                "phase": phase,
+                "archived_path": str(archive_path.resolve()),
+                "archived_sha256": sha256_file(archive_path),
+            },
+        )
 
 
 def _validate_smoke_marker(
@@ -504,9 +548,10 @@ def _load_reusable_receipt(
     manifest_path: Path,
     init_checkpoint: Path,
     completion_checkpoint: Path,
+    expected_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     receipt = _load_json(receipt_path, label="Stage211 reusable curriculum receipt")
-    expected = STAGE211_AUDIO_CURRICULUM[difficulty]
+    expected = expected_profile or STAGE211_AUDIO_CURRICULUM[difficulty]
     expected_fields = {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -585,6 +630,13 @@ def _load_reusable_receipt(
         difficulty=difficulty,
         steps_per_epoch=int(expected["steps_per_epoch"]),
     )
+    if expected_profile is not None:
+        for key in ("supplemental_inventory_path", "supplemental_inventory_sha256"):
+            expected_key = "inventory_path" if key.endswith("_path") else "inventory_sha256"
+            if receipt.get(key) != expected_profile.get(expected_key):
+                raise ValueError(
+                    f"Stage211 {phase}/{difficulty} reusable supplemental inventory changed."
+                )
     return {
         **receipt,
         "receipt_path": str(receipt_path.resolve()),
@@ -608,6 +660,17 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             raise FileNotFoundError(
                 f"Stage211 {difficulty} fixed-eval manifest unavailable: {manifest}"
             )
+    supplemental_inventory = args.supplemental_inventory.expanduser().resolve()
+    supplemental_profile = stage211_supplemental_profile(
+        supplemental_inventory,
+        epochs=STAGE211_FULL_DATA_EPOCHS,
+        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+        require_training_ready=not args.dry_run,
+        verify_part_sha256=False,
+    )
+    supplemental_manifest = Path(str(supplemental_profile["bucket_manifest_path"])).resolve()
     nano_checkpoint = args.nano_checkpoint.expanduser().resolve()
     if not nano_checkpoint.is_file() or nano_checkpoint.stat().st_size <= 0:
         raise FileNotFoundError(str(nano_checkpoint))
@@ -666,6 +729,7 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             ),
             smoke=False,
             dry_run=bool(args.dry_run),
+            supplemental_inventory=None,
         )
         _run_command(runner, dry_run=bool(args.dry_run))
         completion_checkpoint = run_dir / f"step-{target_step}.pt"
@@ -710,6 +774,7 @@ def run_phase(args: argparse.Namespace) -> Path | None:
                 init_checkpoint=current_init,
                 completion_checkpoint=completion_checkpoint,
                 output=receipt_path,
+                supplemental_inventory=None,
             )
             _run_command(receipt_command, dry_run=False)
             receipt = _load_enriched_receipt(receipt_path)
@@ -727,32 +792,93 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             if receipt.get("difficulty") != difficulty:
                 raise ValueError(f"Stage211 receipt cannot admit {next_difficulty}: {receipt_path}")
 
+    supplemental_run_dir = phase_root / STAGE211_SUPPLEMENTAL_DIFFICULTY
+    supplemental_receipt_path = (
+        phase_root / "receipts" / f"{STAGE211_SUPPLEMENTAL_DIFFICULTY}.json"
+    )
+    supplemental_target_step = int(supplemental_profile["steps"])
+    supplemental_latest_step = _latest_step(supplemental_run_dir)
+    supplemental_runner = _runner_command(
+        phase=phase,
+        difficulty=STAGE211_SUPPLEMENTAL_DIFFICULTY,
+        output_dir=supplemental_run_dir,
+        config_dir=config_root,
+        manifest_path=supplemental_manifest,
+        nano_checkpoint=nano_checkpoint,
+        master_port=int(args.master_port),
+        init_checkpoint=current_init if supplemental_latest_step <= 0 else None,
+        curriculum_receipt=preceding_receipt if supplemental_latest_step <= 0 else None,
+        promotion_receipt=None,
+        smoke=False,
+        dry_run=bool(args.dry_run),
+        supplemental_inventory=supplemental_inventory,
+    )
+    _run_command(supplemental_runner, dry_run=bool(args.dry_run))
+    supplemental_completion = supplemental_run_dir / f"step-{supplemental_target_step}.pt"
+    if args.dry_run:
+        print(
+            f"[stage211-full-phase] dry-run completion={supplemental_completion} "
+            f"receipt={supplemental_receipt_path}",
+            flush=True,
+        )
+        return None
+    if (
+        not supplemental_completion.is_file()
+        or _checkpoint_step(supplemental_completion) != supplemental_target_step
+    ):
+        raise ValueError(
+            "Stage211 supplemental_natural lacks exact completion checkpoint "
+            f"step={supplemental_target_step}: {supplemental_completion}"
+        )
+    if supplemental_receipt_path.is_file():
+        supplemental_receipt = _load_reusable_receipt(
+            supplemental_receipt_path,
+            phase=phase,
+            difficulty=STAGE211_SUPPLEMENTAL_DIFFICULTY,
+            run_dir=supplemental_run_dir,
+            manifest_path=supplemental_manifest,
+            init_checkpoint=current_init,
+            completion_checkpoint=supplemental_completion,
+            expected_profile=supplemental_profile,
+        )
+    else:
+        supplemental_receipt_command = _receipt_command(
+            phase=phase,
+            difficulty=STAGE211_SUPPLEMENTAL_DIFFICULTY,
+            run_dir=supplemental_run_dir,
+            manifest_path=supplemental_manifest,
+            init_checkpoint=current_init,
+            completion_checkpoint=supplemental_completion,
+            output=supplemental_receipt_path,
+            supplemental_inventory=supplemental_inventory,
+        )
+        _run_command(supplemental_receipt_command, dry_run=False)
+        supplemental_receipt = _load_enriched_receipt(supplemental_receipt_path)
+    print(
+        "[stage211-full-phase] segment complete "
+        f"difficulty={STAGE211_SUPPLEMENTAL_DIFFICULTY} "
+        f"step={supplemental_target_step} "
+        f"receipt_sha256={supplemental_receipt['receipt_sha256']}",
+        flush=True,
+    )
+    current_init = supplemental_completion
+
     if args.dry_run:
         return None
     final_checkpoint = current_init.resolve()
-    coverage = {
-        "phase": phase,
-        "complete": True,
-        "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
-        "total_hours": STAGE211_AUDIO_TOTAL_HOURS,
-        "total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
-        "total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
-        "total_tail_padding_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
-        ),
-        "total_executed_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
-        ),
-        "segments": receipts,
-        "final_checkpoint_path": str(final_checkpoint),
-        "final_checkpoint_sha256": sha256_file(final_checkpoint),
-    }
+    coverage = build_stage211_full_data_coverage(
+        phase=phase,
+        segments=receipts,
+        supplemental_segment=supplemental_receipt,
+        checkpoint_path=final_checkpoint,
+    )
     validate_stage211_full_data_coverage(
         coverage,
         phase=phase,
         checkpoint_path=final_checkpoint,
     )
     summary_path = phase_root / "curriculum_complete.json"
+    _migrate_legacy_curriculum_summary(phase_root=phase_root, phase=phase)
     _write_immutable_json(
         summary_path,
         {
@@ -792,7 +918,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Run one strict Stage211 A/B/C phase over easy, medium, hard, and long "
-            "with three full epochs per segment and immutable coverage receipts."
+            "plus supplemental natural audio with three full epochs per segment and "
+            "immutable coverage receipts."
         )
     )
     parser.add_argument("--phase", choices=tuple(PHASE_DIR_NAMES), required=True)
@@ -809,6 +936,11 @@ def main() -> int:
         help="Override one manifest as difficulty=/absolute/path.",
     )
     parser.add_argument("--nano-checkpoint", type=Path, default=DEFAULT_NANO_CHECKPOINT)
+    parser.add_argument(
+        "--supplemental-inventory",
+        type=Path,
+        default=DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
+    )
     parser.add_argument("--master-port", type=int, default=29631)
     parser.add_argument("--max-peak-reserved-gib", type=float, default=22.0)
     parser.add_argument("--final-checkpoint-path-output", type=Path, default=None)
