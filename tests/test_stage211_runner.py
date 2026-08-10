@@ -50,6 +50,9 @@ stage211_phase_gate = importlib.import_module("scripts.create_stage211_phase_gat
 stage211_full_phase = importlib.import_module("scripts.run_stage211_full_phase_curriculum")
 stage211_phase_finalizer = importlib.import_module("scripts.finalize_stage211_phase")
 stage211_calibration_eval = importlib.import_module("scripts.validate_stage211_calibration_eval")
+stage211_supplemental_profile_receipt = importlib.import_module(
+    "scripts.create_stage211_supplemental_profile_receipt"
+)
 
 
 def test_stage211_controllers_preserve_virtualenv_python() -> None:
@@ -1762,6 +1765,36 @@ def _write_supplemental_inventory_fixture(
         world_size=STAGE211_FULL_DATA_WORLD_SIZE,
         frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
     )
+
+
+def test_stage211_supplemental_profile_receipt_is_complete_and_immutable(
+    tmp_path: Path,
+) -> None:
+    inventory_path, profile = _write_supplemental_inventory_fixture(tmp_path)
+    receipt = stage211_supplemental_profile_receipt.build_receipt(inventory_path)
+
+    assert receipt["complete"] is True
+    assert receipt["inventory_sha256"] == sha256_file(inventory_path)
+    assert receipt["rows"] == profile["rows"]
+    assert receipt["hours"] == profile["hours"]
+    assert receipt["epochs"] == STAGE211_FULL_DATA_EPOCHS
+    assert receipt["steps"] == profile["steps"]
+    assert receipt["train_part_count"] == 1
+    assert receipt["archive_status_counts"] == {"unknown:absent": 1}
+
+    output = tmp_path / "supplemental-profile-receipt.json"
+    stage211_supplemental_profile_receipt.write_immutable_receipt(output, receipt)
+    stage211_supplemental_profile_receipt.write_immutable_receipt(output, receipt)
+    changed = {**receipt, "steps": int(receipt["steps"]) + 1}
+    with pytest.raises(ValueError, match="Refusing to replace a different"):
+        stage211_supplemental_profile_receipt.write_immutable_receipt(output, changed)
+
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    train_part = Path(inventory["part_records"][0]["path"])
+    payload = train_part.read_bytes()
+    train_part.write_bytes(b"X" + payload[1:])
+    with pytest.raises(ValueError, match="supplemental train part changed"):
+        stage211_supplemental_profile_receipt.build_receipt(inventory_path)
 
 
 def _write_supplemental_coverage_fixture(
