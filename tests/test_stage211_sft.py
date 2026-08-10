@@ -509,6 +509,8 @@ def _write_stepwise_inputs(
                 "public_comparison_report_sha256": sha256_file(support["sft-comparison"]),
                 "logits_promotion_receipt_path": str(support["logits-promotion"].resolve()),
                 "logits_promotion_receipt_sha256": sha256_file(support["logits-promotion"]),
+                "logits_phase_gate_path": str(reports["logits"].resolve()),
+                "logits_phase_gate_sha256": sha256_file(reports["logits"]),
                 "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
                 **nano_baseline_binding,
@@ -521,6 +523,8 @@ def _write_stepwise_inputs(
                     "complete": True,
                     "init_checkpoint_path": str(checkpoints["logits"].resolve()),
                     "init_checkpoint_sha256": sha256_file(checkpoints["logits"]),
+                    "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
+                    "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
                 },
                 "public_progress": {
                     "gate_passed": True,
@@ -624,6 +628,24 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "validate_stage211_phase_gate_report",
         validate_phase,
     )
+    sft_payload = json.loads(reports["sft"].read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        stepwise_report,
+        "_validate_sft_completion",
+        lambda path, checkpoint_path=None: (
+            sft_payload["labeled_data_coverage"],
+            checkpoint_path,
+        ),
+    )
+    monkeypatch.setattr(
+        stepwise_report,
+        "_validate_sft_promotion_receipt",
+        lambda **kwargs: {
+            "nano_teacher_checkpoint_sha256": sft_payload["nano_teacher_checkpoint_sha256"],
+            "gate_report_path": str(reports["logits"].resolve()),
+            "gate_report_sha256": sha256_file(reports["logits"]),
+        },
+    )
     output_json = tmp_path / "stepwise.json"
     output_markdown = tmp_path / "stepwise.md"
 
@@ -664,6 +686,21 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert (
         report["nano_public_baseline_checkpoint_sha256"] == report["nano_teacher_checkpoint_sha256"]
     )
+
+    sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
+    original_mixer_gate_sha256 = sft["mixer_phase_gate_sha256"]
+    sft["mixer_phase_gate_sha256"] = "a" * 64
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="selected Mixer gate"):
+        stepwise_report.build_stepwise_report(
+            calibration_receipt_path=reports["calibration"],
+            mixer_gate_path=reports["mixer"],
+            block_gate_path=reports["block"],
+            logits_gate_path=reports["logits"],
+            sft_final_report_path=reports["sft"],
+        )
+    sft["mixer_phase_gate_sha256"] = original_mixer_gate_sha256
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
 
     block = json.loads(reports["block"].read_text(encoding="utf-8"))
     original_baseline_sha256 = block["nano_public_baseline_checkpoint_sha256"]

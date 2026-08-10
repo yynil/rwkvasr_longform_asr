@@ -13,6 +13,23 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_public_benchmark,
 )
 
+try:
+    from scripts.run_stage211_labeled_sft import (
+        _validate_completion as _validate_sft_completion,
+    )
+    from scripts.run_stage211_strict_chained_alignment import (
+        _validate_promotion_receipt as _validate_sft_promotion_receipt,
+    )
+except ModuleNotFoundError as error:
+    if error.name != "scripts":
+        raise
+    from run_stage211_labeled_sft import (
+        _validate_completion as _validate_sft_completion,
+    )
+    from run_stage211_strict_chained_alignment import (
+        _validate_promotion_receipt as _validate_sft_promotion_receipt,
+    )
+
 
 STAGE_ORDER = ("calibration", "mixer", "block", "logits", "sft")
 STAGE_LABELS = {
@@ -157,44 +174,46 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
         sha_key="nano_teacher_checkpoint_sha256",
         label="Stage211 SFT Nano teacher checkpoint",
     )
-    completion = _load_json(
-        Path(str(report["sft_completion_path"])),
-        label="Stage211 SFT completion report",
+    completion_path = Path(str(report["sft_completion_path"])).resolve()
+    completion, completion_checkpoint = _validate_sft_completion(
+        completion_path,
+        checkpoint_path=checkpoint,
     )
+    if completion_checkpoint != checkpoint or coverage != completion:
+        raise ValueError(
+            "Stage211 SFT final report differs from its validated completion coverage."
+        )
     for key in (
         "nano_teacher_checkpoint_path",
         "nano_teacher_checkpoint_sha256",
     ):
         if completion.get(key) != report.get(key):
-            raise ValueError(
-                f"Stage211 SFT {key} differs from its completion report."
-            )
-    promotion = _load_json(
-        Path(str(report["logits_promotion_receipt_path"])),
-        label="Stage211 logits promotion receipt",
+            raise ValueError(f"Stage211 SFT {key} differs from its completion report.")
+    nano_teacher_checkpoint = Path(str(report["nano_teacher_checkpoint_path"])).resolve()
+    promotion = _validate_sft_promotion_receipt(
+        receipt_path=Path(str(report["logits_promotion_receipt_path"])),
+        target_phase="sft",
+        checkpoint_path=Path(str(coverage["init_checkpoint_path"])),
+        nano_checkpoint_path=nano_teacher_checkpoint,
     )
     if promotion.get("nano_teacher_checkpoint_sha256") != report.get(
         "nano_teacher_checkpoint_sha256"
     ):
-        raise ValueError(
-            "Stage211 SFT Nano teacher differs from the logits promotion receipt."
-        )
+        raise ValueError("Stage211 SFT Nano teacher differs from the logits promotion receipt.")
+    if Path(str(report.get("logits_phase_gate_path") or "")).resolve() != Path(
+        str(promotion.get("gate_report_path") or "")
+    ).resolve() or report.get("logits_phase_gate_sha256") != promotion.get("gate_report_sha256"):
+        raise ValueError("Stage211 SFT final report differs from its Logits promotion gate.")
     baseline_receipt = validate_stage211_nano_public_baseline_receipt(
         Path(str(report.get("nano_public_baseline_receipt_path") or "")),
-        expected_receipt_sha256=str(
-            report.get("nano_public_baseline_receipt_sha256") or ""
-        ),
-        expected_nano_checkpoint_sha256=str(
-            report.get("nano_teacher_checkpoint_sha256") or ""
-        ),
+        expected_receipt_sha256=str(report.get("nano_public_baseline_receipt_sha256") or ""),
+        expected_nano_checkpoint_sha256=str(report.get("nano_teacher_checkpoint_sha256") or ""),
         public_benchmark=benchmark,
     )
     if report.get("nano_public_baseline_checkpoint_sha256") != baseline_receipt.get(
         "nano_checkpoint_sha256"
     ):
-        raise ValueError(
-            "Stage211 SFT Nano public-baseline checkpoint binding mismatch."
-        )
+        raise ValueError("Stage211 SFT Nano public-baseline checkpoint binding mismatch.")
     return report, checkpoint
 
 
@@ -232,9 +251,7 @@ def _phase_nano_teacher_sha256(report: dict[str, Any]) -> str:
         if isinstance(segment, dict)
     }
     if len(values) != 1 or len(next(iter(values), "")) != 64:
-        raise ValueError(
-            "Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256."
-        )
+        raise ValueError("Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256.")
     return next(iter(values))
 
 
@@ -333,21 +350,22 @@ def build_stepwise_report(
         )
         phase_checkpoints[phase] = checkpoint
     sft, sft_checkpoint = _validate_sft_report(sft_final_report_path)
+    if Path(str(sft.get("mixer_phase_gate_path") or "")).resolve() != mixer_gate_path or sft.get(
+        "mixer_phase_gate_sha256"
+    ) != sha256_file(mixer_gate_path):
+        raise ValueError("Stage211 SFT final report does not bind the selected Mixer gate.")
+    if Path(str(sft.get("logits_phase_gate_path") or "")).resolve() != logits_gate_path or sft.get(
+        "logits_phase_gate_sha256"
+    ) != sha256_file(logits_gate_path):
+        raise ValueError("Stage211 SFT final report does not bind the promoted Logits gate.")
     teacher_sha256_by_stage = {
         phase: _phase_nano_teacher_sha256(phase_reports[phase])
         for phase in ("mixer", "block", "logits")
     }
-    teacher_sha256_by_stage["sft"] = str(
-        sft.get("nano_teacher_checkpoint_sha256") or ""
-    )
+    teacher_sha256_by_stage["sft"] = str(sft.get("nano_teacher_checkpoint_sha256") or "")
     unique_teacher_sha256 = set(teacher_sha256_by_stage.values())
-    if (
-        len(unique_teacher_sha256) != 1
-        or len(next(iter(unique_teacher_sha256), "")) != 64
-    ):
-        raise ValueError(
-            "Stage211 A/B/C/D Nano teacher checkpoint SHA-256 chain mismatch."
-        )
+    if len(unique_teacher_sha256) != 1 or len(next(iter(unique_teacher_sha256), "")) != 64:
+        raise ValueError("Stage211 A/B/C/D Nano teacher checkpoint SHA-256 chain mismatch.")
     nano_teacher_checkpoint_sha256 = next(iter(unique_teacher_sha256))
     baseline_bindings = {
         _nano_public_baseline_binding(phase_reports[phase])
@@ -355,9 +373,7 @@ def build_stepwise_report(
     }
     baseline_bindings.add(_nano_public_baseline_binding(sft))
     if len(baseline_bindings) != 1:
-        raise ValueError(
-            "Stage211 A/B/C/D Nano public-baseline provenance chain mismatch."
-        )
+        raise ValueError("Stage211 A/B/C/D Nano public-baseline provenance chain mismatch.")
     (
         nano_public_baseline_receipt_path,
         nano_public_baseline_receipt_sha256,
@@ -368,13 +384,8 @@ def build_stepwise_report(
         expected_receipt_sha256=nano_public_baseline_receipt_sha256,
         expected_nano_checkpoint_sha256=nano_teacher_checkpoint_sha256,
     )
-    if (
-        nano_public_baseline_checkpoint_sha256
-        != baseline_receipt["nano_checkpoint_sha256"]
-    ):
-        raise ValueError(
-            "Stage211 Nano public-baseline checkpoint binding mismatch."
-        )
+    if nano_public_baseline_checkpoint_sha256 != baseline_receipt["nano_checkpoint_sha256"]:
+        raise ValueError("Stage211 Nano public-baseline checkpoint binding mismatch.")
 
     checkpoints = {
         "calibration": calibration_checkpoint,
@@ -500,12 +511,8 @@ def build_stepwise_report(
         "nano_teacher_checkpoint_sha256": nano_teacher_checkpoint_sha256,
         "nano_public_baseline_provenance_passed": True,
         "nano_public_baseline_receipt_path": nano_public_baseline_receipt_path,
-        "nano_public_baseline_receipt_sha256": (
-            nano_public_baseline_receipt_sha256
-        ),
-        "nano_public_baseline_checkpoint_sha256": (
-            nano_public_baseline_checkpoint_sha256
-        ),
+        "nano_public_baseline_receipt_sha256": (nano_public_baseline_receipt_sha256),
+        "nano_public_baseline_checkpoint_sha256": (nano_public_baseline_checkpoint_sha256),
         "total_public_eval_samples_per_stage": sum(
             int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
         ),
@@ -524,8 +531,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"Nano teacher SHA-256: `{report['nano_teacher_checkpoint_sha256']}`",
         "",
-        "Nano public baseline provenance: "
-        f"`{report['nano_public_baseline_receipt_sha256']}`",
+        f"Nano public baseline provenance: `{report['nano_public_baseline_receipt_sha256']}`",
         "",
         "| Dataset | Metric | Samples | Nano | Calibration | Layer A | Block B | "
         "Logits C | SFT D | Final gap |",
