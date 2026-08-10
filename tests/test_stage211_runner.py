@@ -4164,7 +4164,7 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     )
 
     assert 'POLL_SECONDS="${POLL_SECONDS:-3600}"' in script
-    assert 'RESTART_BACKOFF_SECONDS="${RESTART_BACKOFF_SECONDS:-60}"' in script
+    assert 'RESTART_BACKOFF_SECONDS="${RESTART_BACKOFF_SECONDS:-3600}"' in script
     assert "while true; do" in script
     assert 'while tmux has-session -t "${SUPERVISOR_SESSION}"' in script
     assert 'sleep "${POLL_SECONDS}"' in script
