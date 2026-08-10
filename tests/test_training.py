@@ -16,6 +16,10 @@ from rwkvasr.training import (
     RWKVDualModeCTCTrainer,
     build_rwkv_param_groups,
 )
+from rwkvasr.training.deepspeed_loop import (
+    DeepSpeedTrainConfig,
+    _apply_training_freeze as _apply_deepspeed_training_freeze,
+)
 from rwkvasr.training.train_loop import TrainConfig, _resolve_vocab_size
 from rwkvasr.training.wandb_logger import finish_wandb, init_wandb_run, log_wandb
 from rwkvasr.data import can_load_webdataset_length_index_in_memory
@@ -55,6 +59,95 @@ def test_rwkv_optimizer_param_groups_respect_w0_and_weight_decay() -> None:
     decay_names = names["rwkv_decay"]
     assert "ctc_head.weight" in decay_names
     assert "encoder.blocks.0.ffn1_norm.weight" not in decay_names
+
+
+def test_stage211_frozen_nano_ctc_path_backpropagates_only_to_birwkv() -> None:
+    torch.manual_seed(211)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=10,
+            n_embd=8,
+            encoder_output_dim=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=3,
+            vocab_size=6,
+            head_size=4,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+            ctc_decoder_type="funasr_nano_transformer",
+            ctc_decoder_dim=8,
+            ctc_decoder_ffn_dim=16,
+            ctc_decoder_num_layers=1,
+            ctc_decoder_attention_heads=2,
+        )
+    )
+    _apply_deepspeed_training_freeze(
+        model,
+        DeepSpeedTrainConfig(
+            output_dir=".",
+            deepspeed={},
+            frontend_type="sensevoice_rwkv",
+            freeze_encoder_except_time_mixer=True,
+            freeze_ctc_decoder=True,
+            freeze_ctc_head=True,
+        ),
+    )
+
+    features = torch.randn(2, 12, 10)
+    feature_lengths = torch.tensor([12, 10], dtype=torch.long)
+    targets = torch.tensor([1, 2, 1, 3], dtype=torch.long)
+    target_lengths = torch.tensor([2, 2], dtype=torch.long)
+    optimizer = torch.optim.SGD(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=1.0e-2,
+    )
+    losses = model.joint_losses(
+        features,
+        feature_lengths,
+        targets,
+        target_lengths,
+    )
+    losses["loss"].backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    losses = model.joint_losses(
+        features,
+        feature_lengths,
+        targets,
+        target_lengths,
+    )
+    losses["loss"].backward()
+
+    trainable = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    assert trainable
+    assert all(".time_mixer." in name or ".input_proj." in name for name in trainable)
+    assert any(
+        ".time_mixer." in name
+        and parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and torch.count_nonzero(parameter.grad) > 0
+        for name, parameter in trainable.items()
+    )
+    assert any(
+        ".input_proj." in name
+        and parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and torch.count_nonzero(parameter.grad) > 0
+        for name, parameter in trainable.items()
+    )
+    assert model.ctc_decoder is not None
+    frozen_ctc_parameters = [
+        *model.ctc_decoder.parameters(),
+        *model.ctc_head.parameters(),
+    ]
+    assert all(not parameter.requires_grad for parameter in frozen_ctc_parameters)
+    assert all(parameter.grad is None for parameter in frozen_ctc_parameters)
 
 
 def test_dual_mode_trainer_returns_valid_training_mask() -> None:
