@@ -196,10 +196,13 @@ def test_retention_correction_resume_requires_smoke_marker(
         )
 
 
+@pytest.mark.parametrize("phase", ("mixer", "block", "logits"))
 def test_create_stage211_retention_correction_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    phase: str,
 ) -> None:
+    correction_lr = correction.stage211_post_coverage_correction_lr(phase)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     manifest = _write_manifest(tmp_path / "replay")
@@ -226,7 +229,7 @@ def test_create_stage211_retention_correction_receipt(
                 "schema_version": 1,
                 "pipeline": "stage211",
                 "artifact": "full_profile_smoke",
-                "phase": "mixer",
+                "phase": phase,
                 "complete": True,
                 "correction_round": 1,
                 "init_checkpoint_path": str(init_checkpoint.resolve()),
@@ -251,10 +254,10 @@ def test_create_stage211_retention_correction_receipt(
         encoding="utf-8",
     )
 
-    config = stage211_phase_train_config_contract("mixer")
+    config = stage211_phase_train_config_contract(phase)
     config.update(
         {
-            "lr": correction.CORRECTION_LR,
+            "lr": correction_lr,
             "max_steps": 1,
             "batch_size": 36,
             "batch_token_budget": 24_000,
@@ -267,6 +270,7 @@ def test_create_stage211_retention_correction_receipt(
             "ctc_teacher_online_model_path": str(nano_dir.resolve()),
             "init_checkpoint_path": str(init_checkpoint.resolve()),
             "stage211_post_coverage_correction_round": 1,
+            "stage211_post_coverage_correction_phase": phase,
             "stage211_post_coverage_replay_receipt_path": str(replay_receipt.resolve()),
             "stage211_post_coverage_admission_gate_path": str(admission_gate.resolve()),
             "stage211_post_coverage_original_coverage_unchanged": True,
@@ -279,7 +283,7 @@ def test_create_stage211_retention_correction_receipt(
         "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "retention_correction_run",
-        "phase": "mixer",
+        "phase": phase,
         "round": 1,
         "run_dir": str(run_dir.resolve()),
         "replay_receipt_path": str(replay_receipt.resolve()),
@@ -292,7 +296,7 @@ def test_create_stage211_retention_correction_receipt(
         "replay_manifest_sha256": correction.sha256_file(manifest),
         "epochs": correction.CORRECTION_EPOCHS,
         "steps_per_epoch": 1,
-        "learning_rate": correction.CORRECTION_LR,
+        "learning_rate": correction_lr,
         "trainable_boundary": "mixer_only",
         "early_stopping": False,
         "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
@@ -344,13 +348,15 @@ def test_create_stage211_retention_correction_receipt(
         admission_gate_path=admission_gate,
         init_checkpoint_path=init_checkpoint,
         completion_checkpoint_path=completion_checkpoint,
+        phase=phase,
     )
 
     assert receipt["artifact"] == "post_coverage_correction"
     assert receipt["round"] == 1
     assert receipt["rows"] == 8
     assert receipt["steps"] == 1
-    assert receipt["learning_rate"] == correction.CORRECTION_LR
+    assert receipt["phase"] == phase
+    assert receipt["learning_rate"] == correction_lr
     assert receipt["nano_teacher_checkpoint_sha256"] == nano_sha256
     assert receipt["smoke_marker_sha256"] == correction.sha256_file(smoke_marker)
 
@@ -364,6 +370,7 @@ def test_create_stage211_retention_correction_receipt(
         admission_gate_path=admission_gate,
         init_checkpoint_path=init_checkpoint,
         completion_checkpoint_path=completion_checkpoint,
+        phase=phase,
     )
     assert resumed_receipt["train_config_sha256"] == correction.sha256_file(
         run_dir / "train_config.yaml"
@@ -378,4 +385,5 @@ def test_create_stage211_retention_correction_receipt(
             admission_gate_path=admission_gate,
             init_checkpoint_path=init_checkpoint,
             completion_checkpoint_path=completion_checkpoint,
+            phase=phase,
         )

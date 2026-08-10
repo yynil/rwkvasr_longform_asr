@@ -21,6 +21,26 @@ def test_stage211_correction_segment_is_one_complete_low_lr_round() -> None:
     assert segment["split_steps"] == 1234
 
 
+@pytest.mark.parametrize(
+    ("phase", "expected_lr"),
+    (("block", 1.0e-6), ("logits", 1.5e-7)),
+)
+def test_stage211_phase_correction_uses_phase_objective_and_lr(
+    phase: str,
+    expected_lr: float,
+) -> None:
+    segment = runner._correction_segment(
+        round_index=1,
+        steps_per_epoch=321,
+        phase=phase,
+    )
+
+    assert segment["name"] == f"{phase}_correction_round1_321steps"
+    assert segment["target_step"] == 321
+    provenance_lr = runner.stage211_post_coverage_correction_lr(phase)
+    assert provenance_lr == expected_lr
+
+
 def test_stage211_correction_admission_requires_immediate_failed_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

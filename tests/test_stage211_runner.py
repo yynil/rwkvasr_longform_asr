@@ -739,7 +739,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert '--baseline-public-comparison-report "${mixer_gate_dir}/nano_comparison.json"' in script
     assert (
         "--baseline-public-comparison-report "
-        '"${PHASE_GATE_ROOT}/logits/nano_comparison.json"' in script
+        '"${logits_gate_dir}/nano_comparison.json"' in script
     )
     assert '--calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}"' in script
     assert "create_stage211_nano_baseline_receipt.py" in script
@@ -747,7 +747,11 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert 'START_STAGE="${START_STAGE:-full}"' in script
     assert "run_stage211_mixer_retention_loop.py" in script
     assert "MIXER_SELECTION" in script
+    assert "BLOCK_SELECTION" in script
+    assert "LOGITS_SELECTION" in script
     assert '--mixer-gate-selection "${MIXER_SELECTION}"' in script
+    assert '--block-gate-selection "${BLOCK_SELECTION}"' in script
+    assert '--logits-gate-selection "${LOGITS_SELECTION}"' in script
     assert "post_mixer)" in script
 
     main_body = script[script.index("main() {") :]

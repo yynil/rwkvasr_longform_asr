@@ -69,61 +69,79 @@ def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(rendered, encoding="utf-8")
 
 
+def _resolve_phase_gate(
+    *,
+    phase: str,
+    phase_gate_root: Path,
+    selection_path: Path | None,
+    nano_teacher_checkpoint: Path,
+) -> tuple[Path, Path | None]:
+    targets = {"mixer": "block", "block": "logits", "logits": "sft"}
+    if phase not in targets:
+        raise ValueError(f"Unsupported Stage211 phase selection: {phase!r}")
+    phase_gate_root = phase_gate_root.expanduser().resolve()
+    explicit_selection = selection_path is not None
+    selected_path = (
+        selection_path.expanduser().resolve()
+        if selection_path is not None
+        else (phase_gate_root / f"{phase}_selected.json").resolve()
+    )
+    if not selected_path.is_file():
+        if explicit_selection:
+            raise ValueError(f"Stage211 {phase} gate selection is missing: {selected_path}")
+        return (phase_gate_root / phase / "phase_gate.json").resolve(), None
+
+    selection = _load_json(selected_path, label=f"Stage211 {phase} gate selection")
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "mixer_gate_selection" if phase == "mixer" else "phase_gate_selection",
+        "phase": phase,
+    }
+    if any(selection.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"Stage211 {phase} gate selection contract mismatch.")
+    gate_dir = Path(str(selection.get("gate_dir") or "")).resolve()
+    gate_path = Path(str(selection.get("gate_path") or "")).resolve()
+    if gate_path != gate_dir / "phase_gate.json":
+        raise ValueError(f"Stage211 {phase} gate selection path mismatch.")
+    if not gate_path.is_file() or selection.get("gate_sha256") != sha256_file(gate_path):
+        raise ValueError(f"Stage211 selected {phase} gate is missing or changed.")
+    checkpoint = Path(str(selection.get("checkpoint_path") or "")).resolve()
+    if not checkpoint.is_file() or selection.get("checkpoint_sha256") != sha256_file(checkpoint):
+        raise ValueError(f"Stage211 selected {phase} checkpoint is missing or changed.")
+    gate = validate_stage211_phase_gate_report(
+        gate_path,
+        expected_phase=phase,
+        checkpoint_path=checkpoint,
+    )
+    if gate.get("gate_passed") is not True:
+        raise ValueError(f"Stage211 selected {phase} gate did not pass.")
+    promotion = Path(str(selection.get("promotion_receipt_path") or "")).resolve()
+    if not promotion.is_file() or selection.get("promotion_receipt_sha256") != sha256_file(
+        promotion
+    ):
+        raise ValueError(f"Stage211 selected {phase} promotion is missing or changed.")
+    _validate_promotion_receipt(
+        receipt_path=promotion,
+        target_phase=targets[phase],
+        checkpoint_path=checkpoint,
+        nano_checkpoint_path=nano_teacher_checkpoint,
+    )
+    return gate_path, selected_path
+
+
 def _resolve_mixer_gate(
     *,
     phase_gate_root: Path,
     selection_path: Path | None,
     nano_teacher_checkpoint: Path,
 ) -> tuple[Path, Path | None]:
-    phase_gate_root = phase_gate_root.expanduser().resolve()
-    explicit_selection = selection_path is not None
-    selected_path = (
-        selection_path.expanduser().resolve()
-        if selection_path is not None
-        else (phase_gate_root / "mixer_selected.json").resolve()
+    return _resolve_phase_gate(
+        phase="mixer",
+        phase_gate_root=phase_gate_root,
+        selection_path=selection_path,
+        nano_teacher_checkpoint=nano_teacher_checkpoint,
     )
-    if not selected_path.is_file():
-        if explicit_selection:
-            raise ValueError(f"Stage211 Mixer gate selection is missing: {selected_path}")
-        return (phase_gate_root / "mixer" / "phase_gate.json").resolve(), None
-
-    selection = _load_json(selected_path, label="Stage211 Mixer gate selection")
-    expected = {
-        "schema_version": 1,
-        "pipeline": "stage211",
-        "artifact": "mixer_gate_selection",
-        "phase": "mixer",
-    }
-    if any(selection.get(key) != value for key, value in expected.items()):
-        raise ValueError("Stage211 Mixer gate selection contract mismatch.")
-    gate_dir = Path(str(selection.get("gate_dir") or "")).resolve()
-    gate_path = Path(str(selection.get("gate_path") or "")).resolve()
-    if gate_path != gate_dir / "phase_gate.json":
-        raise ValueError("Stage211 Mixer gate selection path mismatch.")
-    if not gate_path.is_file() or selection.get("gate_sha256") != sha256_file(gate_path):
-        raise ValueError("Stage211 selected Mixer gate is missing or changed.")
-    checkpoint = Path(str(selection.get("checkpoint_path") or "")).resolve()
-    if not checkpoint.is_file() or selection.get("checkpoint_sha256") != sha256_file(checkpoint):
-        raise ValueError("Stage211 selected Mixer checkpoint is missing or changed.")
-    gate = validate_stage211_phase_gate_report(
-        gate_path,
-        expected_phase="mixer",
-        checkpoint_path=checkpoint,
-    )
-    if gate.get("gate_passed") is not True:
-        raise ValueError("Stage211 selected Mixer gate did not pass.")
-    promotion = Path(str(selection.get("promotion_receipt_path") or "")).resolve()
-    if not promotion.is_file() or selection.get("promotion_receipt_sha256") != sha256_file(
-        promotion
-    ):
-        raise ValueError("Stage211 selected Mixer promotion is missing or changed.")
-    _validate_promotion_receipt(
-        receipt_path=promotion,
-        target_phase="block",
-        checkpoint_path=checkpoint,
-        nano_checkpoint_path=nano_teacher_checkpoint,
-    )
-    return gate_path, selected_path
 
 
 def _build_sft_public_progress(
@@ -239,21 +257,24 @@ def _validate_final_report(
             "nano_public_baseline_receipt_sha256",
         ),
         ("mixer_phase_gate_path", "mixer_phase_gate_sha256"),
+        ("block_phase_gate_path", "block_phase_gate_sha256"),
+        ("logits_phase_gate_path", "logits_phase_gate_sha256"),
     ):
         artifact = Path(str(report.get(path_key) or "")).resolve()
         if not artifact.is_file() or sha256_file(artifact) != report.get(sha_key):
             raise ValueError(
                 f"Stage211 final report artifact is unavailable or changed: {artifact}"
             )
-    mixer_selection_value = report.get("mixer_gate_selection_path")
-    if mixer_selection_value is not None:
-        mixer_selection = Path(str(mixer_selection_value)).resolve()
-        if not mixer_selection.is_file() or sha256_file(mixer_selection) != report.get(
-            "mixer_gate_selection_sha256"
-        ):
-            raise ValueError(
-                "Stage211 final report Mixer gate selection is unavailable or changed."
-            )
+    for phase in ("mixer", "block", "logits"):
+        selection_value = report.get(f"{phase}_gate_selection_path")
+        if selection_value is not None:
+            selection = Path(str(selection_value)).resolve()
+            if not selection.is_file() or sha256_file(selection) != report.get(
+                f"{phase}_gate_selection_sha256"
+            ):
+                raise ValueError(
+                    f"Stage211 final report {phase} gate selection is unavailable or changed."
+                )
     completion = _load_json(
         Path(str(report["sft_completion_path"])).resolve(),
         label="Stage211 SFT completion",
@@ -305,6 +326,16 @@ def _validate_final_report(
     )
     if mixer_gate.get("public_overlap") != report.get("public_overlap"):
         raise ValueError("Stage211 final report and Mixer overlap bindings differ.")
+    block_gate_path = Path(str(report.get("block_phase_gate_path") or "")).resolve()
+    block_gate = validate_stage211_phase_gate_report(
+        block_gate_path,
+        expected_phase="block",
+        checkpoint_path=Path(
+            str(_load_json(block_gate_path, label="Block gate")["checkpoint_path"])
+        ),
+    )
+    if block_gate.get("public_overlap") != report.get("public_overlap"):
+        raise ValueError("Stage211 final report and Block overlap bindings differ.")
     return report
 
 
@@ -416,12 +447,32 @@ def finalize_sft(args: argparse.Namespace) -> Path:
     )
     mixer_gate_path: Path | None = None
     mixer_selection_path: Path | None = None
+    block_gate_path: Path | None = None
+    block_selection_path: Path | None = None
+    logits_gate_path: Path | None = None
+    logits_selection_path: Path | None = None
     if gate_passed:
         mixer_gate_path, mixer_selection_path = _resolve_mixer_gate(
             phase_gate_root=phase_gate_root,
             selection_path=getattr(args, "mixer_gate_selection", None),
             nano_teacher_checkpoint=nano_teacher_checkpoint,
         )
+        block_gate_path, block_selection_path = _resolve_phase_gate(
+            phase="block",
+            phase_gate_root=phase_gate_root,
+            selection_path=getattr(args, "block_gate_selection", None),
+            nano_teacher_checkpoint=nano_teacher_checkpoint,
+        )
+        logits_gate_path, logits_selection_path = _resolve_phase_gate(
+            phase="logits",
+            phase_gate_root=phase_gate_root,
+            selection_path=getattr(args, "logits_gate_selection", None),
+            nano_teacher_checkpoint=nano_teacher_checkpoint,
+        )
+        if logits_gate_path != Path(str(promotion_receipt["gate_report_path"])).resolve():
+            raise ValueError(
+                "Stage211 selected Logits gate differs from the SFT promotion receipt."
+            )
     report = {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -461,6 +512,22 @@ def finalize_sft(args: argparse.Namespace) -> Path:
         "mixer_gate_selection_sha256": (
             sha256_file(mixer_selection_path) if mixer_selection_path is not None else None
         ),
+        "block_phase_gate_path": (str(block_gate_path) if block_gate_path is not None else None),
+        "block_phase_gate_sha256": (
+            sha256_file(block_gate_path) if block_gate_path is not None else None
+        ),
+        "block_gate_selection_path": (
+            str(block_selection_path) if block_selection_path is not None else None
+        ),
+        "block_gate_selection_sha256": (
+            sha256_file(block_selection_path) if block_selection_path is not None else None
+        ),
+        "logits_gate_selection_path": (
+            str(logits_selection_path) if logits_selection_path is not None else None
+        ),
+        "logits_gate_selection_sha256": (
+            sha256_file(logits_selection_path) if logits_selection_path is not None else None
+        ),
     }
     _write_immutable_json(final_report_path, report)
     if not gate_passed:
@@ -469,13 +536,13 @@ def finalize_sft(args: argparse.Namespace) -> Path:
             f"public-set regression; report={final_report_path}"
         )
     _validate_final_report(final_report_path, checkpoint=checkpoint)
-    if mixer_gate_path is None:
-        raise ValueError("Stage211 final report lacks a selected Mixer gate.")
+    if mixer_gate_path is None or block_gate_path is None or logits_gate_path is None:
+        raise ValueError("Stage211 final report lacks a selected A/B/C gate.")
     create_stepwise_report(
         calibration_receipt_path=args.calibration_reuse_receipt,
         mixer_gate_path=mixer_gate_path,
-        block_gate_path=phase_gate_root / "block" / "phase_gate.json",
-        logits_gate_path=phase_gate_root / "logits" / "phase_gate.json",
+        block_gate_path=block_gate_path,
+        logits_gate_path=logits_gate_path,
         sft_final_report_path=final_report_path,
         output_json=output_dir / "stage211_stepwise_results.json",
         output_markdown=output_dir / "stage211_stepwise_results.md",
@@ -537,6 +604,8 @@ def main() -> int:
     )
     parser.add_argument("--phase-gate-root", type=Path, default=None)
     parser.add_argument("--mixer-gate-selection", type=Path, default=None)
+    parser.add_argument("--block-gate-selection", type=Path, default=None)
+    parser.add_argument("--logits-gate-selection", type=Path, default=None)
     parser.add_argument("--devices", default="0,1,2,3")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

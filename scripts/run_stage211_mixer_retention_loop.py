@@ -62,6 +62,18 @@ DEFAULT_BASELINE_PUBLIC_REPORT = (
     / "nano_comparison.json"
 )
 DEFAULT_SELECTION = Path.home() / "rwkvasr_eval" / "stage211_phase_gates" / "mixer_selected.json"
+PHASE_TARGETS = {"mixer": "block", "block": "logits", "logits": "sft"}
+
+
+def _phase(args: argparse.Namespace) -> str:
+    phase = str(getattr(args, "phase", "mixer"))
+    if phase not in PHASE_TARGETS:
+        raise ValueError(f"Unsupported Stage211 correction-loop phase: {phase!r}")
+    return phase
+
+
+def _selection_artifact(phase: str) -> str:
+    return "mixer_gate_selection" if phase == "mixer" else "phase_gate_selection"
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -100,11 +112,12 @@ def _finalizer_command(
     output_dir: Path,
     correction_receipts: list[Path],
 ) -> list[str]:
+    phase = _phase(args)
     command = [
         str(PYTHON),
         str(FINALIZER),
         "--phase",
-        "mixer",
+        phase,
         "--phase-root",
         str(args.phase_root),
         "--output-dir",
@@ -113,11 +126,18 @@ def _finalizer_command(
         str(args.public_manifest_dir),
         "--nano-prediction-dir",
         str(args.nano_prediction_dir),
-        "--baseline-public-comparison-report",
-        str(args.baseline_public_comparison_report),
         "--devices",
         str(args.devices),
     ]
+    if phase in {"mixer", "block"}:
+        if args.baseline_public_comparison_report is None:
+            raise ValueError(f"Stage211 {phase} correction loop requires a public baseline.")
+        command.extend(
+            (
+                "--baseline-public-comparison-report",
+                str(args.baseline_public_comparison_report),
+            )
+        )
     for receipt in correction_receipts:
         command.extend(("--post-coverage-correction-receipt", str(receipt)))
     return command
@@ -134,6 +154,8 @@ def _correction_command(
     return [
         str(PYTHON),
         str(CORRECTION_RUNNER),
+        "--phase",
+        _phase(args),
         "--round",
         str(round_index),
         "--replay-receipt",
@@ -153,15 +175,21 @@ def _correction_command(
     ]
 
 
-def _validate_gate(gate_path: Path) -> dict[str, Any]:
-    raw = _load_json(gate_path, label="Stage211 Mixer phase gate")
+def _validate_gate(gate_path: Path, *, phase: str = "mixer") -> dict[str, Any]:
+    raw = _load_json(gate_path, label=f"Stage211 {phase} phase gate")
     checkpoint = Path(str(raw.get("checkpoint_path") or "")).resolve()
     return validate_stage211_phase_gate_report(
         gate_path,
-        expected_phase="mixer",
+        expected_phase=phase,
         checkpoint_path=checkpoint,
         require_passed=False,
     )
+
+
+def _validate_gate_for_phase(gate_path: Path, *, phase: str) -> dict[str, Any]:
+    if phase == "mixer":
+        return _validate_gate(gate_path)
+    return _validate_gate(gate_path, phase=phase)
 
 
 def _ensure_promotion(
@@ -170,17 +198,18 @@ def _ensure_promotion(
     gate: dict[str, Any],
     nano_checkpoint: Path,
     dry_run: bool,
+    phase: str = "mixer",
 ) -> Path:
     checkpoint = Path(str(gate["checkpoint_path"])).resolve()
     gate_path = gate_dir / "phase_gate.json"
-    promotion = gate_dir / "mixer_promotion_receipt.json"
+    promotion = gate_dir / f"{phase}_promotion_receipt.json"
     if not promotion.is_file():
         _run(
             [
                 str(PYTHON),
                 str(PROMOTION_BUILDER),
                 "--source-phase",
-                "mixer",
+                phase,
                 "--checkpoint",
                 str(checkpoint),
                 "--gate-report",
@@ -195,7 +224,7 @@ def _ensure_promotion(
         return promotion
     _validate_promotion_receipt(
         receipt_path=promotion,
-        target_phase="block",
+        target_phase=PHASE_TARGETS[phase],
         checkpoint_path=checkpoint,
         nano_checkpoint_path=nano_checkpoint,
     )
@@ -208,14 +237,15 @@ def _selection_payload(
     gate_dir: Path,
     gate: dict[str, Any],
     promotion: Path,
+    phase: str = "mixer",
 ) -> dict[str, Any]:
     gate_path = gate_dir / "phase_gate.json"
     checkpoint = Path(str(gate["checkpoint_path"])).resolve()
     return {
         "schema_version": 1,
         "pipeline": "stage211",
-        "artifact": "mixer_gate_selection",
-        "phase": "mixer",
+        "artifact": _selection_artifact(phase),
+        "phase": phase,
         "correction_round": round_index,
         "gate_dir": str(gate_dir),
         "gate_path": str(gate_path),
@@ -231,25 +261,26 @@ def _validate_existing_selection(
     selection_path: Path,
     *,
     nano_checkpoint: Path,
+    phase: str = "mixer",
 ) -> dict[str, Any]:
-    selection = _load_json(selection_path, label="Stage211 selected Mixer gate")
+    selection = _load_json(selection_path, label=f"Stage211 selected {phase} gate")
     expected = {
         "schema_version": 1,
         "pipeline": "stage211",
-        "artifact": "mixer_gate_selection",
-        "phase": "mixer",
+        "artifact": _selection_artifact(phase),
+        "phase": phase,
     }
     if any(selection.get(key) != value for key, value in expected.items()):
-        raise ValueError("Stage211 selected Mixer gate contract mismatch.")
+        raise ValueError(f"Stage211 selected {phase} gate contract mismatch.")
     gate_dir = Path(str(selection.get("gate_dir") or "")).resolve()
-    gate = _validate_gate(gate_dir / "phase_gate.json")
+    gate = _validate_gate_for_phase(gate_dir / "phase_gate.json", phase=phase)
     if gate.get("gate_passed") is not True:
-        raise ValueError("Stage211 selected Mixer gate is not passing.")
+        raise ValueError(f"Stage211 selected {phase} gate is not passing.")
     promotion = Path(str(selection.get("promotion_receipt_path") or "")).resolve()
     checkpoint = Path(str(gate["checkpoint_path"])).resolve()
     _validate_promotion_receipt(
         receipt_path=promotion,
-        target_phase="block",
+        target_phase=PHASE_TARGETS[phase],
         checkpoint_path=checkpoint,
         nano_checkpoint_path=nano_checkpoint,
     )
@@ -258,20 +289,24 @@ def _validate_existing_selection(
         gate_dir=gate_dir,
         gate=gate,
         promotion=promotion,
+        phase=phase,
     )
     if rebuilt != selection:
-        raise ValueError("Stage211 selected Mixer gate binding changed.")
+        raise ValueError(f"Stage211 selected {phase} gate binding changed.")
     return selection
 
 
 def run_retention_loop(args: argparse.Namespace) -> Path | None:
+    phase = _phase(args)
     if args.selection.is_file():
         selected = _validate_existing_selection(
             args.selection,
             nano_checkpoint=args.nano_checkpoint,
+            phase=phase,
         )
         print(
-            "[stage211-retention-loop] reused selection "
+            "[stage211-correction-loop] reused selection "
+            f"phase={phase} "
             f"round={selected['correction_round']} "
             f"checkpoint={selected['checkpoint_path']}",
             flush=True,
@@ -292,7 +327,7 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
         if args.dry_run:
             return None
         if code == 0 and not original_gate_path.is_file():
-            raise ValueError("Stage211 original Mixer finalizer produced no phase gate.")
+            raise ValueError(f"Stage211 original {phase} finalizer produced no phase gate.")
 
     prior_gate_path = original_gate_path
     correction_receipts: list[Path] = []
@@ -307,7 +342,7 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
             run_dir = args.correction_run_root / f"round_{round_index:02d}"
             receipt = run_dir / "correction_receipt.json"
             if not receipt.is_file():
-                prior_gate = _validate_gate(prior_gate_path)
+                prior_gate = _validate_gate_for_phase(prior_gate_path, phase=phase)
                 if prior_gate.get("gate_passed") is not False:
                     raise ValueError("Stage211 correction admission gate unexpectedly passed.")
                 init_checkpoint = Path(str(prior_gate["checkpoint_path"])).resolve()
@@ -339,13 +374,14 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
                         f"Stage211 correction round {round_index} produced no phase gate."
                     )
 
-        gate = _validate_gate(gate_path)
+        gate = _validate_gate_for_phase(gate_path, phase=phase)
         if gate.get("gate_passed") is True:
             promotion = _ensure_promotion(
                 gate_dir=gate_dir,
                 gate=gate,
                 nano_checkpoint=args.nano_checkpoint,
                 dry_run=bool(args.dry_run),
+                phase=phase,
             )
             if args.dry_run:
                 return None
@@ -354,28 +390,33 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
                 gate_dir=gate_dir,
                 gate=gate,
                 promotion=promotion,
+                phase=phase,
             )
             _write_immutable_json(args.selection, selection)
             print(
-                "[stage211-retention-loop] passed "
-                f"round={round_index} checkpoint={selection['checkpoint_path']} "
+                "[stage211-correction-loop] passed "
+                f"phase={phase} round={round_index} checkpoint={selection['checkpoint_path']} "
                 f"selection={args.selection}",
                 flush=True,
             )
             return args.selection
-        if (gate_dir / "mixer_promotion_receipt.json").exists():
-            raise ValueError("Stage211 failed Mixer gate must not have a promotion receipt.")
+        if (gate_dir / f"{phase}_promotion_receipt.json").exists():
+            phase_label = "Mixer" if phase == "mixer" else phase.capitalize()
+            raise ValueError(
+                f"Stage211 failed {phase_label} gate must not have a promotion receipt."
+            )
         prior_gate_path = gate_path
 
     raise ValueError(
-        f"Stage211 Mixer retention gate failed after {args.max_rounds} complete rounds."
+        f"Stage211 {phase} gate failed after {args.max_rounds} complete correction rounds."
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=("Run the restart-safe Stage211A Mixer retention correction/evaluation loop.")
+        description=("Run a restart-safe Stage211 post-coverage correction/evaluation loop.")
     )
+    parser.add_argument("--phase", choices=tuple(PHASE_TARGETS), default="mixer")
     parser.add_argument("--phase-root", type=Path, default=DEFAULT_PHASE_ROOT)
     parser.add_argument("--original-gate-dir", type=Path, default=DEFAULT_ORIGINAL_GATE_DIR)
     parser.add_argument(

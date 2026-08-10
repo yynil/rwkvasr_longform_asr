@@ -32,6 +32,12 @@ RETENTION_REPLAY_RECEIPT="${RETENTION_REPLAY_RECEIPT:-${METADATA_ROOT}/retention
 RETENTION_RUN_ROOT="${RETENTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211a_mixer_retention_correction}"
 RETENTION_GATE_ROOT="${RETENTION_GATE_ROOT:-${PHASE_GATE_ROOT}/mixer_retention}"
 MIXER_SELECTION="${MIXER_SELECTION:-${PHASE_GATE_ROOT}/mixer_selected.json}"
+BLOCK_CORRECTION_RUN_ROOT="${BLOCK_CORRECTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211b_block_post_coverage_correction}"
+BLOCK_CORRECTION_GATE_ROOT="${BLOCK_CORRECTION_GATE_ROOT:-${PHASE_GATE_ROOT}/block_correction}"
+BLOCK_SELECTION="${BLOCK_SELECTION:-${PHASE_GATE_ROOT}/block_selected.json}"
+LOGITS_CORRECTION_RUN_ROOT="${LOGITS_CORRECTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211c_logits_post_coverage_correction}"
+LOGITS_CORRECTION_GATE_ROOT="${LOGITS_CORRECTION_GATE_ROOT:-${PHASE_GATE_ROOT}/logits_correction}"
+LOGITS_SELECTION="${LOGITS_SELECTION:-${PHASE_GATE_ROOT}/logits_selected.json}"
 
 log() {
   printf '[stage211-abcd-bootstrap] %(%Y-%m-%d %H:%M:%S)T %s\n' -1 "$*"
@@ -214,22 +220,30 @@ run_full_block_phase() {
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --master-port "$((MASTER_PORT + 1))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
-  log "Stage211B full curriculum finished; starting complete phase evaluation"
-  uv run python "${REPO_ROOT}/scripts/finalize_stage211_phase.py" \
+  log "Stage211B full curriculum finished; starting strict correction/evaluation loop"
+  uv run python "${REPO_ROOT}/scripts/run_stage211_mixer_retention_loop.py" \
     --phase block \
     --phase-root "${FULL_OUTPUT_ROOT}/stage211b_block_full_data_3ep" \
-    --output-dir "${PHASE_GATE_ROOT}/block" \
+    --original-gate-dir "${PHASE_GATE_ROOT}/block" \
+    --correction-run-root "${BLOCK_CORRECTION_RUN_ROOT}" \
+    --correction-gate-root "${BLOCK_CORRECTION_GATE_ROOT}" \
+    --replay-receipt "${RETENTION_REPLAY_RECEIPT}" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
+    --nano-checkpoint "${NANO_CHECKPOINT}" \
     --baseline-public-comparison-report "${mixer_gate_dir}/nano_comparison.json" \
+    --config-dir "${FULL_CONFIG_ROOT}" \
+    --selection "${BLOCK_SELECTION}" \
+    --master-port "$((MASTER_PORT + 11))" \
     --devices 0,1,2,3
-  log "Stage211B full phase evaluation and promotion gate finished"
+  log "Stage211B selected Block gate passed"
 }
 
 run_full_logits_phase() {
   local init_checkpoint
-  IFS= read -r init_checkpoint <"${FULL_OUTPUT_ROOT}/stage211b_block_full_data_3ep/final_checkpoint.txt"
-  local promotion_receipt="${PHASE_GATE_ROOT}/block/block_promotion_receipt.json"
+  init_checkpoint="$(jq -er '.checkpoint_path' "${BLOCK_SELECTION}")"
+  local promotion_receipt
+  promotion_receipt="$(jq -er '.promotion_receipt_path' "${BLOCK_SELECTION}")"
   local final_checkpoint_file="${FULL_OUTPUT_ROOT}/stage211c_logits_full_data_3ep/final_checkpoint.txt"
   log "starting strict Stage211C full-data controller"
   uv run python "${REPO_ROOT}/scripts/run_stage211_full_phase_curriculum.py" \
@@ -243,21 +257,31 @@ run_full_logits_phase() {
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --master-port "$((MASTER_PORT + 2))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
-  log "Stage211C full curriculum finished; starting complete Nano-threshold evaluation"
-  uv run python "${REPO_ROOT}/scripts/finalize_stage211_phase.py" \
+  log "Stage211C full curriculum finished; starting strict correction/evaluation loop"
+  uv run python "${REPO_ROOT}/scripts/run_stage211_mixer_retention_loop.py" \
     --phase logits \
     --phase-root "${FULL_OUTPUT_ROOT}/stage211c_logits_full_data_3ep" \
-    --output-dir "${PHASE_GATE_ROOT}/logits" \
+    --original-gate-dir "${PHASE_GATE_ROOT}/logits" \
+    --correction-run-root "${LOGITS_CORRECTION_RUN_ROOT}" \
+    --correction-gate-root "${LOGITS_CORRECTION_GATE_ROOT}" \
+    --replay-receipt "${RETENTION_REPLAY_RECEIPT}" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
+    --nano-checkpoint "${NANO_CHECKPOINT}" \
+    --config-dir "${FULL_CONFIG_ROOT}" \
+    --selection "${LOGITS_SELECTION}" \
+    --master-port "$((MASTER_PORT + 12))" \
     --devices 0,1,2,3
-  log "Stage211C passed the complete Nano CTC gate"
+  log "Stage211C selected Logits gate passed the complete Nano CTC gate"
 }
 
 run_labeled_sft_phase() {
   local init_checkpoint
-  IFS= read -r init_checkpoint <"${FULL_OUTPUT_ROOT}/stage211c_logits_full_data_3ep/final_checkpoint.txt"
-  local promotion_receipt="${PHASE_GATE_ROOT}/logits/logits_promotion_receipt.json"
+  init_checkpoint="$(jq -er '.checkpoint_path' "${LOGITS_SELECTION}")"
+  local promotion_receipt
+  promotion_receipt="$(jq -er '.promotion_receipt_path' "${LOGITS_SELECTION}")"
+  local logits_gate_dir
+  logits_gate_dir="$(jq -er '.gate_dir' "${LOGITS_SELECTION}")"
   local final_checkpoint_file="${SFT_OUTPUT_DIR}/final_checkpoint.txt"
   log "starting restart-safe Stage211D labeled CTC SFT"
   uv run python "${REPO_ROOT}/scripts/run_stage211_labeled_sft.py" \
@@ -276,11 +300,13 @@ run_labeled_sft_phase() {
     --run-dir "${SFT_OUTPUT_DIR}" \
     --output-dir "${PHASE_GATE_ROOT}/sft" \
     --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
-    --baseline-public-comparison-report "${PHASE_GATE_ROOT}/logits/nano_comparison.json" \
+    --baseline-public-comparison-report "${logits_gate_dir}/nano_comparison.json" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
     --phase-gate-root "${PHASE_GATE_ROOT}" \
     --mixer-gate-selection "${MIXER_SELECTION}" \
+    --block-gate-selection "${BLOCK_SELECTION}" \
+    --logits-gate-selection "${LOGITS_SELECTION}" \
     --devices 0,1,2,3
   log "Stage211 A/B/C/D strict alignment pipeline completed"
 }
@@ -309,11 +335,16 @@ main() {
       run_mixer_retention_loop
       ;;
     logits)
+      run_mixer_retention_loop
+      run_full_block_phase
       run_full_logits_phase
       run_labeled_sft_phase
       return
       ;;
     sft)
+      run_mixer_retention_loop
+      run_full_block_phase
+      run_full_logits_phase
       run_labeled_sft_phase
       return
       ;;

@@ -77,6 +77,57 @@ def test_retention_finalizer_command_binds_all_prior_receipts(tmp_path: Path) ->
     )
 
 
+@pytest.mark.parametrize("phase", ("block", "logits"))
+def test_phase_correction_commands_preserve_phase_objective(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    args = _args(tmp_path)
+    args.phase = phase
+    if phase == "logits":
+        args.baseline_public_comparison_report = None
+    receipt = tmp_path / "round1.json"
+
+    finalizer = loop._finalizer_command(
+        args,
+        output_dir=tmp_path / "gate",
+        correction_receipts=[receipt],
+    )
+    correction = loop._correction_command(
+        args,
+        round_index=1,
+        admission_gate=tmp_path / "failed.json",
+        init_checkpoint=tmp_path / "init.pt",
+        run_dir=tmp_path / "run",
+    )
+
+    assert finalizer[finalizer.index("--phase") + 1] == phase
+    assert correction[correction.index("--phase") + 1] == phase
+    assert "--post-coverage-correction-receipt" in finalizer
+    if phase == "block":
+        assert "--baseline-public-comparison-report" in finalizer
+    else:
+        assert "--baseline-public-comparison-report" not in finalizer
+
+    gate = tmp_path / "gate" / "phase_gate.json"
+    checkpoint = tmp_path / f"{phase}.pt"
+    promotion = tmp_path / f"{phase}-promotion.json"
+    gate.parent.mkdir(exist_ok=True)
+    gate.write_text("{}\n", encoding="utf-8")
+    checkpoint.write_bytes(phase.encode())
+    promotion.write_text("{}\n", encoding="utf-8")
+    selection = loop._selection_payload(
+        round_index=1,
+        gate_dir=gate.parent,
+        gate={"checkpoint_path": str(checkpoint.resolve())},
+        promotion=promotion,
+        phase=phase,
+    )
+    assert selection["artifact"] == "phase_gate_selection"
+    assert selection["phase"] == phase
+    assert selection["checkpoint_sha256"] == loop.sha256_file(checkpoint)
+
+
 def test_retention_loop_runs_failed_round_then_passing_round(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

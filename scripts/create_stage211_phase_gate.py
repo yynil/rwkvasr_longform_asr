@@ -393,10 +393,9 @@ def build_phase_gate(
         raise ValueError("Stage211 public comparison checkpoint SHA-256 mismatch.")
     coverage = _parse_coverage_receipts(coverage_receipt_paths, phase=phase)
     correction_receipts = load_stage211_post_coverage_correction_receipts(
-        list(post_coverage_correction_receipt_paths or [])
+        list(post_coverage_correction_receipt_paths or []),
+        phase=phase,
     )
-    if correction_receipts and phase != "mixer":
-        raise ValueError("Stage211 post-coverage corrections are valid only for Mixer.")
     phase_init_checkpoint = Path(str(coverage[0].get("init_checkpoint_path") or "")).resolve()
     if not phase_init_checkpoint.is_file() or sha256_file(phase_init_checkpoint) != coverage[0].get(
         "init_checkpoint_sha256"

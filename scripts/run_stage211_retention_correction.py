@@ -20,12 +20,13 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
     sha256_file,
+    stage211_post_coverage_correction_lr,
     validate_stage211_phase_gate_report,
 )
 
 try:
     from scripts.create_stage211_retention_correction_receipt import (
-        CORRECTION_LR,
+        CORRECTION_LR as _MIXER_CORRECTION_LR,
         MAX_CORRECTION_ROUNDS,
         build_receipt,
     )
@@ -54,7 +55,7 @@ except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
     from create_stage211_retention_correction_receipt import (
-        CORRECTION_LR,
+        CORRECTION_LR as _MIXER_CORRECTION_LR,
         MAX_CORRECTION_ROUNDS,
         build_receipt,
     )
@@ -77,6 +78,10 @@ except ModuleNotFoundError as error:
         _validate_smoke_marker as _validate_full_profile_smoke_marker,
     )
     from validate_stage211_retention_replay import validate_retention_replay
+
+
+# Preserve the public constant used by existing Mixer correction tooling.
+CORRECTION_LR = _MIXER_CORRECTION_LR
 
 
 DEFAULT_REPLAY_RECEIPT = (
@@ -115,15 +120,19 @@ def _admit_failed_gate(
     admission_gate_path: Path,
     init_checkpoint: Path,
     round_index: int,
+    phase: str = "mixer",
 ) -> tuple[dict[str, Any], str]:
     gate = validate_stage211_phase_gate_report(
         admission_gate_path,
-        expected_phase="mixer",
+        expected_phase=phase,
         checkpoint_path=init_checkpoint,
         require_passed=False,
     )
     if gate.get("gate_passed") is not False:
-        raise ValueError("Stage211 correction requires an explicitly failed Mixer gate.")
+        phase_label = "Mixer" if phase == "mixer" else phase.capitalize()
+        raise ValueError(
+            f"Stage211 correction requires an explicitly failed {phase_label} gate."
+        )
     coverage = gate.get("full_data_coverage")
     if not isinstance(coverage, dict):
         raise ValueError("Stage211 correction admission gate lacks full-data coverage.")
@@ -179,18 +188,31 @@ def _audit_replay_storage(replay: dict[str, Any]) -> tuple[Path, dict[str, Any]]
     }
 
 
-def _correction_segment(*, round_index: int, steps_per_epoch: int) -> dict[str, Any]:
-    phase = replace(PHASES["mixer"], lr=CORRECTION_LR)
+def _correction_segment(
+    *,
+    round_index: int,
+    steps_per_epoch: int,
+    phase: str = "mixer",
+) -> dict[str, Any]:
+    phase_config = replace(PHASES[phase], lr=stage211_post_coverage_correction_lr(phase))
     source = _segments(
-        phase=phase,
+        phase=phase_config,
         smoke=False,
         difficulty="easy",
         full_data_profile=True,
     )[0]
     return {
         **source,
-        "name": f"mixer_retention_round{round_index}_{steps_per_epoch}steps",
-        "difficulty": f"retention_round_{round_index:02d}",
+        "name": (
+            f"mixer_retention_round{round_index}_{steps_per_epoch}steps"
+            if phase == "mixer"
+            else f"{phase}_correction_round{round_index}_{steps_per_epoch}steps"
+        ),
+        "difficulty": (
+            f"retention_round_{round_index:02d}"
+            if phase == "mixer"
+            else f"correction_round_{round_index:02d}"
+        ),
         "split_steps": steps_per_epoch,
         "target_step": steps_per_epoch,
     }
@@ -207,12 +229,13 @@ def _provenance_payload(
     nano_checkpoint: Path,
     smoke_marker: Path,
     steps_per_epoch: int,
+    phase: str = "mixer",
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "retention_correction_run",
-        "phase": "mixer",
+        "phase": phase,
         "round": round_index,
         "run_dir": str(run_dir),
         "replay_receipt_path": str(replay_receipt),
@@ -229,7 +252,7 @@ def _provenance_payload(
         "smoke_marker_sha256": sha256_file(smoke_marker),
         "epochs": 1,
         "steps_per_epoch": steps_per_epoch,
-        "learning_rate": CORRECTION_LR,
+        "learning_rate": stage211_post_coverage_correction_lr(phase),
         "trainable_boundary": "mixer_only",
         "early_stopping": False,
     }
@@ -240,8 +263,10 @@ def _correction_config_metadata(
     round_index: int,
     replay_receipt: Path,
     admission_gate: Path,
+    phase: str = "mixer",
 ) -> dict[str, Any]:
     return {
+        "stage211_post_coverage_correction_phase": phase,
         "stage211_post_coverage_correction_round": round_index,
         "stage211_post_coverage_replay_receipt_path": str(replay_receipt),
         "stage211_post_coverage_admission_gate_path": str(admission_gate),
@@ -258,6 +283,7 @@ def _validate_correction_smoke_marker(
     replay_manifest: Path,
     admission_gate: Path,
     nano_checkpoint: Path,
+    phase: str = "mixer",
 ) -> dict[str, Any]:
     raw_marker = json.loads(marker_path.read_text(encoding="utf-8"))
     if not isinstance(raw_marker, dict):
@@ -267,7 +293,7 @@ def _validate_correction_smoke_marker(
     ).resolve()
     marker = _validate_full_profile_smoke_marker(
         marker_path=marker_path,
-        phase="mixer",
+        phase=phase,
         smoke_run_dir=smoke_checkpoint.parent,
         init_checkpoint=init_checkpoint,
         easy_manifest=replay_manifest,
@@ -277,6 +303,7 @@ def _validate_correction_smoke_marker(
     )
     expected = {
         "schema_version": 1,
+        "phase": phase,
         "correction_round": round_index,
         "replay_receipt_path": str(replay_receipt),
         "replay_receipt_sha256": sha256_file(replay_receipt),
@@ -315,6 +342,7 @@ def _run_correction_smoke(
     max_peak_reserved_gib: float,
     formal_latest_step: int,
     dry_run: bool,
+    phase: str = "mixer",
 ) -> Path:
     smoke_run_dir = Path(f"{run_dir}_smoke")
     marker_path = run_dir.parent / f"{run_dir.name}_smoke_passed.json"
@@ -327,21 +355,22 @@ def _run_correction_smoke(
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
             nano_checkpoint=nano_checkpoint,
+            phase=phase,
         )
         return marker_path
     if formal_latest_step > 0 and not dry_run:
         raise ValueError("Stage211 correction formal training lacks its preflight smoke marker.")
 
-    phase = replace(PHASES["mixer"], lr=CORRECTION_LR)
+    phase_config = replace(PHASES[phase], lr=stage211_post_coverage_correction_lr(phase))
     segment = _segments(
-        phase=phase,
+        phase=phase_config,
         smoke=True,
         difficulty="easy",
         full_data_profile=True,
     )[0]
     smoke_latest_step = _latest_step(smoke_run_dir)
     config = _stage211_config(
-        phase=phase,
+        phase=phase_config,
         segment=segment,
         output_dir=smoke_run_dir,
         init_checkpoint=init_checkpoint,
@@ -357,6 +386,7 @@ def _run_correction_smoke(
             round_index=round_index,
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
+            phase=phase,
         )
     )
     smoke_config_dir = config_dir / "smoke"
@@ -376,7 +406,7 @@ def _run_correction_smoke(
         return marker_path
 
     marker = _audit_full_profile_smoke(
-        phase="mixer",
+        phase=phase,
         smoke_run_dir=smoke_run_dir,
         init_checkpoint=init_checkpoint,
         easy_manifest=replay_manifest,
@@ -385,6 +415,7 @@ def _run_correction_smoke(
     marker.update(
         {
             "correction_round": round_index,
+            "correction_phase": phase,
             "replay_receipt_path": str(replay_receipt),
             "replay_receipt_sha256": sha256_file(replay_receipt),
             "admission_gate_path": str(admission_gate),
@@ -402,11 +433,14 @@ def _run_correction_smoke(
         replay_manifest=replay_manifest,
         admission_gate=admission_gate,
         nano_checkpoint=nano_checkpoint,
+        phase=phase,
     )
     return marker_path
 
 
 def run_correction(args: argparse.Namespace) -> Path | None:
+    phase_name = str(getattr(args, "phase", "mixer"))
+    correction_lr = stage211_post_coverage_correction_lr(phase_name)
     round_index = int(args.round)
     if not 1 <= round_index <= MAX_CORRECTION_ROUNDS:
         raise ValueError(f"Stage211 correction round must be 1..{MAX_CORRECTION_ROUNDS}.")
@@ -429,11 +463,12 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         admission_gate_path=admission_gate,
         init_checkpoint=init_checkpoint,
         round_index=round_index,
+        phase=phase_name,
     )
     _validate_target_nano_teacher_checkpoint(
         recorded_sha256=teacher_sha256,
         nano_checkpoint_path=nano_checkpoint,
-        label=f"mixer retention correction round {round_index}",
+        label=f"{phase_name} correction round {round_index}",
     )
     manifest = load_webdataset_bucket_manifest(replay_manifest)
     steps_per_epoch = estimate_bucket_manifest_steps(
@@ -472,13 +507,14 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             f"nano_non_attention_audit={audit['matched']}/{audit['expected']} exact",
             flush=True,
         )
-    phase = replace(PHASES["mixer"], lr=CORRECTION_LR)
+    phase_config = replace(PHASES[phase_name], lr=correction_lr)
     segment = _correction_segment(
         round_index=round_index,
         steps_per_epoch=steps_per_epoch,
+        phase=phase_name,
     )
     config = _stage211_config(
-        phase=phase,
+        phase=phase_config,
         segment=segment,
         output_dir=run_dir,
         init_checkpoint=init_checkpoint,
@@ -494,10 +530,13 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             round_index=round_index,
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
+            phase=phase_name,
         )
     )
     config_dir = (
-        args.config_dir.expanduser().resolve() / "mixer" / f"retention_round_{round_index:02d}"
+        args.config_dir.expanduser().resolve()
+        / phase_name
+        / f"correction_round_{round_index:02d}"
     )
     config_dir.mkdir(parents=True, exist_ok=True)
     smoke_marker_path = _run_correction_smoke(
@@ -514,8 +553,13 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         max_peak_reserved_gib=float(args.max_peak_reserved_gib),
         formal_latest_step=latest_step,
         dry_run=bool(args.dry_run),
+        phase=phase_name,
     )
-    print(f"stage211_retention_correction_smoke={smoke_marker_path}", flush=True)
+    print(
+        f"stage211_post_coverage_correction_smoke phase={phase_name} "
+        f"marker={smoke_marker_path}",
+        flush=True,
+    )
     if not args.dry_run:
         config.update(
             {
@@ -534,6 +578,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             nano_checkpoint=nano_checkpoint,
             smoke_marker=smoke_marker_path,
             steps_per_epoch=steps_per_epoch,
+            phase=phase_name,
         )
         if provenance_path.is_file():
             if json.loads(provenance_path.read_text(encoding="utf-8")) != provenance:
@@ -545,8 +590,8 @@ def run_correction(args: argparse.Namespace) -> Path | None:
     config_path = config_dir / f"stage211_{segment['name']}.yaml"
     save_yaml(config_path, config)
     print(
-        "stage211_retention_correction "
-        f"round={round_index} rows={replay['validated_unique_keys']} "
+        "stage211_post_coverage_correction "
+        f"phase={phase_name} round={round_index} rows={replay['validated_unique_keys']} "
         f"steps={steps_per_epoch} tail_padding={tail_padding} "
         f"latest_step={latest_step} run_dir={run_dir}",
         flush=True,
@@ -579,11 +624,12 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         admission_gate_path=admission_gate,
         init_checkpoint_path=init_checkpoint,
         completion_checkpoint_path=completion_checkpoint,
+        phase=phase_name,
     )
     receipt_path = run_dir / "correction_receipt.json"
     _write_immutable_json(receipt_path, receipt)
     print(
-        f"stage211_retention_correction_complete round={round_index} "
+        f"stage211_post_coverage_correction_complete phase={phase_name} round={round_index} "
         f"checkpoint={completion_checkpoint} receipt={receipt_path}",
         flush=True,
     )
@@ -592,8 +638,9 @@ def run_correction(args: argparse.Namespace) -> Path | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run one strict Stage211A post-coverage retention correction round."
+        description="Run one strict Stage211 post-coverage correction round."
     )
+    parser.add_argument("--phase", choices=("mixer", "block", "logits"), default="mixer")
     parser.add_argument("--round", type=int, required=True)
     parser.add_argument(
         "--replay-receipt",

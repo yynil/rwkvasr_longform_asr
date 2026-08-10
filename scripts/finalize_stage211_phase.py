@@ -242,10 +242,15 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         path.expanduser().resolve()
         for path in getattr(args, "post_coverage_correction_receipt", [])
     ]
-    correction_receipts = load_stage211_post_coverage_correction_receipts(correction_receipt_paths)
+    correction_receipts = (
+        load_stage211_post_coverage_correction_receipts(correction_receipt_paths)
+        if phase == "mixer"
+        else load_stage211_post_coverage_correction_receipts(
+            correction_receipt_paths,
+            phase=phase,
+        )
+    )
     if correction_receipts:
-        if phase != "mixer":
-            raise ValueError("Stage211 post-coverage corrections are valid only for Mixer.")
         checkpoint = Path(
             str(correction_receipts[-1].get("completion_checkpoint_path") or "")
         ).resolve()

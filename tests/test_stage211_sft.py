@@ -658,6 +658,12 @@ def _write_stepwise_inputs(
                 "mixer_phase_gate_sha256": sha256_file(reports["mixer"]),
                 "mixer_gate_selection_path": None,
                 "mixer_gate_selection_sha256": None,
+                "block_phase_gate_path": str(reports["block"].resolve()),
+                "block_phase_gate_sha256": sha256_file(reports["block"]),
+                "block_gate_selection_path": None,
+                "block_gate_selection_sha256": None,
+                "logits_gate_selection_path": None,
+                "logits_gate_selection_sha256": None,
                 "labeled_data_coverage": {
                     "phase": "sft",
                     "complete": True,
@@ -754,6 +760,68 @@ def test_resolve_mixer_gate_uses_bound_retention_selection(
             selection_path=selection_path,
             nano_teacher_checkpoint=nano_checkpoint,
         )
+
+
+@pytest.mark.parametrize(("phase", "target"), (("block", "logits"), ("logits", "sft")))
+def test_resolve_phase_gate_uses_bound_correction_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    target: str,
+) -> None:
+    gate_dir = tmp_path / f"{phase}-correction"
+    gate_dir.mkdir()
+    gate_path = gate_dir / "phase_gate.json"
+    gate_path.write_text('{"gate_passed": true}\n', encoding="utf-8")
+    checkpoint = tmp_path / f"{phase}.pt"
+    checkpoint.write_bytes(phase.encode())
+    nano_checkpoint = tmp_path / "nano.pt"
+    nano_checkpoint.write_bytes(b"nano")
+    promotion = tmp_path / f"{phase}-promotion.json"
+    promotion.write_text("{}\n", encoding="utf-8")
+    selection = tmp_path / f"{phase}_selected.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "phase_gate_selection",
+                "phase": phase,
+                "gate_dir": str(gate_dir.resolve()),
+                "gate_path": str(gate_path.resolve()),
+                "gate_sha256": sha256_file(gate_path),
+                "checkpoint_path": str(checkpoint.resolve()),
+                "checkpoint_sha256": sha256_file(checkpoint),
+                "promotion_receipt_path": str(promotion.resolve()),
+                "promotion_receipt_sha256": sha256_file(promotion),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sft_finalizer,
+        "validate_stage211_phase_gate_report",
+        lambda *args, **kwargs: {"gate_passed": True},
+    )
+    validations: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        sft_finalizer,
+        "_validate_promotion_receipt",
+        lambda **kwargs: validations.append(kwargs) or {},
+    )
+
+    resolved_gate, resolved_selection = sft_finalizer._resolve_phase_gate(
+        phase=phase,
+        phase_gate_root=tmp_path,
+        selection_path=selection,
+        nano_teacher_checkpoint=nano_checkpoint,
+    )
+
+    assert resolved_gate == gate_path.resolve()
+    assert resolved_selection == selection.resolve()
+    assert validations[0]["target_phase"] == target
+    assert validations[0]["checkpoint_path"] == checkpoint.resolve()
 
 
 def test_stepwise_cli_resolves_mixer_gate_from_final_report(
@@ -935,6 +1003,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     original_baseline_sha256 = block["nano_public_baseline_checkpoint_sha256"]
     block["nano_public_baseline_checkpoint_sha256"] = "e" * 64
     reports["block"].write_text(json.dumps(block) + "\n", encoding="utf-8")
+    sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
+    sft["block_phase_gate_sha256"] = sha256_file(reports["block"])
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="public-baseline provenance chain mismatch"):
         stepwise_report.build_stepwise_report(
             calibration_receipt_path=reports["calibration"],
@@ -945,6 +1016,8 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         )
     block["nano_public_baseline_checkpoint_sha256"] = original_baseline_sha256
     reports["block"].write_text(json.dumps(block) + "\n", encoding="utf-8")
+    sft["block_phase_gate_sha256"] = sha256_file(reports["block"])
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
 
     sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
     sft["public_benchmark"]["all_datasets_pass"] = False
@@ -971,6 +1044,8 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     ]
     block["full_data_coverage"]["segments"][0]["nano_teacher_checkpoint_sha256"] = "f" * 64
     reports["block"].write_text(json.dumps(block) + "\n", encoding="utf-8")
+    sft["block_phase_gate_sha256"] = sha256_file(reports["block"])
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Nano teacher checkpoint SHA-256 chain mismatch"):
         stepwise_report.build_stepwise_report(
             calibration_receipt_path=reports["calibration"],
@@ -989,6 +1064,8 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         checkpoints["calibration"]
     )
     reports["block"].write_text(json.dumps(block) + "\n", encoding="utf-8")
+    sft["block_phase_gate_sha256"] = sha256_file(reports["block"])
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="checkpoint chain mismatch"):
         stepwise_report.build_stepwise_report(

@@ -67,8 +67,9 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     return payload
 
 
-def _resolve_cli_mixer_gate(
+def _resolve_cli_phase_gate(
     *,
+    phase: str,
     requested_gate: Path | None,
     sft_final_report_path: Path,
 ) -> Path:
@@ -78,10 +79,22 @@ def _resolve_cli_mixer_gate(
         sft_final_report_path,
         label="Stage211 SFT final report",
     )
-    bound_gate = sft_report.get("mixer_phase_gate_path")
+    bound_gate = sft_report.get(f"{phase}_phase_gate_path")
     if bound_gate:
         return Path(str(bound_gate)).expanduser().resolve()
-    return (DEFAULT_PHASE_GATE_ROOT / "mixer" / "phase_gate.json").resolve()
+    return (DEFAULT_PHASE_GATE_ROOT / phase / "phase_gate.json").resolve()
+
+
+def _resolve_cli_mixer_gate(
+    *,
+    requested_gate: Path | None,
+    sft_final_report_path: Path,
+) -> Path:
+    return _resolve_cli_phase_gate(
+        phase="mixer",
+        requested_gate=requested_gate,
+        sft_final_report_path=sft_final_report_path,
+    )
 
 
 def _validate_bound_file(
@@ -453,6 +466,10 @@ def build_stepwise_report(
         "mixer_phase_gate_sha256"
     ) != sha256_file(mixer_gate_path):
         raise ValueError("Stage211 SFT final report does not bind the selected Mixer gate.")
+    if Path(str(sft.get("block_phase_gate_path") or "")).resolve() != block_gate_path or sft.get(
+        "block_phase_gate_sha256"
+    ) != sha256_file(block_gate_path):
+        raise ValueError("Stage211 SFT final report does not bind the selected Block gate.")
     if Path(str(sft.get("logits_phase_gate_path") or "")).resolve() != logits_gate_path or sft.get(
         "logits_phase_gate_sha256"
     ) != sha256_file(logits_gate_path):
@@ -811,12 +828,12 @@ def main() -> int:
     parser.add_argument(
         "--block-phase-gate",
         type=Path,
-        default=DEFAULT_PHASE_GATE_ROOT / "block" / "phase_gate.json",
+        default=None,
     )
     parser.add_argument(
         "--logits-phase-gate",
         type=Path,
-        default=DEFAULT_PHASE_GATE_ROOT / "logits" / "phase_gate.json",
+        default=None,
     )
     parser.add_argument(
         "--sft-final-report",
@@ -839,11 +856,21 @@ def main() -> int:
         requested_gate=args.mixer_phase_gate,
         sft_final_report_path=args.sft_final_report,
     )
+    block_phase_gate = _resolve_cli_phase_gate(
+        phase="block",
+        requested_gate=args.block_phase_gate,
+        sft_final_report_path=args.sft_final_report,
+    )
+    logits_phase_gate = _resolve_cli_phase_gate(
+        phase="logits",
+        requested_gate=args.logits_phase_gate,
+        sft_final_report_path=args.sft_final_report,
+    )
     report = create_stepwise_report(
         calibration_receipt_path=args.calibration_reuse_receipt,
         mixer_gate_path=mixer_phase_gate,
-        block_gate_path=args.block_phase_gate,
-        logits_gate_path=args.logits_phase_gate,
+        block_gate_path=block_phase_gate,
+        logits_gate_path=logits_phase_gate,
         sft_final_report_path=args.sft_final_report,
         output_json=args.output_json,
         output_markdown=args.output_markdown,

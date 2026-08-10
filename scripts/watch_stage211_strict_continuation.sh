@@ -19,8 +19,8 @@ MONITOR_SCRIPT="${MONITOR_SCRIPT:-${REPO_ROOT}/scripts/monitor_stage211_abcd.sh}
 
 MIXER_COMPLETE="${FULL_OUTPUT_ROOT}/stage211a_mixer_full_data_3ep/curriculum_complete.json"
 MIXER_SELECTION="${PHASE_GATE_ROOT}/mixer_selected.json"
-BLOCK_PROMOTION="${PHASE_GATE_ROOT}/block/block_promotion_receipt.json"
-LOGITS_PROMOTION="${PHASE_GATE_ROOT}/logits/logits_promotion_receipt.json"
+BLOCK_SELECTION="${PHASE_GATE_ROOT}/block_selected.json"
+LOGITS_SELECTION="${PHASE_GATE_ROOT}/logits_selected.json"
 FINAL_REPORT="${PHASE_GATE_ROOT}/sft/stage211_complete.json"
 FINAL_STEPWISE_REPORT="${PHASE_GATE_ROOT}/sft/stage211_stepwise_results.json"
 FINAL_STEPWISE_MARKDOWN="${PHASE_GATE_ROOT}/sft/stage211_stepwise_results.md"
@@ -47,12 +47,12 @@ stage211_json_matches() {
 
 stage211_choose_start_stage() {
   if stage211_json_matches \
-    "${LOGITS_PROMOTION}" \
-    '.pipeline == "stage211" and .target_phase == "sft"'; then
+    "${LOGITS_SELECTION}" \
+    '.pipeline == "stage211" and .artifact == "phase_gate_selection" and .phase == "logits"'; then
     printf '%s\n' sft
   elif stage211_json_matches \
-    "${BLOCK_PROMOTION}" \
-    '.pipeline == "stage211" and .target_phase == "logits"'; then
+    "${BLOCK_SELECTION}" \
+    '.pipeline == "stage211" and .artifact == "phase_gate_selection" and .phase == "block"'; then
     printf '%s\n' logits
   elif stage211_json_matches \
     "${MIXER_SELECTION}" \
@@ -79,8 +79,6 @@ stage211_final_proof_valid() {
     cd "${REPO_ROOT}"
     uv run python "${REPO_ROOT}/scripts/create_stage211_stepwise_report.py" \
       --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
-      --block-phase-gate "${PHASE_GATE_ROOT}/block/phase_gate.json" \
-      --logits-phase-gate "${PHASE_GATE_ROOT}/logits/phase_gate.json" \
       --sft-final-report "${FINAL_REPORT}" \
       --output-json "${FINAL_STEPWISE_REPORT}" \
       --output-markdown "${FINAL_STEPWISE_MARKDOWN}"

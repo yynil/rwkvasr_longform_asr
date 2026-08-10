@@ -23,6 +23,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_RETENTION_CORRECTION_MAX_ROUNDS,
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
+    stage211_post_coverage_correction_lr,
     stage211_phase_train_config_contract,
     validate_stage211_phase_gate_report,
 )
@@ -75,13 +76,14 @@ def _validate_correction_smoke_marker(
     admission_gate: Path,
     init_checkpoint: Path,
     nano_checkpoint: Path,
+    phase: str = "mixer",
 ) -> dict[str, Any]:
     marker = _load_json(marker_path, label="Stage211 correction smoke marker")
     expected = {
         "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "full_profile_smoke",
-        "phase": "mixer",
+        "phase": phase,
         "complete": True,
         "correction_round": round_index,
         "init_checkpoint_path": str(init_checkpoint),
@@ -127,9 +129,17 @@ def _validate_correction_train_config(
     admission_gate: Path,
     init_checkpoint: Path,
     smoke_marker: Path,
+    phase: str = "mixer",
 ) -> None:
-    contract = stage211_phase_train_config_contract("mixer")
-    contract["lr"] = CORRECTION_LR
+    correction_lr = stage211_post_coverage_correction_lr(phase)
+    configured_phase = config.get("stage211_post_coverage_correction_phase", "mixer")
+    if configured_phase != phase:
+        raise ValueError(
+            "Stage211 correction train config phase mismatch: "
+            f"actual={configured_phase!r} expected={phase!r}"
+        )
+    contract = stage211_phase_train_config_contract(phase)
+    contract["lr"] = correction_lr
     for key, expected in contract.items():
         actual = config.get(key)
         if type(actual) is not type(expected) or actual != expected:
@@ -202,7 +212,9 @@ def build_receipt(
     admission_gate_path: Path,
     init_checkpoint_path: Path,
     completion_checkpoint_path: Path,
+    phase: str = "mixer",
 ) -> dict[str, Any]:
+    correction_lr = stage211_post_coverage_correction_lr(phase)
     if not 1 <= round_index <= MAX_CORRECTION_ROUNDS:
         raise ValueError(f"Stage211 correction round must be 1..{MAX_CORRECTION_ROUNDS}.")
     run_dir = run_dir.expanduser().resolve()
@@ -252,7 +264,7 @@ def build_receipt(
 
     admission_gate = validate_stage211_phase_gate_report(
         admission_gate_path,
-        expected_phase="mixer",
+        expected_phase=phase,
         checkpoint_path=init_checkpoint_path,
         require_passed=False,
     )
@@ -283,7 +295,7 @@ def build_receipt(
         "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "retention_correction_run",
-        "phase": "mixer",
+        "phase": phase,
         "round": round_index,
         "run_dir": str(run_dir),
         "replay_receipt_path": str(replay_receipt_path),
@@ -296,7 +308,7 @@ def build_receipt(
         "replay_manifest_sha256": sha256_file(replay_manifest),
         "epochs": CORRECTION_EPOCHS,
         "steps_per_epoch": steps_per_epoch,
-        "learning_rate": CORRECTION_LR,
+        "learning_rate": correction_lr,
         "trainable_boundary": "mixer_only",
         "early_stopping": False,
         "smoke_marker_path": str(smoke_marker_path),
@@ -318,6 +330,7 @@ def build_receipt(
         admission_gate=admission_gate_path,
         init_checkpoint=init_checkpoint_path,
         smoke_marker=smoke_marker_path,
+        phase=phase,
     )
     nano_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(train_config)
     nano_teacher_sha256 = sha256_file(nano_teacher_checkpoint)
@@ -336,6 +349,7 @@ def build_receipt(
         admission_gate=admission_gate_path,
         init_checkpoint=init_checkpoint_path,
         nano_checkpoint=nano_teacher_checkpoint,
+        phase=phase,
     )
 
     runtime_epoch_coverage = audit_stage211_runtime_epoch_coverage(
@@ -351,11 +365,11 @@ def build_receipt(
         "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "post_coverage_correction",
-        "phase": "mixer",
+        "phase": phase,
         "round": round_index,
         "complete": True,
         "epochs": CORRECTION_EPOCHS,
-        "learning_rate": CORRECTION_LR,
+        "learning_rate": correction_lr,
         "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
         "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
@@ -397,8 +411,9 @@ def build_receipt(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Create an immutable Stage211A post-coverage correction receipt."
+        description="Create an immutable Stage211 post-coverage correction receipt."
     )
+    parser.add_argument("--phase", choices=("mixer", "block", "logits"), default="mixer")
     parser.add_argument("--round", type=int, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--replay-receipt", type=Path, required=True)
@@ -415,6 +430,7 @@ def main() -> int:
         admission_gate_path=args.admission_gate,
         init_checkpoint_path=args.init_checkpoint,
         completion_checkpoint_path=args.completion_checkpoint,
+        phase=str(args.phase),
     )
     output_path = args.output.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
