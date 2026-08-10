@@ -816,9 +816,18 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert '--block-gate-selection "${BLOCK_SELECTION}"' in script
     assert '--logits-gate-selection "${LOGITS_SELECTION}"' in script
     assert "post_mixer)" in script
+    assert 'SUPPLEMENTAL_POLL_SECONDS="${SUPPLEMENTAL_POLL_SECONDS:-3600}"' in script
+    assert "wait_for_supplemental_training_data()" in script
+    assert '--inventory "${SUPPLEMENTAL_INVENTORY}"' in script
+    assert '--output "${SUPPLEMENTAL_PROFILE_RECEIPT}"' in script
+    assert "supplemental inventory and immutable profile receipt validated" in script
 
     main_body = script[script.index("main() {") :]
+    readiness_offset = main_body.index("wait_for_supplemental_training_data")
+    case_offset = main_body.index('case "${START_STAGE}"')
+    assert readiness_offset < case_offset
     full_branch = main_body[main_body.index("full)") : main_body.index("post_mixer)")]
+    assert readiness_offset < main_body.index("build_fixed_manifests")
     assert "run_full_mixer_phase" in full_branch
     continuation = main_body[main_body.index("esac") :]
     phase_calls = (
@@ -828,6 +837,54 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     )
     phase_offsets = [continuation.index(call) for call in phase_calls]
     assert phase_offsets == sorted(phase_offsets)
+
+
+@pytest.mark.parametrize(
+    ("create_inputs", "expected_message"),
+    (
+        (False, "supplemental inventory unavailable"),
+        (True, "supplemental readiness validation failed"),
+    ),
+)
+def test_stage211_supervisor_waits_before_setup_when_supplemental_is_not_ready(
+    tmp_path: Path,
+    create_inputs: bool,
+    expected_message: str,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    sleep = fake_bin / "sleep"
+    sleep.write_text("#!/usr/bin/env bash\nexit 73\n", encoding="utf-8")
+    sleep.chmod(0o755)
+    uv = fake_bin / "uv"
+    uv.write_text("#!/usr/bin/env bash\nexit 42\n", encoding="utf-8")
+    uv.chmod(0o755)
+    inventory = tmp_path / "supplemental_inventory.json"
+    profile = tmp_path / "supplemental_profile_receipt.json"
+    if create_inputs:
+        inventory.write_text("{}\n", encoding="utf-8")
+        profile.write_text("{}\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "start_stage211_abcd_after_calibration.sh")],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "STAGE211_REPO_ROOT": str(REPO_ROOT),
+            "SUPPLEMENTAL_INVENTORY": str(inventory),
+            "SUPPLEMENTAL_PROFILE_RECEIPT": str(profile),
+            "SUPPLEMENTAL_POLL_SECONDS": "3600",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 73
+    assert expected_message in result.stdout
+    assert "building and validating shared fixed-eval manifests" not in result.stdout
+    assert "starting strict Stage211A full-data controller" not in result.stdout
 
 
 def test_stage211_hourly_monitor_scopes_errors_to_latest_attempt(

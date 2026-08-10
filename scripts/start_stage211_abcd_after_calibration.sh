@@ -8,6 +8,7 @@ CALIBRATION_SESSION="${CALIBRATION_SESSION:-rwkvasr_stage211a_recovery_formal}"
 METADATA_SESSION="${METADATA_SESSION:-rwkvasr_stage211_metadata_copy}"
 NANO_SESSION="${NANO_SESSION:-rwkvasr_stage211_public_full_nano}"
 POLL_SECONDS="${POLL_SECONDS:-300}"
+SUPPLEMENTAL_POLL_SECONDS="${SUPPLEMENTAL_POLL_SECONDS:-3600}"
 
 CALIBRATION_RUN="${CALIBRATION_RUN:-${HOME}/rwkvasr_runs/sensevoice_rwkv_stage211a_recovery_stage210a30000_nanomlpfrozen_teacherforced_mixeronly_easy1490h_1ep_lr3e6_wd0_4x4090}"
 METADATA_ROOT="${METADATA_ROOT:-${HOME}/rwkvasr_data/stage211_full_curriculum}"
@@ -61,6 +62,24 @@ wait_for_session() {
     sleep "${POLL_SECONDS}"
   done
   log "${label} session released"
+}
+
+wait_for_supplemental_training_data() {
+  while true; do
+    if [[ ! -s "${SUPPLEMENTAL_INVENTORY}" ]]; then
+      log "supplemental inventory unavailable; waiting ${SUPPLEMENTAL_POLL_SECONDS}s path=${SUPPLEMENTAL_INVENTORY}"
+    elif [[ ! -s "${SUPPLEMENTAL_PROFILE_RECEIPT}" ]]; then
+      log "supplemental profile receipt unavailable; waiting ${SUPPLEMENTAL_POLL_SECONDS}s path=${SUPPLEMENTAL_PROFILE_RECEIPT}"
+    elif uv run python "${REPO_ROOT}/scripts/create_stage211_supplemental_profile_receipt.py" \
+      --inventory "${SUPPLEMENTAL_INVENTORY}" \
+      --output "${SUPPLEMENTAL_PROFILE_RECEIPT}"; then
+      log "supplemental inventory and immutable profile receipt validated"
+      return
+    else
+      log "supplemental readiness validation failed; waiting ${SUPPLEMENTAL_POLL_SECONDS}s"
+    fi
+    sleep "${SUPPLEMENTAL_POLL_SECONDS}"
+  done
 }
 
 validate_nano_predictions() {
@@ -331,6 +350,7 @@ run_labeled_sft_phase() {
 
 main() {
   cd "${REPO_ROOT}"
+  wait_for_supplemental_training_data
   case "${START_STAGE}" in
     full)
       wait_for_session "${METADATA_SESSION}" "metadata copy"
