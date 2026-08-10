@@ -10,6 +10,10 @@ from typing import Any
 import torch
 
 from rwkvasr.config import load_yaml
+from rwkvasr.eval.stage211_public_metrics import (
+    build_stage211_public_progress,
+    replay_stage211_public_comparison,
+)
 from rwkvasr.eval.stage211_supplemental import (
     STAGE211_SUPPLEMENTAL_DIFFICULTY,
     stage211_supplemental_profile,
@@ -3308,6 +3312,73 @@ def validate_stage211_phase_gate_report(
         report.get("public_benchmark"),
         require_metric_source_recomputed=True,
     )
+    benchmark_results = {str(result["dataset"]): result for result in benchmark["results"]}
+    manifest_paths = {
+        dataset: Path(str(result["manifest_path"])).expanduser().resolve()
+        for dataset, result in benchmark_results.items()
+    }
+    public_comparison_path = _validate_bound_file(
+        report,
+        path_key="public_comparison_report_path",
+        sha256_key="public_comparison_report_sha256",
+        label=f"Stage211 {expected_phase} public comparison report",
+    )
+    public_comparison_source = _load_json_object(
+        public_comparison_path,
+        label=f"Stage211 {expected_phase} public comparison report",
+    )
+    replayed_benchmark = replay_stage211_public_comparison(
+        public_comparison_source,
+        manifest_paths=manifest_paths,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        expected_checkpoint=checkpoint_path,
+    )
+    _validate_stage211_replayed_value(
+        benchmark,
+        replayed_benchmark,
+        label=f"{expected_phase} public WER/CER benchmark",
+    )
+    replayed_public_progress_gate_passed = True
+    if expected_phase in {"mixer", "block"}:
+        baseline_public_record = report.get("baseline_public_comparison_report")
+        if not isinstance(baseline_public_record, dict):
+            raise ValueError(
+                f"Stage211 {expected_phase} phase gate lacks its baseline public report."
+            )
+        baseline_public_path = _validate_bound_file(
+            baseline_public_record,
+            path_key="path",
+            sha256_key="sha256",
+            label=f"Stage211 {expected_phase} baseline public comparison report",
+        )
+        baseline_public_source = _load_json_object(
+            baseline_public_path,
+            label=f"Stage211 {expected_phase} baseline public comparison report",
+        )
+        replayed_baseline_benchmark = replay_stage211_public_comparison(
+            baseline_public_source,
+            manifest_paths=manifest_paths,
+            benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+            expected_checkpoint=phase_init_checkpoint,
+        )
+        replayed_public_progress = build_stage211_public_progress(
+            baseline=replayed_baseline_benchmark,
+            candidate=replayed_benchmark,
+            benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        )
+        _validate_stage211_replayed_value(
+            report.get("public_progress"),
+            replayed_public_progress,
+            label=f"{expected_phase} public progress gate",
+        )
+        replayed_public_progress_gate_passed = bool(replayed_public_progress["gate_passed"])
+    elif (
+        report.get("baseline_public_comparison_report") is not None
+        or report.get("public_progress") is not None
+    ):
+        raise ValueError(
+            "Stage211 logits phase gate unexpectedly contains a baseline progress gate."
+        )
     validate_stage211_public_overlap_binding(
         report.get("public_overlap"),
         public_benchmark=benchmark,
@@ -3460,6 +3531,11 @@ def validate_stage211_phase_gate_report(
     public_progress_gate_passed = report.get("public_progress_gate_passed")
     if not isinstance(public_progress_gate_passed, bool):
         raise ValueError("Stage211 phase gate lacks a boolean public-progress decision.")
+    if public_progress_gate_passed != replayed_public_progress_gate_passed:
+        raise ValueError(
+            f"Stage211 {expected_phase} public-progress decision does not match "
+            "replayed WER/CER evidence."
+        )
     if expected_phase in {"mixer", "block"}:
         expected_gate_passed = alignment_gate_passed and public_progress_gate_passed
         if require_passed and not public_progress_gate_passed:

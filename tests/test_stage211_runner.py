@@ -40,12 +40,14 @@ from rwkvasr.eval.stage211_supplemental import (
     STAGE211_SUPPLEMENTAL_SOURCES,
     stage211_supplemental_profile,
 )
+from rwkvasr.eval.stage211_public_metrics import replay_stage211_public_comparison
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GLOBAL_DEDUP_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "stage211_global_dedup_manifest.json"
 sys.path.insert(0, str(REPO_ROOT))
 stage211 = importlib.import_module("scripts.run_stage211_strict_chained_alignment")
+public_compare = importlib.import_module("scripts.compare_public_ctc_with_nano")
 stage211_phase_gate = importlib.import_module("scripts.create_stage211_phase_gate")
 stage211_full_phase = importlib.import_module("scripts.run_stage211_full_phase_curriculum")
 stage211_phase_finalizer = importlib.import_module("scripts.finalize_stage211_phase")
@@ -53,6 +55,49 @@ stage211_calibration_eval = importlib.import_module("scripts.validate_stage211_c
 stage211_supplemental_profile_receipt = importlib.import_module(
     "scripts.create_stage211_supplemental_profile_receipt"
 )
+stage211_gate_module = importlib.import_module("rwkvasr.eval.stage211_gate")
+
+
+@pytest.fixture(autouse=True)
+def _compact_public_replay_for_phase_gate_tests(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phase_gate_test = request.node.name.startswith(
+        (
+            "test_stage211_phase_gate_",
+            "test_stage211_block_phase_gate_",
+            "test_stage211_logits_phase_gate_",
+            "test_stage211_nano_baseline_receipt_",
+            "test_stage211_promotion_receipt_binds_",
+            "test_stage211_curriculum_receipt_requires_",
+        )
+    )
+    if not phase_gate_test:
+        return
+    compact = {
+        dataset: {
+            **expected,
+            "samples": (int(expected["samples"]) if dataset == "commonvoice_en_test" else 2),
+        }
+        for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items()
+    }
+    monkeypatch.setattr(sys.modules[__name__], "STAGE211_PUBLIC_BENCHMARKS", compact)
+    monkeypatch.setattr(stage211_gate_module, "STAGE211_PUBLIC_BENCHMARKS", compact)
+    monkeypatch.setattr(stage211_phase_gate, "STAGE211_PUBLIC_BENCHMARKS", compact)
+
+
+def test_stage211_public_benchmark_contract_uses_full_real_sets() -> None:
+    assert {
+        dataset: int(expected["samples"])
+        for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items()
+    } == {
+        "aishell1_test": 7_176,
+        "librispeech_test_clean": 2_620,
+        "librispeech_test_other": 2_939,
+        "commonvoice_en_test": 14_922,
+        "wenetspeech_test_net": 24_774,
+    }
 
 
 def test_stage211_controllers_preserve_virtualenv_python() -> None:
@@ -257,19 +302,19 @@ def test_stage211_public_enrichment_recomputes_bound_predictions(
         "decode": "greedy_ctc",
         "normalization": "ctc",
         "gate": {
-            "max_relative_ratio": 2.0,
-            "max_absolute_gap_points": 100.0,
+            "max_relative_ratio": 1.2,
+            "max_absolute_gap_points": 3.0,
             "requires_every_dataset": True,
         },
         "all_datasets_pass": False,
         "results": [
-            stage211_phase_gate.compare_dataset(
+            public_compare.compare_dataset(
                 dataset=dataset,
                 nano_path=nano,
                 student_path=student,
                 normalization="ctc",
-                max_relative_ratio=2.0,
-                max_absolute_gap_points=100.0,
+                max_relative_ratio=1.2,
+                max_absolute_gap_points=3.0,
             )
         ],
     }
@@ -284,18 +329,79 @@ def test_stage211_public_enrichment_recomputes_bound_predictions(
     assert enriched["results"][0]["student_error_rate"] == pytest.approx(0.25)
 
     report["results"][0]["student_error_rate"] += 0.01
-    with pytest.raises(ValueError, match="recomputed student_error_rate mismatch"):
+    with pytest.raises(ValueError, match="replayed student_error_rate mismatch"):
         stage211_phase_gate._enrich_public_benchmark(
             report,
             manifest_dir=tmp_path,
         )
     report["results"][0]["student_error_rate"] -= 0.01
     report["all_datasets_pass"] = True
-    with pytest.raises(ValueError, match="all_datasets_pass differs"):
+    with pytest.raises(ValueError, match="every-dataset decision mismatch"):
         stage211_phase_gate._enrich_public_benchmark(
             report,
             manifest_dir=tmp_path,
         )
+
+
+def test_stage211_public_replay_matches_canonical_metric_implementation(
+    tmp_path: Path,
+) -> None:
+    dataset = "librispeech_test_clean"
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    manifest = tmp_path / f"{dataset}.jsonl"
+    nano = tmp_path / f"{dataset}.nano.jsonl"
+    student = tmp_path / f"{dataset}.student.jsonl"
+    rows = [
+        {"utt_id": "utt-1", "ref_text": "hello world", "pred_text": "hello world"},
+        {"utt_id": "utt-2", "ref_text": "speech test", "pred_text": "speech test"},
+    ]
+    manifest.write_text(
+        "".join(
+            json.dumps({"utt_id": row["utt_id"], "text": row["ref_text"]}) + "\n" for row in rows
+        ),
+        encoding="utf-8",
+    )
+    nano.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    student_rows = [dict(row) for row in rows]
+    student_rows[1]["pred_text"] = "speech"
+    student.write_text(
+        "".join(json.dumps(row) + "\n" for row in student_rows),
+        encoding="utf-8",
+    )
+    canonical = public_compare.compare_dataset(
+        dataset=dataset,
+        nano_path=nano,
+        student_path=student,
+        normalization="ctc",
+        max_relative_ratio=1.20,
+        max_absolute_gap_points=3.0,
+    )
+    source = {
+        "version": 1,
+        "decode": "greedy_ctc",
+        "normalization": "ctc",
+        "gate": {
+            "max_relative_ratio": 1.20,
+            "max_absolute_gap_points": 3.0,
+            "requires_every_dataset": True,
+        },
+        "all_datasets_pass": False,
+        "student_checkpoint_path": str(checkpoint.resolve()),
+        "student_checkpoint_sha256": sha256_file(checkpoint),
+        "results": [canonical],
+    }
+
+    replayed = replay_stage211_public_comparison(
+        source,
+        manifest_paths={dataset: manifest},
+        benchmarks={dataset: {"language": "en", "metric": "wer", "samples": 2}},
+        expected_checkpoint=checkpoint,
+    )
+
+    assert replayed["results"][0]["student_error_rate"] == pytest.approx(0.25)
+    for key, expected in canonical.items():
+        assert replayed["results"][0][key] == expected
 
 
 def test_stage211_mixer_finalizer_evaluates_latest_retention_checkpoint(
@@ -800,10 +906,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
         '"${CALIBRATION_EVAL_DIR}/public/nano_comparison.json"' in script
     )
     assert '--baseline-public-comparison-report "${mixer_gate_dir}/nano_comparison.json"' in script
-    assert (
-        "--baseline-public-comparison-report "
-        '"${logits_gate_dir}/nano_comparison.json"' in script
-    )
+    assert '--baseline-public-comparison-report "${logits_gate_dir}/nano_comparison.json"' in script
     assert '--calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}"' in script
     assert "create_stage211_nano_baseline_receipt.py" in script
     assert '--output "${NANO_BASELINE_RECEIPT}"' in script
@@ -949,15 +1052,12 @@ def test_stage211_hourly_monitor_reports_bound_live_progress(
     (run_dir / "step-100.pt.tmp").write_bytes(b"incomplete")
     training_log = logs_dir / "train.log"
     training_log.write_text(
-        "[deepspeed-train] step=21 loss=0.2000\n"
-        "[deepspeed-train] step=25 loss=0.1000\n",
+        "[deepspeed-train] step=21 loss=0.2000\n[deepspeed-train] step=25 loss=0.1000\n",
         encoding="utf-8",
     )
     config = tmp_path / "stage211_test.yaml"
     config.write_text(
-        f"output_dir: {run_dir}\n"
-        "wandb_run_name: stage211-live-test\n"
-        "max_steps: 100\n",
+        f"output_dir: {run_dir}\nwandb_run_name: stage211-live-test\nmax_steps: 100\n",
         encoding="utf-8",
     )
 
@@ -995,7 +1095,7 @@ def test_stage211_hourly_monitor_resolves_one_config_from_four_ranks(
         "#!/usr/bin/env bash\n"
         "for rank in 0 1 2 3; do\n"
         "  printf '%s\\n' \"python3 -m rwkvasr.cli.train_ctc_deepspeed "
-        "--config-yaml /tmp/stage211_active.yaml --rank ${rank}\"\n"
+        '--config-yaml /tmp/stage211_active.yaml --rank ${rank}"\n'
         "done\n"
         "printf '%s\\n' 'python3 -m unrelated --config-yaml /tmp/ignored.yaml'\n",
         encoding="utf-8",
@@ -1130,9 +1230,7 @@ def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
         manifest = tmp_path / f"{difficulty}.json"
         manifest.write_text("{}\n", encoding="utf-8")
         manifests[difficulty] = manifest
-    supplemental_inventory, supplemental_profile = _write_supplemental_inventory_fixture(
-        tmp_path
-    )
+    supplemental_inventory, supplemental_profile = _write_supplemental_inventory_fixture(tmp_path)
     supplemental_profile_receipt = tmp_path / "supplemental-profile-receipt.json"
     stage211_supplemental_profile_receipt.write_immutable_receipt(
         supplemental_profile_receipt,
@@ -1531,9 +1629,7 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
         "logits": 0.10,
         "sft": 0.05,
     }[phase_name]
-    assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(
-        expected_ffn_weight
-    )
+    assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(expected_ffn_weight)
     assert config["step_eval_cache_batches"] is True
     assert config["step_eval_feature_seed"] == 0
     if phase_name == "sft":
@@ -1872,9 +1968,7 @@ def _write_supplemental_inventory_fixture(
         "layout_errors": [],
         "selected_rows": 5,
         "selected_hours": sum(selected_hours_by_source.values()),
-        "selected_counts_by_source": {
-            source: 1 for source in STAGE211_SUPPLEMENTAL_SOURCES
-        },
+        "selected_counts_by_source": {source: 1 for source in STAGE211_SUPPLEMENTAL_SOURCES},
         "selected_hours_by_source": selected_hours_by_source,
         "dedupe": {
             "algorithm": "blake2b16(corpus + NUL + source_identity)",
@@ -2492,7 +2586,7 @@ def _write_public_overlap_fixture(tmp_path: Path) -> tuple[Path, Path]:
     ]
     leaked_id = "leaked-test-audio"
     original_manifest = tmp_path / "commonvoice-full-contaminated.jsonl"
-    clean_manifest = tmp_path / "commonvoice-clean.jsonl"
+    clean_manifest = tmp_path / "commonvoice_en_test.jsonl"
     candidate_rows = tmp_path / "commonvoice-overlap-candidates.jsonl"
     exclusions = tmp_path / "commonvoice-exclusions.jsonl"
     original_manifest.write_text(
@@ -3038,6 +3132,232 @@ def _write_alignment_evidence_fixture(
     return alignment_path
 
 
+def _write_public_comparison_evidence_fixture(
+    tmp_path: Path,
+    *,
+    checkpoint: Path,
+    baseline_checkpoint: Path,
+    clean_commonvoice_manifest: Path,
+) -> tuple[Path, dict[str, object], Path, dict[str, object]]:
+    candidate_results: list[dict[str, object]] = []
+    baseline_results: list[dict[str, object]] = []
+    manifest_paths: dict[str, Path] = {}
+    public_labels = {
+        "aishell1_test": "AISHELL-1 test",
+        "librispeech_test_clean": "LibriSpeech test-clean",
+        "librispeech_test_other": "LibriSpeech test-other",
+        "commonvoice_en_test": "Common Voice 22 en test",
+        "wenetspeech_test_net": "WenetSpeech TEST_NET",
+    }
+    for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
+        manifest_path = (
+            clean_commonvoice_manifest
+            if dataset == "commonvoice_en_test"
+            else tmp_path / f"{dataset}.jsonl"
+        )
+        nano_path = tmp_path / f"{dataset}.nano.jsonl"
+        candidate_path = tmp_path / f"{dataset}.candidate.jsonl"
+        baseline_path = tmp_path / f"{dataset}.baseline.jsonl"
+        language = str(expected["language"])
+        sample_count = int(expected["samples"])
+        if dataset == "commonvoice_en_test":
+            reference = "clean"
+            baseline_prediction = ""
+            utt_ids = (f"clean-{index:05d}" for index in range(sample_count))
+        else:
+            reference = "alpha beta" if language == "en" else "你好"
+            baseline_prediction = "alpha" if language == "en" else "你"
+            utt_ids = (f"{dataset}-{index:05d}" for index in range(sample_count))
+
+        manifest_rows: list[str] = []
+        nano_rows: list[str] = []
+        baseline_rows: list[str] = []
+        for row_index, utt_id in enumerate(utt_ids):
+            if dataset != "commonvoice_en_test":
+                manifest_rows.append(
+                    json.dumps({"utt_id": utt_id, "text": reference}, ensure_ascii=True) + "\n"
+                )
+            nano_rows.append(
+                json.dumps(
+                    {
+                        "utt_id": utt_id,
+                        "ref_text": reference,
+                        "pred_text": baseline_prediction if row_index == 0 else reference,
+                    },
+                    ensure_ascii=True,
+                )
+                + "\n"
+            )
+            baseline_rows.append(
+                json.dumps(
+                    {
+                        "utt_id": utt_id,
+                        "ref_text": reference,
+                        "pred_text": baseline_prediction,
+                    },
+                    ensure_ascii=True,
+                )
+                + "\n"
+            )
+        if manifest_rows:
+            manifest_path.write_text("".join(manifest_rows), encoding="utf-8")
+        nano_path.write_text("".join(nano_rows), encoding="utf-8")
+        os.link(nano_path, candidate_path)
+        baseline_path.write_text("".join(baseline_rows), encoding="utf-8")
+        manifest_paths[dataset] = manifest_path.resolve()
+
+        def fixture_result(*, student_path: Path, baseline: bool) -> dict[str, object]:
+            nano_wer = (
+                1.0 / sample_count
+                if dataset == "commonvoice_en_test"
+                else 1.0 / (2.0 * sample_count)
+            )
+            nano_cer = (
+                1.0 / sample_count
+                if dataset == "commonvoice_en_test"
+                else 4.0 / (9.0 * sample_count)
+                if language == "en"
+                else 1.0 / (2.0 * sample_count)
+            )
+            nano_error_rate = nano_wer if expected["metric"] == "wer" else nano_cer
+            baseline_wer = 1.0 if dataset == "commonvoice_en_test" else 0.5
+            baseline_cer = (
+                1.0 if dataset == "commonvoice_en_test" else 4.0 / 9.0 if language == "en" else 0.5
+            )
+            student_wer = baseline_wer if baseline else nano_wer
+            student_cer = baseline_cer if baseline else nano_cer
+            student_error_rate = student_wer if expected["metric"] == "wer" else student_cer
+            nano_unit_ratio = (
+                (sample_count - 1.0) / sample_count
+                if dataset == "commonvoice_en_test"
+                else (2.0 * sample_count - 1.0) / (2.0 * sample_count)
+            )
+            return {
+                "dataset": dataset,
+                "label": public_labels[dataset],
+                "language": language,
+                "metric": expected["metric"],
+                "sample_count": sample_count,
+                "identical_utt_coverage": True,
+                "normalized_reference_mismatch_count": 0,
+                "nano_wer": nano_wer,
+                "student_wer": student_wer,
+                "nano_cer": nano_cer,
+                "student_cer": student_cer,
+                "nano_error_rate": nano_error_rate,
+                "student_error_rate": student_error_rate,
+                "absolute_gap_points": (student_error_rate - nano_error_rate) * 100.0,
+                "relative_ratio": student_error_rate / nano_error_rate,
+                "absolute_gate_pass": not baseline,
+                "relative_gate_pass": not baseline,
+                "gate_pass": not baseline,
+                "nano_prediction_reference_unit_ratio": nano_unit_ratio,
+                "student_prediction_reference_unit_ratio": (
+                    0.0
+                    if baseline and dataset == "commonvoice_en_test"
+                    else 0.5
+                    if baseline
+                    else nano_unit_ratio
+                ),
+                "nano_insertion_rate": 0.0,
+                "student_insertion_rate": 0.0,
+                "nano_deletion_rate": nano_error_rate,
+                "student_deletion_rate": student_error_rate,
+                "nano_substitution_rate": 0.0,
+                "student_substitution_rate": 0.0,
+                "changed_prediction_count": sample_count - 1 if baseline else 0,
+                "student_improved_count": 0,
+                "student_worsened_count": sample_count - 1 if baseline else 0,
+                "unchanged_count": 1 if baseline else sample_count,
+                "nano_prediction_path": str(nano_path.resolve()),
+                "student_prediction_path": str(student_path.resolve()),
+            }
+
+        candidate_results.append(fixture_result(student_path=candidate_path, baseline=False))
+        baseline_results.append(fixture_result(student_path=baseline_path, baseline=True))
+
+    def write_report(
+        *,
+        path: Path,
+        student_checkpoint: Path,
+        results: list[dict[str, object]],
+    ) -> dict[str, object]:
+        report: dict[str, object] = {
+            "version": 1,
+            "systems": {
+                "baseline": "FunASR-Nano-2512 direct CTC",
+                "candidate": "BiRWKV CTC",
+            },
+            "decode": "greedy_ctc",
+            "normalization": "ctc",
+            "gate": {
+                "max_relative_ratio": 1.20,
+                "max_absolute_gap_points": 3.0,
+                "requires_every_dataset": True,
+            },
+            "all_datasets_pass": all(bool(result["gate_pass"]) for result in results),
+            "student_checkpoint_path": str(student_checkpoint.resolve()),
+            "student_checkpoint_sha256": sha256_file(student_checkpoint),
+            "results": results,
+        }
+        path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+        return report
+
+    candidate_report_path = tmp_path / "candidate-public-comparison.json"
+    candidate_report = write_report(
+        path=candidate_report_path,
+        student_checkpoint=checkpoint,
+        results=candidate_results,
+    )
+    baseline_report_path = tmp_path / "baseline-public-comparison.json"
+    baseline_report = write_report(
+        path=baseline_report_path,
+        student_checkpoint=baseline_checkpoint,
+        results=baseline_results,
+    )
+
+    def enrich_report(report: dict[str, object]) -> dict[str, object]:
+        enriched_results = []
+        for result in report["results"]:
+            assert isinstance(result, dict)
+            dataset = str(result["dataset"])
+            manifest_path = manifest_paths[dataset]
+            nano_path = Path(str(result["nano_prediction_path"]))
+            student_path = Path(str(result["student_prediction_path"]))
+            enriched_results.append(
+                {
+                    **result,
+                    "manifest_path": str(manifest_path),
+                    "manifest_sha256": sha256_file(manifest_path),
+                    "nano_prediction_path": str(nano_path),
+                    "nano_prediction_sha256": sha256_file(nano_path),
+                    "student_prediction_path": str(student_path),
+                    "student_prediction_sha256": sha256_file(student_path),
+                    "metric_source_recomputed": True,
+                }
+            )
+        return {
+            **report,
+            "all_datasets_complete": True,
+            "results": enriched_results,
+        }
+
+    candidate_benchmark = enrich_report(candidate_report)
+    baseline_benchmark = enrich_report(baseline_report)
+    progress = stage211_phase_gate._build_public_progress(
+        baseline=baseline_benchmark,
+        candidate=candidate_benchmark,
+    )
+    assert candidate_benchmark["all_datasets_pass"] is True
+    assert progress["gate_passed"] is True
+    return (
+        candidate_report_path,
+        candidate_benchmark,
+        baseline_report_path,
+        progress,
+    )
+
+
 def _write_valid_phase_gate(
     tmp_path: Path,
     *,
@@ -3146,44 +3466,19 @@ def _write_valid_phase_gate(
         checkpoint_path=checkpoint,
     )
 
-    public_results = []
-    for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
-        manifest = (
-            clean_commonvoice_manifest
-            if dataset == "commonvoice_en_test"
-            else tmp_path / f"{dataset}.jsonl"
-        )
-        nano = tmp_path / f"{dataset}.nano.jsonl"
-        student = tmp_path / f"{dataset}.student.jsonl"
-        for path in (nano, student):
-            path.write_text("{}\n", encoding="utf-8")
-        if dataset != "commonvoice_en_test":
-            manifest.write_text("{}\n", encoding="utf-8")
-        public_results.append(
-            {
-                "dataset": dataset,
-                "language": expected["language"],
-                "metric": expected["metric"],
-                "sample_count": expected["samples"],
-                "identical_utt_coverage": True,
-                "normalized_reference_mismatch_count": 0,
-                "metric_source_recomputed": True,
-                "nano_error_rate": 0.1,
-                "student_error_rate": 0.11,
-                "absolute_gap_points": 1.0,
-                "relative_ratio": 1.1,
-                "nano_prediction_reference_unit_ratio": 1.0,
-                "student_prediction_reference_unit_ratio": 0.99,
-                "nano_deletion_rate": 0.01,
-                "student_deletion_rate": 0.02,
-                "manifest_path": str(manifest.resolve()),
-                "manifest_sha256": sha256_file(manifest),
-                "nano_prediction_path": str(nano.resolve()),
-                "nano_prediction_sha256": sha256_file(nano),
-                "student_prediction_path": str(student.resolve()),
-                "student_prediction_sha256": sha256_file(student),
-            }
-        )
+    phase_init_checkpoint = Path(segments[0]["init_checkpoint_path"])
+    (
+        public_comparison_report,
+        public_benchmark,
+        baseline_public_comparison_report,
+        public_progress,
+    ) = _write_public_comparison_evidence_fixture(
+        tmp_path,
+        checkpoint=checkpoint,
+        baseline_checkpoint=phase_init_checkpoint,
+        clean_commonvoice_manifest=clean_commonvoice_manifest,
+    )
+    public_results = public_benchmark["results"]
 
     baseline_results = []
     for result in public_results:
@@ -3248,7 +3543,6 @@ def _write_valid_phase_gate(
         + "\n",
         encoding="utf-8",
     )
-    phase_init_checkpoint = Path(segments[0]["init_checkpoint_path"])
     alignment_train_config = Path(segments[0]["train_config_path"])
     alignment_report = _write_alignment_evidence_fixture(
         tmp_path,
@@ -3310,6 +3604,17 @@ def _write_valid_phase_gate(
                 "gate_passed": True,
                 "alignment_gate_passed": True,
                 "public_progress_gate_passed": True,
+                "public_comparison_report_path": str(public_comparison_report.resolve()),
+                "public_comparison_report_sha256": sha256_file(public_comparison_report),
+                "baseline_public_comparison_report": (
+                    {
+                        "path": str(baseline_public_comparison_report.resolve()),
+                        "sha256": sha256_file(baseline_public_comparison_report),
+                    }
+                    if phase in {"mixer", "block"}
+                    else None
+                ),
+                "public_progress": (public_progress if phase in {"mixer", "block"} else None),
                 "global_dedup_manifest_path": str(GLOBAL_DEDUP_FIXTURE.resolve()),
                 "global_dedup_manifest_sha256": sha256_file(GLOBAL_DEDUP_FIXTURE),
                 "loaded_manifest_receipt_path": str(loaded_manifest_receipt.resolve()),
@@ -3333,13 +3638,7 @@ def _write_valid_phase_gate(
                     "receipt_sha256": sha256_file(public_overlap_receipt),
                 },
                 "full_data_coverage": full_data_coverage,
-                "public_benchmark": {
-                    "decode": "greedy_ctc",
-                    "normalization": "ctc",
-                    "all_datasets_complete": True,
-                    "all_datasets_pass": True,
-                    "results": public_results,
-                },
+                "public_benchmark": public_benchmark,
             }
         )
         + "\n",
@@ -3679,6 +3978,19 @@ def _write_corrected_phase_gate(
         checkpoint_path=checkpoint,
         post_coverage_corrections=[correction],
     )
+    public_source_path = Path(report["public_comparison_report_path"])
+    public_source = json.loads(public_source_path.read_text(encoding="utf-8"))
+    public_source["student_checkpoint_path"] = str(checkpoint.resolve())
+    public_source["student_checkpoint_sha256"] = sha256_file(checkpoint)
+    corrected_public_source_path = tmp_path / "corrected-public-comparison.json"
+    corrected_public_source_path.write_text(
+        json.dumps(public_source) + "\n",
+        encoding="utf-8",
+    )
+    report["public_comparison_report_path"] = str(corrected_public_source_path.resolve())
+    report["public_comparison_report_sha256"] = sha256_file(corrected_public_source_path)
+    report["public_benchmark"]["student_checkpoint_path"] = str(checkpoint.resolve())
+    report["public_benchmark"]["student_checkpoint_sha256"] = sha256_file(checkpoint)
     corrected_gate = tmp_path / "corrected_phase_gate.json"
     corrected_gate.write_text(json.dumps(report) + "\n", encoding="utf-8")
     return corrected_gate
@@ -3926,6 +4238,55 @@ def test_stage211_phase_gate_rejects_mutated_alignment_report(
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="logits",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_replays_public_wer_cer_from_predictions(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="logits",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    comparison_path = Path(gate["public_comparison_report_path"])
+    comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+    comparison["results"][0]["student_error_rate"] = 0.01
+    comparison_path.write_text(json.dumps(comparison) + "\n", encoding="utf-8")
+    gate["public_comparison_report_sha256"] = sha256_file(comparison_path)
+    gate["public_benchmark"]["results"][0]["student_error_rate"] = 0.01
+    gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="replayed student_error_rate mismatch"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="logits",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_replays_public_progress_from_baseline(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    gate["public_progress"]["macro_candidate_error_rate"] = 0.25
+    gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="public progress gate"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
             checkpoint_path=checkpoint,
         )
 
@@ -4335,7 +4696,7 @@ def test_stage211_phase_gate_rejects_nano_baseline_prediction_substitution(
     result["nano_prediction_sha256"] = sha256_file(replacement)
     gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="public-baseline provenance receipt"):
+    with pytest.raises(ValueError, match="public WER/CER benchmark"):
         stage211.validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",
@@ -4516,9 +4877,7 @@ def test_stage211_phase_gate_rejects_mutated_supplemental_inventory(
     )
     report = json.loads(gate_report.read_text(encoding="utf-8"))
     inventory_path = Path(
-        report["full_data_coverage"]["supplemental_natural"][
-            "supplemental_inventory_path"
-        ]
+        report["full_data_coverage"]["supplemental_natural"]["supplemental_inventory_path"]
     )
     inventory_path.write_text(
         inventory_path.read_text(encoding="utf-8") + "\n",
@@ -4698,14 +5057,15 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     )
     assert ".supplemental_dedupe_proof.base_public_overlap_rows == 0" in script
     assert (
-        '.supplemental_dedupe_proof.base_public_overlap_scan_order == '
-        '"manifest_location_index_archive_order_v1"'
-        in script
+        ".supplemental_dedupe_proof.base_public_overlap_scan_order == "
+        '"manifest_location_index_archive_order_v1"' in script
     )
     assert ".supplemental_dedupe_proof.base_public_overlap_scanned_rows > 0" in script
     assert ".supplemental_dedupe_proof.base_public_overlap_receipt_sha256" in script
     assert ".supplemental_dedupe_proof.social_normalized_pcm_exact_complete == true" in script
-    assert '.supplemental_dedupe_proof.social_public_overlap_mode == "normalized_pcm_exact"' in script
+    assert (
+        '.supplemental_dedupe_proof.social_public_overlap_mode == "normalized_pcm_exact"' in script
+    )
     assert (
         ".supplemental_dedupe_proof.archived_social_exact_duplicate_exclusion_complete == true"
         in script
@@ -4744,26 +5104,26 @@ def _run_stage211_continuation_watcher_fixture(
         '&& -f "${TMUX_STATE}.active" ]]; then\n'
         '      rm -f "${TMUX_STATE}.active"\n'
         '      launches="$(cat "${TMUX_STATE}.launches")"\n'
-        '      if ((launches >= 2)); then\n'
+        "      if ((launches >= 2)); then\n"
         '        mkdir -p "$(dirname "${FINAL_REPORT_PATH}")"\n'
-        '        printf \'%s\\n\' '
+        "        printf '%s\\n' "
         '\'{"pipeline":"stage211","artifact":"final_completion",'
         '"complete":true,"gate_passed":true}\' >"${FINAL_REPORT_PATH}"\n'
-        '      fi\n'
-        '      exit 0\n'
-        '    fi\n'
-        '    exit 1\n'
-        '  fi\n'
+        "      fi\n"
+        "      exit 0\n"
+        "    fi\n"
+        "    exit 1\n"
+        "  fi\n"
         '  if [[ "${1:-}" == new-session '
         '&& "$*" == *rwkvasr_stage211_abcd_strict_supervisor* ]]; then\n'
-        '    launches=0\n'
+        "    launches=0\n"
         '    [[ -f "${TMUX_STATE}.launches" ]] '
         '&& launches="$(cat "${TMUX_STATE}.launches")"\n'
         '    printf \'%s\\n\' "$((launches + 1))" >"${TMUX_STATE}.launches"\n'
         '    touch "${TMUX_STATE}.active"\n'
-        '  fi\n'
-        '  exit 0\n'
-        'fi\n'
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
         'if [[ "${1:-}" == has-session ]]; then exit 1; fi\n'
         "exit 0\n",
         encoding="utf-8",

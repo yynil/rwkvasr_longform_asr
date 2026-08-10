@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +25,12 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_public_overlap_binding,
 )
 from rwkvasr.eval.stage211_supplemental import STAGE211_SUPPLEMENTAL_DIFFICULTY
+from rwkvasr.eval.stage211_public_metrics import (
+    build_stage211_public_progress,
+    replay_stage211_public_comparison,
+)
 
 try:
-    from scripts.compare_public_ctc_with_nano import compare_dataset
     from scripts.create_stage211_hidden_alignment_gate import (
         build_gate as build_hidden_alignment_gate,
     )
@@ -38,7 +40,6 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
-    from compare_public_ctc_with_nano import compare_dataset
     from create_stage211_hidden_alignment_gate import (
         build_gate as build_hidden_alignment_gate,
     )
@@ -71,8 +72,7 @@ def _parse_coverage_receipts(
             or receipt.get("artifact") != "curriculum_coverage"
             or receipt.get("phase") != phase
             or receipt.get("complete") is not True
-            or difficulty
-            not in {*STAGE211_AUDIO_CURRICULUM, STAGE211_SUPPLEMENTAL_DIFFICULTY}
+            or difficulty not in {*STAGE211_AUDIO_CURRICULUM, STAGE211_SUPPLEMENTAL_DIFFICULTY}
         ):
             raise ValueError(f"Invalid Stage211 curriculum coverage receipt: {resolved}")
         if difficulty in receipts:
@@ -125,155 +125,19 @@ def _jsonl_records(
     return records
 
 
-def _recompute_public_result(
-    *,
-    report: dict[str, Any],
-    result: dict[str, Any],
-    dataset: str,
-    nano_path: Path,
-    student_path: Path,
-) -> dict[str, Any]:
-    gate = report.get("gate")
-    if not isinstance(gate, dict):
-        raise ValueError("Stage211 public comparison lacks its metric gate contract.")
-    if gate.get("requires_every_dataset") is not True:
-        raise ValueError("Stage211 public comparison must gate every dataset.")
-    recomputed = compare_dataset(
-        dataset=dataset,
-        nano_path=nano_path,
-        student_path=student_path,
-        normalization=str(report["normalization"]),
-        max_relative_ratio=float(gate.get("max_relative_ratio", float("nan"))),
-        max_absolute_gap_points=float(gate.get("max_absolute_gap_points", float("nan"))),
-    )
-    for key, expected in recomputed.items():
-        actual = result.get(key)
-        if key in {"nano_prediction_path", "student_prediction_path"}:
-            if Path(str(actual or "")).resolve() != Path(str(expected)).resolve():
-                raise ValueError(f"Stage211 {dataset} recomputed {key} path mismatch.")
-        elif isinstance(expected, bool):
-            if actual is not expected:
-                raise ValueError(
-                    f"Stage211 {dataset} recomputed {key} mismatch: "
-                    f"reported={actual!r} actual={expected!r}"
-                )
-        elif isinstance(expected, float):
-            try:
-                matches = math.isclose(
-                    float(actual),
-                    expected,
-                    rel_tol=1e-12,
-                    abs_tol=1e-12,
-                )
-            except (TypeError, ValueError):
-                matches = False
-            if not matches:
-                raise ValueError(
-                    f"Stage211 {dataset} recomputed {key} mismatch: "
-                    f"reported={actual!r} actual={expected!r}"
-                )
-        elif actual != expected:
-            raise ValueError(
-                f"Stage211 {dataset} recomputed {key} mismatch: "
-                f"reported={actual!r} actual={expected!r}"
-            )
-    return recomputed
-
-
 def _enrich_public_benchmark(
     report: dict[str, Any],
     *,
     manifest_dir: Path,
 ) -> dict[str, Any]:
-    if report.get("decode") != "greedy_ctc" or report.get("normalization") != "ctc":
-        raise ValueError("Stage211 public comparison must use greedy_ctc and ctc normalization.")
-    raw_results = report.get("results")
-    if not isinstance(raw_results, list):
-        raise ValueError("Stage211 public comparison results must be a list.")
-    by_dataset = {
-        str(result.get("dataset")): result for result in raw_results if isinstance(result, dict)
-    }
-    if set(by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
-        raise ValueError("Stage211 public comparison dataset set is incomplete or unexpected.")
-
-    results: list[dict[str, Any]] = []
-    for dataset in STAGE211_PUBLIC_BENCHMARKS:
-        result = dict(by_dataset[dataset])
-        language = str(STAGE211_PUBLIC_BENCHMARKS[dataset]["language"])
-        manifest_path = (manifest_dir / f"{dataset}.jsonl").resolve()
-        nano_path = Path(str(result.get("nano_prediction_path", "") or "")).resolve()
-        student_path = Path(str(result.get("student_prediction_path", "") or "")).resolve()
-        for label, path in (
-            ("manifest", manifest_path),
-            ("Nano prediction", nano_path),
-            ("student prediction", student_path),
-        ):
-            if not path.is_file() or path.stat().st_size <= 0:
-                raise ValueError(f"Stage211 {dataset} {label} is missing or empty: {path}")
-        manifest_records = _jsonl_records(
-            manifest_path,
-            language=language,
-            reference_keys=("text", "transcript", "ref_text", "reference"),
-        )
-        nano_records = _jsonl_records(
-            nano_path,
-            language=language,
-            reference_keys=("ref_text", "reference", "text", "transcript"),
-        )
-        student_records = _jsonl_records(
-            student_path,
-            language=language,
-            reference_keys=("ref_text", "reference", "text", "transcript"),
-        )
-        expected_samples = int(STAGE211_PUBLIC_BENCHMARKS[dataset]["samples"])
-        if (
-            len(manifest_records) != expected_samples
-            or set(nano_records) != set(manifest_records)
-            or set(student_records) != set(manifest_records)
-        ):
-            raise ValueError(
-                f"Stage211 {dataset} manifest/Nano/student utterance coverage mismatch: "
-                f"manifest={len(manifest_records)} nano={len(nano_records)} "
-                f"student={len(student_records)} expected={expected_samples}"
-            )
-        reference_mismatches = sum(
-            nano_records[utt_id] != reference or student_records[utt_id] != reference
-            for utt_id, reference in manifest_records.items()
-        )
-        if reference_mismatches:
-            raise ValueError(
-                f"Stage211 {dataset} normalized references differ from the manifest: "
-                f"mismatches={reference_mismatches}"
-            )
-        recomputed = _recompute_public_result(
-            report=report,
-            result=result,
-            dataset=dataset,
-            nano_path=nano_path,
-            student_path=student_path,
-        )
-        results.append(
-            {
-                **result,
-                **recomputed,
-                "manifest_path": str(manifest_path),
-                "manifest_sha256": sha256_file(manifest_path),
-                "nano_prediction_path": str(nano_path),
-                "nano_prediction_sha256": sha256_file(nano_path),
-                "student_prediction_path": str(student_path),
-                "student_prediction_sha256": sha256_file(student_path),
-                "metric_source_recomputed": True,
-            }
-        )
-    all_datasets_pass = all(bool(result["gate_pass"]) for result in results)
-    if report.get("all_datasets_pass") is not all_datasets_pass:
-        raise ValueError("Stage211 public comparison all_datasets_pass differs from source replay.")
-    return {
-        **report,
-        "all_datasets_complete": True,
-        "all_datasets_pass": all_datasets_pass,
-        "results": results,
-    }
+    return replay_stage211_public_comparison(
+        report,
+        manifest_paths={
+            dataset: (manifest_dir / f"{dataset}.jsonl").resolve()
+            for dataset in STAGE211_PUBLIC_BENCHMARKS
+        },
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+    )
 
 
 def _build_public_progress(
@@ -282,58 +146,12 @@ def _build_public_progress(
     candidate: dict[str, Any],
     max_dataset_regression: float = 0.03,
 ) -> dict[str, Any]:
-    baseline_results = {str(result["dataset"]): result for result in baseline["results"]}
-    candidate_results = {str(result["dataset"]): result for result in candidate["results"]}
-    if set(baseline_results) != set(candidate_results):
-        raise ValueError("Stage211 baseline/candidate public datasets differ.")
-    rows: list[dict[str, Any]] = []
-    for dataset in STAGE211_PUBLIC_BENCHMARKS:
-        baseline_result = baseline_results[dataset]
-        candidate_result = candidate_results[dataset]
-        for hash_key in ("manifest_sha256", "nano_prediction_sha256"):
-            if baseline_result.get(hash_key) != candidate_result.get(hash_key):
-                raise ValueError(f"Stage211 {dataset} baseline/candidate {hash_key} differs.")
-        baseline_error = float(baseline_result["student_error_rate"])
-        candidate_error = float(candidate_result["student_error_rate"])
-        baseline_deletion = float(baseline_result["student_deletion_rate"])
-        candidate_deletion = float(candidate_result["student_deletion_rate"])
-        rows.append(
-            {
-                "dataset": dataset,
-                "baseline_error_rate": baseline_error,
-                "candidate_error_rate": candidate_error,
-                "absolute_change": candidate_error - baseline_error,
-                "baseline_deletion_rate": baseline_deletion,
-                "candidate_deletion_rate": candidate_deletion,
-                "within_regression_limit": (
-                    candidate_error <= baseline_error + max_dataset_regression
-                ),
-                "improved": candidate_error < baseline_error,
-            }
-        )
-    macro_baseline_error = sum(float(row["baseline_error_rate"]) for row in rows) / len(rows)
-    macro_candidate_error = sum(float(row["candidate_error_rate"]) for row in rows) / len(rows)
-    macro_baseline_deletion = sum(float(row["baseline_deletion_rate"]) for row in rows) / len(rows)
-    macro_candidate_deletion = sum(float(row["candidate_deletion_rate"]) for row in rows) / len(
-        rows
+    return build_stage211_public_progress(
+        baseline=baseline,
+        candidate=candidate,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        max_dataset_regression=max_dataset_regression,
     )
-    gate_passed = (
-        all(bool(row["within_regression_limit"]) for row in rows)
-        and macro_candidate_error < macro_baseline_error
-        and macro_candidate_deletion < macro_baseline_deletion
-        and any(bool(row["improved"]) for row in rows)
-    )
-    return {
-        "gate_passed": gate_passed,
-        "max_dataset_regression": max_dataset_regression,
-        "macro_baseline_error_rate": macro_baseline_error,
-        "macro_candidate_error_rate": macro_candidate_error,
-        "macro_baseline_deletion_rate": macro_baseline_deletion,
-        "macro_candidate_deletion_rate": macro_candidate_deletion,
-        "improved_datasets": sum(bool(row["improved"]) for row in rows),
-        "results": rows,
-        "baseline_public_benchmark": baseline,
-    }
 
 
 def _rebuild_alignment_gate(

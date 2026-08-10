@@ -15,6 +15,11 @@ from rwkvasr.eval.stage211_gate import (
     sha256_file,
     stage211_phase_train_config_contract,
 )
+from rwkvasr.eval.stage211_public_metrics import (
+    build_stage211_sft_public_progress,
+    replay_stage211_public_comparison,
+    replay_stage211_sft_public_evidence,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +28,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sft_runner = importlib.import_module("scripts.run_stage211_labeled_sft")
 sft_finalizer = importlib.import_module("scripts.finalize_stage211_labeled_sft")
 stepwise_report = importlib.import_module("scripts.create_stage211_stepwise_report")
+public_compare = importlib.import_module("scripts.compare_public_ctc_with_nano")
 LABELED_EXPECTED = sft_runner.LABELED_EXPECTED
 
 
@@ -470,6 +476,121 @@ def test_stage211_sft_public_gate_requires_zero_dataset_regressions() -> None:
 
     assert failed["gate_passed"] is False
     assert failed["no_dataset_regression"] is False
+
+
+def test_stage211_sft_public_evidence_replays_baseline_candidate_and_progress(
+    tmp_path: Path,
+) -> None:
+    dataset = "librispeech_test_clean"
+    benchmarks = {dataset: {"language": "en", "metric": "wer", "samples": 2}}
+    baseline_checkpoint = tmp_path / "logits.pt"
+    candidate_checkpoint = tmp_path / "sft.pt"
+    baseline_checkpoint.write_bytes(b"logits")
+    candidate_checkpoint.write_bytes(b"sft")
+    manifest = tmp_path / f"{dataset}.jsonl"
+    nano = tmp_path / f"{dataset}.nano.jsonl"
+    baseline = tmp_path / f"{dataset}.baseline.jsonl"
+    candidate = tmp_path / f"{dataset}.candidate.jsonl"
+    rows = [
+        {"utt_id": "utt-1", "ref_text": "hello world", "pred_text": "hello world"},
+        {"utt_id": "utt-2", "ref_text": "speech test", "pred_text": "speech test"},
+    ]
+    manifest.write_text(
+        "".join(
+            json.dumps({"utt_id": row["utt_id"], "text": row["ref_text"]}) + "\n" for row in rows
+        ),
+        encoding="utf-8",
+    )
+    nano.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    baseline_rows = [dict(row) for row in rows]
+    baseline_rows[1]["pred_text"] = "speech"
+    baseline.write_text(
+        "".join(json.dumps(row) + "\n" for row in baseline_rows),
+        encoding="utf-8",
+    )
+    candidate.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    def source_report(*, checkpoint: Path, student: Path) -> dict[str, object]:
+        result = public_compare.compare_dataset(
+            dataset=dataset,
+            nano_path=nano,
+            student_path=student,
+            normalization="ctc",
+            max_relative_ratio=1.20,
+            max_absolute_gap_points=3.0,
+        )
+        return {
+            "version": 1,
+            "decode": "greedy_ctc",
+            "normalization": "ctc",
+            "gate": {
+                "max_relative_ratio": 1.20,
+                "max_absolute_gap_points": 3.0,
+                "requires_every_dataset": True,
+            },
+            "all_datasets_pass": bool(result["gate_pass"]),
+            "student_checkpoint_path": str(checkpoint.resolve()),
+            "student_checkpoint_sha256": sha256_file(checkpoint),
+            "results": [result],
+        }
+
+    baseline_source = source_report(checkpoint=baseline_checkpoint, student=baseline)
+    candidate_source = source_report(checkpoint=candidate_checkpoint, student=candidate)
+    baseline_source_path = tmp_path / "baseline-comparison.json"
+    candidate_source_path = tmp_path / "candidate-comparison.json"
+    baseline_source_path.write_text(json.dumps(baseline_source) + "\n", encoding="utf-8")
+    candidate_source_path.write_text(json.dumps(candidate_source) + "\n", encoding="utf-8")
+    manifests = {dataset: manifest}
+    baseline_benchmark = replay_stage211_public_comparison(
+        baseline_source,
+        manifest_paths=manifests,
+        benchmarks=benchmarks,
+        expected_checkpoint=baseline_checkpoint,
+    )
+    candidate_benchmark = replay_stage211_public_comparison(
+        candidate_source,
+        manifest_paths=manifests,
+        benchmarks=benchmarks,
+        expected_checkpoint=candidate_checkpoint,
+    )
+    progress = build_stage211_sft_public_progress(
+        baseline=baseline_benchmark,
+        candidate=candidate_benchmark,
+        benchmarks=benchmarks,
+    )
+    report = {
+        "baseline_public_comparison_report_path": str(baseline_source_path.resolve()),
+        "baseline_public_comparison_report_sha256": sha256_file(baseline_source_path),
+        "public_comparison_report_path": str(candidate_source_path.resolve()),
+        "public_comparison_report_sha256": sha256_file(candidate_source_path),
+        "baseline_public_benchmark": baseline_benchmark,
+        "public_benchmark": candidate_benchmark,
+        "public_progress": progress,
+    }
+
+    replayed = replay_stage211_sft_public_evidence(
+        report,
+        benchmarks=benchmarks,
+        expected_baseline_checkpoint=baseline_checkpoint,
+        expected_candidate_checkpoint=candidate_checkpoint,
+    )
+
+    assert replayed["public_progress"]["gate_passed"] is True
+    assert replayed["public_progress"]["improved_datasets"] == 1
+    candidate_source["results"][0]["student_error_rate"] = 0.01
+    candidate_source_path.write_text(json.dumps(candidate_source) + "\n", encoding="utf-8")
+    report["public_comparison_report_sha256"] = sha256_file(candidate_source_path)
+    report["public_benchmark"]["results"][0]["student_error_rate"] = 0.01
+    with pytest.raises(ValueError, match="replayed student_error_rate mismatch"):
+        replay_stage211_sft_public_evidence(
+            report,
+            benchmarks=benchmarks,
+            expected_baseline_checkpoint=baseline_checkpoint,
+            expected_candidate_checkpoint=candidate_checkpoint,
+        )
 
 
 def _bound_public_benchmark(
@@ -1282,6 +1403,28 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "validate_stage211_phase_gate_report",
         validate_phase,
     )
+
+    def replay_sft_public(report: dict[str, object], **kwargs):
+        del kwargs
+        return {
+            "baseline_public_benchmark": report.get(
+                "baseline_public_benchmark",
+                report["public_benchmark"],
+            ),
+            "public_benchmark": report["public_benchmark"],
+            "public_progress": report["public_progress"],
+        }
+
+    monkeypatch.setattr(
+        stepwise_report,
+        "replay_stage211_sft_public_evidence",
+        replay_sft_public,
+    )
+    monkeypatch.setattr(
+        sft_finalizer,
+        "replay_stage211_sft_public_evidence",
+        replay_sft_public,
+    )
     monkeypatch.setattr(
         stepwise_report,
         "DEFAULT_TOKENIZER_SOURCE",
@@ -1350,37 +1493,34 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["public_metric_correction_receipt_sha256"] == sha256_file(
         reports["metric_correction"]
     )
-    assert (
-        report["public_metric_tokenizer_source_sha256"]
-        == sha256_file(reports["metric_tokenizer_source"])
+    assert report["public_metric_tokenizer_source_sha256"] == sha256_file(
+        reports["metric_tokenizer_source"]
     )
     assert report["ctc_label_proof"]["language_counts"] == {
         "en": 222_040,
         "zh": 63_262,
     }
-    assert report["initialization_receipt_sha256"] == sha256_file(
-        reports["initialization"]
-    )
+    assert report["initialization_receipt_sha256"] == sha256_file(reports["initialization"])
     assert report["nano_teacher_chain_passed"] is True
     assert report["supplemental_inventory_chain_passed"] is True
     assert report["supplemental_dedupe_proof"]["source_sets_disjoint"] is True
     assert report["supplemental_dedupe_proof"]["content_fingerprint_complete"] is False
-    assert report["supplemental_dedupe_proof"][
-        "base_public_overlap_normalized_pcm_exact_complete"
-    ] is True
+    assert (
+        report["supplemental_dedupe_proof"]["base_public_overlap_normalized_pcm_exact_complete"]
+        is True
+    )
     assert report["supplemental_dedupe_proof"]["base_public_overlap_rows"] == 0
     assert report["supplemental_dedupe_proof"]["base_public_overlap_scanned_rows"] == 20
     assert report["supplemental_dedupe_proof"]["known_overlap_exclusions"] == [
         "llaso_gigaspeech",
         "llaso_librispeech",
     ]
-    assert report["supplemental_dedupe_proof"][
-        "archived_social_exact_duplicate_exclusion_complete"
-    ] is True
+    assert (
+        report["supplemental_dedupe_proof"]["archived_social_exact_duplicate_exclusion_complete"]
+        is True
+    )
     assert report["supplemental_dedupe_proof"]["archived_social_unique_members"] == 0
-    assert report["supplemental_dedupe_proof"][
-        "usb_natural_audio_resolution_complete"
-    ] is True
+    assert report["supplemental_dedupe_proof"]["usb_natural_audio_resolution_complete"] is True
     assert report["supplemental_dedupe_proof"]["usb_unresolved_natural_entries"] == []
     assert report["all_stage_public_metrics_complete"] is True
     assert report["public_metric_stage_order"] == [
@@ -1415,8 +1555,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["coverage_results"][0]["supplemental_unique_rows"] == 20
     assert len(report["coverage_results"][0]["training_segments"]) == 5
     assert (
-        report["coverage_results"][-1]["unique_or_train_rows"]
-        == LABELED_EXPECTED["train_samples"]
+        report["coverage_results"][-1]["unique_or_train_rows"] == LABELED_EXPECTED["train_samples"]
     )
     assert len(report["dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert report["stages"][-1]["checkpoint_sha256"] == sha256_file(checkpoints["sft"])
@@ -1431,15 +1570,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "Full Data Segment Proof" in output_markdown.read_text(encoding="utf-8")
     assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")
     assert "Public metric definition proof" in output_markdown.read_text(encoding="utf-8")
-    assert "Supplemental cross-pool dedupe" in output_markdown.read_text(
-        encoding="utf-8"
-    )
-    assert "base public normalized-PCM exact audit" in output_markdown.read_text(
-        encoding="utf-8"
-    )
-    assert "USB-wide natural-audio resolution" in output_markdown.read_text(
-        encoding="utf-8"
-    )
+    assert "Supplemental cross-pool dedupe" in output_markdown.read_text(encoding="utf-8")
+    assert "base public normalized-PCM exact audit" in output_markdown.read_text(encoding="utf-8")
+    assert "USB-wide natural-audio resolution" in output_markdown.read_text(encoding="utf-8")
     sft_finalizer._validate_final_report(
         reports["sft"],
         checkpoint=checkpoints["sft"],

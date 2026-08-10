@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +15,10 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_public_overlap_binding,
 )
 from rwkvasr.eval.stage211_initialization import DEFAULT_STAGE211_INITIALIZATION_RECEIPT
+from rwkvasr.eval.stage211_public_metrics import (
+    build_stage211_sft_public_progress,
+    replay_stage211_sft_public_evidence,
+)
 
 try:
     from scripts.create_stage211_stepwise_report import create_stepwise_report
@@ -151,48 +154,12 @@ def _build_sft_public_progress(
     candidate: dict[str, Any],
     tolerance: float = 1e-12,
 ) -> dict[str, Any]:
-    baseline_results = {str(result["dataset"]): result for result in baseline["results"]}
-    candidate_results = {str(result["dataset"]): result for result in candidate["results"]}
-    if set(baseline_results) != set(candidate_results):
-        raise ValueError("Stage211D baseline/candidate public datasets differ.")
-    rows: list[dict[str, Any]] = []
-    for dataset in STAGE211_PUBLIC_BENCHMARKS:
-        baseline_result = baseline_results[dataset]
-        candidate_result = candidate_results[dataset]
-        for hash_key in ("manifest_sha256", "nano_prediction_sha256"):
-            if baseline_result.get(hash_key) != candidate_result.get(hash_key):
-                raise ValueError(f"Stage211D {dataset} baseline/candidate {hash_key} differs.")
-        baseline_error = float(baseline_result["student_error_rate"])
-        candidate_error = float(candidate_result["student_error_rate"])
-        if not math.isfinite(baseline_error) or not math.isfinite(candidate_error):
-            raise ValueError(f"Stage211D {dataset} error rate must be finite.")
-        rows.append(
-            {
-                "dataset": dataset,
-                "metric": STAGE211_PUBLIC_BENCHMARKS[dataset]["metric"],
-                "baseline_error_rate": baseline_error,
-                "candidate_error_rate": candidate_error,
-                "absolute_change": candidate_error - baseline_error,
-                "no_regression": candidate_error <= baseline_error + tolerance,
-                "improved": candidate_error < baseline_error - tolerance,
-            }
-        )
-    macro_baseline = sum(float(row["baseline_error_rate"]) for row in rows) / len(rows)
-    macro_candidate = sum(float(row["candidate_error_rate"]) for row in rows) / len(rows)
-    no_regressions = all(bool(row["no_regression"]) for row in rows)
-    improved_datasets = sum(bool(row["improved"]) for row in rows)
-    macro_improved = macro_candidate < macro_baseline - tolerance
-    gate_passed = no_regressions and macro_improved and improved_datasets > 0
-    return {
-        "gate_passed": gate_passed,
-        "tolerance": tolerance,
-        "no_dataset_regression": no_regressions,
-        "macro_improved": macro_improved,
-        "improved_datasets": improved_datasets,
-        "macro_baseline_error_rate": macro_baseline,
-        "macro_candidate_error_rate": macro_candidate,
-        "results": rows,
-    }
+    return build_stage211_sft_public_progress(
+        baseline=baseline,
+        candidate=candidate,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        tolerance=tolerance,
+    )
 
 
 def _validate_final_report(
@@ -220,13 +187,25 @@ def _validate_final_report(
         report.get("public_benchmark"),
         require_metric_source_recomputed=True,
     )
+    labeled_coverage = report.get("labeled_data_coverage")
+    if not isinstance(labeled_coverage, dict):
+        raise ValueError("Stage211 final report lacks labeled-data coverage.")
+    replayed_public = replay_stage211_sft_public_evidence(
+        report,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        expected_baseline_checkpoint=Path(
+            str(labeled_coverage.get("init_checkpoint_path") or "")
+        ).resolve(),
+        expected_candidate_checkpoint=checkpoint,
+    )
+    benchmark = replayed_public["public_benchmark"]
     if benchmark.get("all_datasets_pass") is not True:
         raise ValueError("Stage211D did not pass the every-dataset Nano WER/CER gate.")
     validate_stage211_public_overlap_binding(
         report.get("public_overlap"),
         public_benchmark=benchmark,
     )
-    progress = report.get("public_progress")
+    progress = replayed_public["public_progress"]
     if (
         not isinstance(progress, dict)
         or progress.get("gate_passed") is not True
@@ -306,9 +285,6 @@ def _validate_final_report(
         raise ValueError("Stage211 final report Nano public-baseline checkpoint binding mismatch.")
     if baseline_receipt.get("public_overlap") != report.get("public_overlap"):
         raise ValueError("Stage211 final report and Nano baseline overlap bindings differ.")
-    labeled_coverage = report.get("labeled_data_coverage")
-    if not isinstance(labeled_coverage, dict):
-        raise ValueError("Stage211 final report lacks labeled-data coverage.")
     logits_gate_path = Path(str(report.get("logits_phase_gate_path") or "")).resolve()
     logits_gate = validate_stage211_phase_gate_report(
         logits_gate_path,

@@ -19,6 +19,7 @@ from rwkvasr.eval.stage211_initialization import (
     DEFAULT_STAGE211_INITIALIZATION_RECEIPT,
     validate_stage211_initialization_receipt,
 )
+from rwkvasr.eval.stage211_public_metrics import replay_stage211_sft_public_evidence
 from rwkvasr.eval.stage211_supplemental import STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
 
 try:
@@ -193,15 +194,6 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
         sha_key="checkpoint_sha256",
         label="Stage211 SFT checkpoint",
     )
-    progress = report.get("public_progress")
-    if (
-        not isinstance(progress, dict)
-        or progress.get("gate_passed") is not True
-        or progress.get("no_dataset_regression") is not True
-        or progress.get("macro_improved") is not True
-        or int(progress.get("improved_datasets", 0)) <= 0
-    ):
-        raise ValueError("Stage211 SFT public-progress gate did not pass.")
     coverage = report.get("labeled_data_coverage")
     if (
         not isinstance(coverage, dict)
@@ -213,6 +205,23 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
         report.get("public_benchmark"),
         require_metric_source_recomputed=True,
     )
+    replayed_public = replay_stage211_sft_public_evidence(
+        report,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        expected_baseline_checkpoint=Path(
+            str(coverage.get("init_checkpoint_path") or "")
+        ).resolve(),
+        expected_candidate_checkpoint=checkpoint,
+    )
+    benchmark = replayed_public["public_benchmark"]
+    progress = replayed_public["public_progress"]
+    if (
+        progress.get("gate_passed") is not True
+        or progress.get("no_dataset_regression") is not True
+        or progress.get("macro_improved") is not True
+        or int(progress.get("improved_datasets", 0)) <= 0
+    ):
+        raise ValueError("Stage211 SFT public-progress gate did not pass.")
     if benchmark.get("all_datasets_pass") is not True:
         raise ValueError("Stage211 SFT did not pass the every-dataset Nano WER/CER gate.")
     validate_stage211_public_overlap_binding(
@@ -393,9 +402,7 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
     }
     for key, expected in expected_preparation.items():
         if preparation.get(key) != expected:
-            raise ValueError(
-                f"Stage211 SFT CTC label-preparation {key} mismatch."
-            )
+            raise ValueError(f"Stage211 SFT CTC label-preparation {key} mismatch.")
     for path_key, sha_key in (
         ("summary_path", "summary_sha256"),
         ("log_path", "log_sha256"),
@@ -495,9 +502,7 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
             }
         original_segments = coverage.get("segments")
         supplemental_segment = coverage.get("supplemental_natural")
-        if not isinstance(original_segments, list) or not isinstance(
-            supplemental_segment, dict
-        ):
+        if not isinstance(original_segments, list) or not isinstance(supplemental_segment, dict):
             raise ValueError(f"Stage211 {stage} coverage segment proof is incomplete.")
         training_segments = []
         for segment in [*original_segments, supplemental_segment]:
@@ -519,23 +524,15 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
                     "steps": int(segment["steps"]),
                     "row_exposures": int(segment["row_exposures"]),
                     "hour_exposures": float(segment["hour_exposures"]),
-                    "tail_padding_sample_exposures": int(
-                        segment["tail_padding_sample_exposures"]
-                    ),
-                    "executed_sample_exposures": int(
-                        segment["executed_sample_exposures"]
-                    ),
+                    "tail_padding_sample_exposures": int(segment["tail_padding_sample_exposures"]),
+                    "executed_sample_exposures": int(segment["executed_sample_exposures"]),
                 }
             )
         expected_integer_totals = {
             "rows": unique_rows,
             "row_exposures": row_exposures,
-            "tail_padding_sample_exposures": int(
-                coverage["total_tail_padding_sample_exposures"]
-            ),
-            "executed_sample_exposures": int(
-                coverage["total_executed_sample_exposures"]
-            ),
+            "tail_padding_sample_exposures": int(coverage["total_tail_padding_sample_exposures"]),
+            "executed_sample_exposures": int(coverage["total_executed_sample_exposures"]),
         }
         for key, expected in expected_integer_totals.items():
             if sum(int(row[key]) for row in training_segments) != expected:
@@ -576,9 +573,7 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
             ),
             "original_unique_rows": int(coverage["original_total_unique_rows"]),
             "supplemental_unique_rows": int(supplemental_segment["rows"]),
-            "supplemental_inventory_path": str(
-                supplemental_segment["supplemental_inventory_path"]
-            ),
+            "supplemental_inventory_path": str(supplemental_segment["supplemental_inventory_path"]),
             "supplemental_inventory_sha256": str(
                 supplemental_segment["supplemental_inventory_sha256"]
             ),
@@ -680,20 +675,16 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
         or base_audit.get("training_ready") is not True
         or base_audit.get("admission_state") != "normalized_pcm_exact_public_clear"
         or base_audit.get("comparison_mode") != "normalized_pcm_exact"
-        or base_audit.get("scan_order")
-        != STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
+        or base_audit.get("scan_order") != STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
         or base_audit.get("near_duplicate_complete") is not False
         or int(base_audit.get("decode_failures", -1)) != 0
         or int(base_audit.get("public_overlap_rows", -1)) != 0
         or base_audit.get("base_inventory_path") != str(base_inventory_path)
-        or base_audit.get("base_inventory_sha256")
-        != base_component.get("inventory_sha256")
+        or base_audit.get("base_inventory_sha256") != base_component.get("inventory_sha256")
         or int(base_audit.get("scanned_rows", -1)) != int(base_component.get("rows", -2))
         or base_audit_record.get("comparison_mode") != "normalized_pcm_exact"
-        or base_audit_record.get("scan_order")
-        != STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
-        or int(base_audit_record.get("scanned_rows", -1))
-        != int(base_component.get("rows", -2))
+        or base_audit_record.get("scan_order") != STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
+        or int(base_audit_record.get("scanned_rows", -1)) != int(base_component.get("rows", -2))
         or int(base_audit_record.get("public_overlap_rows", -1)) != 0
         or base_audit_record.get("training_ready") is not True
     ):
@@ -1090,16 +1081,12 @@ def build_stepwise_report(
         "ctc_label_normalization_chain_passed": True,
         "ctc_label_proof": ctc_label_proof,
         "public_metric_definition_chain_passed": True,
-        "public_metric_correction_receipt_path": str(
-            public_metric_correction_receipt_path
-        ),
+        "public_metric_correction_receipt_path": str(public_metric_correction_receipt_path),
         "public_metric_correction_receipt_sha256": sha256_file(
             public_metric_correction_receipt_path
         ),
         "public_metric_tokenizer_contract": metric_correction["tokenizer_contract"],
-        "public_metric_tokenizer_source_sha256": metric_correction[
-            "tokenizer_source_sha256"
-        ],
+        "public_metric_tokenizer_source_sha256": metric_correction["tokenizer_source_sha256"],
         "initialization_receipt_path": str(initialization_receipt_path),
         "initialization_receipt_sha256": sha256_file(initialization_receipt_path),
         "initialization_proof": {
@@ -1379,9 +1366,7 @@ def main() -> int:
         sft_final_report_path=args.sft_final_report,
         output_json=args.output_json,
         output_markdown=args.output_markdown,
-        public_metric_correction_receipt_path=(
-            args.public_metric_correction_receipt
-        ),
+        public_metric_correction_receipt_path=(args.public_metric_correction_receipt),
     )
     print(
         f"stepwise_report={args.output_json.resolve()} "
