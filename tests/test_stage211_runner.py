@@ -931,15 +931,104 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert readiness_offset < case_offset
     full_branch = main_body[main_body.index("full)") : main_body.index("post_mixer)")]
     assert readiness_offset < main_body.index("build_fixed_manifests")
-    assert "run_full_mixer_phase" in full_branch
-    continuation = main_body[main_body.index("esac") :]
-    phase_calls = (
-        "run_full_block_phase",
-        "run_full_logits_phase",
-        "run_labeled_sft_phase",
+    assert all(
+        call in full_branch
+        for call in (
+            "run_full_mixer_phase",
+            "run_full_block_phase",
+            "run_full_logits_phase",
+            "run_labeled_sft_phase",
+        )
     )
-    phase_offsets = [continuation.index(call) for call in phase_calls]
-    assert phase_offsets == sorted(phase_offsets)
+    logits_branch = main_body[main_body.index("logits)") : main_body.index("sft)")]
+    assert "run_block_correction_loop" in logits_branch
+    assert "run_full_block_phase" not in logits_branch
+    assert "run_full_logits_phase" in logits_branch
+    sft_branch = main_body[main_body.index("sft)") : main_body.index("*)")]
+    assert "run_block_correction_loop" in sft_branch
+    assert "run_logits_correction_loop" in sft_branch
+    assert "run_full_block_phase" not in sft_branch
+    assert "run_full_logits_phase" not in sft_branch
+
+
+@pytest.mark.parametrize(
+    ("start_stage", "expected_full_phase"),
+    (("logits", "logits"), ("sft", None)),
+)
+def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controllers(
+    tmp_path: Path,
+    start_stage: str,
+    expected_full_phase: str | None,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    call_log = tmp_path / "calls.log"
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >>"${CALL_LOG}"\n',
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    jq = fake_bin / "jq"
+    jq.write_text(
+        "#!/usr/bin/env bash\n"
+        'name="$(basename "$3" _selected.json)"\n'
+        'case "$2" in\n'
+        '  .checkpoint_path) printf \'/tmp/%s-checkpoint.pt\\n\' "$name" ;;\n'
+        '  .promotion_receipt_path) printf \'/tmp/%s-promotion.json\\n\' "$name" ;;\n'
+        '  .gate_dir) printf \'/tmp/%s-gate\\n\' "$name" ;;\n'
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    jq.chmod(0o755)
+    inventory = tmp_path / "supplemental_inventory.json"
+    profile = tmp_path / "supplemental_profile_receipt.json"
+    inventory.write_text("{}\n", encoding="utf-8")
+    profile.write_text("{}\n", encoding="utf-8")
+
+    subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "start_stage211_abcd_after_calibration.sh")],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CALL_LOG": str(call_log),
+            "START_STAGE": start_stage,
+            "STAGE211_REPO_ROOT": str(REPO_ROOT),
+            "SUPPLEMENTAL_INVENTORY": str(inventory),
+            "SUPPLEMENTAL_PROFILE_RECEIPT": str(profile),
+            "MIXER_SELECTION": str(tmp_path / "mixer_selected.json"),
+            "BLOCK_SELECTION": str(tmp_path / "block_selected.json"),
+            "LOGITS_SELECTION": str(tmp_path / "logits_selected.json"),
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=5,
+    )
+
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    full_phase_calls = [
+        call for call in calls if "run_stage211_full_phase_curriculum.py" in call
+    ]
+    if expected_full_phase is None:
+        assert full_phase_calls == []
+    else:
+        assert len(full_phase_calls) == 1
+        assert f"--phase {expected_full_phase}" in full_phase_calls[0]
+    assert not any(
+        "run_stage211_full_phase_curriculum.py" in call
+        and ("--phase mixer" in call or "--phase block" in call)
+        for call in calls
+    )
+    correction_calls = [
+        call for call in calls if "run_stage211_mixer_retention_loop.py" in call
+    ]
+    assert len(correction_calls) == 3
+    assert "--phase block" in correction_calls[1]
+    assert "--phase logits" in correction_calls[2]
 
 
 @pytest.mark.parametrize(

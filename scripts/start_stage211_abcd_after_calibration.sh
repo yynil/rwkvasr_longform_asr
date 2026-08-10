@@ -237,8 +237,6 @@ run_full_block_phase() {
   init_checkpoint="$(jq -er '.checkpoint_path' "${MIXER_SELECTION}")"
   local promotion_receipt
   promotion_receipt="$(jq -er '.promotion_receipt_path' "${MIXER_SELECTION}")"
-  local mixer_gate_dir
-  mixer_gate_dir="$(jq -er '.gate_dir' "${MIXER_SELECTION}")"
   local final_checkpoint_file="${FULL_OUTPUT_ROOT}/stage211b_block_full_data_3ep/final_checkpoint_with_supplemental.txt"
   log "starting strict Stage211B full-data controller"
   uv run python "${REPO_ROOT}/scripts/run_stage211_full_phase_curriculum.py" \
@@ -255,6 +253,13 @@ run_full_block_phase() {
     --master-port "$((MASTER_PORT + 1))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211B full curriculum finished; starting strict correction/evaluation loop"
+  run_block_correction_loop
+  log "Stage211B selected Block gate passed"
+}
+
+run_block_correction_loop() {
+  local mixer_gate_dir
+  mixer_gate_dir="$(jq -er '.gate_dir' "${MIXER_SELECTION}")"
   uv run python "${REPO_ROOT}/scripts/run_stage211_mixer_retention_loop.py" \
     --phase block \
     --phase-root "${FULL_OUTPUT_ROOT}/stage211b_block_full_data_3ep" \
@@ -270,7 +275,6 @@ run_full_block_phase() {
     --selection "${BLOCK_SELECTION}" \
     --master-port "$((MASTER_PORT + 11))" \
     --devices 0,1,2,3
-  log "Stage211B selected Block gate passed"
 }
 
 run_full_logits_phase() {
@@ -294,6 +298,11 @@ run_full_logits_phase() {
     --master-port "$((MASTER_PORT + 2))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211C full curriculum finished; starting strict correction/evaluation loop"
+  run_logits_correction_loop
+  log "Stage211C selected Logits gate passed the complete Nano CTC gate"
+}
+
+run_logits_correction_loop() {
   uv run python "${REPO_ROOT}/scripts/run_stage211_mixer_retention_loop.py" \
     --phase logits \
     --phase-root "${FULL_OUTPUT_ROOT}/stage211c_logits_full_data_3ep" \
@@ -308,7 +317,6 @@ run_full_logits_phase() {
     --selection "${LOGITS_SELECTION}" \
     --master-port "$((MASTER_PORT + 12))" \
     --devices 0,1,2,3
-  log "Stage211C selected Logits gate passed the complete Nano CTC gate"
 }
 
 run_labeled_sft_phase() {
@@ -366,39 +374,43 @@ main() {
       fi
       ensure_initialization_receipt
       run_full_mixer_phase
+      run_full_block_phase
+      run_full_logits_phase
+      run_labeled_sft_phase
       ;;
     post_mixer)
       ensure_initialization_receipt
       run_mixer_retention_loop
+      run_full_block_phase
+      run_full_logits_phase
+      run_labeled_sft_phase
       ;;
     block)
       ensure_initialization_receipt
       run_mixer_retention_loop
+      run_full_block_phase
+      run_full_logits_phase
+      run_labeled_sft_phase
       ;;
     logits)
       ensure_initialization_receipt
       run_mixer_retention_loop
-      run_full_block_phase
+      run_block_correction_loop
       run_full_logits_phase
       run_labeled_sft_phase
-      return
       ;;
     sft)
       ensure_initialization_receipt
       run_mixer_retention_loop
-      run_full_block_phase
-      run_full_logits_phase
+      run_block_correction_loop
+      run_logits_correction_loop
       run_labeled_sft_phase
-      return
       ;;
     *)
       echo "Unsupported START_STAGE=${START_STAGE}; expected full/post_mixer/block/logits/sft" >&2
       exit 2
       ;;
   esac
-  run_full_block_phase
-  run_full_logits_phase
-  run_labeled_sft_phase
 }
 
 main "$@"
