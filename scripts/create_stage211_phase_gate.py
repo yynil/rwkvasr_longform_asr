@@ -9,14 +9,10 @@ from rwkvasr.eval import normalize_asr_text_for_metrics
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
     STAGE211_AUDIO_CURRICULUM,
-    STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES,
-    STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
-    STAGE211_AUDIO_TOTAL_HOURS,
-    STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
-    STAGE211_AUDIO_TOTAL_ROWS,
-    STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES,
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
+    build_stage211_full_data_coverage,
+    load_stage211_post_coverage_correction_receipts,
     sha256_file,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
@@ -294,6 +290,7 @@ def build_phase_gate(
     manifest_dir: Path,
     coverage_receipt_paths: list[Path],
     alignment_report_path: Path | None,
+    post_coverage_correction_receipt_paths: list[Path] | None = None,
     baseline_public_comparison_report_path: Path | None = None,
     nano_public_baseline_receipt_path: Path = (DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT),
 ) -> dict[str, Any]:
@@ -313,6 +310,11 @@ def build_phase_gate(
     if public_report.get("student_checkpoint_sha256") != sha256_file(checkpoint_path):
         raise ValueError("Stage211 public comparison checkpoint SHA-256 mismatch.")
     coverage = _parse_coverage_receipts(coverage_receipt_paths, phase=phase)
+    correction_receipts = load_stage211_post_coverage_correction_receipts(
+        list(post_coverage_correction_receipt_paths or [])
+    )
+    if correction_receipts and phase != "mixer":
+        raise ValueError("Stage211 post-coverage corrections are valid only for Mixer.")
     phase_init_checkpoint = Path(str(coverage[0].get("init_checkpoint_path") or "")).resolve()
     if not phase_init_checkpoint.is_file() or sha256_file(phase_init_checkpoint) != coverage[0].get(
         "init_checkpoint_sha256"
@@ -455,21 +457,12 @@ def build_phase_gate(
         "alignment_report": alignment_record,
         "baseline_public_comparison_report": baseline_public_record,
         "public_progress": public_progress,
-        "full_data_coverage": {
-            "phase": phase,
-            "complete": True,
-            "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
-            "total_hours": STAGE211_AUDIO_TOTAL_HOURS,
-            "total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
-            "total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
-            "total_tail_padding_sample_exposures": (
-                STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
-            ),
-            "total_executed_sample_exposures": (STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES),
-            "segments": coverage,
-            "final_checkpoint_path": str(checkpoint_path),
-            "final_checkpoint_sha256": final_checkpoint_sha256,
-        },
+        "full_data_coverage": build_stage211_full_data_coverage(
+            phase=phase,
+            segments=coverage,
+            checkpoint_path=checkpoint_path,
+            post_coverage_corrections=correction_receipts,
+        ),
         "public_comparison_report_path": str(public_comparison_report_path),
         "public_comparison_report_sha256": sha256_file(public_comparison_report_path),
         "nano_public_baseline_receipt_path": str(nano_public_baseline_receipt_path),
@@ -496,6 +489,12 @@ def main() -> int:
     )
     parser.add_argument("--alignment-report", type=Path, default=None)
     parser.add_argument(
+        "--post-coverage-correction-receipt",
+        type=Path,
+        action="append",
+        default=[],
+    )
+    parser.add_argument(
         "--baseline-public-comparison-report",
         type=Path,
         default=None,
@@ -514,6 +513,7 @@ def main() -> int:
         public_comparison_report_path=args.public_comparison_report,
         manifest_dir=args.manifest_dir,
         coverage_receipt_paths=list(args.coverage_receipt),
+        post_coverage_correction_receipt_paths=list(args.post_coverage_correction_receipt),
         alignment_report_path=args.alignment_report,
         baseline_public_comparison_report_path=(args.baseline_public_comparison_report),
         nano_public_baseline_receipt_path=args.nano_public_baseline_receipt,

@@ -25,9 +25,14 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
     STAGE211_PUBLIC_BENCHMARKS,
+    STAGE211_RETENTION_CORRECTION_EPOCHS,
+    STAGE211_RETENTION_CORRECTION_LR,
+    build_stage211_full_data_coverage,
     sha256_file,
+    stage211_post_coverage_correction_exposure,
     stage211_phase_train_config_contract,
     validate_stage211_nano_public_baseline_receipt,
+    validate_stage211_phase_gate_report,
     validate_stage211_phase_train_config,
 )
 
@@ -75,6 +80,105 @@ def test_stage211_public_eval_shards_large_second_stage(
     assert len(calls) == 1
     assert calls[0][1] is not None
     assert calls[0][1]["CTC_SHARD_STAGE2"] == "1"
+
+
+def test_stage211_mixer_finalizer_evaluates_latest_retention_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_checkpoint = tmp_path / "phase-init.pt"
+    baseline_checkpoint.write_bytes(b"phase-init")
+    long_checkpoint = tmp_path / "long-complete.pt"
+    long_checkpoint.write_bytes(b"long-complete")
+    corrected_checkpoint = tmp_path / "retention-complete.pt"
+    corrected_checkpoint.write_bytes(b"retention-complete")
+    curriculum_receipt = tmp_path / "long-receipt.json"
+    curriculum_receipt.write_text("{}\n", encoding="utf-8")
+    correction_receipt = tmp_path / "correction-receipt.json"
+    correction_receipt.write_text("{}\n", encoding="utf-8")
+    manifest = tmp_path / "stratified.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    correction = {
+        "completion_checkpoint_path": str(corrected_checkpoint.resolve()),
+        "row_exposures": 8,
+        "hour_exposures": 0.01,
+        "steps": 1,
+        "tail_padding_sample_exposures": 4,
+        "executed_sample_exposures": 12,
+    }
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_resolve_curriculum",
+        lambda **kwargs: (
+            {
+                "segments": [
+                    {
+                        "difficulty": "easy",
+                        "init_checkpoint_path": str(baseline_checkpoint.resolve()),
+                        "init_checkpoint_sha256": sha256_file(baseline_checkpoint),
+                    }
+                ]
+            },
+            long_checkpoint,
+            [curriculum_receipt],
+        ),
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "load_stage211_post_coverage_correction_receipts",
+        lambda paths: [correction],
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "validate_stage211_full_data_coverage",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_stratified_cell_manifests",
+        lambda path: {cell: manifest for cell in stage211_phase_finalizer.STRATIFIED_HIDDEN_CELLS},
+    )
+    monkeypatch.setattr(stage211_phase_finalizer, "_run_public_eval", lambda **kwargs: None)
+    monkeypatch.setattr(stage211_phase_finalizer, "_run_nano_comparison", lambda **kwargs: None)
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_run",
+        lambda command, *, dry_run, env=None: commands.append(command),
+    )
+
+    stage211_phase_finalizer.finalize_phase(
+        SimpleNamespace(
+            phase="mixer",
+            phase_root=tmp_path / "phase",
+            public_manifest_dir=tmp_path / "public-manifests",
+            nano_prediction_dir=tmp_path / "nano" / "predictions",
+            nano_public_baseline_receipt=None,
+            output_dir=tmp_path / "eval",
+            devices="0,1,2,3",
+            dry_run=True,
+            baseline_public_comparison_report=tmp_path / "baseline-public.json",
+            post_coverage_correction_receipt=[correction_receipt],
+            stratified_hidden_receipt=tmp_path / "stratified-receipt.json",
+        )
+    )
+
+    pair_command = next(
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.ALIGNMENT_PAIR_EVAL_SCRIPT) in command
+    )
+    assert pair_command[pair_command.index("--candidate-checkpoint") + 1] == str(
+        corrected_checkpoint.resolve()
+    )
+    phase_gate_command = next(
+        command
+        for command in commands
+        if str(stage211_phase_finalizer.PHASE_GATE_SCRIPT) in command
+    )
+    assert phase_gate_command[
+        phase_gate_command.index("--post-coverage-correction-receipt") + 1
+    ] == str(correction_receipt.resolve())
 
 
 def test_stage211_logits_finalizer_runs_independent_alignment_gate(
@@ -1807,6 +1911,357 @@ def _write_valid_phase_gate(
         encoding="utf-8",
     )
     return gate_report
+
+
+def _write_failed_phase_gate(gate_report: Path) -> Path:
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    alignment_path = Path(report["alignment_report"]["path"])
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment["gate_passed"] = False
+    alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
+    report["alignment_report"]["sha256"] = sha256_file(alignment_path)
+    report["alignment_gate_passed"] = False
+    report["gate_passed"] = False
+    failed_gate = gate_report.with_name("failed_phase_gate.json")
+    failed_gate.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    return failed_gate
+
+
+def _write_retention_correction(
+    tmp_path: Path,
+    *,
+    failed_gate: Path,
+    completion_checkpoint: Path,
+) -> tuple[dict[str, object], Path]:
+    failed = json.loads(failed_gate.read_text(encoding="utf-8"))
+    init_checkpoint = Path(failed["checkpoint_path"])
+    nano_checkpoint = Path(
+        failed["full_data_coverage"]["segments"][0]["nano_teacher_checkpoint_path"]
+    )
+    replay_root = tmp_path / "retention-replay"
+    replay_root.mkdir()
+    replay_manifest = replay_root / "manifest.json"
+    replay_manifest.write_text("{}\n", encoding="utf-8")
+    replay_part = replay_root / "part.jsonl"
+    replay_part.write_text('{"key":"replay-1"}\n', encoding="utf-8")
+    replay_builder = replay_root / "builder.py"
+    replay_builder.write_text("# builder\n", encoding="utf-8")
+    replay_preflight = replay_root / "capacity.json"
+    replay_preflight.write_text("{}\n", encoding="utf-8")
+    source_manifests = {}
+    for difficulty in STAGE211_AUDIO_CURRICULUM:
+        path = replay_root / f"{difficulty}.manifest.json"
+        path.write_text("{}\n", encoding="utf-8")
+        source_manifests[difficulty] = {
+            "path": str(path.resolve()),
+            "sha256": sha256_file(path),
+        }
+    exclusions = []
+    for name in ("stratified", "fixed"):
+        path = replay_root / f"{name}.json"
+        path.write_text("{}\n", encoding="utf-8")
+        exclusions.append(
+            {
+                "path": str(path.resolve()),
+                "sha256": sha256_file(path),
+            }
+        )
+    replay_receipt = replay_root / "receipt.json"
+    replay_receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "retention_replay_manifest",
+                "samples": 8,
+                "unique_keys": 8,
+                "total_hours": 0.01,
+                "manifest_path": str(replay_manifest.resolve()),
+                "manifest_sha256": sha256_file(replay_manifest),
+                "builder": {
+                    "path": str(replay_builder.resolve()),
+                    "sha256": sha256_file(replay_builder),
+                },
+                "capacity_preflight_path": str(replay_preflight.resolve()),
+                "capacity_preflight_sha256": sha256_file(replay_preflight),
+                "source_manifests": source_manifests,
+                "exclusions": exclusions,
+                "output_parts": [
+                    {
+                        "path": str(replay_part.resolve()),
+                        "sha256": sha256_file(replay_part),
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    run_dir = tmp_path / "retention-round-01"
+    run_dir.mkdir()
+    train_config = run_dir / "train_config.yaml"
+    config = stage211_phase_train_config_contract("mixer")
+    config.update(
+        {
+            "lr": STAGE211_RETENTION_CORRECTION_LR,
+            "max_steps": 1,
+            "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+            "batch_token_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "length_bucket_drop_last": False,
+            "skip_oversized_samples": False,
+            "webdataset_skip_decode_errors": False,
+            "webdataset_bucket_manifest_path": str(replay_manifest.resolve()),
+            "webdataset_split": "train",
+            "ctc_teacher_online_model_path": str(nano_checkpoint.parent.resolve()),
+            "init_checkpoint_path": str(init_checkpoint.resolve()),
+            "stage211_post_coverage_correction_round": 1,
+            "stage211_post_coverage_replay_receipt_path": str(replay_receipt.resolve()),
+            "stage211_post_coverage_admission_gate_path": str(failed_gate.resolve()),
+            "stage211_post_coverage_original_coverage_unchanged": True,
+        }
+    )
+    save_yaml(train_config, config)
+    provenance = run_dir / "stage211_correction_provenance.json"
+    provenance.write_text("{}\n", encoding="utf-8")
+    epoch_checkpoint = run_dir / "epoch-1.pt"
+    epoch_checkpoint.write_bytes(b"epoch-1")
+    correction = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "post_coverage_correction",
+        "phase": "mixer",
+        "round": 1,
+        "complete": True,
+        "epochs": STAGE211_RETENTION_CORRECTION_EPOCHS,
+        "learning_rate": STAGE211_RETENTION_CORRECTION_LR,
+        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
+        "rows": 8,
+        "row_exposures": 8,
+        "hours": 0.01,
+        "hour_exposures": 0.01,
+        "steps_per_epoch": 1,
+        "steps": 1,
+        "tail_padding_samples_per_epoch": 4,
+        "tail_padding_sample_exposures": 4,
+        "executed_sample_exposures": 12,
+        "run_dir": str(run_dir.resolve()),
+        "provenance_path": str(provenance.resolve()),
+        "provenance_sha256": sha256_file(provenance),
+        "train_config_path": str(train_config.resolve()),
+        "train_config_sha256": sha256_file(train_config),
+        "replay_receipt_path": str(replay_receipt.resolve()),
+        "replay_receipt_sha256": sha256_file(replay_receipt),
+        "bucket_manifest_path": str(replay_manifest.resolve()),
+        "bucket_manifest_sha256": sha256_file(replay_manifest),
+        "admission_gate_path": str(failed_gate.resolve()),
+        "admission_gate_sha256": sha256_file(failed_gate),
+        "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
+        "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+        "init_checkpoint_path": str(init_checkpoint.resolve()),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint),
+        "completion_checkpoint_path": str(completion_checkpoint.resolve()),
+        "completion_checkpoint_sha256": sha256_file(completion_checkpoint),
+        "runtime_epoch_coverage": {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "runtime_epoch_coverage",
+            "complete": True,
+            "epochs": 1,
+            "steps_per_epoch": 1,
+            "total_steps": 1,
+            "records": [
+                {
+                    "epoch": 1,
+                    "step": 1,
+                    "epoch_batch_offset": 0,
+                    "completed_epoch_batch_count": 1,
+                    "checkpoint_path": str(epoch_checkpoint.resolve()),
+                    "checkpoint_sha256": sha256_file(epoch_checkpoint),
+                }
+            ],
+        },
+        "parameter_delta_audit": {
+            "schema_version": 1,
+            "policy": "stage211_timemixer_and_input_projection_only",
+            "complete": True,
+            "allowed_key_markers": list(STAGE211_ALLOWED_OPERATOR_KEY_MARKERS),
+            "initial_tensor_count": 4,
+            "completion_tensor_count": 4,
+            "allowed_changed_tensors": 1,
+            "allowed_changed_numel": 1,
+            "allowed_unchanged_tensors": 1,
+            "frozen_unchanged_tensors": 2,
+            "forbidden_changed_tensors": 0,
+        },
+    }
+    receipt_path = run_dir / "correction_receipt.json"
+    receipt_path.write_text(json.dumps(correction) + "\n", encoding="utf-8")
+    return {
+        **correction,
+        "receipt_path": str(receipt_path.resolve()),
+        "receipt_sha256": sha256_file(receipt_path),
+    }, replay_part
+
+
+def _write_corrected_phase_gate(
+    tmp_path: Path,
+    *,
+    failed_gate: Path,
+    checkpoint: Path,
+    correction: dict[str, object],
+) -> Path:
+    report = json.loads(failed_gate.read_text(encoding="utf-8"))
+    failed_alignment_path = Path(report["alignment_report"]["path"])
+    alignment = json.loads(failed_alignment_path.read_text(encoding="utf-8"))
+    old_candidate_path = Path(alignment["candidate_report_path"])
+    candidate_source = json.loads(old_candidate_path.read_text(encoding="utf-8"))
+    candidate_source.update(
+        {
+            "step": 1,
+            "checkpoint_step": 1,
+            "checkpoint_path": str(checkpoint.resolve()),
+            "checkpoint_sha256": sha256_file(checkpoint),
+        }
+    )
+    candidate_source_path = tmp_path / "corrected-alignment-candidate.json"
+    candidate_source_path.write_text(
+        json.dumps(candidate_source) + "\n",
+        encoding="utf-8",
+    )
+    alignment.update(
+        {
+            "checkpoint_path": str(checkpoint.resolve()),
+            "checkpoint_sha256": sha256_file(checkpoint),
+            "candidate_report_path": str(candidate_source_path.resolve()),
+            "candidate_report_sha256": sha256_file(candidate_source_path),
+            "gate_passed": True,
+        }
+    )
+    alignment_path = tmp_path / "corrected-alignment-gate.json"
+    alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
+    report.update(
+        {
+            "checkpoint_path": str(checkpoint.resolve()),
+            "checkpoint_sha256": sha256_file(checkpoint),
+            "gate_passed": True,
+            "alignment_gate_passed": True,
+        }
+    )
+    report["alignment_report"] = {
+        "path": str(alignment_path.resolve()),
+        "sha256": sha256_file(alignment_path),
+        "artifact": "hidden_alignment_gate",
+    }
+    original_segments = report["full_data_coverage"]["segments"]
+    report["full_data_coverage"] = build_stage211_full_data_coverage(
+        phase="mixer",
+        segments=original_segments,
+        checkpoint_path=checkpoint,
+        post_coverage_corrections=[correction],
+    )
+    corrected_gate = tmp_path / "corrected_phase_gate.json"
+    corrected_gate.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    return corrected_gate
+
+
+def test_stage211_phase_gate_validates_retention_correction_chain(
+    tmp_path: Path,
+) -> None:
+    original_checkpoint = tmp_path / "long-complete.pt"
+    original_checkpoint.write_bytes(b"long-complete")
+    original_gate = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=original_checkpoint,
+    )
+    failed_gate = _write_failed_phase_gate(original_gate)
+    corrected_checkpoint = tmp_path / "retention-complete.pt"
+    corrected_checkpoint.write_bytes(b"retention-complete")
+    correction, replay_part = _write_retention_correction(
+        tmp_path,
+        failed_gate=failed_gate,
+        completion_checkpoint=corrected_checkpoint,
+    )
+    corrected_gate = _write_corrected_phase_gate(
+        tmp_path,
+        failed_gate=failed_gate,
+        checkpoint=corrected_checkpoint,
+        correction=correction,
+    )
+
+    validated = validate_stage211_phase_gate_report(
+        corrected_gate,
+        expected_phase="mixer",
+        checkpoint_path=corrected_checkpoint,
+    )
+    assert (
+        validated["full_data_coverage"]["segments"]
+        == json.loads(failed_gate.read_text(encoding="utf-8"))["full_data_coverage"]["segments"]
+    )
+    assert validated["full_data_coverage"]["post_coverage_correction_exposure"] == (
+        stage211_post_coverage_correction_exposure([correction])
+    )
+
+    replay_part.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="output part 0 SHA-256 mismatch"):
+        validate_stage211_phase_gate_report(
+            corrected_gate,
+            expected_phase="mixer",
+            checkpoint_path=corrected_checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_correction_checkpoint_chain_break(
+    tmp_path: Path,
+) -> None:
+    original_checkpoint = tmp_path / "long-complete.pt"
+    original_checkpoint.write_bytes(b"long-complete")
+    failed_gate = _write_failed_phase_gate(
+        _write_valid_phase_gate(
+            tmp_path,
+            phase="mixer",
+            checkpoint=original_checkpoint,
+        )
+    )
+    corrected_checkpoint = tmp_path / "retention-complete.pt"
+    corrected_checkpoint.write_bytes(b"retention-complete")
+    correction, _ = _write_retention_correction(
+        tmp_path,
+        failed_gate=failed_gate,
+        completion_checkpoint=corrected_checkpoint,
+    )
+    wrong_init = tmp_path / "wrong-init.pt"
+    wrong_init.write_bytes(b"wrong-init")
+    receipt_path = Path(str(correction["receipt_path"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["init_checkpoint_path"] = str(wrong_init.resolve())
+    receipt["init_checkpoint_sha256"] = sha256_file(wrong_init)
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    correction = {
+        **receipt,
+        "receipt_path": str(receipt_path.resolve()),
+        "receipt_sha256": sha256_file(receipt_path),
+    }
+    corrected_gate = _write_corrected_phase_gate(
+        tmp_path,
+        failed_gate=failed_gate,
+        checkpoint=corrected_checkpoint,
+        correction=correction,
+    )
+
+    with pytest.raises(ValueError, match="does not initialize from the preceding checkpoint"):
+        validate_stage211_phase_gate_report(
+            corrected_gate,
+            expected_phase="mixer",
+            checkpoint_path=corrected_checkpoint,
+        )
 
 
 def test_stage211_promotion_receipt_binds_checkpoint_and_gate_hashes(

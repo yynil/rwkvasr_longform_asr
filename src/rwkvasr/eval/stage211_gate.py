@@ -15,6 +15,9 @@ STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
 STAGE211_FULL_DATA_FRAME_BUDGET = 24_000
+STAGE211_RETENTION_CORRECTION_MAX_ROUNDS = 3
+STAGE211_RETENTION_CORRECTION_EPOCHS = 1
+STAGE211_RETENTION_CORRECTION_LR = 1.0e-6
 STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES = 256
 STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT = "alignment_checkpoint_eval"
 STAGE211_ALLOWED_OPERATOR_KEY_MARKERS = (".time_mixer.", ".input_proj.")
@@ -656,6 +659,449 @@ def _validate_parameter_delta_audit(
         )
 
 
+def stage211_post_coverage_correction_exposure(
+    corrections: list[dict[str, Any]],
+) -> dict[str, int | float]:
+    return {
+        "rounds": len(corrections),
+        "row_exposures": sum(int(row["row_exposures"]) for row in corrections),
+        "hour_exposures": sum(float(row["hour_exposures"]) for row in corrections),
+        "steps": sum(int(row["steps"]) for row in corrections),
+        "tail_padding_sample_exposures": sum(
+            int(row["tail_padding_sample_exposures"]) for row in corrections
+        ),
+        "executed_sample_exposures": sum(
+            int(row["executed_sample_exposures"]) for row in corrections
+        ),
+    }
+
+
+def load_stage211_post_coverage_correction_receipts(
+    receipt_paths: list[Path],
+) -> list[dict[str, Any]]:
+    if len(receipt_paths) > STAGE211_RETENTION_CORRECTION_MAX_ROUNDS:
+        raise ValueError("Stage211 retention correction round limit exceeded.")
+    corrections: list[dict[str, Any]] = []
+    for round_index, raw_path in enumerate(receipt_paths, start=1):
+        path = raw_path.expanduser().resolve()
+        receipt = _load_json_object(
+            path,
+            label=f"Stage211 retention correction round {round_index} receipt",
+        )
+        expected = {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "post_coverage_correction",
+            "phase": "mixer",
+            "round": round_index,
+            "complete": True,
+        }
+        if any(receipt.get(key) != value for key, value in expected.items()):
+            raise ValueError(
+                f"Invalid Stage211 retention correction receipt for round {round_index}: {path}"
+            )
+        corrections.append(
+            {
+                **receipt,
+                "receipt_path": str(path),
+                "receipt_sha256": sha256_file(path),
+            }
+        )
+    return corrections
+
+
+def build_stage211_full_data_coverage(
+    *,
+    phase: str,
+    segments: list[dict[str, Any]],
+    checkpoint_path: Path,
+    post_coverage_corrections: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    checkpoint_path = checkpoint_path.expanduser().resolve()
+    corrections = list(post_coverage_corrections or [])
+    coverage: dict[str, Any] = {
+        "phase": phase,
+        "complete": True,
+        "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS,
+        "total_hours": STAGE211_AUDIO_TOTAL_HOURS,
+        "total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
+        "total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
+        "total_tail_padding_sample_exposures": (STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES),
+        "total_executed_sample_exposures": (STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES),
+        "segments": segments,
+        "final_checkpoint_path": str(checkpoint_path),
+        "final_checkpoint_sha256": sha256_file(checkpoint_path),
+    }
+    if corrections:
+        coverage["post_coverage_corrections"] = corrections
+        coverage["post_coverage_correction_exposure"] = stage211_post_coverage_correction_exposure(
+            corrections
+        )
+    return coverage
+
+
+def _validate_stage211_retention_replay_binding(
+    correction: dict[str, Any],
+) -> tuple[dict[str, Any], Path]:
+    replay_receipt_path = _validate_bound_file(
+        correction,
+        path_key="replay_receipt_path",
+        sha256_key="replay_receipt_sha256",
+        label="Stage211 retention replay receipt",
+    )
+    replay = _load_json_object(
+        replay_receipt_path,
+        label="Stage211 retention replay receipt",
+    )
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "retention_replay_manifest",
+        "unique_keys": replay.get("samples"),
+    }
+    if any(replay.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 retention replay receipt contract mismatch.")
+    if int(replay.get("samples", -1)) != int(correction.get("rows", -2)):
+        raise ValueError("Stage211 correction and replay row counts differ.")
+    replay_hours = float(replay.get("total_hours", float("nan")))
+    correction_hours = float(correction.get("hours", float("nan")))
+    if (
+        not math.isfinite(replay_hours)
+        or not math.isfinite(correction_hours)
+        or abs(replay_hours - correction_hours) > 1e-9
+    ):
+        raise ValueError("Stage211 correction and replay hour counts differ.")
+    manifest_path = _validate_bound_file(
+        replay,
+        path_key="manifest_path",
+        sha256_key="manifest_sha256",
+        label="Stage211 retention replay bucket manifest",
+    )
+    if Path(
+        str(correction.get("bucket_manifest_path") or "")
+    ).resolve() != manifest_path or correction.get("bucket_manifest_sha256") != replay.get(
+        "manifest_sha256"
+    ):
+        raise ValueError("Stage211 correction replay manifest binding mismatch.")
+    builder = replay.get("builder")
+    if not isinstance(builder, dict):
+        raise ValueError("Stage211 retention replay lacks a builder binding.")
+    _validate_bound_file(
+        builder,
+        path_key="path",
+        sha256_key="sha256",
+        label="Stage211 retention replay builder",
+    )
+    _validate_bound_file(
+        replay,
+        path_key="capacity_preflight_path",
+        sha256_key="capacity_preflight_sha256",
+        label="Stage211 retention replay capacity preflight",
+    )
+    source_manifests = replay.get("source_manifests")
+    if not isinstance(source_manifests, dict) or set(source_manifests) != {
+        "easy",
+        "medium",
+        "hard",
+        "long",
+    }:
+        raise ValueError("Stage211 retention replay source coverage mismatch.")
+    for difficulty, record in source_manifests.items():
+        if not isinstance(record, dict):
+            raise ValueError(f"Stage211 retention replay {difficulty} binding is invalid.")
+        _validate_bound_file(
+            record,
+            path_key="path",
+            sha256_key="sha256",
+            label=f"Stage211 retention replay {difficulty} source manifest",
+        )
+    exclusions = replay.get("exclusions")
+    if not isinstance(exclusions, list) or len(exclusions) != 2:
+        raise ValueError("Stage211 retention replay exclusions are incomplete.")
+    for index, record in enumerate(exclusions):
+        if not isinstance(record, dict):
+            raise ValueError("Stage211 retention replay exclusion binding is invalid.")
+        _validate_bound_file(
+            record,
+            path_key="path",
+            sha256_key="sha256",
+            label=f"Stage211 retention replay exclusion {index}",
+        )
+    output_parts = replay.get("output_parts")
+    if not isinstance(output_parts, list) or not output_parts:
+        raise ValueError("Stage211 retention replay output-part coverage is empty.")
+    for index, record in enumerate(output_parts):
+        if not isinstance(record, dict):
+            raise ValueError("Stage211 retention replay output-part binding is invalid.")
+        _validate_bound_file(
+            record,
+            path_key="path",
+            sha256_key="sha256",
+            label=f"Stage211 retention replay output part {index}",
+        )
+    return replay, manifest_path
+
+
+def _validate_stage211_correction_train_config(
+    correction: dict[str, Any],
+    *,
+    manifest_path: Path,
+    init_checkpoint: Path,
+    nano_teacher_checkpoint: Path,
+) -> None:
+    train_config_path = _validate_bound_file(
+        correction,
+        path_key="train_config_path",
+        sha256_key="train_config_sha256",
+        label="Stage211 retention correction train config",
+    )
+    config = load_yaml(train_config_path)
+    contract = stage211_phase_train_config_contract("mixer")
+    contract["lr"] = STAGE211_RETENTION_CORRECTION_LR
+    for key, expected in contract.items():
+        actual = config.get(key)
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError(
+                "Stage211 retention correction train config contract mismatch: "
+                f"key={key} actual={actual!r} expected={expected!r}"
+            )
+    expected_fields = {
+        "max_steps": int(correction["steps_per_epoch"]),
+        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "batch_token_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
+        "webdataset_bucket_manifest_path": str(manifest_path),
+        "webdataset_split": "train",
+        "stage211_post_coverage_correction_round": int(correction["round"]),
+        "stage211_post_coverage_replay_receipt_path": str(
+            Path(str(correction["replay_receipt_path"])).resolve()
+        ),
+        "stage211_post_coverage_admission_gate_path": str(
+            Path(str(correction["admission_gate_path"])).resolve()
+        ),
+        "stage211_post_coverage_original_coverage_unchanged": True,
+    }
+    for key, expected in expected_fields.items():
+        if config.get(key) != expected:
+            raise ValueError(
+                "Stage211 retention correction train config mismatch: "
+                f"key={key} actual={config.get(key)!r} expected={expected!r}"
+            )
+    init_path = config.get("init_checkpoint_path")
+    resume_from = config.get("resume_from")
+    if not (
+        (init_path == str(init_checkpoint) and resume_from is None)
+        or (init_path is None and resume_from == "latest")
+    ):
+        raise ValueError(
+            "Stage211 retention correction train config does not bind its initial "
+            "checkpoint or an in-run latest resume."
+        )
+    if resolve_stage211_nano_teacher_checkpoint(config) != nano_teacher_checkpoint:
+        raise ValueError("Stage211 retention correction train config uses another Nano teacher.")
+
+
+def _validate_stage211_post_coverage_corrections(
+    corrections: Any,
+    *,
+    coverage: dict[str, Any],
+    original_segments: list[dict[str, Any]],
+    original_completion_sha256: str,
+    nano_teacher_checkpoint_sha256: str,
+) -> tuple[list[dict[str, Any]], str]:
+    if corrections is None:
+        corrections = []
+    if not isinstance(corrections, list):
+        raise ValueError("Stage211 post-coverage corrections must be a list.")
+    if len(corrections) > STAGE211_RETENTION_CORRECTION_MAX_ROUNDS:
+        raise ValueError("Stage211 retention correction round limit exceeded.")
+    if corrections and coverage.get("phase") != "mixer":
+        raise ValueError("Stage211 post-coverage correction is valid only for Mixer.")
+
+    previous_checkpoint_sha256 = original_completion_sha256
+    replay_receipt_sha256: str | None = None
+    validated: list[dict[str, Any]] = []
+    for round_index, correction in enumerate(corrections, start=1):
+        if not isinstance(correction, dict):
+            raise ValueError("Stage211 post-coverage correction record must be an object.")
+        expected_fields = {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "post_coverage_correction",
+            "phase": "mixer",
+            "round": round_index,
+            "complete": True,
+            "epochs": STAGE211_RETENTION_CORRECTION_EPOCHS,
+            "learning_rate": STAGE211_RETENTION_CORRECTION_LR,
+            "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+            "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+            "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "length_bucket_drop_last": False,
+            "skip_oversized_samples": False,
+            "webdataset_skip_decode_errors": False,
+        }
+        if any(correction.get(key) != value for key, value in expected_fields.items()):
+            raise ValueError(
+                f"Stage211 retention correction round {round_index} contract mismatch."
+            )
+        rows = int(correction.get("rows", -1))
+        steps_per_epoch = int(correction.get("steps_per_epoch", -1))
+        tail_padding = int(correction.get("tail_padding_samples_per_epoch", -1))
+        hours = float(correction.get("hours", float("nan")))
+        if (
+            rows <= 0
+            or steps_per_epoch <= 0
+            or tail_padding < 0
+            or not math.isfinite(hours)
+            or hours <= 0.0
+            or int(correction.get("row_exposures", -1)) != rows
+            or int(correction.get("steps", -1)) != steps_per_epoch
+            or int(correction.get("tail_padding_sample_exposures", -1)) != tail_padding
+            or int(correction.get("executed_sample_exposures", -1)) != rows + tail_padding
+            or abs(float(correction.get("hour_exposures", float("nan"))) - hours) > 1e-9
+        ):
+            raise ValueError(
+                f"Stage211 retention correction round {round_index} exposure mismatch."
+            )
+        receipt_path = _validate_bound_file(
+            correction,
+            path_key="receipt_path",
+            sha256_key="receipt_sha256",
+            label=f"Stage211 retention correction round {round_index} receipt",
+        )
+        receipt = _load_json_object(
+            receipt_path,
+            label=f"Stage211 retention correction round {round_index} receipt",
+        )
+        embedded_receipt = {
+            key: value
+            for key, value in correction.items()
+            if key not in {"receipt_path", "receipt_sha256"}
+        }
+        if receipt != embedded_receipt:
+            raise ValueError(
+                f"Stage211 retention correction round {round_index} differs from its receipt."
+            )
+        validate_stage211_runtime_epoch_coverage(
+            correction.get("runtime_epoch_coverage"),
+            epochs=STAGE211_RETENTION_CORRECTION_EPOCHS,
+            steps_per_epoch=steps_per_epoch,
+            label=f"mixer/retention-round-{round_index}",
+        )
+        _validate_parameter_delta_audit(
+            correction,
+            phase="mixer",
+            difficulty=f"retention-round-{round_index}",
+        )
+        replay, replay_manifest_path = _validate_stage211_retention_replay_binding(correction)
+        current_replay_sha256 = str(correction.get("replay_receipt_sha256") or "")
+        if replay_receipt_sha256 is not None and current_replay_sha256 != replay_receipt_sha256:
+            raise ValueError("Stage211 retention correction rounds use different replay data.")
+        replay_receipt_sha256 = current_replay_sha256
+
+        init_checkpoint = _validate_bound_file(
+            correction,
+            path_key="init_checkpoint_path",
+            sha256_key="init_checkpoint_sha256",
+            label=f"Stage211 retention correction round {round_index} initial checkpoint",
+        )
+        if correction.get("init_checkpoint_sha256") != previous_checkpoint_sha256:
+            raise ValueError(
+                f"Stage211 retention correction round {round_index} does not initialize "
+                "from the preceding checkpoint."
+            )
+        _validate_bound_file(
+            correction,
+            path_key="completion_checkpoint_path",
+            sha256_key="completion_checkpoint_sha256",
+            label=f"Stage211 retention correction round {round_index} completion checkpoint",
+        )
+        nano_teacher_checkpoint = _validate_bound_file(
+            correction,
+            path_key="nano_teacher_checkpoint_path",
+            sha256_key="nano_teacher_checkpoint_sha256",
+            label=f"Stage211 retention correction round {round_index} Nano teacher",
+        )
+        if correction.get("nano_teacher_checkpoint_sha256") != nano_teacher_checkpoint_sha256:
+            raise ValueError(
+                f"Stage211 retention correction round {round_index} uses another Nano teacher."
+            )
+        _validate_bound_file(
+            correction,
+            path_key="provenance_path",
+            sha256_key="provenance_sha256",
+            label=f"Stage211 retention correction round {round_index} provenance",
+        )
+        _validate_stage211_correction_train_config(
+            correction,
+            manifest_path=replay_manifest_path,
+            init_checkpoint=init_checkpoint,
+            nano_teacher_checkpoint=nano_teacher_checkpoint,
+        )
+
+        admission_gate_path = _validate_bound_file(
+            correction,
+            path_key="admission_gate_path",
+            sha256_key="admission_gate_sha256",
+            label=f"Stage211 retention correction round {round_index} admission gate",
+        )
+        admission_gate = validate_stage211_phase_gate_report(
+            admission_gate_path,
+            expected_phase="mixer",
+            checkpoint_path=init_checkpoint,
+            require_passed=False,
+        )
+        if admission_gate.get("gate_passed") is not False:
+            raise ValueError(
+                f"Stage211 retention correction round {round_index} admission gate passed."
+            )
+        admission_coverage = admission_gate.get("full_data_coverage")
+        if not isinstance(admission_coverage, dict):
+            raise ValueError("Stage211 retention correction admission coverage is missing.")
+        if admission_coverage.get("segments") != original_segments:
+            raise ValueError("Stage211 retention correction rewrites original coverage segments.")
+        prior_corrections = admission_coverage.get("post_coverage_corrections", [])
+        if prior_corrections != validated:
+            raise ValueError(
+                f"Stage211 retention correction round {round_index} admission chain mismatch."
+            )
+        if int(replay.get("samples", -1)) != rows:
+            raise ValueError("Stage211 retention correction replay sample count mismatch.")
+        previous_checkpoint_sha256 = str(correction["completion_checkpoint_sha256"])
+        validated.append(dict(correction))
+
+    aggregate = coverage.get("post_coverage_correction_exposure")
+    if validated:
+        expected_aggregate = stage211_post_coverage_correction_exposure(validated)
+        if not isinstance(aggregate, dict):
+            raise ValueError("Stage211 correction exposure summary is missing.")
+        for key, expected in expected_aggregate.items():
+            actual = aggregate.get(key)
+            try:
+                if isinstance(expected, float):
+                    actual_number: int | float = float(actual)
+                else:
+                    actual_number = int(actual)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "Stage211 correction exposure summary contains a non-numeric value."
+                ) from error
+            if isinstance(expected, float):
+                if (
+                    not math.isfinite(float(actual_number))
+                    or abs(float(actual_number) - expected) > 1e-6
+                ):
+                    raise ValueError("Stage211 correction hour-exposure summary mismatch.")
+            elif int(actual_number) != expected:
+                raise ValueError("Stage211 correction exposure summary mismatch.")
+    elif aggregate is not None:
+        raise ValueError("Stage211 empty correction chain must not report correction exposure.")
+    return validated, previous_checkpoint_sha256
+
+
 def validate_stage211_full_data_coverage(
     coverage: Any,
     *,
@@ -860,6 +1306,16 @@ def validate_stage211_full_data_coverage(
             )
         previous_checkpoint_sha256 = str(segment["completion_checkpoint_sha256"])
 
+    corrections, previous_checkpoint_sha256 = _validate_stage211_post_coverage_corrections(
+        coverage.get("post_coverage_corrections", []),
+        coverage=coverage,
+        original_segments=[by_difficulty[name] for name in STAGE211_AUDIO_CURRICULUM],
+        original_completion_sha256=str(previous_checkpoint_sha256 or ""),
+        nano_teacher_checkpoint_sha256=str(nano_teacher_checkpoint_sha256 or ""),
+    )
+    if corrections and coverage.get("phase") != "mixer":
+        raise ValueError("Stage211 post-coverage corrections are Mixer-only.")
+
     final_checkpoint = Path(str(coverage.get("final_checkpoint_path") or "")).resolve()
     if final_checkpoint != checkpoint_path.resolve():
         raise ValueError(
@@ -870,7 +1326,9 @@ def validate_stage211_full_data_coverage(
             "Stage211 full-data final checkpoint SHA-256 does not match the selected checkpoint."
         )
     if previous_checkpoint_sha256 != str(coverage["final_checkpoint_sha256"]):
-        raise ValueError("Stage211 long-segment checkpoint is not the full-data final checkpoint.")
+        raise ValueError(
+            "Stage211 latest curriculum/correction checkpoint is not the phase final checkpoint."
+        )
     return dict(coverage)
 
 

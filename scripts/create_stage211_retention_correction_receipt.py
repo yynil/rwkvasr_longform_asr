@@ -17,6 +17,9 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_BATCH_SIZE,
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
+    STAGE211_RETENTION_CORRECTION_EPOCHS,
+    STAGE211_RETENTION_CORRECTION_LR,
+    STAGE211_RETENTION_CORRECTION_MAX_ROUNDS,
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
     stage211_phase_train_config_contract,
@@ -40,9 +43,9 @@ except ModuleNotFoundError as error:
     from validate_stage211_retention_replay import validate_retention_replay
 
 
-MAX_CORRECTION_ROUNDS = 3
-CORRECTION_EPOCHS = 1
-CORRECTION_LR = 1.0e-6
+MAX_CORRECTION_ROUNDS = STAGE211_RETENTION_CORRECTION_MAX_ROUNDS
+CORRECTION_EPOCHS = STAGE211_RETENTION_CORRECTION_EPOCHS
+CORRECTION_LR = STAGE211_RETENTION_CORRECTION_LR
 
 
 def _checkpoint_step(path: Path) -> int:
@@ -65,8 +68,12 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
 def _validate_correction_train_config(
     config: dict[str, Any],
     *,
+    round_index: int,
     steps_per_epoch: int,
     replay_manifest: Path,
+    replay_receipt: Path,
+    admission_gate: Path,
+    init_checkpoint: Path,
 ) -> None:
     contract = stage211_phase_train_config_contract("mixer")
     contract["lr"] = CORRECTION_LR
@@ -92,6 +99,10 @@ def _validate_correction_train_config(
         "weight_decay": 0.0,
         "webdataset_bucket_manifest_path": str(replay_manifest),
         "webdataset_split": "train",
+        "stage211_post_coverage_correction_round": round_index,
+        "stage211_post_coverage_replay_receipt_path": str(replay_receipt),
+        "stage211_post_coverage_admission_gate_path": str(admission_gate),
+        "stage211_post_coverage_original_coverage_unchanged": True,
     }
     for key, expected in expected_fields.items():
         if config.get(key) != expected:
@@ -99,6 +110,16 @@ def _validate_correction_train_config(
                 f"Stage211 correction train config {key} mismatch: "
                 f"actual={config.get(key)!r} expected={expected!r}"
             )
+    init_path = config.get("init_checkpoint_path")
+    resume_from = config.get("resume_from")
+    if not (
+        (init_path == str(init_checkpoint) and resume_from is None)
+        or (init_path is None and resume_from == "latest")
+    ):
+        raise ValueError(
+            "Stage211 correction train config does not bind its initial checkpoint "
+            "or an in-run latest resume."
+        )
 
 
 def _admission_teacher_sha256(admission_gate: dict[str, Any]) -> str:
@@ -211,6 +232,13 @@ def build_receipt(
         "admission_gate_sha256": sha256_file(admission_gate_path),
         "init_checkpoint_path": str(init_checkpoint_path),
         "init_checkpoint_sha256": sha256_file(init_checkpoint_path),
+        "replay_manifest_path": str(replay_manifest),
+        "replay_manifest_sha256": sha256_file(replay_manifest),
+        "epochs": CORRECTION_EPOCHS,
+        "steps_per_epoch": steps_per_epoch,
+        "learning_rate": CORRECTION_LR,
+        "trainable_boundary": "mixer_only",
+        "early_stopping": False,
     }
     if any(provenance.get(key) != value for key, value in expected_provenance.items()):
         raise ValueError("Stage211 correction provenance contract mismatch.")
@@ -221,13 +249,22 @@ def build_receipt(
     train_config = load_yaml(train_config_path)
     _validate_correction_train_config(
         train_config,
+        round_index=round_index,
         steps_per_epoch=steps_per_epoch,
         replay_manifest=replay_manifest,
+        replay_receipt=replay_receipt_path,
+        admission_gate=admission_gate_path,
+        init_checkpoint=init_checkpoint_path,
     )
     nano_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(train_config)
     nano_teacher_sha256 = sha256_file(nano_teacher_checkpoint)
     if nano_teacher_sha256 != _admission_teacher_sha256(admission_gate):
         raise ValueError("Stage211 correction Nano teacher differs from its admission gate.")
+    if (
+        provenance.get("nano_teacher_checkpoint_path") != str(nano_teacher_checkpoint)
+        or provenance.get("nano_teacher_checkpoint_sha256") != nano_teacher_sha256
+    ):
+        raise ValueError("Stage211 correction provenance Nano teacher binding mismatch.")
 
     runtime_epoch_coverage = audit_stage211_runtime_epoch_coverage(
         run_dir=run_dir,

@@ -109,6 +109,11 @@ def test_create_stage211_retention_correction_receipt(
             "webdataset_bucket_manifest_path": str(manifest.resolve()),
             "webdataset_split": "train",
             "ctc_teacher_online_model_path": str(nano_dir.resolve()),
+            "init_checkpoint_path": str(init_checkpoint.resolve()),
+            "stage211_post_coverage_correction_round": 1,
+            "stage211_post_coverage_replay_receipt_path": str(replay_receipt.resolve()),
+            "stage211_post_coverage_admission_gate_path": str(admission_gate.resolve()),
+            "stage211_post_coverage_original_coverage_unchanged": True,
         }
     )
     save_yaml(run_dir / "train_config.yaml", config)
@@ -125,6 +130,15 @@ def test_create_stage211_retention_correction_receipt(
         "admission_gate_sha256": correction.sha256_file(admission_gate),
         "init_checkpoint_path": str(init_checkpoint.resolve()),
         "init_checkpoint_sha256": correction.sha256_file(init_checkpoint),
+        "replay_manifest_path": str(manifest.resolve()),
+        "replay_manifest_sha256": correction.sha256_file(manifest),
+        "epochs": correction.CORRECTION_EPOCHS,
+        "steps_per_epoch": 1,
+        "learning_rate": correction.CORRECTION_LR,
+        "trainable_boundary": "mixer_only",
+        "early_stopping": False,
+        "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
+        "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
     }
     (run_dir / "stage211_correction_provenance.json").write_text(
         json.dumps(provenance) + "\n",
@@ -178,6 +192,21 @@ def test_create_stage211_retention_correction_receipt(
     assert receipt["steps"] == 1
     assert receipt["learning_rate"] == correction.CORRECTION_LR
     assert receipt["nano_teacher_checkpoint_sha256"] == nano_sha256
+
+    config["init_checkpoint_path"] = None
+    config["resume_from"] = "latest"
+    save_yaml(run_dir / "train_config.yaml", config)
+    resumed_receipt = correction.build_receipt(
+        round_index=1,
+        run_dir=run_dir,
+        replay_receipt_path=replay_receipt,
+        admission_gate_path=admission_gate,
+        init_checkpoint_path=init_checkpoint,
+        completion_checkpoint_path=completion_checkpoint,
+    )
+    assert resumed_receipt["train_config_sha256"] == correction.sha256_file(
+        run_dir / "train_config.yaml"
+    )
 
     gate_payload["gate_passed"] = True
     with pytest.raises(ValueError, match="explicitly failed admission gate"):

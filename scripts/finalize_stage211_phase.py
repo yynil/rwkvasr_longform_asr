@@ -11,6 +11,8 @@ from typing import Any
 
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
+    build_stage211_full_data_coverage,
+    load_stage211_post_coverage_correction_receipts,
     sha256_file,
     validate_stage211_full_data_coverage,
 )
@@ -234,6 +236,31 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         phase=phase,
         phase_root=phase_root,
     )
+    correction_receipt_paths = [
+        path.expanduser().resolve()
+        for path in getattr(args, "post_coverage_correction_receipt", [])
+    ]
+    correction_receipts = load_stage211_post_coverage_correction_receipts(correction_receipt_paths)
+    if correction_receipts:
+        if phase != "mixer":
+            raise ValueError("Stage211 post-coverage corrections are valid only for Mixer.")
+        checkpoint = Path(
+            str(correction_receipts[-1].get("completion_checkpoint_path") or "")
+        ).resolve()
+        segments = coverage.get("segments")
+        if not isinstance(segments, list):
+            raise ValueError("Stage211 phase coverage lacks segment records.")
+        coverage = build_stage211_full_data_coverage(
+            phase=phase,
+            segments=segments,
+            checkpoint_path=checkpoint,
+            post_coverage_corrections=correction_receipts,
+        )
+        validate_stage211_full_data_coverage(
+            coverage,
+            phase=phase,
+            checkpoint_path=checkpoint,
+        )
     segments = coverage.get("segments")
     if not isinstance(segments, list):
         raise ValueError("Stage211 phase coverage lacks segment records.")
@@ -456,6 +483,13 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     ]
     for receipt_path in receipt_paths:
         phase_gate_command.extend(("--coverage-receipt", str(receipt_path)))
+    for correction_receipt_path in correction_receipt_paths:
+        phase_gate_command.extend(
+            (
+                "--post-coverage-correction-receipt",
+                str(correction_receipt_path),
+            )
+        )
     if alignment_gate_path is not None:
         phase_gate_command.extend(("--alignment-report", str(alignment_gate_path)))
     if phase in {"mixer", "block"}:
@@ -534,6 +568,12 @@ def main() -> int:
         "--baseline-public-comparison-report",
         type=Path,
         default=None,
+    )
+    parser.add_argument(
+        "--post-coverage-correction-receipt",
+        type=Path,
+        action="append",
+        default=[],
     )
     parser.add_argument("--devices", default="0,1,2,3")
     parser.add_argument("--alignment-device", default="cuda:0")
