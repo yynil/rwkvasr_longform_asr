@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import io
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -44,31 +45,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[bytes]]:
             "vctk",
         }
     )
-    audio_bytes = [
-        _flac(
-            np.asarray(
-                np.sin(np.linspace(0.0, float(index + 1) * 20.0, 16_000)) * 0.2,
-                dtype=np.float32,
-            )
-        )
-        for index in range(len(sources))
-    ]
-    parquet_path = tmp_path / "source.parquet"
     audio_type = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
-    table = pa.table(
-        {
-            "id": pa.array([f"row-{index}" for index in range(len(sources))]),
-            "audio": pa.array(
-                [
-                    {"bytes": payload, "path": f"row-{index}.flac"}
-                    for index, payload in enumerate(audio_bytes)
-                ],
-                type=audio_type,
-            ),
-            "duration_ms": pa.array([1000] * len(sources), type=pa.int32()),
-        }
-    )
-    pq.write_table(table, parquet_path, row_group_size=len(sources))
+    audio_bytes: list[bytes] = []
+    parquet_records: list[dict[str, object]] = []
 
     fixed_part = tmp_path / "fixed_eval.jsonl"
     fixed_part.write_text("{}\n" * 256, encoding="utf-8")
@@ -79,40 +58,91 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[bytes]]:
 
     manifest_root = tmp_path / "base/webdataset_buckets_audio_text"
     part_records: list[dict[str, object]] = []
-    for index, source in enumerate(sources):
-        relative = f"train/{source}.jsonl"
-        part_path = manifest_root / relative
-        part_path.parent.mkdir(parents=True, exist_ok=True)
-        row = {
-            "shard_name": str(parquet_path),
-            "key": f"key-{index}",
-            "utt_id": f"utt-{index}",
-            "split": "train",
-            "num_frames": 100,
-            "audio_member": f"row-{index}.flac",
-            "audio_format": "flac",
-            "audio_size": None,
-            "json_member": "",
-            "storage_kind": "parquet",
-            "parquet_row_group": 0,
-            "parquet_row_index": index,
-            "parquet_id": f"row-{index}",
-            "source_dataset": source,
-            "language": "en",
-            "sample_rate": 16_000,
-            "duration_ms": 1000,
-            "uses_text_labels": False,
-        }
-        part_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
-        part_records.append(
+    global_index = 0
+    for source in sources:
+        source_rows = 2 if source == "peoples_speech_clean" else 1
+        parquet_path = tmp_path / f"{source}.parquet"
+        source_audio: list[bytes] = []
+        for row_index in range(source_rows):
+            payload = _flac(
+                np.asarray(
+                    np.sin(
+                        np.linspace(
+                            0.0,
+                            float(global_index + 1) * 20.0,
+                            16_000,
+                        )
+                    )
+                    * 0.2,
+                    dtype=np.float32,
+                )
+            )
+            audio_bytes.append(payload)
+            source_audio.append(payload)
+            relative = f"train/{source}_{row_index:02d}.jsonl"
+            part_path = manifest_root / relative
+            part_path.parent.mkdir(parents=True, exist_ok=True)
+            row_id = f"row-{global_index}"
+            row = {
+                "shard_name": str(parquet_path),
+                "key": f"key-{global_index}",
+                "utt_id": f"utt-{global_index}",
+                "split": "train",
+                "num_frames": 100,
+                "audio_member": f"{row_id}.flac",
+                "audio_format": "flac",
+                "audio_size": None,
+                "json_member": "",
+                "storage_kind": "parquet",
+                "parquet_row_group": 0,
+                "parquet_row_index": row_index,
+                "parquet_id": row_id,
+                "source_dataset": source,
+                "language": "en",
+                "sample_rate": 16_000,
+                "duration_ms": 1000,
+                "uses_text_labels": False,
+            }
+            part_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            part_records.append(
+                {
+                    "path": relative,
+                    "num_samples": 1,
+                    "first_shard": str(parquet_path),
+                    "last_shard": str(parquet_path),
+                    "source_label": source,
+                    "size_bytes": part_path.stat().st_size,
+                    "sha256": _sha256(part_path),
+                }
+            )
+            global_index += 1
+        table = pa.table(
             {
-                "path": relative,
-                "num_samples": 1,
-                "first_shard": str(parquet_path),
-                "last_shard": str(parquet_path),
-                "source_label": source,
-                "size_bytes": part_path.stat().st_size,
-                "sha256": _sha256(part_path),
+                "id": pa.array(
+                    [f"row-{global_index - source_rows + index}" for index in range(source_rows)]
+                ),
+                "audio": pa.array(
+                    [
+                        {
+                            "bytes": payload,
+                            "path": f"row-{global_index - source_rows + index}.flac",
+                        }
+                        for index, payload in enumerate(source_audio)
+                    ],
+                    type=audio_type,
+                ),
+                "duration_ms": pa.array([1000] * source_rows, type=pa.int32()),
+            }
+        )
+        pq.write_table(table, parquet_path, row_group_size=source_rows)
+        stat = parquet_path.stat()
+        parquet_records.append(
+            {
+                "path": str(parquet_path),
+                "size_bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "sha256": _sha256(parquet_path),
+                "status": "accepted",
             }
         )
     manifest_path = manifest_root / "manifest.json"
@@ -127,11 +157,11 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[bytes]]:
             "entries_per_part": 100_000,
             "splits": {
                 "train": {
-                    "num_samples": len(sources),
+                    "num_samples": global_index,
                     "buckets": [
                         {
                             "bucket_id": 1,
-                            "num_samples": len(sources),
+                            "num_samples": global_index,
                             "parts": part_records,
                         }
                     ],
@@ -151,9 +181,12 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[bytes]]:
             },
         },
     )
-    source_counts = {source: 1 for source in sources}
-    source_hours = {source: 1.0 / 3600.0 for source in sources}
-    stat = parquet_path.stat()
+    source_counts = {
+        source: 2 if source == "peoples_speech_clean" else 1 for source in sources
+    }
+    source_hours = {
+        source: count / 3600.0 for source, count in source_counts.items()
+    }
     _write_json(
         inventory_path,
         {
@@ -196,21 +229,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[bytes]]:
             },
             "dedupe": {
                 "algorithm": "blake2b16(corpus + NUL + source_identity)",
-                "accepted_unique_rows": len(sources),
+                "accepted_unique_rows": global_index,
             },
-            "selected_rows": len(sources),
-            "selected_hours": len(sources) / 3600.0,
+            "selected_rows": global_index,
+            "selected_hours": global_index / 3600.0,
             "selected_counts_by_source": source_counts,
             "selected_hours_by_source": source_hours,
-            "archive_records": [
-                {
-                    "path": str(parquet_path),
-                    "size_bytes": stat.st_size,
-                    "mtime_ns": stat.st_mtime_ns,
-                    "sha256": _sha256(parquet_path),
-                    "status": "accepted",
-                }
-            ],
+            "archive_records": parquet_records,
             "bucket_manifest_path": str(manifest_path),
             "bucket_manifest_sha256": _sha256(manifest_path),
             "part_records": part_records,
@@ -223,6 +248,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[bytes]]:
 def test_base_public_pcm_audit_is_resumable_and_fail_closed(
     tmp_path: Path,
     overlap: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inventory_path, base_audio = _fixture(tmp_path)
     public_audio = tmp_path / "public.flac"
@@ -252,30 +278,78 @@ def test_base_public_pcm_audit_is_resumable_and_fail_closed(
         output_root=output_root,
         expected_rows=None,
     )
-    first = audit.run_fingerprint_worker(
-        base=base,
+    assert audit.build_location_index(base=base, output_root=output_root) == "created"
+    assert audit.build_location_index(base=base, output_root=output_root) == "reused"
+    location_index = audit.validate_location_index(output_root, base=base)
+    assert len(location_index["archives"]) == 5
+    assert sorted(record["rows"] for record in location_index["archives"]) == [1, 1, 1, 1, 2]
+    with sqlite3.connect(location_index["database_path"]) as connection:
+        grouped_rows = connection.execute(
+            "SELECT COUNT(*) FROM entries WHERE source_dataset = 'peoples_speech_clean'"
+        ).fetchone()[0]
+    assert grouped_rows == 2
+    original_make_shard_reader = audit._make_shard_reader
+    reader_opens: dict[str, int] = {}
+    row_group_loads: dict[str, int] = {}
+
+    class CountingReader:
+        def __init__(self, reader: object, shard_path: Path) -> None:
+            self.reader = reader
+            self.shard_path = str(shard_path)
+
+        def read_audio_row(
+            self,
+            *,
+            row_group: int,
+            row_index: int,
+        ) -> tuple[bytes, dict[str, object]]:
+            if self.reader._cached_row_group != row_group:  # type: ignore[attr-defined]
+                row_group_loads[self.shard_path] = (
+                    row_group_loads.get(self.shard_path, 0) + 1
+                )
+            return self.reader.read_audio_row(  # type: ignore[no-any-return,attr-defined]
+                row_group=row_group,
+                row_index=row_index,
+            )
+
+        def close(self) -> None:
+            self.reader.close()  # type: ignore[attr-defined]
+
+    def counting_make_shard_reader(storage_kind: str, shard_path: Path) -> object:
+        reader_opens[str(shard_path)] = reader_opens.get(str(shard_path), 0) + 1
+        return CountingReader(original_make_shard_reader(storage_kind, shard_path), shard_path)
+
+    monkeypatch.setattr(audit, "_make_shard_reader", counting_make_shard_reader)
+    first = audit.run_archive_worker(
+        location_index=location_index,
         output_root=output_root,
         worker_index=0,
         num_workers=1,
-        max_parts=None,
+        max_archives=None,
     )
-    second = audit.run_fingerprint_worker(
-        base=base,
+    second = audit.run_archive_worker(
+        location_index=location_index,
         output_root=output_root,
         worker_index=0,
         num_workers=1,
-        max_parts=None,
+        max_archives=None,
     )
     assert first == {"assigned": 5, "created": 5}
     assert second == {"assigned": 5, "reused": 5}
+    assert set(reader_opens.values()) == {1}
+    assert set(row_group_loads.values()) == {1}
 
     result = audit.finalize_audit(
         base=base,
         public_manifests=public_manifests,
         output_root=output_root,
         expected_public_rows=None,
+        location_index=location_index,
     )
-    assert result["scanned_rows"] == 5
+    assert result["scanned_rows"] == 6
+    assert result["scan_order"] == audit.PRODUCTION_SCAN_ORDER
+    assert len(result["archive_fingerprint_receipts"]) == 5
+    assert "part_fingerprint_receipts" not in result
     assert result["public_overlap_rows"] == int(overlap)
     assert result["training_ready"] is (not overlap)
     assert (
@@ -293,25 +367,71 @@ def test_base_public_pcm_audit_is_resumable_and_fail_closed(
             )
 
 
-def test_base_public_pcm_audit_rejects_changed_fingerprint_part(tmp_path: Path) -> None:
+def test_base_public_pcm_audit_rejects_changed_archive_fingerprint(tmp_path: Path) -> None:
     inventory_path, _ = _fixture(tmp_path)
     base = audit.validate_base_inventory(inventory_path)
     output_root = tmp_path / "audit"
-    audit.run_fingerprint_worker(
-        base=base,
+    audit.build_location_index(base=base, output_root=output_root)
+    location_index = audit.validate_location_index(output_root, base=base)
+    audit.run_archive_worker(
+        location_index=location_index,
         output_root=output_root,
         worker_index=0,
         num_workers=1,
-        max_parts=None,
+        max_archives=None,
     )
-    fingerprint_path = output_root / "part_fingerprints/part_000000.jsonl"
+    fingerprint_path = output_root / "archive_fingerprints/archive_000000.jsonl"
     fingerprint_path.write_bytes(fingerprint_path.read_bytes() + b"{}\n")
 
-    with pytest.raises(ValueError, match="fingerprint part changed"):
-        audit.run_fingerprint_worker(
-            base=base,
+    with pytest.raises(ValueError, match="archive fingerprint changed"):
+        audit.run_archive_worker(
+            location_index=location_index,
             output_root=output_root,
             worker_index=0,
             num_workers=1,
-            max_parts=None,
+            max_archives=None,
         )
+
+
+def test_base_public_pcm_all_cli_uses_archive_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory_path, _ = _fixture(tmp_path)
+    public_audio = tmp_path / "public.flac"
+    public_audio.write_bytes(_flac(np.linspace(-0.4, 0.4, 8_000, dtype=np.float32)))
+    public_manifest = tmp_path / "public.jsonl"
+    public_manifest.write_text(
+        json.dumps(
+            {
+                "utt_id": "public-utt",
+                "audio_filepath": str(public_audio),
+                "dataset": "public_test",
+                "text": "reference",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "audit"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "audit_stage211_base_public_pcm_overlap.py",
+            "--base-inventory",
+            str(inventory_path),
+            "--output-root",
+            str(output_root),
+            "--public-manifest",
+            f"public_test={public_manifest}",
+            "all",
+        ],
+    )
+
+    assert audit.main() == 0
+    result = json.loads((output_root / "audit_receipt.json").read_text(encoding="utf-8"))
+    assert result["scan_order"] == audit.PRODUCTION_SCAN_ORDER
+    assert result["scanned_rows"] == 6
+    assert len(result["archive_fingerprint_receipts"]) == 5
+    assert not (output_root / "part_fingerprints").exists()

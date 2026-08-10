@@ -359,6 +359,7 @@ def _base_public_audit(tmp_path: Path, *, base_inventory: Path) -> Path:
                 "training_ready": True,
                 "admission_state": "normalized_pcm_exact_public_clear",
                 "comparison_mode": "normalized_pcm_exact",
+                "scan_order": "manifest_location_index_archive_order_v1",
                 "near_duplicate_complete": False,
                 "decode_failures": 0,
                 "public_overlap_rows": 0,

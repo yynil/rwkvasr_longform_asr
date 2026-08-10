@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.eval.stage211_supplemental import (
+    STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER,
     validate_stage211_supplemental_inventory,
 )
 
@@ -301,6 +302,8 @@ def build_combined_inventory(
             abs_tol=1e-9,
         )
         or int(base_public_overlap_audit.get("public_overlap_rows", -1)) != 0
+        or base_public_overlap_audit.get("scan_order")
+        != STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
     ):
         raise ValueError("Stage211 base public-overlap audit does not bind this base pool.")
     social_validated = validate_filtered_inventory(
@@ -421,6 +424,7 @@ def build_combined_inventory(
             "receipt_path": str(base_public_overlap_audit_path),
             "receipt_sha256": _sha256(base_public_overlap_audit_path),
             "comparison_mode": "normalized_pcm_exact",
+            "scan_order": STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER,
             "scanned_rows": int(base_public_overlap_audit["scanned_rows"]),
             "scanned_hours": float(base_public_overlap_audit["scanned_hours"]),
             "public_overlap_rows": 0,

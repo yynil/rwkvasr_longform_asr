@@ -19,6 +19,7 @@ from rwkvasr.eval.stage211_initialization import (
     DEFAULT_STAGE211_INITIALIZATION_RECEIPT,
     validate_stage211_initialization_receipt,
 )
+from rwkvasr.eval.stage211_supplemental import STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
 
 try:
     from scripts.install_stage211_unicode_metric_correction import (
@@ -679,6 +680,8 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
         or base_audit.get("training_ready") is not True
         or base_audit.get("admission_state") != "normalized_pcm_exact_public_clear"
         or base_audit.get("comparison_mode") != "normalized_pcm_exact"
+        or base_audit.get("scan_order")
+        != STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
         or base_audit.get("near_duplicate_complete") is not False
         or int(base_audit.get("decode_failures", -1)) != 0
         or int(base_audit.get("public_overlap_rows", -1)) != 0
@@ -687,6 +690,8 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
         != base_component.get("inventory_sha256")
         or int(base_audit.get("scanned_rows", -1)) != int(base_component.get("rows", -2))
         or base_audit_record.get("comparison_mode") != "normalized_pcm_exact"
+        or base_audit_record.get("scan_order")
+        != STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
         or int(base_audit_record.get("scanned_rows", -1))
         != int(base_component.get("rows", -2))
         or int(base_audit_record.get("public_overlap_rows", -1)) != 0
@@ -746,6 +751,7 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
         "stage179_unique_rows": stage179_rows,
         "stage179_hours": stage179_hours,
         "base_public_overlap_normalized_pcm_exact_complete": True,
+        "base_public_overlap_scan_order": base_audit["scan_order"],
         "base_public_overlap_rows": 0,
         "base_public_overlap_scanned_rows": int(base_audit["scanned_rows"]),
         "base_public_overlap_receipt_path": str(base_audit_path),
@@ -1163,7 +1169,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"schema `{report['supplemental_dedupe_proof']['inventory_schema_version']}`, "
         "base public normalized-PCM exact audit: "
         f"`{str(report['supplemental_dedupe_proof']['base_public_overlap_normalized_pcm_exact_complete']).lower()}` "
-        f"({int(report['supplemental_dedupe_proof']['base_public_overlap_scanned_rows']):,} rows, 0 overlap), "
+        f"({int(report['supplemental_dedupe_proof']['base_public_overlap_scanned_rows']):,} rows, 0 overlap, "
+        f"`{report['supplemental_dedupe_proof']['base_public_overlap_scan_order']}`), "
         "social normalized-PCM exact dedupe/public filtering: "
         f"`{str(report['supplemental_dedupe_proof']['social_normalized_pcm_exact_complete']).lower()}`/"
         f"`{report['supplemental_dedupe_proof']['social_public_overlap_mode']}`, "

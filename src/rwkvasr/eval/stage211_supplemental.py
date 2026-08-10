@@ -29,6 +29,7 @@ STAGE211_BASE_SUPPLEMENTAL_SOURCES = {
     "vctk",
 }
 STAGE211_SUPPLEMENTAL_SOURCES = STAGE211_BASE_SUPPLEMENTAL_SOURCES
+STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER = "manifest_location_index_archive_order_v1"
 STAGE211_USB_PENDING_NATURAL_ADMISSION = {
     "LLaSO-Align",
     "MLCommons",
@@ -204,6 +205,7 @@ def _validate_combined_base_public_overlap(
         "training_ready": True,
         "admission_state": "normalized_pcm_exact_public_clear",
         "comparison_mode": "normalized_pcm_exact",
+        "scan_order": STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER,
         "near_duplicate_complete": False,
         "decode_failures": 0,
         "public_overlap_rows": 0,
@@ -223,6 +225,7 @@ def _validate_combined_base_public_overlap(
             abs_tol=1e-9,
         )
         or record.get("comparison_mode") != "normalized_pcm_exact"
+        or record.get("scan_order") != STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
         or int(record.get("scanned_rows", -1)) != int(base["rows"])
         or not math.isclose(
             float(record.get("scanned_hours", float("nan"))),
