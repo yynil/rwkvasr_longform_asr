@@ -13,6 +13,7 @@ from rwkvasr.data import load_webdataset_bucket_manifest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 builder = importlib.import_module("scripts.build_stage211_retention_replay")
+validator = importlib.import_module("scripts.validate_stage211_retention_replay")
 
 
 def _write_source_manifest(root: Path, *, difficulty: str) -> tuple[Path, list[str]]:
@@ -209,6 +210,14 @@ def test_build_stage211_retention_replay_is_balanced_and_immutable(
     assert set(receipt["cells"]["easy_en"]["sources"].values()) == {4}
     assert all(len(part["sha256"]) == 64 for part in receipt["output_parts"])
 
+    validated = validator.validate_retention_replay(
+        output_dir / "receipt.json",
+        expected_cell_targets=targets,
+        expected_fixed_eval_samples=len(fixed),
+    )
+    assert validated["validated_unique_keys"] == 59
+    assert len(validated["receipt_sha256"]) == 64
+
     repeated = builder.build_retention_replay(
         source_manifests=source_manifests,
         output_dir=output_dir,
@@ -231,6 +240,18 @@ def test_build_stage211_retention_replay_is_balanced_and_immutable(
             seed=2112,
             bucket_width=80,
             max_rows_per_part=3,
+        )
+
+    first_part = Path(receipt["output_parts"][0]["path"])
+    first_part.write_text(
+        first_part.read_text(encoding="utf-8") + "{}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="output part SHA-256 mismatch"):
+        validator.validate_retention_replay(
+            output_dir / "receipt.json",
+            expected_cell_targets=targets,
+            expected_fixed_eval_samples=len(fixed),
         )
 
 
