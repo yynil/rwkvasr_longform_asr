@@ -223,3 +223,26 @@ def test_supplemental_manifest_requires_fixed_eval_split(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="fixed-eval manifest"):
         builder._load_fixed_eval_split(bad_manifest)
+
+
+def test_supplemental_manifest_preserves_interrupted_staging(tmp_path: Path) -> None:
+    output = tmp_path / "supplemental"
+    staging = tmp_path / "supplemental.partial"
+    staging.mkdir()
+    marker = staging / "completed-part.jsonl"
+    marker.write_text('{"key":"preserve-me"}\n', encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="inspect and recover"):
+        builder.build_manifest(
+            peoples_root=tmp_path / "peoples",
+            llaso_root=tmp_path / "llaso",
+            output=output,
+            bucket_width=80,
+            entries_per_part=2,
+            hash_archives=False,
+            require_production_layout=False,
+            fixed_eval_manifest_path=tmp_path / "unused-fixed-eval.json",
+            stage179_global_dedup_manifest_path=tmp_path / "unused-stage179.json",
+        )
+
+    assert marker.read_text(encoding="utf-8") == '{"key":"preserve-me"}\n'

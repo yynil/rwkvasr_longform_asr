@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import time
 import wave
 import zipfile
@@ -534,7 +533,10 @@ def build_manifest(
         raise FileExistsError(f"Refusing to replace existing supplemental manifest: {output}")
     staging = output.with_name(output.name + ".partial")
     if staging.exists():
-        shutil.rmtree(staging)
+        raise FileExistsError(
+            "Refusing to delete an interrupted Stage211 supplemental build; "
+            f"inspect and recover or remove it explicitly: {staging}"
+        )
     staging.mkdir(parents=True)
     archive_records: list[dict[str, Any]] = []
     writer = BucketManifestWriter(
