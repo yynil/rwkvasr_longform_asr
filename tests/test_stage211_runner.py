@@ -4056,6 +4056,9 @@ def _run_stage211_continuation_watcher_fixture(
     tmp_path: Path,
     *,
     uv_mode: str,
+    tmux_mode: str = "stateless",
+    watch_once: str | None = "1",
+    initial_final_report: bool = True,
 ) -> tuple[subprocess.CompletedProcess[str], str, Path]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -4064,6 +4067,33 @@ def _run_stage211_continuation_watcher_fixture(
     tmux.write_text(
         "#!/usr/bin/env bash\n"
         'printf \'%s\\n\' "$*" >>"${TMUX_CALLS}"\n'
+        'if [[ "${TMUX_MODE}" == multi_handoff ]]; then\n'
+        '  if [[ "${1:-}" == has-session ]]; then\n'
+        '    if [[ "$*" == *rwkvasr_stage211_abcd_hourly_monitor* ]]; then exit 0; fi\n'
+        '    if [[ "$*" == *rwkvasr_stage211_abcd_strict_supervisor* '
+        '&& -f "${TMUX_STATE}.active" ]]; then\n'
+        '      rm -f "${TMUX_STATE}.active"\n'
+        '      launches="$(cat "${TMUX_STATE}.launches")"\n'
+        '      if ((launches >= 2)); then\n'
+        '        mkdir -p "$(dirname "${FINAL_REPORT_PATH}")"\n'
+        '        printf \'%s\\n\' '
+        '\'{"pipeline":"stage211","artifact":"final_completion",'
+        '"complete":true,"gate_passed":true}\' >"${FINAL_REPORT_PATH}"\n'
+        '      fi\n'
+        '      exit 0\n'
+        '    fi\n'
+        '    exit 1\n'
+        '  fi\n'
+        '  if [[ "${1:-}" == new-session '
+        '&& "$*" == *rwkvasr_stage211_abcd_strict_supervisor* ]]; then\n'
+        '    launches=0\n'
+        '    [[ -f "${TMUX_STATE}.launches" ]] '
+        '&& launches="$(cat "${TMUX_STATE}.launches")"\n'
+        '    printf \'%s\\n\' "$((launches + 1))" >"${TMUX_STATE}.launches"\n'
+        '    touch "${TMUX_STATE}.active"\n'
+        '  fi\n'
+        '  exit 0\n'
+        'fi\n'
         'if [[ "${1:-}" == has-session ]]; then exit 1; fi\n'
         "exit 0\n",
         encoding="utf-8",
@@ -4098,18 +4128,22 @@ def _run_stage211_continuation_watcher_fixture(
     phase_gate_root = tmp_path / "gates"
     final_report = phase_gate_root / "sft" / "stage211_complete.json"
     final_report.parent.mkdir(parents=True)
-    final_report.write_text(
-        json.dumps(
-            {
-                "pipeline": "stage211",
-                "artifact": "final_completion",
-                "complete": True,
-                "gate_passed": True,
-            }
+    if initial_final_report:
+        final_report.write_text(
+            json.dumps(
+                {
+                    "pipeline": "stage211",
+                    "artifact": "final_completion",
+                    "complete": True,
+                    "gate_passed": True,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        + "\n",
-        encoding="utf-8",
-    )
+    extra_env = {}
+    if watch_once is not None:
+        extra_env["WATCH_ONCE"] = watch_once
     result = subprocess.run(
         ["bash", str(REPO_ROOT / "scripts" / "watch_stage211_strict_continuation.sh")],
         cwd=REPO_ROOT,
@@ -4117,11 +4151,16 @@ def _run_stage211_continuation_watcher_fixture(
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "TMUX_CALLS": str(tmux_calls),
+            "TMUX_MODE": tmux_mode,
+            "TMUX_STATE": str(tmp_path / "tmux-state"),
+            "FINAL_REPORT_PATH": str(final_report),
             "UV_MODE": uv_mode,
             "PHASE_GATE_ROOT": str(phase_gate_root),
             "FULL_OUTPUT_ROOT": str(tmp_path / "runs"),
             "WATCH_LOG": str(tmp_path / "watch.log"),
-            "WATCH_ONCE": "1",
+            "POLL_SECONDS": "0",
+            "RESTART_BACKOFF_SECONDS": "0",
+            **extra_env,
         },
         text=True,
         capture_output=True,
@@ -4170,3 +4209,21 @@ def test_stage211_continuation_watcher_rejects_placeholder_bilingual_metrics(
     assert "final Stage211 stepwise proof failed validation" in result.stdout
     assert "START_STAGE=full" in result.stdout
     assert "new-session" in tmux_calls
+
+
+def test_stage211_continuation_watcher_survives_multiple_supervisor_handoffs(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, phase_gate_root = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="success",
+        tmux_mode="multi_handoff",
+        watch_once=None,
+        initial_final_report=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert tmux_calls.count("new-session") == 2
+    assert result.stdout.count("replacement supervisor launched") == 2
+    assert "SFT and stepwise proofs pass" in result.stdout
+    assert (phase_gate_root / "sft" / "stage211_stepwise_results.json").is_file()
