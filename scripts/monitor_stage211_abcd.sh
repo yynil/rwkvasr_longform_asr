@@ -34,6 +34,89 @@ stage211_latest_training_record() {
   rg '\[deepspeed-train\] step=' "${log_path}" 2>/dev/null | tail -n 1 || true
 }
 
+stage211_yaml_scalar() {
+  local config_path="$1"
+  local key="$2"
+  awk -v key="${key}" '
+    index($0, key ":") == 1 {
+      value = substr($0, length(key) + 2)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
+        value = substr(value, 2, length(value) - 2)
+      }
+      print value
+      exit
+    }
+  ' "${config_path}"
+}
+
+stage211_latest_export_step() {
+  local run_dir="$1"
+  local checkpoint name step latest=0
+  shopt -s nullglob
+  for checkpoint in "${run_dir}"/step-*.pt; do
+    name="${checkpoint##*/}"
+    if [[ "${name}" =~ ^step-([0-9]+)\.pt$ ]]; then
+      step="${BASH_REMATCH[1]}"
+      if ((10#${step} > latest)); then
+        latest=$((10#${step}))
+      fi
+    fi
+  done
+  shopt -u nullglob
+  printf '%s\n' "${latest}"
+}
+
+stage211_active_config_paths() {
+  ps -C python3 -o args= 2>/dev/null |
+    awk '
+      /rwkvasr\.cli\.train_ctc_deepspeed/ && /stage211/ {
+        for (index = 1; index <= NF; ++index) {
+          if ($index == "--config-yaml" && index < NF) {
+            print $(index + 1)
+          }
+        }
+      }
+    ' |
+    sort -u || true
+}
+
+stage211_emit_config_progress() {
+  local config_path="$1"
+  local run_dir target_step run_name latest_log latest_record live_step persisted_step progress
+  if [[ ! -s "${config_path}" ]]; then
+    printf 'active_config_missing=%s\n' "${config_path}"
+    return
+  fi
+  run_dir="$(stage211_yaml_scalar "${config_path}" output_dir)"
+  target_step="$(stage211_yaml_scalar "${config_path}" max_steps)"
+  run_name="$(stage211_yaml_scalar "${config_path}" wandb_run_name)"
+  if [[ -z "${run_dir}" || ! "${target_step}" =~ ^[0-9]+$ || "${target_step}" == 0 ]]; then
+    printf 'active_config_invalid=%s output_dir=%s max_steps=%s\n' \
+      "${config_path}" "${run_dir:-missing}" "${target_step:-missing}"
+    return
+  fi
+  latest_log="$({
+    find "${run_dir}/logs" -maxdepth 1 -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null || true
+  } | sort -nr | head -n 1 | cut -d' ' -f2-)"
+  latest_record=""
+  if [[ -n "${latest_log}" ]]; then
+    latest_record="$(stage211_latest_training_record "${latest_log}")"
+  fi
+  live_step="$(sed -n 's/.*\[deepspeed-train\] step=\([0-9][0-9]*\).*/\1/p' <<<"${latest_record}")"
+  live_step="${live_step:-0}"
+  persisted_step="$(stage211_latest_export_step "${run_dir}")"
+  progress="$(awk -v live="${live_step}" -v target="${target_step}" 'BEGIN { printf "%.4f", 100.0 * live / target }')"
+  printf 'active_config=%s\n' "${config_path}"
+  printf 'run_name=%s run_dir=%s\n' "${run_name:-unknown}" "${run_dir}"
+  printf 'live_step=%s target_step=%s progress_pct=%s persisted_step=%s\n' \
+    "${live_step}" "${target_step}" "${progress}" "${persisted_step}"
+  if [[ -n "${latest_record}" ]]; then
+    printf '%s\n' "${latest_record}"
+  fi
+}
+
 stage211_current_attempt_errors() {
   local log_path="$1"
   local attempt_start
@@ -66,6 +149,16 @@ stage211_emit_snapshot() {
   printf '%s\n' '-- training ranks --'
   ps -C python3 -o pid=,stat=,etime=,pcpu=,args= 2>/dev/null |
     awk '/rwkvasr\.cli\.train_ctc_deepspeed/ && /stage211/ { print }' || true
+  printf '%s\n' '-- active training progress --'
+  local active_configs=0 config_path
+  while IFS= read -r config_path; do
+    [[ -n "${config_path}" ]] || continue
+    active_configs=$((active_configs + 1))
+    stage211_emit_config_progress "${config_path}"
+  done < <(stage211_active_config_paths)
+  if ((active_configs == 0)); then
+    printf '%s\n' none
+  fi
   printf '%s\n' '-- supervisor tail --'
   tail -n 20 "${OUTPUT_ROOT}/supervisor.log" 2>&1 || true
   printf '%s\n' '-- public evaluation coverage --'

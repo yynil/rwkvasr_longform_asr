@@ -881,6 +881,52 @@ def test_stage211_hourly_monitor_scopes_errors_to_latest_attempt(
     assert "online_layer_frame_delta=1" in failed.stdout
 
 
+def test_stage211_hourly_monitor_reports_bound_live_progress(
+    tmp_path: Path,
+) -> None:
+    monitor_script = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+    run_dir = tmp_path / "run"
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True)
+    (run_dir / "step-20.pt").write_bytes(b"checkpoint")
+    (run_dir / "step-100.pt.tmp").write_bytes(b"incomplete")
+    training_log = logs_dir / "train.log"
+    training_log.write_text(
+        "[deepspeed-train] step=21 loss=0.2000\n"
+        "[deepspeed-train] step=25 loss=0.1000\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "stage211_test.yaml"
+    config.write_text(
+        f"output_dir: {run_dir}\n"
+        "wandb_run_name: stage211-live-test\n"
+        "max_steps: 100\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; stage211_emit_config_progress "$2"',
+            "stage211-monitor-test",
+            str(monitor_script),
+            str(config),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"active_config={config}" in result.stdout
+    assert f"run_name=stage211-live-test run_dir={run_dir}" in result.stdout
+    assert "live_step=25 target_step=100 progress_pct=25.0000 persisted_step=20" in result.stdout
+    assert result.stdout.count("[deepspeed-train] step=") == 1
+    assert "step=25 loss=0.1000" in result.stdout
+
+
 def test_stage211_calibration_eval_validator_cli_loads() -> None:
     result = subprocess.run(
         [
