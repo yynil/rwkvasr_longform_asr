@@ -180,6 +180,63 @@ def _validate_combined_component_inventories(
     return base, social, social_sources
 
 
+def _validate_combined_base_public_overlap(
+    inventory: dict[str, Any],
+    *,
+    base: dict[str, Any],
+) -> None:
+    record = inventory.get("base_public_overlap_audit")
+    if not isinstance(record, dict):
+        raise ValueError("Stage211 combined inventory lacks base public-overlap proof.")
+    receipt_path = _bound_file(
+        record,
+        path_key="receipt_path",
+        sha256_key="receipt_sha256",
+        label="Stage211 base public-overlap audit",
+        verify_sha256=True,
+    )
+    audit = _load_json(receipt_path, label="Stage211 base public-overlap audit")
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "stage211_base_public_pcm_overlap_audit",
+        "complete": True,
+        "training_ready": True,
+        "admission_state": "normalized_pcm_exact_public_clear",
+        "comparison_mode": "normalized_pcm_exact",
+        "near_duplicate_complete": False,
+        "decode_failures": 0,
+        "public_overlap_rows": 0,
+    }
+    if any(audit.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 base public-overlap audit is incomplete.")
+    if (
+        audit.get("base_inventory_path") != base["inventory_path"]
+        or audit.get("base_inventory_sha256") != base["inventory_sha256"]
+        or audit.get("base_bucket_manifest_path") != base["bucket_manifest_path"]
+        or audit.get("base_bucket_manifest_sha256") != base["bucket_manifest_sha256"]
+        or int(audit.get("scanned_rows", -1)) != int(base["rows"])
+        or not math.isclose(
+            float(audit.get("scanned_hours", float("nan"))),
+            float(base["hours"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or record.get("comparison_mode") != "normalized_pcm_exact"
+        or int(record.get("scanned_rows", -1)) != int(base["rows"])
+        or not math.isclose(
+            float(record.get("scanned_hours", float("nan"))),
+            float(base["hours"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or int(record.get("public_overlap_rows", -1)) != 0
+        or record.get("training_ready") is not True
+        or record.get("near_duplicate_complete") is not False
+    ):
+        raise ValueError("Stage211 base public-overlap audit binding changed.")
+
+
 def _validate_combined_usb_coverage(
     inventory: dict[str, Any],
     *,
@@ -345,6 +402,7 @@ def validate_stage211_supplemental_inventory(
             )
         )
         _validate_combined_usb_coverage(inventory, social=component_social)
+        _validate_combined_base_public_overlap(inventory, base=component_base)
     expected_sources = (
         STAGE211_BASE_SUPPLEMENTAL_SOURCES | social_sources
         if combined
@@ -406,7 +464,9 @@ def validate_stage211_supplemental_inventory(
     ):
         raise ValueError("Stage211 supplemental cross-pool dedupe proof is invalid.")
     if combined and (
-        cross_pool.get("social_normalized_pcm_exact_complete") is not True
+        cross_pool.get("base_public_overlap_normalized_pcm_exact_complete") is not True
+        or int(cross_pool.get("base_public_overlap_rows", -1)) != 0
+        or cross_pool.get("social_normalized_pcm_exact_complete") is not True
         or cross_pool.get("social_public_overlap_mode") != "normalized_pcm_exact"
         or cross_pool.get("archived_social_exact_duplicate_exclusion_complete") is not True
         or cross_pool.get("usb_top_level_classification_complete") is not True

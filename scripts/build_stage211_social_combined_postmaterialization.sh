@@ -7,6 +7,7 @@ REPO_ROOT="${STAGE211_REPO_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 MATERIALIZED_INVENTORY="${MATERIALIZED_INVENTORY:-${HOME}/rwkvasr_data/stage211_social_vad_materialized_v1/materialized_inventory.json}"
 FILTERED_ROOT="${FILTERED_ROOT:-${HOME}/rwkvasr_data/stage211_social_vad_filtered_v1}"
 BASE_INVENTORY="${BASE_INVENTORY:-${HOME}/rwkvasr_data/stage211_supplemental_natural_v1/supplemental_inventory.json}"
+BASE_PUBLIC_OVERLAP_ROOT="${BASE_PUBLIC_OVERLAP_ROOT:-${HOME}/rwkvasr_data/stage211_base_public_pcm_overlap_v1}"
 COMBINED_ROOT="${COMBINED_ROOT:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v2}"
 USB_COVERAGE_RECEIPT="${USB_COVERAGE_RECEIPT:-${HOME}/rwkvasr_data/stage211_usb_top_level_coverage_v1/coverage_receipt.json}"
 ARCHIVED_SOCIAL_OVERLAP_RECEIPT="${ARCHIVED_SOCIAL_OVERLAP_RECEIPT:-${HOME}/rwkvasr_data/stage211_archived_social_overlap_v1/overlap_receipt.json}"
@@ -26,6 +27,15 @@ if [[ ! -s "${ARCHIVED_SOCIAL_OVERLAP_RECEIPT}" ]]; then
   echo "Stage211 archived-social overlap receipt is unavailable: ${ARCHIVED_SOCIAL_OVERLAP_RECEIPT}" >&2
   exit 1
 fi
+while [[ ! -s "${BASE_INVENTORY}" ]]; do
+  sleep "${POLL_SECONDS}"
+done
+
+env CUDA_VISIBLE_DEVICES='' uv run python \
+  scripts/audit_stage211_base_public_pcm_overlap.py \
+  --base-inventory "${BASE_INVENTORY}" \
+  --output-root "${BASE_PUBLIC_OVERLAP_ROOT}" \
+  all
 
 env CUDA_VISIBLE_DEVICES='' uv run python \
   scripts/filter_stage211_social_pcm_overlap.py \
@@ -41,6 +51,7 @@ env CUDA_VISIBLE_DEVICES='' uv run python \
 
 uv run python scripts/build_stage211_combined_supplemental_inventory.py \
   --base-inventory "${BASE_INVENTORY}" \
+  --base-public-overlap-audit "${BASE_PUBLIC_OVERLAP_ROOT}/audit_receipt.json" \
   --social-inventory "${FILTERED_ROOT}/filtered_inventory.json" \
   --usb-coverage-receipt "${USB_COVERAGE_RECEIPT}" \
   --archived-social-overlap-receipt "${ARCHIVED_SOCIAL_OVERLAP_RECEIPT}" \

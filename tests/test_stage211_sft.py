@@ -676,17 +676,56 @@ def _write_stepwise_inputs(
         + "\n",
         encoding="utf-8",
     )
+    base_component_inventory = tmp_path / "base-component-inventory.json"
+    base_component_inventory.write_text("{}\n", encoding="utf-8")
+    base_public_overlap_audit = tmp_path / "base-public-overlap-audit.json"
+    base_public_overlap_audit.write_text(
+        json.dumps(
+            {
+                "artifact": "stage211_base_public_pcm_overlap_audit",
+                "complete": True,
+                "training_ready": True,
+                "admission_state": "normalized_pcm_exact_public_clear",
+                "comparison_mode": "normalized_pcm_exact",
+                "near_duplicate_complete": False,
+                "decode_failures": 0,
+                "public_overlap_rows": 0,
+                "base_inventory_path": str(base_component_inventory.resolve()),
+                "base_inventory_sha256": sha256_file(base_component_inventory),
+                "scanned_rows": 20,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     supplemental_inventory = tmp_path / "supplemental-inventory.json"
     supplemental_inventory.write_text(
         json.dumps(
             {
                 "schema_version": 2,
                 "artifact": "stage211_supplemental_combined_inventory",
-                "component_inventories": {"base_natural": {}, "social_vad": {}},
+                "component_inventories": {
+                    "base_natural": {
+                        "inventory_path": str(base_component_inventory.resolve()),
+                        "inventory_sha256": sha256_file(base_component_inventory),
+                        "rows": 20,
+                    },
+                    "social_vad": {},
+                },
+                "base_public_overlap_audit": {
+                    "receipt_path": str(base_public_overlap_audit.resolve()),
+                    "receipt_sha256": sha256_file(base_public_overlap_audit),
+                    "comparison_mode": "normalized_pcm_exact",
+                    "scanned_rows": 20,
+                    "public_overlap_rows": 0,
+                    "training_ready": True,
+                },
                 "cross_pool_dedupe": {
                     "mode": "source_identity_plus_known_corpus_exclusion",
                     "content_fingerprint_complete": False,
                     "source_sets_disjoint": True,
+                    "base_public_overlap_normalized_pcm_exact_complete": True,
+                    "base_public_overlap_rows": 0,
                     "social_normalized_pcm_exact_complete": True,
                     "social_public_overlap_mode": "normalized_pcm_exact",
                     "archived_social_exact_duplicate_exclusion_complete": True,
@@ -1324,6 +1363,11 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["supplemental_inventory_chain_passed"] is True
     assert report["supplemental_dedupe_proof"]["source_sets_disjoint"] is True
     assert report["supplemental_dedupe_proof"]["content_fingerprint_complete"] is False
+    assert report["supplemental_dedupe_proof"][
+        "base_public_overlap_normalized_pcm_exact_complete"
+    ] is True
+    assert report["supplemental_dedupe_proof"]["base_public_overlap_rows"] == 0
+    assert report["supplemental_dedupe_proof"]["base_public_overlap_scanned_rows"] == 20
     assert report["supplemental_dedupe_proof"]["known_overlap_exclusions"] == [
         "llaso_gigaspeech",
         "llaso_librispeech",
@@ -1386,6 +1430,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")
     assert "Public metric definition proof" in output_markdown.read_text(encoding="utf-8")
     assert "Supplemental cross-pool dedupe" in output_markdown.read_text(
+        encoding="utf-8"
+    )
+    assert "base public normalized-PCM exact audit" in output_markdown.read_text(
         encoding="utf-8"
     )
     assert "USB-wide natural-audio resolution" in output_markdown.read_text(

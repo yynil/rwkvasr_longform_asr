@@ -16,8 +16,10 @@ from rwkvasr.eval.stage211_supplemental import (
 )
 
 try:
+    from scripts.audit_stage211_base_public_pcm_overlap import validate_audit_receipt
     from scripts.filter_stage211_social_pcm_overlap import validate_filtered_inventory
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+    from audit_stage211_base_public_pcm_overlap import validate_audit_receipt
     from filter_stage211_social_pcm_overlap import validate_filtered_inventory
 
 
@@ -26,6 +28,9 @@ DEFAULT_BASE_INVENTORY = (
 )
 DEFAULT_SOCIAL_INVENTORY = (
     Path.home() / "rwkvasr_data/stage211_social_vad_filtered_v1/filtered_inventory.json"
+)
+DEFAULT_BASE_PUBLIC_OVERLAP_AUDIT = (
+    Path.home() / "rwkvasr_data/stage211_base_public_pcm_overlap_v1/audit_receipt.json"
 )
 DEFAULT_USB_COVERAGE_RECEIPT = (
     Path.home()
@@ -246,6 +251,7 @@ def _write_atomic_directory(
 def build_combined_inventory(
     *,
     base_inventory_path: Path,
+    base_public_overlap_audit_path: Path,
     social_inventory_path: Path,
     usb_coverage_receipt_path: Path,
     archived_social_overlap_receipt_path: Path,
@@ -253,6 +259,7 @@ def build_combined_inventory(
 ) -> dict[str, Any]:
     started = time.time()
     base_inventory_path = base_inventory_path.expanduser().resolve()
+    base_public_overlap_audit_path = base_public_overlap_audit_path.expanduser().resolve()
     social_inventory_path = social_inventory_path.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
     output_inventory = output_root / "supplemental_inventory.json"
@@ -276,6 +283,26 @@ def build_combined_inventory(
     base = base_validated["inventory"]
     if base.get("schema_version") != 1:
         raise ValueError("Stage211 combined builder requires the version-1 base natural pool.")
+    base_public_overlap_audit = validate_audit_receipt(
+        base_public_overlap_audit_path,
+        require_training_ready=True,
+        verify_overlap_replay=True,
+    )
+    if (
+        base_public_overlap_audit.get("base_inventory_path") != str(base_inventory_path)
+        or base_public_overlap_audit.get("base_inventory_sha256")
+        != base_validated["inventory_sha256"]
+        or int(base_public_overlap_audit.get("scanned_rows", -1))
+        != int(base_validated["rows"])
+        or not math.isclose(
+            float(base_public_overlap_audit.get("scanned_hours", float("nan"))),
+            float(base_validated["hours"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or int(base_public_overlap_audit.get("public_overlap_rows", -1)) != 0
+    ):
+        raise ValueError("Stage211 base public-overlap audit does not bind this base pool.")
     social_validated = validate_filtered_inventory(
         social_inventory_path,
         verify_part_sha256=True,
@@ -390,6 +417,16 @@ def build_combined_inventory(
                 "near_duplicate_complete": False,
             },
         },
+        "base_public_overlap_audit": {
+            "receipt_path": str(base_public_overlap_audit_path),
+            "receipt_sha256": _sha256(base_public_overlap_audit_path),
+            "comparison_mode": "normalized_pcm_exact",
+            "scanned_rows": int(base_public_overlap_audit["scanned_rows"]),
+            "scanned_hours": float(base_public_overlap_audit["scanned_hours"]),
+            "public_overlap_rows": 0,
+            "training_ready": True,
+            "near_duplicate_complete": False,
+        },
         "usb_top_level_coverage": {
             "receipt_path": str(usb_coverage_receipt_path),
             "receipt_sha256": _sha256(usb_coverage_receipt_path),
@@ -430,6 +467,8 @@ def build_combined_inventory(
             "supplemental_sources": sorted(base_sources | social_sources),
             "source_sets_disjoint": True,
             "known_overlap_exclusions": ["llaso_gigaspeech", "llaso_librispeech"],
+            "base_public_overlap_normalized_pcm_exact_complete": True,
+            "base_public_overlap_rows": 0,
             "social_normalized_pcm_exact_complete": True,
             "social_public_overlap_mode": "normalized_pcm_exact",
             "archived_social_exact_duplicate_exclusion_complete": True,
@@ -495,6 +534,11 @@ def _parse_args() -> argparse.Namespace:
         description="Build the Stage211 base-natural plus filtered-social combined inventory."
     )
     parser.add_argument("--base-inventory", type=Path, default=DEFAULT_BASE_INVENTORY)
+    parser.add_argument(
+        "--base-public-overlap-audit",
+        type=Path,
+        default=DEFAULT_BASE_PUBLIC_OVERLAP_AUDIT,
+    )
     parser.add_argument("--social-inventory", type=Path, default=DEFAULT_SOCIAL_INVENTORY)
     parser.add_argument(
         "--usb-coverage-receipt",
@@ -514,6 +558,7 @@ def main() -> int:
     args = _parse_args()
     result = build_combined_inventory(
         base_inventory_path=args.base_inventory,
+        base_public_overlap_audit_path=args.base_public_overlap_audit,
         social_inventory_path=args.social_inventory,
         usb_coverage_receipt_path=args.usb_coverage_receipt,
         archived_social_overlap_receipt_path=args.archived_social_overlap_receipt,

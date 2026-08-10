@@ -25,6 +25,14 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@pytest.fixture(autouse=True)
+def _validate_synthetic_base_public_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    def validate(path: Path, **_: object) -> dict[str, object]:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(combined, "validate_audit_receipt", validate)
+
+
 def _part(path: Path, *, rows: int, source: str) -> dict[str, object]:
     path.write_text(
         "".join(json.dumps({"key": f"{source}-{index}"}) + "\n" for index in range(rows)),
@@ -337,6 +345,37 @@ def _usb_proofs(tmp_path: Path, *, social_inventory: Path) -> tuple[Path, Path]:
     return coverage, overlap
 
 
+def _base_public_audit(tmp_path: Path, *, base_inventory: Path) -> Path:
+    base = json.loads(base_inventory.read_text(encoding="utf-8"))
+    manifest = Path(base["bucket_manifest_path"])
+    path = tmp_path / "base_public_overlap_audit.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "stage211_base_public_pcm_overlap_audit",
+                "complete": True,
+                "training_ready": True,
+                "admission_state": "normalized_pcm_exact_public_clear",
+                "comparison_mode": "normalized_pcm_exact",
+                "near_duplicate_complete": False,
+                "decode_failures": 0,
+                "public_overlap_rows": 0,
+                "base_inventory_path": str(base_inventory),
+                "base_inventory_sha256": _sha256(base_inventory),
+                "base_bucket_manifest_path": str(manifest),
+                "base_bucket_manifest_sha256": _sha256(manifest),
+                "scanned_rows": int(base["selected_rows"]),
+                "scanned_hours": float(base["selected_hours"]),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -> None:
     _, _, eval_split, fixed_binding = _fixed_eval(tmp_path)
     base = _base_inventory(
@@ -349,11 +388,13 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
         eval_split=eval_split,
         fixed_binding=fixed_binding,
     )
+    base_public_audit = _base_public_audit(tmp_path, base_inventory=base)
     coverage, overlap = _usb_proofs(tmp_path, social_inventory=social)
     output = tmp_path / "combined"
 
     result = combined.build_combined_inventory(
         base_inventory_path=base,
+        base_public_overlap_audit_path=base_public_audit,
         social_inventory_path=social,
         usb_coverage_receipt_path=coverage,
         archived_social_overlap_receipt_path=overlap,
@@ -365,6 +406,10 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
     assert result["storage_kinds"] == ["parquet", "tar", "zip"]
     assert result["language"] == ["en", "zh"]
     assert result["cross_pool_dedupe"]["content_fingerprint_complete"] is False
+    assert result["cross_pool_dedupe"][
+        "base_public_overlap_normalized_pcm_exact_complete"
+    ] is True
+    assert result["cross_pool_dedupe"]["base_public_overlap_rows"] == 0
     assert result["cross_pool_dedupe"]["social_normalized_pcm_exact_complete"] is True
     assert result["cross_pool_dedupe"][
         "archived_social_exact_duplicate_exclusion_complete"
@@ -390,6 +435,7 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
     assert (
         combined.build_combined_inventory(
             base_inventory_path=base,
+            base_public_overlap_audit_path=base_public_audit,
             social_inventory_path=social,
             usb_coverage_receipt_path=coverage,
             archived_social_overlap_receipt_path=overlap,
@@ -411,10 +457,12 @@ def test_combined_inventory_rejects_changed_component(tmp_path: Path) -> None:
         eval_split=eval_split,
         fixed_binding=fixed_binding,
     )
+    base_public_audit = _base_public_audit(tmp_path, base_inventory=base)
     coverage, overlap = _usb_proofs(tmp_path, social_inventory=social)
     output = tmp_path / "combined"
     combined.build_combined_inventory(
         base_inventory_path=base,
+        base_public_overlap_audit_path=base_public_audit,
         social_inventory_path=social,
         usb_coverage_receipt_path=coverage,
         archived_social_overlap_receipt_path=overlap,

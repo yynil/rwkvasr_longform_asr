@@ -625,6 +625,8 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
         or cross_pool.get("mode") != "source_identity_plus_known_corpus_exclusion"
         or cross_pool.get("source_sets_disjoint") is not True
         or cross_pool.get("content_fingerprint_complete") is not False
+        or cross_pool.get("base_public_overlap_normalized_pcm_exact_complete") is not True
+        or int(cross_pool.get("base_public_overlap_rows", -1)) != 0
         or cross_pool.get("social_normalized_pcm_exact_complete") is not True
         or cross_pool.get("social_public_overlap_mode") != "normalized_pcm_exact"
         or cross_pool.get("archived_social_exact_duplicate_exclusion_complete") is not True
@@ -654,6 +656,43 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
     components = inventory.get("component_inventories")
     if not isinstance(components, dict) or set(components) != {"base_natural", "social_vad"}:
         raise ValueError("Stage211 supplemental component inventory proof is incomplete.")
+    base_component = components.get("base_natural")
+    base_audit_record = inventory.get("base_public_overlap_audit")
+    if not isinstance(base_component, dict) or not isinstance(base_audit_record, dict):
+        raise ValueError("Stage211 supplemental base public-overlap proof is incomplete.")
+    base_inventory_path = Path(str(base_component.get("inventory_path") or "")).resolve()
+    base_audit_path = Path(str(base_audit_record.get("receipt_path") or "")).resolve()
+    if (
+        not base_inventory_path.is_file()
+        or sha256_file(base_inventory_path) != base_component.get("inventory_sha256")
+        or not base_audit_path.is_file()
+        or sha256_file(base_audit_path) != base_audit_record.get("receipt_sha256")
+    ):
+        raise ValueError("Stage211 supplemental base public-overlap binding changed.")
+    base_audit = _load_json(
+        base_audit_path,
+        label="Stage211 base public-overlap audit",
+    )
+    if (
+        base_audit.get("artifact") != "stage211_base_public_pcm_overlap_audit"
+        or base_audit.get("complete") is not True
+        or base_audit.get("training_ready") is not True
+        or base_audit.get("admission_state") != "normalized_pcm_exact_public_clear"
+        or base_audit.get("comparison_mode") != "normalized_pcm_exact"
+        or base_audit.get("near_duplicate_complete") is not False
+        or int(base_audit.get("decode_failures", -1)) != 0
+        or int(base_audit.get("public_overlap_rows", -1)) != 0
+        or base_audit.get("base_inventory_path") != str(base_inventory_path)
+        or base_audit.get("base_inventory_sha256")
+        != base_component.get("inventory_sha256")
+        or int(base_audit.get("scanned_rows", -1)) != int(base_component.get("rows", -2))
+        or base_audit_record.get("comparison_mode") != "normalized_pcm_exact"
+        or int(base_audit_record.get("scanned_rows", -1))
+        != int(base_component.get("rows", -2))
+        or int(base_audit_record.get("public_overlap_rows", -1)) != 0
+        or base_audit_record.get("training_ready") is not True
+    ):
+        raise ValueError("Stage211 supplemental base public-overlap audit changed.")
     usb_record = inventory.get("usb_top_level_coverage")
     overlap_record = inventory.get("archived_social_exclusion")
     resolution = inventory.get("usb_natural_audio_resolution")
@@ -706,6 +745,11 @@ def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
         "stage179_manifest_sha256": stage179_manifest_sha256,
         "stage179_unique_rows": stage179_rows,
         "stage179_hours": stage179_hours,
+        "base_public_overlap_normalized_pcm_exact_complete": True,
+        "base_public_overlap_rows": 0,
+        "base_public_overlap_scanned_rows": int(base_audit["scanned_rows"]),
+        "base_public_overlap_receipt_path": str(base_audit_path),
+        "base_public_overlap_receipt_sha256": sha256_file(base_audit_path),
         "social_normalized_pcm_exact_complete": bool(
             cross_pool.get("social_normalized_pcm_exact_complete", False)
         ),
@@ -1117,6 +1161,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "Supplemental components: "
         f"schema `{report['supplemental_dedupe_proof']['inventory_schema_version']}`, "
+        "base public normalized-PCM exact audit: "
+        f"`{str(report['supplemental_dedupe_proof']['base_public_overlap_normalized_pcm_exact_complete']).lower()}` "
+        f"({int(report['supplemental_dedupe_proof']['base_public_overlap_scanned_rows']):,} rows, 0 overlap), "
         "social normalized-PCM exact dedupe/public filtering: "
         f"`{str(report['supplemental_dedupe_proof']['social_normalized_pcm_exact_complete']).lower()}`/"
         f"`{report['supplemental_dedupe_proof']['social_public_overlap_mode']}`, "
