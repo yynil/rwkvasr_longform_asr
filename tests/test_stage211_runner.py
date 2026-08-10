@@ -940,6 +940,21 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
             "run_labeled_sft_phase",
         )
     )
+    post_mixer_branch = main_body[
+        main_body.index("post_mixer)") : main_body.index("block)")
+    ]
+    block_branch = main_body[main_body.index("block)") : main_body.index("logits)")]
+    for branch in (post_mixer_branch, block_branch):
+        offsets = [
+            branch.index(call)
+            for call in (
+                "run_mixer_retention_loop",
+                "run_full_block_phase",
+                "run_full_logits_phase",
+                "run_labeled_sft_phase",
+            )
+        ]
+        assert offsets == sorted(offsets)
     logits_branch = main_body[main_body.index("logits)") : main_body.index("sft)")]
     assert "run_block_correction_loop" in logits_branch
     assert "run_full_block_phase" not in logits_branch
