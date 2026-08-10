@@ -649,7 +649,30 @@ def _write_stepwise_inputs(
         "nano_public_baseline_checkpoint_sha256": nano_teacher_sha256,
     }
     supplemental_inventory = tmp_path / "supplemental-inventory.json"
-    supplemental_inventory.write_text("{}\n", encoding="utf-8")
+    supplemental_inventory.write_text(
+        json.dumps(
+            {
+                "cross_pool_dedupe": {
+                    "mode": "source_identity_plus_known_corpus_exclusion",
+                    "content_fingerprint_complete": False,
+                    "source_sets_disjoint": True,
+                    "known_overlap_exclusions": [
+                        "llaso_gigaspeech",
+                        "llaso_librispeech",
+                    ],
+                    "supplemental_sources": ["mls_english", "peoples_speech_clean"],
+                    "stage179": {
+                        "manifest_path": str(GLOBAL_DEDUP_FIXTURE.resolve()),
+                        "manifest_sha256": sha256_file(GLOBAL_DEDUP_FIXTURE),
+                        "total_unique_rows": 62_072_225,
+                        "total_unique_hours": 118_465.16068055555,
+                    },
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     calibration_receipt = tmp_path / "calibration-reuse.json"
     calibration_receipt.write_text(
@@ -675,7 +698,10 @@ def _write_stepwise_inputs(
         encoding="utf-8",
     )
 
-    reports = {"calibration": calibration_receipt}
+    reports = {
+        "calibration": calibration_receipt,
+        "supplemental_inventory": supplemental_inventory,
+    }
     previous = "calibration"
     for index, stage in enumerate(("mixer", "block", "logits"), start=1):
         preflight_marker = tmp_path / f"{stage}-preflight-smoke.json"
@@ -1243,6 +1269,12 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     )
     assert report["nano_teacher_chain_passed"] is True
     assert report["supplemental_inventory_chain_passed"] is True
+    assert report["supplemental_dedupe_proof"]["source_sets_disjoint"] is True
+    assert report["supplemental_dedupe_proof"]["content_fingerprint_complete"] is False
+    assert report["supplemental_dedupe_proof"]["known_overlap_exclusions"] == [
+        "llaso_gigaspeech",
+        "llaso_librispeech",
+    ]
     assert report["all_stage_public_metrics_complete"] is True
     assert report["public_metric_stage_order"] == [
         "calibration",
@@ -1292,6 +1324,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "Full Data Segment Proof" in output_markdown.read_text(encoding="utf-8")
     assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")
     assert "Public metric definition proof" in output_markdown.read_text(encoding="utf-8")
+    assert "Supplemental cross-pool dedupe" in output_markdown.read_text(
+        encoding="utf-8"
+    )
     sft_finalizer._validate_final_report(
         reports["sft"],
         checkpoint=checkpoints["sft"],
@@ -1315,6 +1350,18 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
             public_metric_correction_receipt_path=reports["metric_correction"],
         )
     tokenizer_source.write_text(tokenizer_text, encoding="utf-8")
+
+    supplemental_inventory = reports["supplemental_inventory"]
+    supplemental_text = supplemental_inventory.read_text(encoding="utf-8")
+    supplemental_payload = json.loads(supplemental_text)
+    supplemental_payload["cross_pool_dedupe"]["content_fingerprint_complete"] = True
+    supplemental_inventory.write_text(
+        json.dumps(supplemental_payload) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cross-pool dedupe contract mismatch"):
+        stepwise_report._supplemental_dedupe_proof(supplemental_inventory)
+    supplemental_inventory.write_text(supplemental_text, encoding="utf-8")
 
     sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
     original_mixer_gate_sha256 = sft["mixer_phase_gate_sha256"]

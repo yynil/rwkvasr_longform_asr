@@ -609,6 +609,53 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"Stage211 stage has no training coverage: {stage!r}")
 
 
+def _supplemental_dedupe_proof(inventory_path: Path) -> dict[str, Any]:
+    inventory = _load_json(
+        inventory_path,
+        label="Stage211 supplemental natural inventory",
+    )
+    cross_pool = inventory.get("cross_pool_dedupe")
+    if not isinstance(cross_pool, dict):
+        raise ValueError("Stage211 supplemental inventory lacks cross-pool dedupe proof.")
+    expected_exclusions = {"llaso_gigaspeech", "llaso_librispeech"}
+    exclusions = set(cross_pool.get("known_overlap_exclusions") or [])
+    if (
+        cross_pool.get("mode") != "source_identity_plus_known_corpus_exclusion"
+        or cross_pool.get("source_sets_disjoint") is not True
+        or cross_pool.get("content_fingerprint_complete") is not False
+        or exclusions != expected_exclusions
+    ):
+        raise ValueError("Stage211 supplemental cross-pool dedupe contract mismatch.")
+    supplemental_sources = cross_pool.get("supplemental_sources")
+    if not isinstance(supplemental_sources, list) or not supplemental_sources:
+        raise ValueError("Stage211 supplemental source-set proof is empty.")
+    stage179 = cross_pool.get("stage179")
+    if not isinstance(stage179, dict):
+        raise ValueError("Stage211 supplemental inventory lacks Stage179 binding.")
+    stage179_manifest = Path(str(stage179.get("manifest_path") or "")).resolve()
+    stage179_manifest_sha256 = str(stage179.get("manifest_sha256") or "")
+    if (
+        not stage179_manifest.is_file()
+        or sha256_file(stage179_manifest) != stage179_manifest_sha256
+    ):
+        raise ValueError("Stage211 supplemental Stage179 binding is missing or changed.")
+    stage179_rows = int(stage179.get("total_unique_rows", -1))
+    stage179_hours = float(stage179.get("total_unique_hours", float("nan")))
+    if stage179_rows <= 0 or not math.isfinite(stage179_hours) or stage179_hours <= 0.0:
+        raise ValueError("Stage211 supplemental Stage179 coverage binding is invalid.")
+    return {
+        "mode": cross_pool["mode"],
+        "source_sets_disjoint": True,
+        "content_fingerprint_complete": False,
+        "known_overlap_exclusions": sorted(exclusions),
+        "supplemental_sources": sorted(str(source) for source in supplemental_sources),
+        "stage179_manifest_path": str(stage179_manifest),
+        "stage179_manifest_sha256": stage179_manifest_sha256,
+        "stage179_unique_rows": stage179_rows,
+        "stage179_hours": stage179_hours,
+    }
+
+
 def build_stepwise_report(
     *,
     initialization_receipt_path: Path,
@@ -730,6 +777,7 @@ def build_stepwise_report(
         or sha256_file(supplemental_inventory) != supplemental_inventory_sha256
     ):
         raise ValueError("Stage211 A/B/C supplemental inventory binding is invalid.")
+    supplemental_dedupe_proof = _supplemental_dedupe_proof(supplemental_inventory)
     baseline_bindings = {
         _nano_public_baseline_binding(phase_reports[phase])
         for phase in ("mixer", "block", "logits")
@@ -957,6 +1005,7 @@ def build_stepwise_report(
         "supplemental_inventory_chain_passed": True,
         "supplemental_inventory_path": str(supplemental_inventory),
         "supplemental_inventory_sha256": supplemental_inventory_sha256,
+        "supplemental_dedupe_proof": supplemental_dedupe_proof,
         "total_public_eval_samples_per_stage": sum(
             int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
         ),
@@ -990,6 +1039,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"`{report['public_metric_tokenizer_source_sha256']}`)",
         "",
         f"Supplemental inventory: `{report['supplemental_inventory_sha256']}`",
+        "",
+        "Supplemental cross-pool dedupe: "
+        f"`{report['supplemental_dedupe_proof']['mode']}`, "
+        "source sets disjoint: `true`, content fingerprint complete: `false`, "
+        "known exclusions: `llaso_gigaspeech,llaso_librispeech`",
         "",
         "CTC label normalization: `ctc`, tokenizer: `sensevoice_tiktoken`, "
         f"unknown tokens: `{int(report['ctc_label_proof']['ctc_unk_tokens'])}`, "
