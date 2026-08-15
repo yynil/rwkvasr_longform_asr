@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from rwkvasr.eval.stage211_gate import (
+    DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_FULL_DATA_BATCH_SIZE,
     STAGE211_FULL_DATA_EPOCHS,
@@ -20,6 +21,7 @@ from rwkvasr.eval.stage211_gate import (
     build_stage211_full_data_coverage,
     sha256_file,
     validate_stage211_full_data_coverage,
+    validate_stage211_loaded_manifest_receipt,
 )
 from rwkvasr.eval.stage211_supplemental import (
     DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
@@ -171,6 +173,55 @@ def _parse_manifest_overrides(
             )
         manifests[difficulty] = Path(raw_path)
     return {difficulty: path.expanduser().resolve() for difficulty, path in manifests.items()}
+
+
+def _require_loaded_manifest_bindings(
+    *,
+    manifests: dict[str, Path],
+    receipt: dict[str, Any],
+) -> None:
+    raw_segments = receipt.get("segments")
+    if not isinstance(raw_segments, list):
+        raise ValueError("Stage211 loaded-manifest receipt lacks difficulty records.")
+    segments = {
+        str(segment.get("difficulty") or ""): segment
+        for segment in raw_segments
+        if isinstance(segment, dict)
+    }
+    if set(manifests) != set(STAGE211_AUDIO_CURRICULUM) or set(segments) != set(
+        STAGE211_AUDIO_CURRICULUM
+    ):
+        raise ValueError("Stage211 full-phase difficulty-manifest set mismatch.")
+    for difficulty in STAGE211_AUDIO_CURRICULUM:
+        manifest = manifests[difficulty].expanduser().resolve()
+        segment = segments[difficulty]
+        recorded_manifest = Path(
+            str(segment.get("runtime_manifest_path") or "")
+        ).expanduser().resolve()
+        if manifest != recorded_manifest:
+            raise ValueError(
+                f"Stage211 {difficulty} manifest differs from loaded-manifest provenance."
+            )
+        if str(segment.get("runtime_manifest_sha256") or "") != sha256_file(manifest):
+            raise ValueError(
+                f"Stage211 {difficulty} manifest SHA-256 differs from loaded-manifest provenance."
+            )
+
+
+def _validate_loaded_manifest_bindings(
+    *,
+    manifests: dict[str, Path],
+    receipt_path: Path,
+) -> dict[str, Any]:
+    receipt_path = receipt_path.expanduser().resolve()
+    receipt = validate_stage211_loaded_manifest_receipt(receipt_path)
+    _require_loaded_manifest_bindings(manifests=manifests, receipt=receipt)
+    print(
+        "[stage211-full-phase] loaded-manifest admission passed "
+        f"difficulties={len(manifests)} receipt_sha256={sha256_file(receipt_path)}",
+        flush=True,
+    )
+    return receipt
 
 
 def _run_command(command: list[str], *, dry_run: bool) -> None:
@@ -695,6 +746,17 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             raise FileNotFoundError(
                 f"Stage211 {difficulty} fixed-eval manifest unavailable: {manifest}"
             )
+    if not args.dry_run:
+        _validate_loaded_manifest_bindings(
+            manifests=manifests,
+            receipt_path=Path(
+                getattr(
+                    args,
+                    "loaded_manifest_receipt",
+                    DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
+                )
+            ),
+        )
     supplemental_inventory = args.supplemental_inventory.expanduser().resolve()
     supplemental_profile_receipt = _validate_supplemental_profile_receipt(
         args.supplemental_profile_receipt,
@@ -998,6 +1060,11 @@ def main() -> int:
     parser.add_argument("--config-root", type=Path, default=DEFAULT_CONFIG_ROOT)
     parser.add_argument("--metadata-root", type=Path, default=DEFAULT_METADATA_ROOT)
     parser.add_argument("--easy-manifest", type=Path, default=DEFAULT_EASY_MANIFEST)
+    parser.add_argument(
+        "--loaded-manifest-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
+    )
     parser.add_argument(
         "--manifest",
         action="append",

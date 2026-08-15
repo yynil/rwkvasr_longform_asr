@@ -2938,6 +2938,33 @@ def test_stage211_loaded_manifest_receipt_binds_actual_runtime_manifests(
     } == runtime_manifests
 
 
+def test_stage211_full_phase_admits_only_receipt_bound_difficulty_manifests(
+    tmp_path: Path,
+) -> None:
+    receipt_path, runtime_manifests = _write_loaded_manifest_fixture(tmp_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    stage211_full_phase._require_loaded_manifest_bindings(
+        manifests=runtime_manifests,
+        receipt=receipt,
+    )
+
+    swapped = dict(runtime_manifests)
+    swapped["hard"] = runtime_manifests["easy"]
+    with pytest.raises(ValueError, match="hard manifest differs"):
+        stage211_full_phase._require_loaded_manifest_bindings(
+            manifests=swapped,
+            receipt=receipt,
+        )
+
+    runtime_manifests["hard"].write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="hard manifest SHA-256 differs"):
+        stage211_full_phase._require_loaded_manifest_bindings(
+            manifests=runtime_manifests,
+            receipt=receipt,
+        )
+
+
 def test_stage211_loaded_manifest_receipt_rejects_runtime_manifest_rewrite(
     tmp_path: Path,
 ) -> None:
