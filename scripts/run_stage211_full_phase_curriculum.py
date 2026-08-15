@@ -746,17 +746,6 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             raise FileNotFoundError(
                 f"Stage211 {difficulty} fixed-eval manifest unavailable: {manifest}"
             )
-    if not args.dry_run:
-        _validate_loaded_manifest_bindings(
-            manifests=manifests,
-            receipt_path=Path(
-                getattr(
-                    args,
-                    "loaded_manifest_receipt",
-                    DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
-                )
-            ),
-        )
     supplemental_inventory = args.supplemental_inventory.expanduser().resolve()
     supplemental_profile_receipt = _validate_supplemental_profile_receipt(
         args.supplemental_profile_receipt,
@@ -773,6 +762,16 @@ def run_phase(args: argparse.Namespace) -> Path | None:
     )
     if not args.dry_run:
         validate_stage211_formal_supplemental_profile(supplemental_profile)
+        _validate_loaded_manifest_bindings(
+            manifests=manifests,
+            receipt_path=Path(
+                getattr(
+                    args,
+                    "loaded_manifest_receipt",
+                    DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
+                )
+            ),
+        )
     supplemental_manifest = Path(str(supplemental_profile["bucket_manifest_path"])).resolve()
     print(
         "[stage211-full-phase] supplemental profile receipt "
