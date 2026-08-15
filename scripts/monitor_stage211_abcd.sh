@@ -76,6 +76,73 @@ stage211_latest_export_step() {
   printf '%s\n' "${latest}"
 }
 
+stage211_latest_step_eval_report() {
+  local run_dir="$1"
+  local report name step latest=0 latest_path=""
+  shopt -s nullglob
+  for report in "${run_dir}"/step_eval_layers_step-*.yaml; do
+    name="${report##*/}"
+    if [[ "${name}" =~ ^step_eval_layers_step-([0-9]+)\.yaml$ ]]; then
+      step="${BASH_REMATCH[1]}"
+      if ((10#${step} > latest)); then
+        latest=$((10#${step}))
+        latest_path="${report}"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  printf '%s\n' "${latest_path}"
+}
+
+stage211_emit_fixed_step_eval_progress() {
+  local run_dir="$1"
+  local baseline_path="${run_dir}/step_eval_baseline.yaml"
+  local latest_path baseline_loss latest_step latest_loss eval_samples filename_step
+  if [[ ! -s "${baseline_path}" ]]; then
+    printf 'fixed_eval_scope=fixed_hidden_not_public_wer_cer status=baseline_unavailable\n'
+    return
+  fi
+  baseline_loss="$(stage211_yaml_scalar "${baseline_path}" eval_loss)"
+  latest_path="$(stage211_latest_step_eval_report "${run_dir}")"
+  if [[ -z "${latest_path}" ]]; then
+    printf 'fixed_eval_scope=fixed_hidden_not_public_wer_cer status=latest_unavailable baseline_loss=%s\n' \
+      "${baseline_loss:-invalid}"
+    return
+  fi
+  latest_step="$(stage211_yaml_scalar "${latest_path}" step)"
+  latest_loss="$(stage211_yaml_scalar "${latest_path}" eval_loss)"
+  eval_samples="$(stage211_yaml_scalar "${latest_path}" eval_samples)"
+  filename_step="${latest_path##*step-}"
+  filename_step="${filename_step%.yaml}"
+  if [[ ! "${baseline_loss}" =~ ^[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] ||
+    [[ ! "${latest_step}" =~ ^[0-9]+$ ]] ||
+    [[ ! "${latest_loss}" =~ ^[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] ||
+    [[ ! "${eval_samples}" =~ ^[0-9]+$ ]] ||
+    [[ "${latest_step}" != "${filename_step}" ]]; then
+    printf 'fixed_eval_scope=fixed_hidden_not_public_wer_cer status=invalid report=%s baseline_loss=%s recorded_step=%s filename_step=%s latest_loss=%s eval_samples=%s\n' \
+      "${latest_path}" "${baseline_loss:-missing}" "${latest_step:-missing}" \
+      "${filename_step:-missing}" "${latest_loss:-missing}" "${eval_samples:-missing}"
+    return
+  fi
+  awk \
+    -v baseline="${baseline_loss}" \
+    -v latest="${latest_loss}" \
+    -v step="${latest_step}" \
+    -v samples="${eval_samples}" \
+    -v report="${latest_path}" '
+      BEGIN {
+        delta = latest - baseline
+        tolerance = 1e-12
+        trend = delta < -tolerance ? "improved" : (delta > tolerance ? "regressed" : "flat")
+        if (baseline == 0) {
+          printf "fixed_eval_scope=fixed_hidden_not_public_wer_cer status=ok baseline_loss=%.10f latest_step=%d latest_loss=%.10f delta_abs=%+.10f delta_pct=undefined trend=%s eval_samples=%d report=%s\n", baseline, step, latest, delta, trend, samples, report
+        } else {
+          printf "fixed_eval_scope=fixed_hidden_not_public_wer_cer status=ok baseline_loss=%.10f latest_step=%d latest_loss=%.10f delta_abs=%+.10f delta_pct=%+.4f trend=%s eval_samples=%d report=%s\n", baseline, step, latest, delta, 100.0 * delta / baseline, trend, samples, report
+        }
+      }
+    '
+}
+
 stage211_active_config_paths() {
   ps -C python3 -o args= 2>/dev/null |
     awk '
@@ -120,6 +187,7 @@ stage211_emit_config_progress() {
   printf 'run_name=%s run_dir=%s\n' "${run_name:-unknown}" "${run_dir}"
   printf 'live_step=%s target_step=%s progress_pct=%s persisted_step=%s\n' \
     "${live_step}" "${target_step}" "${progress}" "${persisted_step}"
+  stage211_emit_fixed_step_eval_progress "${run_dir}"
   if [[ -n "${latest_record}" ]]; then
     printf '%s\n' "${latest_record}"
   fi
