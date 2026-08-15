@@ -1311,11 +1311,91 @@ def test_stage211_hourly_monitor_reports_latest_fixed_eval_without_calling_it_pu
 
     assert result.returncode == 0, result.stderr
     assert "fixed_eval_scope=fixed_hidden_not_public_wer_cer status=ok" in result.stdout
+    assert "sentinel_cell=unknown sentinel_language=unknown sentinel_sources=unknown" in result.stdout
     assert "baseline_loss=0.1000000000 latest_step=20 latest_loss=0.1750000000" in result.stdout
     assert "delta_abs=+0.0750000000 delta_pct=+75.0000 trend=regressed" in result.stdout
     assert "eval_samples=256" in result.stdout
     assert f"report={latest}" in result.stdout
     assert "step-999" not in result.stdout
+
+
+def test_stage211_hourly_monitor_identifies_sha_bound_easy_zh_sentinel(
+    tmp_path: Path,
+) -> None:
+    monitor_script = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    fixed_part = tmp_path / "part_000000.jsonl"
+    fixed_part.write_text('{"key":"fixed-easy-zh"}\n', encoding="utf-8")
+    fixed_sha = sha256_file(fixed_part)
+    provenance = (
+        "eval_provenance:\n"
+        "  parts:\n"
+        f"  - path: {fixed_part}\n"
+        f"    sha256: {fixed_sha}\n"
+        "    num_samples: 256\n"
+    )
+    (run_dir / "step_eval_baseline.yaml").write_text(
+        "step: 0\neval_loss: 0.1000000000\neval_samples: 256\n" + provenance,
+        encoding="utf-8",
+    )
+    (run_dir / "step_eval_layers_step-10.yaml").write_text(
+        "step: 10\neval_loss: 0.0900000000\neval_samples: 256\n" + provenance,
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; stage211_emit_fixed_step_eval_progress "$2"',
+            "stage211-monitor-test",
+            str(monitor_script),
+            str(run_dir),
+        ],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "FIXED_EVAL_CANONICAL_PART": str(fixed_part),
+            "FIXED_EVAL_CANONICAL_PART_SHA256": fixed_sha,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "sentinel_cell=easy_zh sentinel_language=zh "
+        "sentinel_sources=aishell3,commonvoice_cn" in result.stdout
+    )
+
+    fixed_part.write_text('{"key":"changed-after-binding"}\n', encoding="utf-8")
+    changed = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; stage211_emit_fixed_step_eval_progress "$2"',
+            "stage211-monitor-test",
+            str(monitor_script),
+            str(run_dir),
+        ],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "FIXED_EVAL_CANONICAL_PART": str(fixed_part),
+            "FIXED_EVAL_CANONICAL_PART_SHA256": fixed_sha,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert changed.returncode == 0, changed.stderr
+    assert (
+        "sentinel_cell=unknown sentinel_language=unknown sentinel_sources=unknown"
+        in changed.stdout
+    )
 
 
 def test_stage211_hourly_monitor_rejects_fixed_eval_step_filename_mismatch(

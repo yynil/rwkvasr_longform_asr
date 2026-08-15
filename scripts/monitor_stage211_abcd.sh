@@ -18,6 +18,8 @@ MONITOR_PYTHON="${MONITOR_PYTHON:-${REPO_ROOT}/.venv/bin/python3}"
 POLL_SECONDS="${POLL_SECONDS:-3600}"
 RECENT_LOG_MINUTES="${RECENT_LOG_MINUTES:-90}"
 MONITOR_ONCE="${MONITOR_ONCE:-0}"
+FIXED_EVAL_CANONICAL_PART="${FIXED_EVAL_CANONICAL_PART:-${HOME}/rwkvasr_data/stage211_full_curriculum/fixed_hidden_eval/part_000000.jsonl}"
+FIXED_EVAL_CANONICAL_PART_SHA256="${FIXED_EVAL_CANONICAL_PART_SHA256:-9f4bf09cdbbf5bc963d6282a640e45fcd8da75f2e23a41e4515b6766288c84f1}"
 
 ATTEMPT_MARKER='[rwkvasr] Distributed init complete.'
 ERROR_PATTERN='traceback|out of memory|\boom\b|loss=(nan|inf)|exception|decode error|NCCL.*(error|abort)|teacher_missing=[1-9]|online_layer_missing=[1-9]|online_layer_frame_delta=[1-9]|dropped_tail=[1-9]|skipped_samples=[1-9]'
@@ -94,19 +96,48 @@ stage211_latest_step_eval_report() {
   printf '%s\n' "${latest_path}"
 }
 
+stage211_fixed_eval_scope_details() {
+  local baseline_path="$1"
+  local binding part_path recorded_sha actual_sha
+  binding="$(awk '
+    /^[[:space:]]*- path:/ {
+      path = $0
+      sub(/^[[:space:]]*- path:[[:space:]]*/, "", path)
+      getline
+      sha = $0
+      sub(/^[[:space:]]*sha256:[[:space:]]*/, "", sha)
+      print path "\t" sha
+      exit
+    }
+  ' "${baseline_path}" 2>/dev/null)"
+  IFS=$'\t' read -r part_path recorded_sha <<<"${binding}"
+  if [[ "${part_path:-}" == "${FIXED_EVAL_CANONICAL_PART}" ]] &&
+    [[ "${recorded_sha:-}" == "${FIXED_EVAL_CANONICAL_PART_SHA256}" ]] &&
+    [[ -s "${part_path}" ]]; then
+    actual_sha="$(sha256sum "${part_path}" 2>/dev/null | awk '{print $1}')"
+    if [[ "${actual_sha}" == "${recorded_sha}" ]]; then
+      printf '%s\n' \
+        'sentinel_cell=easy_zh sentinel_language=zh sentinel_sources=aishell3,commonvoice_cn'
+      return
+    fi
+  fi
+  printf '%s\n' 'sentinel_cell=unknown sentinel_language=unknown sentinel_sources=unknown'
+}
+
 stage211_emit_fixed_step_eval_progress() {
   local run_dir="$1"
   local baseline_path="${run_dir}/step_eval_baseline.yaml"
-  local latest_path baseline_loss latest_step latest_loss eval_samples filename_step
+  local latest_path baseline_loss latest_step latest_loss eval_samples filename_step scope_details
   if [[ ! -s "${baseline_path}" ]]; then
-    printf 'fixed_eval_scope=fixed_hidden_not_public_wer_cer status=baseline_unavailable\n'
+    printf 'fixed_eval_scope=fixed_hidden_not_public_wer_cer status=baseline_unavailable sentinel_cell=unknown sentinel_language=unknown sentinel_sources=unknown\n'
     return
   fi
+  scope_details="$(stage211_fixed_eval_scope_details "${baseline_path}")"
   baseline_loss="$(stage211_yaml_scalar "${baseline_path}" eval_loss)"
   latest_path="$(stage211_latest_step_eval_report "${run_dir}")"
   if [[ -z "${latest_path}" ]]; then
-    printf 'fixed_eval_scope=fixed_hidden_not_public_wer_cer status=latest_unavailable baseline_loss=%s\n' \
-      "${baseline_loss:-invalid}"
+    printf 'fixed_eval_scope=fixed_hidden_not_public_wer_cer status=latest_unavailable %s baseline_loss=%s\n' \
+      "${scope_details}" "${baseline_loss:-invalid}"
     return
   fi
   latest_step="$(stage211_yaml_scalar "${latest_path}" step)"
@@ -119,8 +150,8 @@ stage211_emit_fixed_step_eval_progress() {
     [[ ! "${latest_loss}" =~ ^[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] ||
     [[ ! "${eval_samples}" =~ ^[0-9]+$ ]] ||
     [[ "${latest_step}" != "${filename_step}" ]]; then
-    printf 'fixed_eval_scope=fixed_hidden_not_public_wer_cer status=invalid report=%s baseline_loss=%s recorded_step=%s filename_step=%s latest_loss=%s eval_samples=%s\n' \
-      "${latest_path}" "${baseline_loss:-missing}" "${latest_step:-missing}" \
+    printf 'fixed_eval_scope=fixed_hidden_not_public_wer_cer status=invalid %s report=%s baseline_loss=%s recorded_step=%s filename_step=%s latest_loss=%s eval_samples=%s\n' \
+      "${scope_details}" "${latest_path}" "${baseline_loss:-missing}" "${latest_step:-missing}" \
       "${filename_step:-missing}" "${latest_loss:-missing}" "${eval_samples:-missing}"
     return
   fi
@@ -129,15 +160,16 @@ stage211_emit_fixed_step_eval_progress() {
     -v latest="${latest_loss}" \
     -v step="${latest_step}" \
     -v samples="${eval_samples}" \
-    -v report="${latest_path}" '
+    -v report="${latest_path}" \
+    -v scope_details="${scope_details}" '
       BEGIN {
         delta = latest - baseline
         tolerance = 1e-12
         trend = delta < -tolerance ? "improved" : (delta > tolerance ? "regressed" : "flat")
         if (baseline == 0) {
-          printf "fixed_eval_scope=fixed_hidden_not_public_wer_cer status=ok baseline_loss=%.10f latest_step=%d latest_loss=%.10f delta_abs=%+.10f delta_pct=undefined trend=%s eval_samples=%d report=%s\n", baseline, step, latest, delta, trend, samples, report
+          printf "fixed_eval_scope=fixed_hidden_not_public_wer_cer status=ok %s baseline_loss=%.10f latest_step=%d latest_loss=%.10f delta_abs=%+.10f delta_pct=undefined trend=%s eval_samples=%d report=%s\n", scope_details, baseline, step, latest, delta, trend, samples, report
         } else {
-          printf "fixed_eval_scope=fixed_hidden_not_public_wer_cer status=ok baseline_loss=%.10f latest_step=%d latest_loss=%.10f delta_abs=%+.10f delta_pct=%+.4f trend=%s eval_samples=%d report=%s\n", baseline, step, latest, delta, 100.0 * delta / baseline, trend, samples, report
+          printf "fixed_eval_scope=fixed_hidden_not_public_wer_cer status=ok %s baseline_loss=%.10f latest_step=%d latest_loss=%.10f delta_abs=%+.10f delta_pct=%+.4f trend=%s eval_samples=%d report=%s\n", scope_details, baseline, step, latest, delta, 100.0 * delta / baseline, trend, samples, report
         }
       }
     '
