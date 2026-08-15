@@ -9,8 +9,9 @@ import math
 import os
 import sqlite3
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from rwkvasr.data.webdataset_lengths import (
     _make_shard_reader,
@@ -45,9 +46,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
 DEFAULT_BASE_INVENTORY = (
     Path.home() / "rwkvasr_data/stage211_supplemental_natural_v1/supplemental_inventory.json"
 )
-DEFAULT_OUTPUT_ROOT = (
-    Path.home() / "rwkvasr_data/stage211_base_public_pcm_overlap_v1"
-)
+DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_data/stage211_base_public_pcm_overlap_v1"
 SCHEMA_VERSION = 1
 PART_ARTIFACT = "stage211_base_public_pcm_part_fingerprints"
 INDEX_ARTIFACT = "stage211_base_public_pcm_location_index"
@@ -68,10 +67,74 @@ def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _copy_archive_to_cache(
+    *,
+    source_path: Path,
+    cache_dir: Path,
+    archive_index: int,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "".join(source_path.suffixes) or ".archive"
+    cache_path = cache_dir / (f"archive_{archive_index:06d}_{expected_sha256[:16]}{suffix}")
+    if cache_path.is_file():
+        if (
+            cache_path.stat().st_size != expected_size_bytes
+            or _sha256(cache_path) != expected_sha256
+        ):
+            cache_path.unlink(missing_ok=True)
+            raise ValueError(f"Stage211 base PCM archive cache changed: {cache_path}")
+        return cache_path
+
+    temporary = cache_path.with_name(f"{cache_path.name}.tmp.{os.getpid()}")
+    digest = hashlib.sha256()
+    copied_size = 0
+    try:
+        with source_path.open("rb") as source, temporary.open("xb") as target:
+            while chunk := source.read(8 << 20):
+                target.write(chunk)
+                digest.update(chunk)
+                copied_size += len(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        if copied_size != expected_size_bytes or digest.hexdigest() != expected_sha256:
+            raise ValueError(f"Stage211 base PCM source archive changed: {source_path}")
+        temporary.replace(cache_path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return cache_path
+
+
+@contextmanager
+def _archive_read_path(
+    *,
+    source_path: Path,
+    archive_cache_dir: Path | None,
+    archive_index: int,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> Iterator[Path]:
+    if archive_cache_dir is None:
+        yield source_path
+        return
+    cache_path = _copy_archive_to_cache(
+        source_path=source_path,
+        cache_dir=archive_cache_dir,
+        archive_index=archive_index,
+        expected_size_bytes=expected_size_bytes,
+        expected_sha256=expected_sha256,
+    )
+    try:
+        yield cache_path
+    finally:
+        cache_path.unlink(missing_ok=True)
+
+
 def _canonical_line(payload: dict[str, Any]) -> bytes:
     return (
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-        + "\n"
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode("utf-8")
 
 
@@ -111,9 +174,9 @@ def _immutable_bytes(path: Path, payload: bytes) -> str:
 
 
 def _immutable_json(path: Path, payload: dict[str, Any]) -> str:
-    rendered = (
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
+    rendered = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
     return _immutable_bytes(path, rendered)
 
 
@@ -215,8 +278,7 @@ def _validate_part_receipt(
     fingerprint_path = Path(str(receipt.get("fingerprint_part_path") or "")).resolve()
     if (
         not fingerprint_path.is_file()
-        or fingerprint_path.stat().st_size
-        != int(receipt.get("fingerprint_part_size_bytes", -1))
+        or fingerprint_path.stat().st_size != int(receipt.get("fingerprint_part_size_bytes", -1))
         or _sha256(fingerprint_path) != receipt.get("fingerprint_part_sha256")
     ):
         raise ValueError(f"Stage211 base PCM fingerprint part changed: {fingerprint_path}")
@@ -259,7 +321,9 @@ def fingerprint_base_part(
                     continue
                 raw = json.loads(line)
                 if not isinstance(raw, dict):
-                    raise ValueError(f"Stage211 base row is not an object: {input_path}:{line_number}")
+                    raise ValueError(
+                        f"Stage211 base row is not an object: {input_path}:{line_number}"
+                    )
                 entry = parse_webdataset_length_entry(raw)
                 source_label = str(raw.get("source_dataset") or "")
                 if entry.split != "train" or source_label != part["source_label"]:
@@ -309,10 +373,9 @@ def fingerprint_base_part(
                 f"Stage211 base PCM part row count changed: {row_count}/{part['rows']}"
             )
         if fingerprint_path.is_file():
-            if (
-                fingerprint_path.stat().st_size != temporary.stat().st_size
-                or _sha256(fingerprint_path) != _sha256(temporary)
-            ):
+            if fingerprint_path.stat().st_size != temporary.stat().st_size or _sha256(
+                fingerprint_path
+            ) != _sha256(temporary):
                 raise ValueError(
                     f"Existing Stage211 base PCM part differs from replay: {fingerprint_path}"
                 )
@@ -481,8 +544,7 @@ def _index_database_summary(database_path: Path, *, base: dict[str, Any]) -> dic
         or not source_hours_match
         or sum(int(archive["rows"]) for archive in archives) != rows
         or sum(int(archive["duration_ms"]) for archive in archives) != duration_ms
-        or [int(archive["archive_index"]) for archive in archives]
-        != list(range(len(archives)))
+        or [int(archive["archive_index"]) for archive in archives] != list(range(len(archives)))
     ):
         raise ValueError("Stage211 base PCM location-index coverage changed.")
     return {
@@ -699,8 +761,7 @@ def build_location_index(*, base: dict[str, Any], output_root: Path) -> str:
         ).fetchone()
         if multi_source_archive is not None:
             raise ValueError(
-                "Stage211 base archive maps to multiple source datasets: "
-                f"{multi_source_archive[0]}"
+                f"Stage211 base archive maps to multiple source datasets: {multi_source_archive[0]}"
             )
         archive_rows = list(
             connection.execute(
@@ -789,8 +850,7 @@ def _validate_archive_receipt(
     fingerprint_path = Path(str(receipt.get("fingerprint_path") or "")).resolve()
     if (
         not fingerprint_path.is_file()
-        or fingerprint_path.stat().st_size
-        != int(receipt.get("fingerprint_size_bytes", -1))
+        or fingerprint_path.stat().st_size != int(receipt.get("fingerprint_size_bytes", -1))
         or _sha256(fingerprint_path) != receipt.get("fingerprint_sha256")
     ):
         raise ValueError(f"Stage211 base PCM archive fingerprint changed: {fingerprint_path}")
@@ -830,6 +890,7 @@ def fingerprint_base_archive(
     location_index: dict[str, Any],
     output_root: Path,
     archive_index: int,
+    archive_cache_dir: Path | None = None,
 ) -> str:
     archives = location_index["archives"]
     if not 0 <= archive_index < len(archives):
@@ -845,9 +906,8 @@ def fingerprint_base_archive(
         return "reused"
     shard_path = Path(archive["shard_path"])
     stat = shard_path.stat()
-    if (
-        stat.st_size != int(archive["archive_size_bytes"])
-        or stat.st_mtime_ns != int(archive["archive_mtime_ns"])
+    if stat.st_size != int(archive["archive_size_bytes"]) or stat.st_mtime_ns != int(
+        archive["archive_mtime_ns"]
     ):
         raise ValueError(f"Stage211 base source archive changed: {shard_path}")
 
@@ -857,68 +917,74 @@ def fingerprint_base_archive(
         f"file:{location_index['database_path']}?mode=ro",
         uri=True,
     )
-    reader = _make_shard_reader(str(archive["storage_kind"]), shard_path)
+    reader: Any | None = None
     rows = 0
     duration_ms = 0
     pcm_samples = 0
     try:
-        order = (
-            "parquet_row_group, parquet_row_index"
-            if archive["storage_kind"] == "parquet"
-            else "audio_member"
-        )
-        query = (
-            "SELECT key, utt_id, source_dataset, duration_ms, num_frames, sample_rate, "
-            "storage_kind, shard_path, audio_member, audio_format, audio_size, zip_crc32, "
-            "zip_compress_type, parquet_row_group, parquet_row_index, parquet_id "
-            f"FROM entries WHERE shard_path = ? ORDER BY {order}"
-        )
-        with temporary.open("wb") as target:
-            for indexed_row in connection.execute(query, (str(shard_path),)):
-                entry = _entry_from_index_row(indexed_row)
-                if str(indexed_row[2]) != archive["source_dataset"]:
-                    raise ValueError(
-                        f"Stage211 base archive source changed: {shard_path}"
+        with _archive_read_path(
+            source_path=shard_path,
+            archive_cache_dir=archive_cache_dir,
+            archive_index=archive_index,
+            expected_size_bytes=int(archive["archive_size_bytes"]),
+            expected_sha256=str(archive["archive_sha256"]),
+        ) as read_path:
+            reader = _make_shard_reader(str(archive["storage_kind"]), read_path)
+            order = (
+                "parquet_row_group, parquet_row_index"
+                if archive["storage_kind"] == "parquet"
+                else "audio_member"
+            )
+            query = (
+                "SELECT key, utt_id, source_dataset, duration_ms, num_frames, sample_rate, "
+                "storage_kind, shard_path, audio_member, audio_format, audio_size, zip_crc32, "
+                "zip_compress_type, parquet_row_group, parquet_row_index, parquet_id "
+                f"FROM entries WHERE shard_path = ? ORDER BY {order}"
+            )
+            with temporary.open("wb") as target:
+                for indexed_row in connection.execute(query, (str(shard_path),)):
+                    entry = _entry_from_index_row(indexed_row)
+                    if str(indexed_row[2]) != archive["source_dataset"]:
+                        raise ValueError(f"Stage211 base archive source changed: {shard_path}")
+                    audio_bytes, _ = _read_indexed_entry_payload(reader, entry)
+                    fingerprint, samples = canonical_pcm_fingerprint(io.BytesIO(audio_bytes))
+                    row_duration_ms = int(indexed_row[3])
+                    if samples <= 0 or row_duration_ms <= 0:
+                        raise ValueError(f"Stage211 base archive PCM duration changed: {entry.key}")
+                    target.write(
+                        _canonical_line(
+                            {
+                                "archive_index": archive_index,
+                                "audio_member_sha256": _sha256_bytes(audio_bytes),
+                                "canonical_pcm_sha256": fingerprint,
+                                "duration_ms": row_duration_ms,
+                                "key": entry.key,
+                                "pcm_samples": samples,
+                                "source_dataset": str(indexed_row[2]),
+                                "storage_kind": entry.storage_kind,
+                                "utt_id": entry.utt_id,
+                            }
+                        )
                     )
-                audio_bytes, _ = _read_indexed_entry_payload(reader, entry)
-                fingerprint, samples = canonical_pcm_fingerprint(io.BytesIO(audio_bytes))
-                row_duration_ms = int(indexed_row[3])
-                if samples <= 0 or row_duration_ms <= 0:
-                    raise ValueError(
-                        f"Stage211 base archive PCM duration changed: {entry.key}"
-                    )
-                target.write(
-                    _canonical_line(
-                        {
-                            "archive_index": archive_index,
-                            "audio_member_sha256": _sha256_bytes(audio_bytes),
-                            "canonical_pcm_sha256": fingerprint,
-                            "duration_ms": row_duration_ms,
-                            "key": entry.key,
-                            "pcm_samples": samples,
-                            "source_dataset": str(indexed_row[2]),
-                            "storage_kind": entry.storage_kind,
-                            "utt_id": entry.utt_id,
-                        }
-                    )
-                )
-                rows += 1
-                duration_ms += row_duration_ms
-                pcm_samples += samples
+                    rows += 1
+                    duration_ms += row_duration_ms
+                    pcm_samples += samples
+            reader.close()
+            reader = None
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
     finally:
-        reader.close()
+        if reader is not None:
+            reader.close()
         connection.close()
     if rows != int(archive["rows"]) or duration_ms != int(archive["duration_ms"]):
         temporary.unlink(missing_ok=True)
         raise ValueError(f"Stage211 base PCM archive coverage changed: {shard_path}")
     if fingerprint_path.is_file():
-        if (
-            fingerprint_path.stat().st_size != temporary.stat().st_size
-            or _sha256(fingerprint_path) != _sha256(temporary)
-        ):
+        if fingerprint_path.stat().st_size != temporary.stat().st_size or _sha256(
+            fingerprint_path
+        ) != _sha256(temporary):
             temporary.unlink(missing_ok=True)
             raise ValueError(
                 f"Existing Stage211 base archive fingerprint differs: {fingerprint_path}"
@@ -961,6 +1027,7 @@ def run_archive_worker(
     worker_index: int,
     num_workers: int,
     max_archives: int | None,
+    archive_cache_dir: Path | None = None,
 ) -> dict[str, int]:
     if num_workers <= 0 or not 0 <= worker_index < num_workers:
         raise ValueError("worker-index must satisfy 0 <= worker-index < num-workers")
@@ -977,6 +1044,7 @@ def run_archive_worker(
             location_index=location_index,
             output_root=output_root,
             archive_index=archive_index,
+            archive_cache_dir=archive_cache_dir,
         )
         counts[status] += 1
         print(
@@ -1082,9 +1150,7 @@ def validate_audit_receipt(
         "receipt_path": location_index["receipt_path"],
         "receipt_sha256": location_index["receipt_sha256"],
         "database_path": location_index["database_path"],
-        "database_size_bytes": int(
-            location_index["receipt"]["database_size_bytes"]
-        ),
+        "database_size_bytes": int(location_index["receipt"]["database_size_bytes"]),
         "database_sha256": location_index["receipt"]["database_sha256"],
         "rows": int(location_index["rows"]),
         "archive_count": len(location_index["archives"]),
@@ -1115,8 +1181,7 @@ def validate_audit_receipt(
             abs_tol=1e-9,
         )
         or audit.get("scanned_counts_by_source") != dict(sorted(source_counts.items()))
-        or audit.get("scanned_duration_ms_by_source")
-        != dict(sorted(source_duration_ms.items()))
+        or audit.get("scanned_duration_ms_by_source") != dict(sorted(source_duration_ms.items()))
         or source_counts != Counter(base["inventory"]["selected_counts_by_source"])
     ):
         raise ValueError("Stage211 base public PCM audit coverage changed.")
@@ -1128,8 +1193,7 @@ def validate_audit_receipt(
         for record in recorded_public_receipts
     }
     expected_public_rows = {
-        str(record["dataset"]): int(record["rows"])
-        for record in recorded_public_receipts
+        str(record["dataset"]): int(record["rows"]) for record in recorded_public_receipts
     }
     public_by_fingerprint, public_receipts = _load_public_fingerprint_map(
         public_manifests=public_manifests,
@@ -1141,8 +1205,7 @@ def validate_audit_receipt(
     overlap_path = Path(str(audit.get("overlap_output", {}).get("path") or "")).resolve()
     if (
         not overlap_path.is_file()
-        or overlap_path.stat().st_size
-        != int(audit.get("overlap_output", {}).get("size_bytes", -1))
+        or overlap_path.stat().st_size != int(audit.get("overlap_output", {}).get("size_bytes", -1))
         or _sha256(overlap_path) != audit.get("overlap_output", {}).get("sha256")
     ):
         raise ValueError("Stage211 base public PCM overlap output changed.")
@@ -1210,9 +1273,7 @@ def finalize_audit(
         "complete": True,
         "training_ready": training_ready,
         "admission_state": (
-            "normalized_pcm_exact_public_clear"
-            if training_ready
-            else "public_overlap_detected"
+            "normalized_pcm_exact_public_clear" if training_ready else "public_overlap_detected"
         ),
         "comparison_mode": "normalized_pcm_exact",
         "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
@@ -1234,9 +1295,7 @@ def finalize_audit(
             "receipt_path": location_index["receipt_path"],
             "receipt_sha256": location_index["receipt_sha256"],
             "database_path": location_index["database_path"],
-            "database_size_bytes": int(
-                location_index["receipt"]["database_size_bytes"]
-            ),
+            "database_size_bytes": int(location_index["receipt"]["database_size_bytes"]),
             "database_sha256": location_index["receipt"]["database_sha256"],
             "rows": int(location_index["rows"]),
             "archive_count": len(location_index["archives"]),
@@ -1291,12 +1350,14 @@ def _parse_args() -> argparse.Namespace:
     archive_worker.add_argument("--worker-index", type=int, default=0)
     archive_worker.add_argument("--num-workers", type=int, default=1)
     archive_worker.add_argument("--max-archives", type=int, default=None)
+    archive_worker.add_argument("--archive-cache-dir", type=Path, default=None)
     subparsers.add_parser("public")
     subparsers.add_parser("finalize")
     all_parser = subparsers.add_parser("all")
     all_parser.add_argument("--worker-index", type=int, default=0)
     all_parser.add_argument("--num-workers", type=int, default=1)
     all_parser.add_argument("--max-archives", type=int, default=None)
+    all_parser.add_argument("--archive-cache-dir", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -1304,9 +1365,7 @@ def main() -> int:
     args = _parse_args()
     output_root = args.output_root.expanduser().resolve()
     public_manifests = _parse_public_manifest(args.public_manifest)
-    expected_rows = (
-        EXPECTED_PUBLIC_ROWS if public_manifests == DEFAULT_PUBLIC_MANIFESTS else None
-    )
+    expected_rows = EXPECTED_PUBLIC_ROWS if public_manifests == DEFAULT_PUBLIC_MANIFESTS else None
     base = validate_base_inventory(args.base_inventory)
     location_index: dict[str, Any] | None = None
     if args.command in {"public", "all"}:
@@ -1339,6 +1398,11 @@ def main() -> int:
             worker_index=args.worker_index,
             num_workers=args.num_workers,
             max_archives=args.max_archives,
+            archive_cache_dir=(
+                args.archive_cache_dir.expanduser().resolve()
+                if args.archive_cache_dir is not None
+                else None
+            ),
         )
         print(f"[stage211-base-public-pcm] archive_result={result}", flush=True)
     if args.command in {"finalize", "all"}:

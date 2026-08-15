@@ -8,6 +8,7 @@ MATERIALIZED_INVENTORY="${MATERIALIZED_INVENTORY:-${HOME}/rwkvasr_data/stage211_
 FILTERED_ROOT="${FILTERED_ROOT:-${HOME}/rwkvasr_data/stage211_social_vad_filtered_v1}"
 BASE_INVENTORY="${BASE_INVENTORY:-${HOME}/rwkvasr_data/stage211_supplemental_natural_v1/supplemental_inventory.json}"
 BASE_PUBLIC_OVERLAP_ROOT="${BASE_PUBLIC_OVERLAP_ROOT:-${HOME}/rwkvasr_data/stage211_base_public_pcm_overlap_v1}"
+BASE_PUBLIC_ARCHIVE_CACHE_DIR="${BASE_PUBLIC_ARCHIVE_CACHE_DIR:-${TMPDIR:-/tmp}/rwkvasr_stage211_base_public_pcm_cache}"
 COMBINED_ROOT="${COMBINED_ROOT:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v2}"
 USB_COVERAGE_RECEIPT="${USB_COVERAGE_RECEIPT:-${HOME}/rwkvasr_data/stage211_usb_top_level_coverage_v1/coverage_receipt.json}"
 ARCHIVED_SOCIAL_OVERLAP_RECEIPT="${ARCHIVED_SOCIAL_OVERLAP_RECEIPT:-${HOME}/rwkvasr_data/stage211_archived_social_overlap_v1/overlap_receipt.json}"
@@ -43,7 +44,8 @@ env CUDA_VISIBLE_DEVICES='' uv run python \
   scripts/audit_stage211_base_public_pcm_overlap.py \
   --base-inventory "${BASE_INVENTORY}" \
   --output-root "${BASE_PUBLIC_OVERLAP_ROOT}" \
-  all
+  all \
+  --archive-cache-dir "${BASE_PUBLIC_ARCHIVE_CACHE_DIR}"
 
 wait_for_artifact "social materialized inventory" "${MATERIALIZED_INVENTORY}"
 

@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import io
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -31,6 +32,33 @@ def _flac(waveform: np.ndarray) -> bytes:
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
+def test_base_public_pcm_archive_cache_rejects_and_removes_changed_cache(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.zip"
+    source_path.write_bytes(b"immutable archive bytes")
+    expected_sha256 = _sha256(source_path)
+    cache_path = audit._copy_archive_to_cache(
+        source_path=source_path,
+        cache_dir=tmp_path / "cache",
+        archive_index=7,
+        expected_size_bytes=source_path.stat().st_size,
+        expected_sha256=expected_sha256,
+    )
+    cache_path.write_bytes(b"x" * source_path.stat().st_size)
+
+    with pytest.raises(ValueError, match="archive cache changed"):
+        audit._copy_archive_to_cache(
+            source_path=source_path,
+            cache_dir=tmp_path / "cache",
+            archive_index=7,
+            expected_size_bytes=source_path.stat().st_size,
+            expected_sha256=expected_sha256,
+        )
+
+    assert not cache_path.exists()
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, list[bytes]]:
@@ -172,21 +200,15 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[bytes]]:
                         {
                             "bucket_id": 0,
                             "num_samples": 256,
-                            "parts": [
-                                {"path": str(fixed_part), "num_samples": 256}
-                            ],
+                            "parts": [{"path": str(fixed_part), "num_samples": 256}],
                         }
                     ],
                 },
             },
         },
     )
-    source_counts = {
-        source: 2 if source == "peoples_speech_clean" else 1 for source in sources
-    }
-    source_hours = {
-        source: count / 3600.0 for source, count in source_counts.items()
-    }
+    source_counts = {source: 2 if source == "peoples_speech_clean" else 1 for source in sources}
+    source_hours = {source: count / 3600.0 for source, count in source_counts.items()}
     _write_json(
         inventory_path,
         {
@@ -253,9 +275,7 @@ def test_base_public_pcm_audit_is_resumable_and_fail_closed(
     inventory_path, base_audio = _fixture(tmp_path)
     public_audio = tmp_path / "public.flac"
     public_audio.write_bytes(
-        base_audio[0]
-        if overlap
-        else _flac(np.linspace(-0.4, 0.4, 8_000, dtype=np.float32))
+        base_audio[0] if overlap else _flac(np.linspace(-0.4, 0.4, 8_000, dtype=np.float32))
     )
     public_manifest = tmp_path / "public.jsonl"
     public_manifest.write_text(
@@ -304,9 +324,7 @@ def test_base_public_pcm_audit_is_resumable_and_fail_closed(
             row_index: int,
         ) -> tuple[bytes, dict[str, object]]:
             if self.reader._cached_row_group != row_group:  # type: ignore[attr-defined]
-                row_group_loads[self.shard_path] = (
-                    row_group_loads.get(self.shard_path, 0) + 1
-                )
+                row_group_loads[self.shard_path] = row_group_loads.get(self.shard_path, 0) + 1
             return self.reader.read_audio_row(  # type: ignore[no-any-return,attr-defined]
                 row_group=row_group,
                 row_index=row_index,
@@ -320,24 +338,39 @@ def test_base_public_pcm_audit_is_resumable_and_fail_closed(
         return CountingReader(original_make_shard_reader(storage_kind, shard_path), shard_path)
 
     monkeypatch.setattr(audit, "_make_shard_reader", counting_make_shard_reader)
+    archive_cache_dir = tmp_path / "archive_cache"
     first = audit.run_archive_worker(
         location_index=location_index,
         output_root=output_root,
         worker_index=0,
         num_workers=1,
         max_archives=None,
+        archive_cache_dir=archive_cache_dir,
     )
+    receipt_bytes = {
+        path.name: path.read_bytes()
+        for path in (output_root / "archive_fingerprints").glob("*.receipt.json")
+    }
     second = audit.run_archive_worker(
         location_index=location_index,
         output_root=output_root,
         worker_index=0,
         num_workers=1,
         max_archives=None,
+        archive_cache_dir=archive_cache_dir,
     )
     assert first == {"assigned": 5, "created": 5}
     assert second == {"assigned": 5, "reused": 5}
     assert set(reader_opens.values()) == {1}
     assert set(row_group_loads.values()) == {1}
+    assert all(Path(path).parent == archive_cache_dir for path in reader_opens)
+    assert archive_cache_dir.is_dir()
+    assert list(archive_cache_dir.iterdir()) == []
+    source_archives = {record["shard_path"] for record in location_index["archives"]}
+    for receipt_path in (output_root / "archive_fingerprints").glob("*.receipt.json"):
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert receipt["shard_path"] in source_archives
+        assert receipt_path.read_bytes() == receipt_bytes[receipt_path.name]
 
     result = audit.finalize_audit(
         base=base,
@@ -391,6 +424,69 @@ def test_base_public_pcm_audit_rejects_changed_archive_fingerprint(tmp_path: Pat
             num_workers=1,
             max_archives=None,
         )
+
+
+def test_base_public_pcm_archive_cache_is_removed_after_decode_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory_path, _ = _fixture(tmp_path)
+    base = audit.validate_base_inventory(inventory_path)
+    output_root = tmp_path / "audit"
+    cache_dir = tmp_path / "archive_cache"
+    audit.build_location_index(base=base, output_root=output_root)
+    location_index = audit.validate_location_index(output_root, base=base)
+
+    def fail_fingerprint(source: object) -> tuple[str, int]:
+        raise RuntimeError("controlled decode failure")
+
+    monkeypatch.setattr(audit, "canonical_pcm_fingerprint", fail_fingerprint)
+    with pytest.raises(RuntimeError, match="controlled decode failure"):
+        audit.run_archive_worker(
+            location_index=location_index,
+            output_root=output_root,
+            worker_index=0,
+            num_workers=1,
+            max_archives=1,
+            archive_cache_dir=cache_dir,
+        )
+
+    assert cache_dir.is_dir()
+    assert list(cache_dir.iterdir()) == []
+    assert not list((output_root / "archive_fingerprints").glob("*.tmp.*"))
+
+
+def test_base_public_pcm_archive_cache_rejects_same_stat_changed_source(
+    tmp_path: Path,
+) -> None:
+    inventory_path, _ = _fixture(tmp_path)
+    base = audit.validate_base_inventory(inventory_path)
+    output_root = tmp_path / "audit"
+    cache_dir = tmp_path / "archive_cache"
+    audit.build_location_index(base=base, output_root=output_root)
+    location_index = audit.validate_location_index(output_root, base=base)
+    archive = location_index["archives"][0]
+    source_path = Path(archive["shard_path"])
+    source_bytes = bytearray(source_path.read_bytes())
+    source_bytes[len(source_bytes) // 2] ^= 1
+    source_path.write_bytes(source_bytes)
+    os.utime(
+        source_path,
+        ns=(int(archive["archive_mtime_ns"]), int(archive["archive_mtime_ns"])),
+    )
+
+    with pytest.raises(ValueError, match="source archive changed"):
+        audit.run_archive_worker(
+            location_index=location_index,
+            output_root=output_root,
+            worker_index=0,
+            num_workers=1,
+            max_archives=1,
+            archive_cache_dir=cache_dir,
+        )
+
+    assert cache_dir.is_dir()
+    assert list(cache_dir.iterdir()) == []
 
 
 def test_base_public_pcm_all_cli_uses_archive_order(
