@@ -26,6 +26,7 @@ from rwkvasr.eval.stage211_supplemental import (
     DEFAULT_STAGE211_SUPPLEMENTAL_ROOT,
     STAGE211_SUPPLEMENTAL_DIFFICULTY,
     stage211_supplemental_profile,
+    validate_stage211_formal_supplemental_profile,
 )
 try:
     from scripts.create_stage211_supplemental_profile_receipt import (
@@ -706,6 +707,8 @@ def run_phase(args: argparse.Namespace) -> Path | None:
         require_training_ready=not args.dry_run,
         verify_part_sha256=False,
     )
+    if not args.dry_run:
+        validate_stage211_formal_supplemental_profile(supplemental_profile)
     supplemental_manifest = Path(str(supplemental_profile["bucket_manifest_path"])).resolve()
     print(
         "[stage211-full-phase] supplemental profile receipt "

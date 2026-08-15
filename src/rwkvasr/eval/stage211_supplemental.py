@@ -629,3 +629,21 @@ def stage211_supplemental_profile(
         )
         * int(epochs),
     }
+
+
+def validate_stage211_formal_supplemental_profile(
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Reject the obsolete base-only pool at a formal Stage211 training boundary."""
+    inventory = profile.get("inventory")
+    if (
+        not isinstance(inventory, dict)
+        or inventory.get("schema_version") != 2
+        or inventory.get("artifact") != "stage211_supplemental_combined_inventory"
+    ):
+        raise ValueError(
+            "Formal Stage211 supplemental_natural training requires the completed "
+            "schema-v2 combined supplemental inventory; the base-natural inventory "
+            "is not a complete fifth segment."
+        )
+    return profile

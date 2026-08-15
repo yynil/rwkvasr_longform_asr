@@ -14,6 +14,7 @@ from rwkvasr.data import load_webdataset_bucket_manifest
 from rwkvasr.eval.stage211_supplemental import (
     STAGE211_BASE_SUPPLEMENTAL_SOURCES,
     stage211_supplemental_profile,
+    validate_stage211_formal_supplemental_profile,
     validate_stage211_supplemental_inventory,
 )
 
@@ -484,6 +485,16 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
         frame_budget=8_000,
     )
     assert profile["row_exposures"] == 21
+    assert validate_stage211_formal_supplemental_profile(profile) is profile
+    base_profile = stage211_supplemental_profile(
+        base,
+        epochs=3,
+        batch_size=1,
+        world_size=4,
+        frame_budget=8_000,
+    )
+    with pytest.raises(ValueError, match="schema-v2 combined supplemental inventory"):
+        validate_stage211_formal_supplemental_profile(base_profile)
     assert (
         combined.build_combined_inventory(
             base_inventory_path=base,

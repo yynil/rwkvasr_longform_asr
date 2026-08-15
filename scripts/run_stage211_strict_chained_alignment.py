@@ -30,6 +30,7 @@ from rwkvasr.eval.stage211_supplemental import (
     DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
     STAGE211_SUPPLEMENTAL_DIFFICULTY,
     stage211_supplemental_profile,
+    validate_stage211_formal_supplemental_profile,
 )
 
 try:
@@ -1345,6 +1346,8 @@ def main() -> int:
             require_training_ready=not args.dry_run,
             verify_part_sha256=False,
         )
+        if not args.dry_run:
+            validate_stage211_formal_supplemental_profile(supplemental_profile)
         if Path(str(supplemental_profile["bucket_manifest_path"])).resolve() != Path(
             bucket_manifest
         ).resolve():
