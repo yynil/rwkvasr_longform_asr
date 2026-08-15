@@ -28,6 +28,8 @@ from rwkvasr.eval.stage211_supplemental import (
     stage211_supplemental_profile,
     validate_stage211_formal_supplemental_profile,
 )
+from rwkvasr.eval.stage211_storage import compact_stage211_completed_segment
+
 try:
     from scripts.create_stage211_supplemental_profile_receipt import (
         build_receipt as build_supplemental_profile_receipt,
@@ -829,6 +831,17 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             f"receipt_sha256={receipt['receipt_sha256']}",
             flush=True,
         )
+        compaction = compact_stage211_completed_segment(
+            curriculum_receipt_path=receipt_path,
+            expected_receipt=receipt,
+        )
+        print(
+            "[stage211-full-phase] completed-segment storage compacted "
+            f"difficulty={difficulty} removed_tags={len(compaction['removed_tags'])} "
+            f"bytes_planned={compaction['bytes_planned']} "
+            f"receipt_sha256={compaction['receipt_sha256']}",
+            flush=True,
+        )
         current_init = completion_checkpoint
         preceding_receipt = receipt_path
         if index + 1 < len(STAGE211_AUDIO_CURRICULUM):
@@ -903,6 +916,18 @@ def run_phase(args: argparse.Namespace) -> Path | None:
         f"difficulty={STAGE211_SUPPLEMENTAL_DIFFICULTY} "
         f"step={supplemental_target_step} "
         f"receipt_sha256={supplemental_receipt['receipt_sha256']}",
+        flush=True,
+    )
+    supplemental_compaction = compact_stage211_completed_segment(
+        curriculum_receipt_path=supplemental_receipt_path,
+        expected_receipt=supplemental_receipt,
+    )
+    print(
+        "[stage211-full-phase] completed-segment storage compacted "
+        f"difficulty={STAGE211_SUPPLEMENTAL_DIFFICULTY} "
+        f"removed_tags={len(supplemental_compaction['removed_tags'])} "
+        f"bytes_planned={supplemental_compaction['bytes_planned']} "
+        f"receipt_sha256={supplemental_compaction['receipt_sha256']}",
         flush=True,
     )
     current_init = supplemental_completion
