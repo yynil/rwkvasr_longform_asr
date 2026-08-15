@@ -26,6 +26,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
     stage211_sft_ctc_suppressed_token_ids,
+    validate_stage211_phase_train_config,
     validate_stage211_phase_gate_report,
     validate_stage211_runtime_epoch_coverage,
 )
@@ -1068,6 +1069,7 @@ def _config(
         labeled_webdataset_root=labeled_webdataset_root,
         labeled_length_index=labeled_length_index,
     )
+    validate_stage211_phase_train_config(config, phase=phase.name)
     return config
 
 

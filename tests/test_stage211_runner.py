@@ -1908,6 +1908,30 @@ def _config_for_phase(
     )
 
 
+@pytest.mark.parametrize("phase_name", tuple(stage211.PHASES))
+def test_stage211_config_preflights_phase_objective_before_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase_name: str,
+) -> None:
+    calls: list[str] = []
+    original = stage211.validate_stage211_phase_train_config
+
+    def recording_validator(config: dict[str, object], *, phase: str) -> dict[str, object]:
+        calls.append(phase)
+        return original(config, phase=phase)
+
+    monkeypatch.setattr(
+        stage211,
+        "validate_stage211_phase_train_config",
+        recording_validator,
+    )
+
+    _config_for_phase(tmp_path, phase_name)
+
+    assert calls == [phase_name]
+
+
 def test_stage211_config_uses_explicit_nano_checkpoint_parent(tmp_path: Path) -> None:
     phase = stage211.PHASES["mixer"]
     segment = stage211._segments(phase=phase, smoke=False)[0]
