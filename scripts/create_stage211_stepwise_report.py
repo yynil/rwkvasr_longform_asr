@@ -1078,6 +1078,9 @@ def build_stepwise_report(
         "requested_to_internal_stage": dict(REQUESTED_TO_INTERNAL_STAGE),
         "checkpoint_chain_passed": True,
         "nano_initialization_chain_passed": True,
+        "nano_initialization_source_chain_passed": initialization[
+            "loader_source_chain_passed"
+        ],
         "ctc_label_normalization_chain_passed": True,
         "ctc_label_proof": ctc_label_proof,
         "public_metric_definition_chain_passed": True,
@@ -1095,6 +1098,7 @@ def build_stepwise_report(
             "runtime_load_report": initialization["runtime_load_report"],
             "freeze_report": initialization["freeze_report"],
             "frozen_tensor_audit": initialization["frozen_tensor_audit"],
+            "loader_source_validation": initialization["loader_source_validation"],
         },
         "nano_teacher_chain_passed": True,
         "nano_teacher_checkpoint_sha256": nano_teacher_checkpoint_sha256,

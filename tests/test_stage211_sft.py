@@ -1484,6 +1484,10 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     }
     assert report["checkpoint_chain_passed"] is True
     assert report["nano_initialization_chain_passed"] is True
+    assert report["nano_initialization_source_chain_passed"] is True
+    assert [
+        row["mode"] for row in report["initialization_proof"]["loader_source_validation"]
+    ] == ["exact_file_sha256", "exact_file_sha256"]
     assert report["ctc_label_normalization_chain_passed"] is True
     assert report["ctc_label_proof"]["full_length_index_audit_passed"] is True
     assert report["ctc_label_proof"]["text_normalization"] == "ctc"

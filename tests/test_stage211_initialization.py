@@ -10,7 +10,12 @@ import torch
 import yaml
 
 from rwkvasr.eval.stage211_gate import sha256_file
-from rwkvasr.eval.stage211_initialization import validate_stage211_initialization_receipt
+from rwkvasr.eval import stage211_initialization
+from rwkvasr.eval.stage211_initialization import (
+    _normalized_loader_ast,
+    _validate_loader_source_binding,
+    validate_stage211_initialization_receipt,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -164,6 +169,11 @@ def test_initialization_receipt_audits_exact_nano_frozen_tensors(tmp_path: Path)
     )
 
     assert validated["runtime_load_report"]["qkv_mapped_to_both_directions"] is True
+    assert validated["loader_source_chain_passed"] is True
+    assert [row["mode"] for row in validated["loader_source_validation"]] == [
+        "exact_file_sha256",
+        "exact_file_sha256",
+    ]
     assert validated["frozen_tensor_audit"] == {
         "complete": True,
         "non_attention_mlp_norm_tensors": 564,
@@ -179,6 +189,106 @@ def test_initialization_receipt_audits_exact_nano_frozen_tensors(tmp_path: Path)
     output.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="runtime load report"):
         validate_stage211_initialization_receipt(output)
+
+
+def test_initialization_loader_source_accepts_only_recorded_git_evolution() -> None:
+    source = REPO_ROOT / "src" / "rwkvasr" / "modules" / "rwkv_asr_ctc.py"
+
+    evidence = _validate_loader_source_binding(
+        {
+            "path": str(source.resolve()),
+            "sha256": "ed555d921292bfb4fc4efcf4dbaf24c8ca6fe8c0dc31cde968bba78156e4bc56",
+        },
+        index=0,
+    )
+
+    assert evidence["mode"] == "git_history_non_initialization_ast_equivalent"
+    assert evidence["historical_commit"] == "c4fee65421617b29ab70d415e5f3721f0ca64cbe"
+    assert evidence["normalization"] == "strip_ctc_target_validation_v1"
+    assert evidence["removed_current_methods"] == 1
+    assert evidence["removed_current_calls"] == 1
+    assert len(evidence["normalized_ast_sha256"]) == 64
+
+
+def test_initialization_loader_source_rejects_other_ast_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    historical_source = b"""\
+class RWKVCTCModel:
+    def ctc_loss(self, logits, targets, target_lengths):
+        return logits
+"""
+    changed_source = b"""\
+class RWKVCTCModel:
+    def ctc_loss(self, logits, targets, target_lengths):
+        self._validate_ctc_targets(targets, target_lengths)
+        return logits + 1
+
+    def _validate_ctc_targets(self, targets, target_lengths):
+        if len(targets) != sum(target_lengths):
+            raise ValueError
+"""
+    source = tmp_path / "rwkv_asr_ctc.py"
+    source.write_bytes(changed_source)
+    historical_sha256 = stage211_initialization._sha256_bytes(historical_source)
+    monkeypatch.setattr(stage211_initialization, "_EVOLVED_LOADER_PATH", source.resolve())
+    monkeypatch.setattr(
+        stage211_initialization,
+        "_git_historical_source",
+        lambda path, *, expected_sha256: ("a" * 40, historical_source),
+    )
+
+    historical_ast, _, _ = _normalized_loader_ast(historical_source)
+    current_ast, methods, calls = _normalized_loader_ast(changed_source)
+    assert methods == 1
+    assert calls == 1
+    assert current_ast != historical_ast
+    with pytest.raises(ValueError, match="outside the approved"):
+        _validate_loader_source_binding(
+            {"path": str(source.resolve()), "sha256": historical_sha256},
+            index=0,
+        )
+
+
+def test_initialization_loader_source_rejects_changed_validation_call_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    historical_source = b"""\
+class RWKVCTCModel:
+    def ctc_loss(self, logits, targets, target_lengths):
+        return logits
+"""
+    changed_source = b"""\
+class RWKVCTCModel:
+    def ctc_loss(self, logits, targets, target_lengths):
+        self._validate_ctc_targets(target_lengths, targets)
+        return logits
+
+    def _validate_ctc_targets(self, targets, target_lengths):
+        return None
+"""
+    source = tmp_path / "rwkv_asr_ctc.py"
+    source.write_bytes(changed_source)
+    monkeypatch.setattr(stage211_initialization, "_EVOLVED_LOADER_PATH", source.resolve())
+    monkeypatch.setattr(
+        stage211_initialization,
+        "_git_historical_source",
+        lambda path, *, expected_sha256: ("a" * 40, historical_source),
+    )
+
+    _, methods, calls = _normalized_loader_ast(changed_source)
+    assert methods == 1
+    assert calls == 0
+    with pytest.raises(ValueError, match="outside the approved"):
+        _validate_loader_source_binding(
+            {
+                "path": str(source.resolve()),
+                "sha256": stage211_initialization._sha256_bytes(historical_source),
+            },
+            index=0,
+        )
 
 
 def test_initialization_frozen_tensor_audit_rejects_changed_mlp(tmp_path: Path) -> None:

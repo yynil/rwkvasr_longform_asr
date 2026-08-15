@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
 import math
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +15,11 @@ from rwkvasr.eval.stage211_gate import sha256_file
 DEFAULT_STAGE211_INITIALIZATION_RECEIPT = (
     Path.home() / "rwkvasr_eval" / "stage211_initialization" / "nano_initialization_receipt.json"
 )
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_EVOLVED_LOADER_PATH = (
+    _REPO_ROOT / "src" / "rwkvasr" / "modules" / "rwkv_asr_ctc.py"
+).resolve()
+_EVOLVED_LOADER_NORMALIZATION = "strip_ctc_target_validation_v1"
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -38,6 +46,146 @@ def _validate_bound_file(
     if re.fullmatch(r"[0-9a-f]{64}", digest) is None or sha256_file(path) != digest:
         raise ValueError(f"{label} SHA-256 mismatch: {path}")
     return path
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _is_approved_ctc_target_validation_call(statement: ast.stmt) -> bool:
+    call = statement.value if isinstance(statement, ast.Expr) else None
+    function = call.func if isinstance(call, ast.Call) else None
+    return bool(
+        isinstance(function, ast.Attribute)
+        and isinstance(function.value, ast.Name)
+        and function.value.id == "self"
+        and function.attr == "_validate_ctc_targets"
+        and len(call.args) == 2
+        and all(isinstance(argument, ast.Name) for argument in call.args)
+        and [argument.id for argument in call.args if isinstance(argument, ast.Name)]
+        == ["targets", "target_lengths"]
+        and not call.keywords
+    )
+
+
+def _normalized_loader_ast(source: bytes) -> tuple[str, int, int]:
+    tree = ast.parse(source.decode("utf-8"))
+    removed_methods = 0
+    removed_calls = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name != "RWKVCTCModel":
+            continue
+        retained: list[ast.stmt] = []
+        for item in node.body:
+            if (
+                isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name == "_validate_ctc_targets"
+            ):
+                removed_methods += 1
+                continue
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "ctc_loss":
+                filtered: list[ast.stmt] = []
+                for statement in item.body:
+                    if _is_approved_ctc_target_validation_call(statement):
+                        removed_calls += 1
+                        continue
+                    filtered.append(statement)
+                item.body = filtered
+            retained.append(item)
+        node.body = retained
+    rendered = ast.dump(tree, annotate_fields=True, include_attributes=False)
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest(), removed_methods, removed_calls
+
+
+def _git_historical_source(path: Path, *, expected_sha256: str) -> tuple[str, bytes]:
+    try:
+        relative = path.resolve().relative_to(_REPO_ROOT).as_posix()
+    except ValueError as error:
+        raise ValueError(
+            f"Stage211 evolved initialization loader is outside the repository: {path}"
+        ) from error
+    commits = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "log", "--format=%H", "--", relative],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    for commit in commits:
+        source = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "show", f"{commit}:{relative}"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        if _sha256_bytes(source) != expected_sha256:
+            continue
+        ancestor = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "merge-base", "--is-ancestor", commit, "HEAD"],
+            check=False,
+        )
+        if ancestor.returncode != 0:
+            raise ValueError(
+                "Stage211 receipt-bound initialization loader commit is not an ancestor of HEAD."
+            )
+        return commit, source
+    raise ValueError(
+        "Stage211 initialization loader source changed and its receipt-bound bytes "
+        "are unavailable from repository history."
+    )
+
+
+def _validate_loader_source_binding(
+    binding: dict[str, Any],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    path = Path(str(binding.get("path") or "")).expanduser().resolve()
+    expected_sha256 = str(binding.get("sha256") or "")
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"Stage211 initialization loader source {index} is missing: {path}")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise ValueError(f"Stage211 initialization loader source {index} SHA-256 is invalid.")
+    current_source = path.read_bytes()
+    current_sha256 = _sha256_bytes(current_source)
+    if current_sha256 == expected_sha256:
+        return {
+            "path": str(path),
+            "mode": "exact_file_sha256",
+            "receipt_sha256": expected_sha256,
+            "current_sha256": current_sha256,
+        }
+    if path != _EVOLVED_LOADER_PATH:
+        raise ValueError(f"Stage211 initialization loader source {index} SHA-256 mismatch: {path}")
+
+    historical_commit, historical_source = _git_historical_source(
+        path,
+        expected_sha256=expected_sha256,
+    )
+    historical_ast_sha256, historical_methods, historical_calls = _normalized_loader_ast(
+        historical_source
+    )
+    current_ast_sha256, current_methods, current_calls = _normalized_loader_ast(current_source)
+    if (
+        historical_methods != 0
+        or historical_calls != 0
+        or current_methods != 1
+        or current_calls != 1
+        or current_ast_sha256 != historical_ast_sha256
+    ):
+        raise ValueError(
+            "Stage211 initialization loader changed outside the approved CTC-target "
+            "validation-only evolution."
+        )
+    return {
+        "path": str(path),
+        "mode": "git_history_non_initialization_ast_equivalent",
+        "receipt_sha256": expected_sha256,
+        "current_sha256": current_sha256,
+        "historical_commit": historical_commit,
+        "normalization": _EVOLVED_LOADER_NORMALIZATION,
+        "normalized_ast_sha256": current_ast_sha256,
+        "removed_current_methods": current_methods,
+        "removed_current_calls": current_calls,
+    }
 
 
 def validate_stage211_initialization_receipt(
@@ -90,14 +238,12 @@ def validate_stage211_initialization_receipt(
     source_bindings = receipt.get("loader_source_bindings")
     if not isinstance(source_bindings, list) or len(source_bindings) != 2:
         raise ValueError("Stage211 initialization receipt lacks loader source bindings.")
+    loader_source_validation: list[dict[str, Any]] = []
     for index, binding in enumerate(source_bindings):
         if not isinstance(binding, dict):
             raise ValueError("Stage211 initialization loader source binding is invalid.")
-        _validate_bound_file(
-            binding,
-            path_key="path",
-            sha256_key="sha256",
-            label=f"Stage211 initialization loader source {index}",
+        loader_source_validation.append(
+            _validate_loader_source_binding(binding, index=index)
         )
 
     runtime = receipt.get("runtime_load_report")
@@ -157,4 +303,7 @@ def validate_stage211_initialization_receipt(
     if tensor_audit.get("mismatch_examples") != []:
         raise ValueError("Stage211 initialization frozen-tensor audit contains mismatches.")
 
-    return dict(receipt)
+    validated = dict(receipt)
+    validated["loader_source_validation"] = loader_source_validation
+    validated["loader_source_chain_passed"] = True
+    return validated
