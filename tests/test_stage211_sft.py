@@ -12,6 +12,8 @@ import torch
 from rwkvasr.config import save_yaml
 from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
+    STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
+    STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
     sha256_file,
     stage211_phase_train_config_contract,
 )
@@ -30,6 +32,11 @@ sft_finalizer = importlib.import_module("scripts.finalize_stage211_labeled_sft")
 stepwise_report = importlib.import_module("scripts.create_stage211_stepwise_report")
 public_compare = importlib.import_module("scripts.compare_public_ctc_with_nano")
 LABELED_EXPECTED = sft_runner.LABELED_EXPECTED
+SFT_SUPPORT_EXPECTED = {
+    "ctc_suppressed_token_ids_count": STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
+    "ctc_suppressed_token_ids_sha256": STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
+    "teacher_projection_support_matches_student": True,
+}
 
 
 def test_stage211_sft_controller_preserves_virtualenv_python() -> None:
@@ -155,6 +162,7 @@ def test_stage211_stepwise_ctc_label_proof_rejects_changed_normalization(
     coverage = {
         **LABELED_EXPECTED,
         "ctc_suppress_non_pronunciation_tokens": True,
+        **SFT_SUPPORT_EXPECTED,
         "labeled_data_audit": audit,
     }
 
@@ -374,6 +382,7 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
         "ctc_suppress_non_pronunciation_tokens": True,
+        **SFT_SUPPORT_EXPECTED,
         **LABELED_EXPECTED,
         "labeled_data_audit": labeled_audit,
         "labeled_webdataset_root": str(root),
@@ -1050,6 +1059,7 @@ def _write_stepwise_inputs(
                     "complete": True,
                     "epochs": 1,
                     "ctc_suppress_non_pronunciation_tokens": True,
+                    **SFT_SUPPORT_EXPECTED,
                     **LABELED_EXPECTED,
                     "labeled_data_audit": labeled_audit,
                     "init_checkpoint_path": str(checkpoints["logits"].resolve()),
@@ -1493,6 +1503,12 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["ctc_label_proof"]["text_normalization"] == "ctc"
     assert report["ctc_label_proof"]["ctc_unk_tokens"] == 0
     assert report["ctc_label_proof"]["ctc_suppress_non_pronunciation_tokens"] is True
+    assert report["ctc_label_proof"]["ctc_suppressed_token_ids_count"] == 3_629
+    assert (
+        report["ctc_label_proof"]["ctc_suppressed_token_ids_sha256"]
+        == STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
+    )
+    assert report["ctc_label_proof"]["teacher_projection_support_matches_student"] is True
     assert report["public_metric_definition_chain_passed"] is True
     assert report["public_metric_correction_receipt_sha256"] == sha256_file(
         reports["metric_correction"]

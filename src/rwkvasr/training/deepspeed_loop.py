@@ -6059,6 +6059,31 @@ def _resolve_ctc_teacher_online_device(
     return f"cuda:{int(device_index)}"
 
 
+def _validate_online_ctc_teacher_projection_support(
+    *,
+    suppress_non_pronunciation_tokens: bool,
+    teacher_model_path: str | None,
+    output_weights: tuple[float, ...],
+    student_suppressed_token_ids: tuple[int, ...] | list[int],
+    teacher_ignored_token_ids: tuple[int, ...] | list[int],
+) -> None:
+    if (
+        not suppress_non_pronunciation_tokens
+        or teacher_model_path is None
+        or not any(float(weight) > 0.0 for weight in output_weights)
+    ):
+        return
+    student_support = tuple(sorted({int(token_id) for token_id in student_suppressed_token_ids}))
+    teacher_support = tuple(sorted({int(token_id) for token_id in teacher_ignored_token_ids}))
+    if teacher_support != student_support:
+        raise ValueError(
+            "Online CTC teacher projection support must exactly match the "
+            "student CTC suppressed-token support when pronunciation-only "
+            "logits are enabled: "
+            f"teacher={len(teacher_support)} student={len(student_support)}"
+        )
+
+
 def _save_export_checkpoints(
     *,
     engine: deepspeed.DeepSpeedEngine,
@@ -6348,6 +6373,31 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     )
     ctc_teacher_online_layer_only = _is_layer_hidden_only_objective(config)
     ctc_teacher_online_layer_input_mode = str(config.ctc_teacher_online_layer_input_mode)
+    online_ctc_output_weights = (
+        ctc_teacher_online_weight,
+        ctc_teacher_online_blank_weight,
+        ctc_teacher_online_mass_weight,
+        ctc_teacher_online_full_weight,
+        ctc_teacher_online_conditional_nonblank_weight,
+        ctc_teacher_online_conditional_nonblank_hard_weight,
+        ctc_teacher_online_sequence_weight,
+        ctc_teacher_online_sequence_presence_weight,
+        ctc_teacher_online_sequence_window_weight,
+        ctc_teacher_online_nonblank_hard_weight,
+        ctc_teacher_online_nonblank_margin_weight,
+        ctc_teacher_online_nonblank_window_weight,
+        ctc_teacher_online_nonblank_window_margin_weight,
+        ctc_teacher_online_nonblank_window_topk_weight,
+    )
+    _validate_online_ctc_teacher_projection_support(
+        suppress_non_pronunciation_tokens=bool(
+            config.ctc_suppress_non_pronunciation_tokens
+        ),
+        teacher_model_path=config.ctc_teacher_online_model_path,
+        output_weights=online_ctc_output_weights,
+        student_suppressed_token_ids=model_config.ctc_suppressed_token_ids,
+        teacher_ignored_token_ids=config.ctc_teacher_online_project_ignored_token_ids,
+    )
     if config.allow_missing_targets and (
         float(config.ctc_loss_weight) > 0.0 or float(config.decoder_loss_weight) > 0.0
     ):

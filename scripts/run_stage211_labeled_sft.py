@@ -15,6 +15,8 @@ import yaml
 
 from rwkvasr.config import load_yaml
 from rwkvasr.eval.stage211_gate import (
+    STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
+    STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
     validate_stage211_phase_train_config,
@@ -424,6 +426,13 @@ def _validate_completion(
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
         "ctc_suppress_non_pronunciation_tokens": True,
+        "ctc_suppressed_token_ids_count": (
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
+        ),
+        "ctc_suppressed_token_ids_sha256": (
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
+        ),
+        "teacher_projection_support_matches_student": True,
         **LABELED_EXPECTED,
     }
     for key, value in expected.items():
@@ -688,6 +697,13 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             "skip_oversized_samples": False,
             "webdataset_skip_decode_errors": False,
             "ctc_suppress_non_pronunciation_tokens": True,
+            "ctc_suppressed_token_ids_count": (
+                STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
+            ),
+            "ctc_suppressed_token_ids_sha256": (
+                STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
+            ),
+            "teacher_projection_support_matches_student": True,
             **LABELED_EXPECTED,
             "labeled_data_audit": audit,
             "labeled_webdataset_root": str(labeled_root),

@@ -9,6 +9,8 @@ from typing import Any
 from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_PUBLIC_BENCHMARKS,
+    STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
+    STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
     sha256_file,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
@@ -386,6 +388,18 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Stage211 SFT CTC label proof {key} mismatch.")
     if coverage.get("ctc_suppress_non_pronunciation_tokens") is not True:
         raise ValueError("Stage211 SFT did not suppress non-pronunciation CTC logits.")
+    expected_support = {
+        "ctc_suppressed_token_ids_count": (
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
+        ),
+        "ctc_suppressed_token_ids_sha256": (
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
+        ),
+        "teacher_projection_support_matches_student": True,
+    }
+    for key, expected in expected_support.items():
+        if coverage.get(key) != expected:
+            raise ValueError(f"Stage211 SFT CTC pronunciation support {key} mismatch.")
     preparation = audit.get("label_preparation")
     if not isinstance(preparation, dict):
         raise ValueError("Stage211 SFT CTC label-preparation proof is missing.")
@@ -397,6 +411,12 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
         "ctc_unk_tokens": 0,
         "non_pronunciation_target_policy": "ctc_normalization",
         "non_pronunciation_logit_policy": "tokenizer_special_tokens_suppressed",
+        "ctc_suppressed_token_ids_count": (
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
+        ),
+        "ctc_suppressed_token_ids_sha256": (
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
+        ),
         "source_counts": STAGE211_LABELED_SOURCE_COUNTS,
         "language_counts": STAGE211_LABELED_LANGUAGE_COUNTS,
     }
@@ -417,6 +437,7 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
         "full_length_index_audit_passed": True,
         "ctc_label_normalization_chain_passed": True,
         "ctc_suppress_non_pronunciation_tokens": True,
+        **expected_support,
         "train_samples": int(audit["train_samples"]),
         "eval_samples": int(audit["eval_samples"]),
         "total_samples": int(audit["total_samples"]),

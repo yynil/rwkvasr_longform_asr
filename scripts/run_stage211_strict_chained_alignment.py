@@ -23,6 +23,9 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
+    STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
+    STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
+    stage211_sft_ctc_suppressed_token_ids,
     validate_stage211_phase_gate_report,
     validate_stage211_runtime_epoch_coverage,
 )
@@ -693,6 +696,12 @@ def _label_preparation_proof(
         "ctc_unk_tokens": 0,
         "non_pronunciation_target_policy": "ctc_normalization",
         "non_pronunciation_logit_policy": "tokenizer_special_tokens_suppressed",
+        "ctc_suppressed_token_ids_count": (
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
+        ),
+        "ctc_suppressed_token_ids_sha256": (
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
+        ),
         "source_counts": dict(STAGE211_LABELED_SOURCE_COUNTS),
         "language_counts": dict(STAGE211_LABELED_LANGUAGE_COUNTS),
     }
@@ -980,8 +989,13 @@ def _config(
             raise ValueError(
                 "Stage211 SFT requires an explicit labeled WebDataset root and length index."
             )
+        suppressed_token_ids = list(stage211_sft_ctc_suppressed_token_ids())
         config.update(
             {
+                "ctc_suppressed_token_ids": suppressed_token_ids,
+                "ctc_teacher_online_project_ignored_token_ids": list(
+                    suppressed_token_ids
+                ),
                 "webdataset_root": str(labeled_webdataset_root),
                 "webdataset_index_path": None,
                 "webdataset_length_index_path": str(labeled_length_index),

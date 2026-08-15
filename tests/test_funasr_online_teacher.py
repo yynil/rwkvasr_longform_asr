@@ -231,3 +231,57 @@ def test_feature_records_batches_teacher_forward_and_preserves_student_features(
     assert set(decoder_hiddens) == {"input", "layer_0", "layer_1"}
     assert decoder_hiddens["layer_1"].shape == (3, 6)
     assert decoder_hiddens["layer_1"].dtype == torch.float16
+
+
+def test_feature_records_project_ignored_tokens_before_ctc_distribution_outputs() -> None:
+    teacher = object.__new__(FunASRNanoCTCTopKOnlineTeacher)
+    teacher.config = FunASROnlineCTCTeacherConfig(
+        model_path="unused",
+        device="cpu",
+        top_k=3,
+        project_blank_id=7,
+        project_vocab_size=8,
+        project_ignored_token_ids=(0, 6),
+        return_full_log_probs=True,
+        keep_full_log_probs_on_device=True,
+    )
+    teacher.model = _FakeNanoModel(dim=4, vocab_size=7)
+    teacher.audio_rows = {}
+    with torch.no_grad():
+        teacher.model.ctc.ctc_lo.weight.zero_()
+        teacher.model.ctc.ctc_lo.bias.copy_(
+            torch.tensor([20.0, 5.0, 2.0, 1.0, 0.0, -1.0, 4.0])
+        )
+
+    record = teacher.feature_records(
+        ["utt-projected"],
+        torch.zeros(1, 3, 4),
+        torch.tensor([3], dtype=torch.long),
+    )["utt-projected"]
+
+    full_log_probs = record["full_log_probs"].float()
+    expected_allowed = torch.log_softmax(
+        torch.tensor([5.0, 2.0, 1.0, 0.0, -1.0, 4.0]),
+        dim=-1,
+    )
+    assert record["projected_distribution_normalized"] is True
+    assert torch.isneginf(full_log_probs[:, 0]).all()
+    assert torch.isneginf(full_log_probs[:, 6]).all()
+    assert torch.allclose(
+        torch.logsumexp(full_log_probs, dim=-1),
+        torch.zeros(3),
+        atol=2.0e-3,
+    )
+    assert torch.allclose(
+        torch.as_tensor(record["blank_log_probs"]),
+        expected_allowed[5].expand(3),
+        atol=1.0e-6,
+    )
+    assert torch.allclose(
+        full_log_probs[:, 7],
+        expected_allowed[5].expand(3),
+        atol=2.0e-3,
+    )
+    assert not torch.as_tensor(record["topk_token_ids"]).eq(0).any()
+    assert not torch.as_tensor(record["topk_token_ids"]).eq(6).any()
+    assert torch.as_tensor(record["argmax_token_ids"]).tolist() == [1]

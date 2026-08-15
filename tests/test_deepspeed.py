@@ -38,6 +38,7 @@ from rwkvasr.training.deepspeed_loop import (
     _teacher_forced_student_layer_hiddens,
     _teacher_layer_capture_ids,
     _validate_exact_batch_coverage,
+    _validate_online_ctc_teacher_projection_support,
     train_ctc_model_deepspeed,
 )
 from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, RWKVCTCModel, RWKVCTCModelConfig
@@ -69,6 +70,35 @@ def test_online_ctc_teacher_device_uses_cuda_zero_for_single_process_debug() -> 
     assert _resolve_ctc_teacher_online_device(None, torch.device("cuda", 2), local_rank=2) == "cuda:2"
     assert _resolve_ctc_teacher_online_device("cuda:1", torch.device("cuda"), local_rank=-1) == "cuda:1"
     assert _resolve_ctc_teacher_online_device(None, torch.device("cpu"), local_rank=-1) == "cpu"
+
+
+def test_online_ctc_teacher_projection_support_matches_pronunciation_mask() -> None:
+    _validate_online_ctc_teacher_projection_support(
+        suppress_non_pronunciation_tokens=True,
+        teacher_model_path="nano",
+        output_weights=(0.05, 0.10),
+        student_suppressed_token_ids=(3, 5, 7),
+        teacher_ignored_token_ids=[7, 3, 5],
+    )
+
+    with pytest.raises(ValueError, match="projection support must exactly match"):
+        _validate_online_ctc_teacher_projection_support(
+            suppress_non_pronunciation_tokens=True,
+            teacher_model_path="nano",
+            output_weights=(0.05, 0.10),
+            student_suppressed_token_ids=(3, 5, 7),
+            teacher_ignored_token_ids=(3, 5),
+        )
+
+
+def test_online_ctc_teacher_projection_support_is_irrelevant_without_output_loss() -> None:
+    _validate_online_ctc_teacher_projection_support(
+        suppress_non_pronunciation_tokens=True,
+        teacher_model_path="nano",
+        output_weights=(0.0, 0.0),
+        student_suppressed_token_ids=(3, 5, 7),
+        teacher_ignored_token_ids=(3,),
+    )
 
 
 def test_deepspeed_loop_leaves_gradient_accumulation_to_engine() -> None:

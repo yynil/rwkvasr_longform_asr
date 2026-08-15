@@ -4,12 +4,17 @@ import hashlib
 import json
 import math
 import re
+from functools import cache
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from rwkvasr.config import load_yaml
+from rwkvasr.data import (
+    build_text_tokenizer,
+    ctc_suppressed_token_ids_for_tokenizer,
+)
 from rwkvasr.eval.stage211_public_metrics import (
     build_stage211_public_progress,
     replay_stage211_public_comparison,
@@ -36,6 +41,13 @@ STAGE211_POST_COVERAGE_CORRECTION_LRS = {
 }
 STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES = 256
 STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT = "alignment_checkpoint_eval"
+STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT = 3_629
+STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256 = (
+    "745c61a54cc6118c7a7988407d8f4fb8a794b0a6102f0ecf2aaf577945fc50f0"
+)
+_STAGE211_TOKENIZER_MODEL_PATH = "assets/fun-asr-nano-2512/multilingual.tiktoken"
+_STAGE211_STUDENT_BLANK_ID = 60_515
+_STAGE211_NANO_BLANK_ID = 60_514
 _STAGE211_ALIGNMENT_LAYER_IDS = tuple(range(70))
 _STAGE211_ALIGNMENT_LAYER_KEYS = {str(index) for index in _STAGE211_ALIGNMENT_LAYER_IDS}
 _STAGE211_ALIGNMENT_WEAK_BANDS = {
@@ -195,9 +207,9 @@ STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES = (
 )
 _STAGE211_COMMON_PHASE_TRAIN_CONFIG: dict[str, Any] = {
     "vocab_size": 60_515,
-    "blank_id": 60_515,
+    "blank_id": _STAGE211_STUDENT_BLANK_ID,
     "tokenizer_type": "sensevoice_tiktoken",
-    "tokenizer_model_path": "assets/fun-asr-nano-2512/multilingual.tiktoken",
+    "tokenizer_model_path": _STAGE211_TOKENIZER_MODEL_PATH,
     "tokenizer_append_eos": False,
     "text_normalization": "ctc",
     "weight_decay": 0.0,
@@ -235,9 +247,9 @@ _STAGE211_COMMON_PHASE_TRAIN_CONFIG: dict[str, Any] = {
     "ctc_teacher_online_nonblank_window_loss_mode": "conditional_nonblank_hard",
     "ctc_teacher_online_nonblank_window_radius": 2,
     "ctc_teacher_online_nonblank_window_temperature": 0.2,
-    "ctc_teacher_online_project_ignored_token_ids": [60_514],
+    "ctc_teacher_online_project_ignored_token_ids": [_STAGE211_NANO_BLANK_ID],
     "ctc_teacher_online_top_k": 32,
-    "funasr_nano_ctc_teacher_blank_id": 60_514,
+    "funasr_nano_ctc_teacher_blank_id": _STAGE211_NANO_BLANK_ID,
 }
 _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
     "mixer": {
@@ -336,12 +348,57 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+@cache
+def stage211_sft_ctc_suppressed_token_ids() -> tuple[int, ...]:
+    tokenizer_model_path = Path(__file__).resolve().parents[3] / _STAGE211_TOKENIZER_MODEL_PATH
+    if not tokenizer_model_path.is_file():
+        raise FileNotFoundError(
+            f"Stage211 tokenizer model is unavailable: {tokenizer_model_path}"
+        )
+    tokenizer = build_text_tokenizer(
+        "sensevoice_tiktoken",
+        model_path=str(tokenizer_model_path),
+    )
+    token_ids = tuple(
+        sorted(
+            set(
+                ctc_suppressed_token_ids_for_tokenizer(
+                    tokenizer,
+                    blank_id=_STAGE211_STUDENT_BLANK_ID,
+                )
+            )
+        )
+    )
+    fingerprint = hashlib.sha256(
+        ",".join(str(token_id) for token_id in token_ids).encode("ascii")
+    ).hexdigest()
+    if (
+        len(token_ids) != STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
+        or fingerprint != STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
+        or _STAGE211_NANO_BLANK_ID not in token_ids
+        or _STAGE211_STUDENT_BLANK_ID in token_ids
+    ):
+        raise ValueError(
+            "Stage211 SFT pronunciation-token support differs from its bound contract: "
+            f"count={len(token_ids)} sha256={fingerprint} "
+            f"nano_blank_suppressed={_STAGE211_NANO_BLANK_ID in token_ids} "
+            f"student_blank_suppressed={_STAGE211_STUDENT_BLANK_ID in token_ids}"
+        )
+    return token_ids
+
+
 def stage211_phase_train_config_contract(phase: str) -> dict[str, Any]:
     try:
         phase_values = _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES[phase]
     except KeyError as error:
         raise ValueError(f"Unsupported Stage211 phase objective: {phase!r}") from error
     contract = {**_STAGE211_COMMON_PHASE_TRAIN_CONFIG, **phase_values}
+    if phase == "sft":
+        suppressed_token_ids = list(stage211_sft_ctc_suppressed_token_ids())
+        contract["ctc_suppressed_token_ids"] = suppressed_token_ids
+        contract["ctc_teacher_online_project_ignored_token_ids"] = list(
+            suppressed_token_ids
+        )
     return {
         key: list(value) if isinstance(value, list) else value for key, value in contract.items()
     }

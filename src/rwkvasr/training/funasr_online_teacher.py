@@ -475,10 +475,29 @@ class FunASRNanoCTCTopKOnlineTeacher:
         encoder_frame_count = int(encoder_out_lens[sample_idx].item())
         x = ctc_logp[sample_idx, :frame_count, :].float()
         vocab_size = int(x.shape[-1])
+        teacher_blank_id = int(self.model.blank_id)
+        projection_ignored_ids = tuple(
+            sorted(
+                {
+                    int(token_id)
+                    for token_id in self.config.project_ignored_token_ids
+                    if 0 <= int(token_id) < vocab_size
+                    and int(token_id) != teacher_blank_id
+                }
+            )
+        )
+        if projection_ignored_ids:
+            x = x.clone()
+            ignored_index = torch.tensor(
+                projection_ignored_ids,
+                device=x.device,
+                dtype=torch.long,
+            )
+            x.index_fill_(dim=-1, index=ignored_index, value=float("-inf"))
+            x = x - torch.logsumexp(x, dim=-1, keepdim=True)
         yseq = torch.unique_consecutive(x.argmax(dim=-1), dim=-1)
         k = min(max(1, int(self.config.top_k)), vocab_size)
         topk_log_probs, topk_ids = torch.topk(x, k=k, dim=-1)
-        teacher_blank_id = int(self.model.blank_id)
         argmax_token_ids = yseq[yseq != teacher_blank_id].to(dtype=torch.int32)
         blank_log_probs = x[:, teacher_blank_id]
         blank_in_topk = topk_ids.eq(teacher_blank_id).any(dim=-1)
@@ -502,6 +521,7 @@ class FunASRNanoCTCTopKOnlineTeacher:
             "teacher_vocab_size": vocab_size,
             "project_blank_id": int(self.config.project_blank_id),
             "project_ignored_token_ids": [int(value) for value in self.config.project_ignored_token_ids],
+            "projected_distribution_normalized": True,
             "topk_token_ids": mapped_ids.detach().cpu().to(dtype=torch.int32),
             "topk_log_probs": topk_log_probs.detach().cpu().to(dtype=torch.float32),
             "blank_log_probs": blank_log_probs.detach().cpu().to(dtype=torch.float32),
