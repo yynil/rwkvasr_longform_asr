@@ -18,6 +18,7 @@ MONITOR_LOG="${MONITOR_LOG:-${FULL_OUTPUT_ROOT}/monitor_hourly.log}"
 BOOTSTRAP_SCRIPT="${BOOTSTRAP_SCRIPT:-${REPO_ROOT}/scripts/start_stage211_abcd_after_calibration.sh}"
 MONITOR_SCRIPT="${MONITOR_SCRIPT:-${REPO_ROOT}/scripts/monitor_stage211_abcd.sh}"
 SELECTION_VALIDATOR_SCRIPT="${SELECTION_VALIDATOR_SCRIPT:-${REPO_ROOT}/scripts/run_stage211_mixer_retention_loop.py}"
+CURRICULUM_VALIDATOR_SCRIPT="${CURRICULUM_VALIDATOR_SCRIPT:-${REPO_ROOT}/scripts/finalize_stage211_phase.py}"
 NANO_CHECKPOINT="${NANO_CHECKPOINT:-${HOME}/models/Fun-ASR-Nano-2512-modelscope/model.pt}"
 
 MIXER_COMPLETE="${FULL_OUTPUT_ROOT}/stage211a_mixer_full_data_3ep/curriculum_complete.json"
@@ -65,6 +66,18 @@ stage211_selection_valid() {
   ) >>"${WATCH_LOG}" 2>&1
 }
 
+stage211_mixer_curriculum_valid() {
+  [[ -s "${MIXER_COMPLETE}" ]] || return 1
+  mkdir -p "$(dirname "${WATCH_LOG}")"
+  (
+    cd "${REPO_ROOT}"
+    uv run python "${CURRICULUM_VALIDATOR_SCRIPT}" \
+      --phase mixer \
+      --phase-root "${FULL_OUTPUT_ROOT}/stage211a_mixer_full_data_3ep" \
+      --validate-curriculum-only
+  ) >>"${WATCH_LOG}" 2>&1
+}
+
 stage211_choose_start_stage() {
   if stage211_selection_valid logits "${LOGITS_SELECTION}"; then
     printf '%s\n' sft
@@ -72,9 +85,7 @@ stage211_choose_start_stage() {
     printf '%s\n' logits
   elif stage211_selection_valid mixer "${MIXER_SELECTION}"; then
     printf '%s\n' block
-  elif stage211_json_matches \
-    "${MIXER_COMPLETE}" \
-    '.pipeline == "stage211" and .artifact == "full_phase_curriculum" and .phase == "mixer" and .complete == true and .full_data_coverage.supplemental_natural.complete == true and .full_data_coverage.supplemental_natural.epochs == 3'; then
+  elif stage211_mixer_curriculum_valid; then
     printf '%s\n' post_mixer
   else
     printf '%s\n' full

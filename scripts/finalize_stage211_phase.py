@@ -125,6 +125,20 @@ def _resolve_curriculum(
     return coverage, checkpoint, receipt_paths
 
 
+def validate_curriculum_only(*, phase: str, phase_root: Path) -> Path:
+    coverage, checkpoint, receipt_paths = _resolve_curriculum(
+        phase=phase,
+        phase_root=phase_root.expanduser().resolve(),
+    )
+    print(
+        "[stage211-finalize] curriculum validation passed "
+        f"phase={phase} segments={len(receipt_paths)} "
+        f"rows={coverage['total_unique_rows']} checkpoint={checkpoint}",
+        flush=True,
+    )
+    return checkpoint
+
+
 def _run_public_eval(
     *,
     checkpoint: Path,
@@ -168,9 +182,7 @@ def _validate_public_eval_inputs(
     if not isinstance(raw_results, list) or len(raw_results) != len(DATASETS):
         raise ValueError("Stage211 Nano public-baseline preflight dataset count mismatch.")
     by_dataset = {
-        str(result.get("dataset")): result
-        for result in raw_results
-        if isinstance(result, dict)
+        str(result.get("dataset")): result for result in raw_results if isinstance(result, dict)
     }
     if len(by_dataset) != len(DATASETS) or set(by_dataset) != set(DATASETS):
         raise ValueError("Stage211 Nano public-baseline preflight dataset set mismatch.")
@@ -693,8 +705,22 @@ def main() -> int:
     parser.add_argument("--stratified-alignment-batch-size", type=int, default=1)
     parser.add_argument("--stratified-alignment-num-workers", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--validate-curriculum-only",
+        action="store_true",
+        help=(
+            "Deep-validate completed five-segment curriculum evidence without "
+            "creating evaluation outputs or launching model evaluation."
+        ),
+    )
     args = parser.parse_args()
 
+    if args.validate_curriculum_only:
+        validate_curriculum_only(
+            phase=str(args.phase),
+            phase_root=args.phase_root,
+        )
+        return 0
     finalize_phase(args)
     return 0
 

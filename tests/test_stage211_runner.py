@@ -5608,21 +5608,85 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert '[[ "${BASH_SOURCE[0]}" == "$0" ]]' in script
     assert "stage211_selection_valid" in script
     assert "--validate-selection-only" in script
+    assert "stage211_mixer_curriculum_valid" in script
+    assert "--validate-curriculum-only" in script
 
 
-def _choose_stage211_continuation_stage(tmp_path: Path, summary: dict[str, object]) -> str:
+def test_stage211_curriculum_only_validation_skips_all_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    checkpoint = tmp_path / "supplemental-complete.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    calls: list[tuple[str, Path]] = []
+
+    def fake_resolve_curriculum(*, phase: str, phase_root: Path):
+        calls.append((phase, phase_root))
+        receipts = [tmp_path / f"receipt-{index}" for index in range(5)]
+        return {"total_unique_rows": 123}, checkpoint, receipts
+
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_resolve_curriculum",
+        fake_resolve_curriculum,
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "finalize_phase",
+        lambda args: pytest.fail("curriculum-only validation launched evaluation"),
+    )
+    phase_root = tmp_path / "phase"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(stage211_phase_finalizer.__file__),
+            "--phase",
+            "mixer",
+            "--phase-root",
+            str(phase_root),
+            "--validate-curriculum-only",
+        ],
+    )
+
+    assert stage211_phase_finalizer.main() == 0
+    assert calls == [("mixer", phase_root.resolve())]
+    assert "segments=5 rows=123" in capsys.readouterr().out
+
+
+def _choose_stage211_continuation_stage(
+    tmp_path: Path,
+    summary: dict[str, object],
+    *,
+    curriculum_validator_exit_code: int = 42,
+) -> str:
     output_root = tmp_path / "runs"
     summary_path = output_root / "stage211a_mixer_full_data_3ep" / "curriculum_complete.json"
     summary_path.parent.mkdir(parents=True)
     summary_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >>"${CURRICULUM_VALIDATOR_CALLS}"\n'
+        'exit "${CURRICULUM_VALIDATOR_EXIT_CODE}"\n',
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
     script = REPO_ROOT / "scripts" / "watch_stage211_strict_continuation.sh"
     result = subprocess.run(
         ["bash", "-c", 'source "$1"; stage211_choose_start_stage', "_", str(script)],
         cwd=REPO_ROOT,
         env={
             **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "FULL_OUTPUT_ROOT": str(output_root),
             "PHASE_GATE_ROOT": str(tmp_path / "gates"),
+            "WATCH_LOG": str(tmp_path / "watch.log"),
+            "CURRICULUM_VALIDATOR_CALLS": str(tmp_path / "curriculum-validator-calls.log"),
+            "CURRICULUM_VALIDATOR_EXIT_CODE": str(curriculum_validator_exit_code),
         },
         text=True,
         capture_output=True,
@@ -5668,9 +5732,33 @@ def test_stage211_continuation_watcher_routes_complete_supplemental_to_post_mixe
                 "complete": True,
                 "full_data_coverage": {"supplemental_natural": {"complete": True, "epochs": 3}},
             },
+            curriculum_validator_exit_code=0,
         )
         == "post_mixer"
     )
+
+
+def test_stage211_continuation_watcher_rejects_shallow_supplemental_summary(
+    tmp_path: Path,
+) -> None:
+    assert (
+        _choose_stage211_continuation_stage(
+            tmp_path,
+            {
+                "pipeline": "stage211",
+                "artifact": "full_phase_curriculum",
+                "phase": "mixer",
+                "complete": True,
+                "full_data_coverage": {"supplemental_natural": {"complete": True, "epochs": 3}},
+            },
+            curriculum_validator_exit_code=17,
+        )
+        == "full"
+    )
+    validator_command = (tmp_path / "curriculum-validator-calls.log").read_text(encoding="utf-8")
+    assert str(stage211_phase_finalizer.__file__) in validator_command
+    assert "--phase mixer" in validator_command
+    assert "--validate-curriculum-only" in validator_command
 
 
 @pytest.mark.parametrize(
