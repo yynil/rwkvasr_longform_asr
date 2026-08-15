@@ -5735,9 +5735,13 @@ def _run_stage211_continuation_watcher_fixture(
         'mkdir -p "$(dirname "${output_json}")"\n'
         'if [[ "${UV_MODE}" == malformed_metrics ]]; then\n'
         '  dataset_proof=\'"public_metric_stage_order":["calibration","mixer","block","logits","sft"],"all_stage_public_metrics_complete":true,"english_wer_datasets":["en1","en2","en3"],"chinese_cer_datasets":["zh1","zh2"],"dataset_results":[1,2,3,4,5]\'\n'
-        "else\n"
+        'elif [[ "${UV_MODE}" == missing_language_macro ]]; then\n'
         '  stages=\'{"calibration":{},"mixer":{},"block":{},"logits":{},"sft":{}}\'\n'
         '  dataset_proof=\'"public_metric_stage_order":["calibration","mixer","block","logits","sft"],"all_stage_public_metrics_complete":true,"english_wer_datasets":["en1","en2","en3"],"chinese_cer_datasets":["zh1","zh2"],"dataset_results":[{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'}]\'\n'
+        "else\n"
+        '  stages=\'{"calibration":{},"mixer":{},"block":{},"logits":{},"sft":{}}\'\n'
+        '  macro_stages=\'{"calibration":0.5,"mixer":0.4,"block":0.3,"logits":0.2,"sft":0.1}\'\n'
+        '  dataset_proof=\'"public_metric_stage_order":["calibration","mixer","block","logits","sft"],"all_stage_public_metrics_complete":true,"english_wer_datasets":["en1","en2","en3"],"chinese_cer_datasets":["zh1","zh2"],"language_metric_summaries":[{"name":"english_wer","language":"en","metric":"wer","aggregation":"unweighted_dataset_macro","datasets":["en1","en2","en3"],"dataset_count":3,"sample_count":3,"nano_error_rate":0.1,"stages":\'"${macro_stages}"\'},{"name":"chinese_cer","language":"zh","metric":"cer","aggregation":"unweighted_dataset_macro","datasets":["zh1","zh2"],"dataset_count":2,"sample_count":2,"nano_error_rate":0.1,"stages":\'"${macro_stages}"\'}],"dataset_results":[{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'}]\'\n'
         "fi\n"
         'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_initialization_chain_passed":true,"nano_initialization_source_chain_passed":true,"ctc_label_normalization_chain_passed":true,"ctc_label_proof":{"full_length_index_audit_passed":true,"ctc_suppress_non_pronunciation_tokens":true,"ctc_suppressed_token_ids_count":3629,"ctc_suppressed_token_ids_sha256":"745c61a54cc6118c7a7988407d8f4fb8a794b0a6102f0ecf2aaf577945fc50f0","teacher_projection_support_matches_student":true,"ctc_unk_tokens":0},"public_metric_definition_chain_passed":true,"public_metric_tokenizer_contract":"unicode_alnum_words_basic_cjk_chars_v1","public_metric_correction_receipt_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","public_metric_tokenizer_source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"supplemental_dedupe_proof":{"inventory_schema_version":2,"inventory_artifact":"stage211_supplemental_combined_inventory","mode":"source_identity_plus_known_corpus_exclusion","source_sets_disjoint":true,"content_fingerprint_complete":false,"base_public_overlap_normalized_pcm_exact_complete":true,"base_public_overlap_scan_order":"manifest_location_index_archive_order_v1","base_public_overlap_rows":0,"base_public_overlap_scanned_rows":1,"base_public_overlap_receipt_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","social_normalized_pcm_exact_complete":true,"social_public_overlap_mode":"normalized_pcm_exact","archived_social_exact_duplicate_exclusion_complete":true,"archived_social_unique_members":0,"archived_social_overlap_receipt_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","usb_top_level_classification_complete":true,"usb_natural_audio_resolution_complete":true,"usb_unresolved_natural_entries":[],"usb_top_level_coverage_receipt_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","near_duplicate_complete":false,"component_inventories":{"base_natural":{},"social_vad":{}},"known_overlap_exclusions":["llaso_gigaspeech","llaso_librispeech"]},"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],\'"${dataset_proof}"\'}\' >"${output_json}"\n'
         "printf '%s\\n' '# stepwise' >\"${output_markdown}\"\n",
@@ -5823,6 +5827,20 @@ def test_stage211_continuation_watcher_rejects_placeholder_bilingual_metrics(
     result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
         tmp_path,
         uv_mode="malformed_metrics",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "final Stage211 stepwise proof failed validation" in result.stdout
+    assert "START_STAGE=full" in result.stdout
+    assert "new-session" in tmux_calls
+
+
+def test_stage211_continuation_watcher_requires_language_macro_metrics(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="missing_language_macro",
     )
 
     assert result.returncode == 0, result.stderr

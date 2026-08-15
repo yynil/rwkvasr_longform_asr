@@ -1556,6 +1556,32 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         list(row["stages"]) == report["public_metric_stage_order"]
         for row in report["dataset_results"]
     )
+    language_summaries = {
+        summary["name"]: summary for summary in report["language_metric_summaries"]
+    }
+    assert set(language_summaries) == {"english_wer", "chinese_cer"}
+    for name, language, metric, dataset_count in (
+        ("english_wer", "en", "wer", 3),
+        ("chinese_cer", "zh", "cer", 2),
+    ):
+        summary = language_summaries[name]
+        rows = [
+            row
+            for row in report["dataset_results"]
+            if row["language"] == language and row["metric"] == metric
+        ]
+        assert summary["aggregation"] == "unweighted_dataset_macro"
+        assert summary["dataset_count"] == dataset_count
+        assert summary["datasets"] == [row["dataset"] for row in rows]
+        assert summary["sample_count"] == sum(row["sample_count"] for row in rows)
+        assert summary["nano_error_rate"] == pytest.approx(
+            sum(row["nano_error_rate"] for row in rows) / dataset_count
+        )
+        for stage in report["public_metric_stage_order"]:
+            assert summary["stages"][stage] == pytest.approx(
+                sum(row["stages"][stage]["student_error_rate"] for row in rows)
+                / dataset_count
+            )
     assert report["public_overlap_chain_passed"] is True
     assert report["public_overlap_receipt_sha256"] == sha256_file(
         tmp_path / "public-overlap-receipt.json"
@@ -1586,6 +1612,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     )
     assert "Layer A" in output_markdown.read_text(encoding="utf-8")
     assert "SFT D" in output_markdown.read_text(encoding="utf-8")
+    assert "Language Macro Metrics" in output_markdown.read_text(encoding="utf-8")
+    assert "unweighted_dataset_macro" in output_markdown.read_text(encoding="utf-8")
+    assert "Per-Dataset Metrics" in output_markdown.read_text(encoding="utf-8")
     assert "Training Coverage" in output_markdown.read_text(encoding="utf-8")
     assert "Full Data Segment Proof" in output_markdown.read_text(encoding="utf-8")
     assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")

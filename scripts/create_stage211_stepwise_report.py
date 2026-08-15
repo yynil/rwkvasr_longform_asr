@@ -314,6 +314,46 @@ def _benchmark_rows(benchmark: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def _language_metric_summaries(
+    dataset_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    summaries = []
+    for name, language, metric in (
+        ("english_wer", "en", "wer"),
+        ("chinese_cer", "zh", "cer"),
+    ):
+        rows = [
+            row
+            for row in dataset_results
+            if row.get("language") == language and row.get("metric") == metric
+        ]
+        expected_count = 3 if language == "en" else 2
+        if len(rows) != expected_count:
+            raise ValueError(
+                f"Stage211 {name} macro requires exactly {expected_count} datasets."
+            )
+        stage_values = {
+            stage: sum(float(row["stages"][stage]["student_error_rate"]) for row in rows)
+            / len(rows)
+            for stage in STAGE_ORDER
+        }
+        summaries.append(
+            {
+                "name": name,
+                "language": language,
+                "metric": metric,
+                "aggregation": "unweighted_dataset_macro",
+                "datasets": [str(row["dataset"]) for row in rows],
+                "dataset_count": len(rows),
+                "sample_count": sum(int(row["sample_count"]) for row in rows),
+                "nano_error_rate": sum(float(row["nano_error_rate"]) for row in rows)
+                / len(rows),
+                "stages": stage_values,
+            }
+        )
+    return summaries
+
+
 def _phase_initial_checkpoint(report: dict[str, Any]) -> tuple[Path, str]:
     coverage = report["full_data_coverage"]
     segments = coverage.get("segments")
@@ -1036,6 +1076,7 @@ def build_stepwise_report(
         raise ValueError("Stage211 final report lacks the required English WER/Chinese CER split.")
     if any(tuple(row["stages"]) != STAGE_ORDER for row in dataset_results):
         raise ValueError("Stage211 final report lacks a complete ordered public-metric stage map.")
+    language_metric_summaries = _language_metric_summaries(dataset_results)
 
     stage_records = [
         _stage_record(
@@ -1145,6 +1186,7 @@ def build_stepwise_report(
         "all_stage_public_metrics_complete": True,
         "english_wer_datasets": english_wer_datasets,
         "chinese_cer_datasets": chinese_cer_datasets,
+        "language_metric_summaries": language_metric_summaries,
         "checkpoint_chain": chain,
         "stages": stage_records,
         "coverage_results": coverage_results,
@@ -1197,10 +1239,36 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"unknown tokens: `{int(report['ctc_label_proof']['ctc_unk_tokens'])}`, "
         "non-pronunciation logits suppressed: `true`",
         "",
-        "| Dataset | Metric | Samples | Nano | Calibration | Layer A | Block B | "
-        "Logits C | SFT D | Final gap |",
+        "## Language Macro Metrics",
+        "",
+        "Aggregation: `unweighted_dataset_macro`.",
+        "",
+        "| Language | Metric | Datasets | Samples | Nano | Calibration | Layer A | "
+        "Block B | Logits C | SFT D |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    for summary in report["language_metric_summaries"]:
+        stages = summary["stages"]
+        lines.append(
+            f"| {str(summary['language']).upper()} | {str(summary['metric']).upper()} | "
+            f"{int(summary['dataset_count'])} | {int(summary['sample_count']):,} | "
+            f"{float(summary['nano_error_rate']) * 100.0:.3f}% | "
+            f"{float(stages['calibration']) * 100.0:.3f}% | "
+            f"{float(stages['mixer']) * 100.0:.3f}% | "
+            f"{float(stages['block']) * 100.0:.3f}% | "
+            f"{float(stages['logits']) * 100.0:.3f}% | "
+            f"{float(stages['sft']) * 100.0:.3f}% |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Per-Dataset Metrics",
+            "",
+            "| Dataset | Metric | Samples | Nano | Calibration | Layer A | Block B | "
+            "Logits C | SFT D | Final gap |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        )
+    )
     for row in report["dataset_results"]:
         stages = row["stages"]
         nano = float(row["nano_error_rate"]) * 100.0
