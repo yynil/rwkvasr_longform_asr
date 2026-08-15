@@ -162,4 +162,6 @@ stage211_main() {
   done
 }
 
-stage211_main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  stage211_main "$@"
+fi

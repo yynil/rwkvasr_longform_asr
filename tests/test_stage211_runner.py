@@ -5378,6 +5378,70 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert '.requested_alignment_stage_order == ["rwkv_layer", "block", "logits", "sft"]' in script
     assert "post_mixer" in script
     assert "tmux kill-session" not in script
+    assert '[[ "${BASH_SOURCE[0]}" == "$0" ]]' in script
+
+
+def _choose_stage211_continuation_stage(tmp_path: Path, summary: dict[str, object]) -> str:
+    output_root = tmp_path / "runs"
+    summary_path = output_root / "stage211a_mixer_full_data_3ep" / "curriculum_complete.json"
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    script = REPO_ROOT / "scripts" / "watch_stage211_strict_continuation.sh"
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; stage211_choose_start_stage', "_", str(script)],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "FULL_OUTPUT_ROOT": str(output_root),
+            "PHASE_GATE_ROOT": str(tmp_path / "gates"),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_stage211_continuation_watcher_routes_legacy_four_segment_summary_to_full(
+    tmp_path: Path,
+) -> None:
+    assert (
+        _choose_stage211_continuation_stage(
+            tmp_path,
+            {
+                "pipeline": "stage211",
+                "artifact": "full_phase_curriculum",
+                "phase": "mixer",
+                "complete": True,
+                "full_data_coverage": {
+                    "segments": [
+                        {"difficulty": difficulty, "epochs": 3}
+                        for difficulty in ("easy", "medium", "hard", "long")
+                    ]
+                },
+            },
+        )
+        == "full"
+    )
+
+
+def test_stage211_continuation_watcher_routes_complete_supplemental_to_post_mixer(
+    tmp_path: Path,
+) -> None:
+    assert (
+        _choose_stage211_continuation_stage(
+            tmp_path,
+            {
+                "pipeline": "stage211",
+                "artifact": "full_phase_curriculum",
+                "phase": "mixer",
+                "complete": True,
+                "full_data_coverage": {"supplemental_natural": {"complete": True, "epochs": 3}},
+            },
+        )
+        == "post_mixer"
+    )
 
 
 def _run_stage211_continuation_watcher_fixture(
