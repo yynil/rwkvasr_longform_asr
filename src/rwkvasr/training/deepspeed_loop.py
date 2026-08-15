@@ -8670,6 +8670,18 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 extra_state=epoch_extra,
                 save_deepspeed_sharded=bool(config.save_deepspeed_sharded_checkpoints),
             )
+            _maybe_barrier()
+            if _is_rank_zero() and config.periodic_checkpoint_keep_last is None:
+                saved_step_records = [
+                    record
+                    for record in step_checkpoint_history
+                    if record.get("deepspeed_checkpoint_dir") or record.get("checkpoint_path")
+                ]
+                _prune_deepspeed_step_checkpoint_artifacts(
+                    top_records=best_step_checkpoints,
+                    saved_records=saved_step_records,
+                )
+            _maybe_barrier()
             if _is_rank_zero():
                 eval_loss_text = f"{epoch_eval_loss:.4f}" if epoch_eval_valid else "skipped"
                 _rank_zero_log(

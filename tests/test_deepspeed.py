@@ -18,6 +18,7 @@ from rwkvasr.training.deepspeed_loop import (
     _ctc_frame_group_sums,
     _ctc_teacher_layer_hidden_loss,
     _ctc_teacher_top1_nonblank_mask,
+    _capture_student_sensevoice_layer_hiddens,
     _finalize_layer_eval_metrics,
     _maybe_load_initial_model_checkpoint,
     _materialize_step_eval_batches,
@@ -435,6 +436,61 @@ def test_teacher_forced_layer_alignment_matches_direct_layer_forwards() -> None:
                 helper_outputs[layer_id][component],
                 direct_outputs[layer_id][component],
             )
+
+
+def test_stacked_layer_capture_reconstructs_same_forward_residuals() -> None:
+    torch.manual_seed(2705)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    encoder = model.encoder.sensevoice_encoder
+    selected = (0, 2)
+    layer_inputs: dict[int, torch.Tensor] = {}
+    input_handles = []
+    for layer_id in selected:
+        input_handles.append(
+            encoder.layers[layer_id].register_forward_pre_hook(
+                lambda _module, args, target_id=layer_id: layer_inputs.__setitem__(
+                    target_id,
+                    args[0],
+                )
+            )
+        )
+
+    try:
+        with _capture_student_sensevoice_layer_hiddens(model, selected) as captured:
+            _, encoded_lengths, _ = model.encoder(
+                torch.randn(2, 7, 80),
+                torch.tensor([7, 4]),
+            )
+    finally:
+        for handle in input_handles:
+            handle.remove()
+
+    assert torch.equal(encoded_lengths, torch.tensor([7, 4]))
+    assert set(captured) == set(selected)
+    assert set(layer_inputs) == set(selected)
+    for layer_id in selected:
+        assert set(captured[layer_id]) == {"mixer", "ffn", "block"}
+        post_mixer = captured[layer_id]["mixer"]
+        if encoder.layers[layer_id].input_dim == encoder.layers[layer_id].hidden_dim:
+            post_mixer = layer_inputs[layer_id] + post_mixer
+        assert torch.equal(
+            captured[layer_id]["block"],
+            post_mixer + captured[layer_id]["ffn"],
+        )
 
 
 def test_layer_hidden_loss_matches_identical_sampled_components() -> None:
@@ -984,7 +1040,14 @@ def test_train_ctc_model_deepspeed_keeps_top_k_step_checkpoints(tmp_path: Path) 
     assert len(step_metrics["step_checkpoints"]) == 2
     assert len(step_metrics["best"]) == 1
     remaining = sorted(path.name for path in out_dir.glob("step-*.pt"))
-    assert len(remaining) == 1
+    assert remaining == [Path(step_metrics["best"][0]["checkpoint_path"]).name]
+    remaining_ds = sorted(path.name for path in (out_dir / "ds_checkpoints").glob("step-*"))
+    assert remaining_ds == [
+        Path(step_metrics["best"][0]["deepspeed_checkpoint_dir"]).name
+    ]
+    latest = load_yaml(out_dir / "latest_checkpoint.yaml")
+    assert Path(latest["checkpoint_path"]).name == "epoch-1.pt"
+    assert Path(latest["checkpoint_path"]).is_file()
 
 
 def test_normalize_deepspeed_config_does_not_force_cpu_offload() -> None:
