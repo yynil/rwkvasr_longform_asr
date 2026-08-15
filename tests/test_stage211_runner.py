@@ -1258,6 +1258,47 @@ def test_stage211_hourly_monitor_resolves_one_config_from_four_ranks(
     assert result.stdout.splitlines() == ["/tmp/stage211_active.yaml"]
 
 
+def test_stage211_hourly_monitor_invokes_social_pcm_progress_reporter(
+    tmp_path: Path,
+) -> None:
+    monitor_script = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+    inventory = tmp_path / "materialized_inventory.json"
+    inventory.write_text("{}\n", encoding="utf-8")
+    output_root = tmp_path / "filtered"
+    output_root.mkdir()
+    reporter = tmp_path / "reporter.py"
+    reporter.write_text(
+        "import sys\nprint('reporter_args=' + '|'.join(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; stage211_emit_social_pcm_progress',
+            "stage211-monitor-test",
+            str(monitor_script),
+        ],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "MONITOR_PYTHON": sys.executable,
+            "SOCIAL_PCM_INVENTORY": str(inventory),
+            "SOCIAL_PCM_OUTPUT_ROOT": str(output_root),
+            "SOCIAL_PCM_PROGRESS_REPORTER": str(reporter),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (
+        f"reporter_args=--materialized-inventory|{inventory}|--output-root|{output_root}"
+    )
+
+
 def test_stage211_calibration_eval_validator_cli_loads() -> None:
     result = subprocess.run(
         [

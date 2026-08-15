@@ -11,6 +11,9 @@ PHASE_GATE_ROOT="${PHASE_GATE_ROOT:-${HOME}/rwkvasr_eval/stage211_phase_gates}"
 MONITOR_LOG="${MONITOR_LOG:-${OUTPUT_ROOT}/monitor_hourly.log}"
 BASE_PUBLIC_OVERLAP_ROOT="${BASE_PUBLIC_OVERLAP_ROOT:-${HOME}/rwkvasr_data/stage211_base_public_pcm_overlap_v1}"
 SUPPLEMENTAL_PROGRESS_REPORTER="${SUPPLEMENTAL_PROGRESS_REPORTER:-${REPO_ROOT}/scripts/report_stage211_base_public_pcm_progress.py}"
+SOCIAL_PCM_INVENTORY="${SOCIAL_PCM_INVENTORY:-${HOME}/rwkvasr_data/stage211_social_vad_materialized_v1/materialized_inventory.json}"
+SOCIAL_PCM_OUTPUT_ROOT="${SOCIAL_PCM_OUTPUT_ROOT:-${HOME}/rwkvasr_data/stage211_social_vad_filtered_v1}"
+SOCIAL_PCM_PROGRESS_REPORTER="${SOCIAL_PCM_PROGRESS_REPORTER:-${REPO_ROOT}/scripts/report_stage211_social_pcm_progress.py}"
 MONITOR_PYTHON="${MONITOR_PYTHON:-${REPO_ROOT}/.venv/bin/python3}"
 POLL_SECONDS="${POLL_SECONDS:-3600}"
 RECENT_LOG_MINUTES="${RECENT_LOG_MINUTES:-90}"
@@ -131,6 +134,19 @@ stage211_current_attempt_errors() {
     tail -n 3 || true
 }
 
+stage211_emit_social_pcm_progress() {
+  if [[ -x "${MONITOR_PYTHON}" && -f "${SOCIAL_PCM_PROGRESS_REPORTER}" && \
+    -s "${SOCIAL_PCM_INVENTORY}" ]]; then
+    nice -n 10 "${MONITOR_PYTHON}" "${SOCIAL_PCM_PROGRESS_REPORTER}" \
+      --materialized-inventory "${SOCIAL_PCM_INVENTORY}" \
+      --output-root "${SOCIAL_PCM_OUTPUT_ROOT}" 2>&1 || true
+  else
+    printf 'unavailable inventory=%s output_root=%s reporter=%s python=%s\n' \
+      "${SOCIAL_PCM_INVENTORY}" "${SOCIAL_PCM_OUTPUT_ROOT}" \
+      "${SOCIAL_PCM_PROGRESS_REPORTER}" "${MONITOR_PYTHON}"
+  fi
+}
+
 stage211_recent_logs() {
   local root
   for root in "$@"; do
@@ -193,6 +209,8 @@ stage211_emit_snapshot() {
     printf 'unavailable root=%s reporter=%s python=%s\n' \
       "${BASE_PUBLIC_OVERLAP_ROOT}" "${SUPPLEMENTAL_PROGRESS_REPORTER}" "${MONITOR_PYTHON}"
   fi
+  printf '%s\n' '-- social exact PCM prefilter --'
+  stage211_emit_social_pcm_progress
   printf '%s\n' '-- recent training records --'
   while IFS= read -r -d '' log_path; do
     latest_record="$(stage211_latest_training_record "${log_path}")"
