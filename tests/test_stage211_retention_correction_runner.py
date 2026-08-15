@@ -128,3 +128,45 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     assert provenance["early_stopping"] is False
     assert len(provenance["admission_gate_sha256"]) == 64
     assert provenance["smoke_marker_sha256"] == runner.sha256_file(smoke_marker)
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_lr"),
+    (("block", 1.0e-6), ("logits", 1.5e-7)),
+)
+def test_stage211_downstream_correction_provenance_records_phase_objective_with_frozen_nano_path(
+    tmp_path: Path,
+    phase: str,
+    expected_lr: float,
+) -> None:
+    inputs = {
+        name: tmp_path / name
+        for name in (
+            "replay.json",
+            "manifest.json",
+            "gate.json",
+            "init.pt",
+            "model.pt",
+            "smoke.json",
+        )
+    }
+    for path in inputs.values():
+        path.write_bytes(path.name.encode())
+
+    provenance = runner._provenance_payload(
+        round_index=2,
+        run_dir=tmp_path / "run",
+        replay_receipt=inputs["replay.json"],
+        replay_manifest=inputs["manifest.json"],
+        admission_gate=inputs["gate.json"],
+        init_checkpoint=inputs["init.pt"],
+        nano_checkpoint=inputs["model.pt"],
+        smoke_marker=inputs["smoke.json"],
+        steps_per_epoch=321,
+        phase=phase,
+    )
+
+    assert provenance["phase"] == phase
+    assert provenance["learning_rate"] == expected_lr
+    assert provenance["trainable_boundary"] == "mixer_only"
+    assert provenance["early_stopping"] is False
