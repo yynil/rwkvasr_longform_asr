@@ -339,6 +339,57 @@ def _write_immutable(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(rendered, encoding="utf-8")
 
 
+def create_or_validate_receipt(
+    *,
+    calibration_reuse_receipt_path: Path,
+    nano_checkpoint: Path,
+    output: Path,
+) -> tuple[dict[str, Any], str]:
+    calibration_reuse_receipt_path = calibration_reuse_receipt_path.expanduser().resolve()
+    nano_checkpoint = nano_checkpoint.expanduser().resolve()
+    output = output.expanduser().resolve()
+    if output.exists():
+        calibration = _load_json(
+            calibration_reuse_receipt_path,
+            label="Stage211 calibration reuse receipt",
+        )
+        calibration_checkpoint = Path(str(calibration.get("checkpoint_path") or "")).resolve()
+        calibration_checkpoint_sha256 = sha256_file(calibration_checkpoint)
+        if calibration.get("checkpoint_sha256") != calibration_checkpoint_sha256:
+            raise ValueError("Stage211 calibration checkpoint binding is invalid.")
+        nano_checkpoint_sha256 = sha256_file(nano_checkpoint)
+        validated = validate_stage211_initialization_receipt(
+            output,
+            expected_calibration_checkpoint=calibration_checkpoint,
+            expected_nano_checkpoint_sha256=nano_checkpoint_sha256,
+        )
+        expected_inputs = {
+            "calibration_reuse_receipt_path": str(calibration_reuse_receipt_path),
+            "calibration_reuse_receipt_sha256": sha256_file(calibration_reuse_receipt_path),
+            "calibration_checkpoint_path": str(calibration_checkpoint),
+            "calibration_checkpoint_sha256": calibration_checkpoint_sha256,
+            "nano_checkpoint_path": str(nano_checkpoint),
+            "nano_checkpoint_sha256": nano_checkpoint_sha256,
+        }
+        if any(validated.get(key) != value for key, value in expected_inputs.items()):
+            raise ValueError(
+                "Stage211 existing initialization receipt caller input binding mismatch."
+            )
+        return validated, "reused"
+
+    receipt = build_receipt(
+        calibration_reuse_receipt_path=calibration_reuse_receipt_path,
+        nano_checkpoint=nano_checkpoint,
+    )
+    _write_immutable(output, receipt)
+    validated = validate_stage211_initialization_receipt(
+        output,
+        expected_calibration_checkpoint=Path(receipt["calibration_checkpoint_path"]),
+        expected_nano_checkpoint_sha256=receipt["nano_checkpoint_sha256"],
+    )
+    return validated, "created"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Create the immutable Stage211 Nano QKV/MLP/decoder/head initialization proof."
@@ -351,18 +402,14 @@ def main() -> int:
     parser.add_argument("--nano-checkpoint", type=Path, default=DEFAULT_NANO_CHECKPOINT)
     parser.add_argument("--output", type=Path, default=DEFAULT_STAGE211_INITIALIZATION_RECEIPT)
     args = parser.parse_args()
-    receipt = build_receipt(
+    receipt, status = create_or_validate_receipt(
         calibration_reuse_receipt_path=args.calibration_reuse_receipt,
         nano_checkpoint=args.nano_checkpoint,
-    )
-    _write_immutable(args.output, receipt)
-    validate_stage211_initialization_receipt(
-        args.output,
-        expected_calibration_checkpoint=Path(receipt["calibration_checkpoint_path"]),
-        expected_nano_checkpoint_sha256=receipt["nano_checkpoint_sha256"],
+        output=args.output,
     )
     print(
         f"initialization_receipt={args.output.expanduser().resolve()} "
+        f"status={status} "
         f"nano_sha256={receipt['nano_checkpoint_sha256']} "
         f"exact_audited_tensors={receipt['frozen_tensor_audit']['non_attention_mlp_norm_tensors'] + receipt['frozen_tensor_audit']['ctc_decoder_tensors']} "
         f"head_rows={receipt['frozen_tensor_audit']['ctc_head_project_rows']}",

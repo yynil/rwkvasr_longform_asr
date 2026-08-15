@@ -191,6 +191,69 @@ def test_initialization_receipt_audits_exact_nano_frozen_tensors(tmp_path: Path)
         validate_stage211_initialization_receipt(output)
 
 
+def test_initialization_cli_reuses_deep_validated_immutable_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calibration_receipt, nano_checkpoint = _write_production_shaped_inputs(tmp_path)
+    receipt = receipt_builder.build_receipt(
+        calibration_reuse_receipt_path=calibration_receipt,
+        nano_checkpoint=nano_checkpoint,
+    )
+    output = tmp_path / "initialization-receipt.json"
+    receipt_builder._write_immutable(output, receipt)
+    original_bytes = output.read_bytes()
+    monkeypatch.setattr(
+        receipt_builder,
+        "build_receipt",
+        lambda **kwargs: pytest.fail("existing receipt must not be rebuilt"),
+    )
+
+    validated, status = receipt_builder.create_or_validate_receipt(
+        calibration_reuse_receipt_path=calibration_receipt,
+        nano_checkpoint=nano_checkpoint,
+        output=output,
+    )
+
+    assert status == "reused"
+    assert validated["loader_source_chain_passed"] is True
+    assert output.read_bytes() == original_bytes
+
+
+def test_initialization_cli_creates_receipt_only_when_absent(tmp_path: Path) -> None:
+    calibration_receipt, nano_checkpoint = _write_production_shaped_inputs(tmp_path)
+    output = tmp_path / "initialization-receipt.json"
+
+    validated, status = receipt_builder.create_or_validate_receipt(
+        calibration_reuse_receipt_path=calibration_receipt,
+        nano_checkpoint=nano_checkpoint,
+        output=output,
+    )
+
+    assert status == "created"
+    assert validated["loader_source_chain_passed"] is True
+    assert output.is_file()
+
+
+def test_initialization_cli_rejects_different_caller_receipt(tmp_path: Path) -> None:
+    calibration_receipt, nano_checkpoint = _write_production_shaped_inputs(tmp_path)
+    receipt = receipt_builder.build_receipt(
+        calibration_reuse_receipt_path=calibration_receipt,
+        nano_checkpoint=nano_checkpoint,
+    )
+    output = tmp_path / "initialization-receipt.json"
+    receipt_builder._write_immutable(output, receipt)
+    alternate_receipt = tmp_path / "alternate-calibration-reuse.json"
+    alternate_receipt.write_bytes(calibration_receipt.read_bytes())
+
+    with pytest.raises(ValueError, match="caller input binding mismatch"):
+        receipt_builder.create_or_validate_receipt(
+            calibration_reuse_receipt_path=alternate_receipt,
+            nano_checkpoint=nano_checkpoint,
+            output=output,
+        )
+
+
 def test_initialization_loader_source_accepts_only_recorded_git_evolution() -> None:
     source = REPO_ROOT / "src" / "rwkvasr" / "modules" / "rwkv_asr_ctc.py"
 
