@@ -1846,6 +1846,32 @@ def test_stage211_audio_bucket_storage_audit_binds_runtime_paths(
     )
     assert config["webdataset_root"] == str(webdataset_root.resolve())
     assert config["webdataset_length_index_path"] == str(length_index.resolve())
+    assert config["webdataset_bucket_manifest_path"] == str(manifest)
+    assert config["webdataset_split"] == "train"
+
+    changed = dict(config)
+    changed["webdataset_split"] = "easy"
+    with pytest.raises(ValueError, match="webdataset_split=train"):
+        stage211._validate_runtime_data_binding(
+            config=changed,
+            phase=phase,
+            bucket_manifest=manifest,
+            audio_data_audit=audit,
+            labeled_webdataset_root=None,
+            labeled_length_index=None,
+        )
+
+    changed = dict(config)
+    changed["webdataset_bucket_manifest_path"] = str(tmp_path / "old-easy-manifest.json")
+    with pytest.raises(ValueError, match="differs from the admitted manifest"):
+        stage211._validate_runtime_data_binding(
+            config=changed,
+            phase=phase,
+            bucket_manifest=manifest,
+            audio_data_audit=audit,
+            labeled_webdataset_root=None,
+            labeled_length_index=None,
+        )
 
 
 def _config_for_phase(
@@ -2573,6 +2599,8 @@ def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
     assert admitted.returncode == 0, admitted.stderr
     assert "difficulty=medium" in admitted.stdout
     assert "full_data_profile=true" in admitted.stdout
+    assert "loader_split=train" in admitted.stdout
+    assert "split=easy" not in admitted.stdout
     assert "target_step=1003713" in admitted.stdout
 
 

@@ -865,6 +865,46 @@ def _zero_output_weights(config: dict[str, Any]) -> None:
         config[key] = 0.0
 
 
+def _validate_runtime_data_binding(
+    *,
+    config: dict[str, Any],
+    phase: AlignmentPhase,
+    bucket_manifest: Path,
+    audio_data_audit: dict[str, Any] | None,
+    labeled_webdataset_root: Path | None,
+    labeled_length_index: Path | None,
+) -> None:
+    if str(config.get("webdataset_split") or "") != "train":
+        raise ValueError("Stage211 runtime config must use webdataset_split=train.")
+    configured_manifest = (
+        Path(str(config.get("webdataset_bucket_manifest_path") or "")).expanduser().resolve()
+    )
+    if configured_manifest != bucket_manifest.expanduser().resolve():
+        raise ValueError(
+            "Stage211 runtime config bucket manifest differs from the admitted manifest."
+        )
+    if phase.requires_labels:
+        if labeled_webdataset_root is None or labeled_length_index is None:
+            raise ValueError("Stage211 labeled runtime data binding is incomplete.")
+        expected_root = labeled_webdataset_root.expanduser().resolve()
+        expected_length_index = labeled_length_index.expanduser().resolve()
+    elif audio_data_audit is not None:
+        expected_root = Path(str(audio_data_audit["webdataset_root"])).expanduser().resolve()
+        expected_length_index = (
+            Path(str(audio_data_audit["length_index_path"])).expanduser().resolve()
+        )
+    else:
+        return
+    configured_root = Path(str(config.get("webdataset_root") or "")).expanduser().resolve()
+    configured_length_index = (
+        Path(str(config.get("webdataset_length_index_path") or "")).expanduser().resolve()
+    )
+    if configured_root != expected_root:
+        raise ValueError("Stage211 runtime config WebDataset root differs from its data audit.")
+    if configured_length_index != expected_length_index:
+        raise ValueError("Stage211 runtime config length index differs from its data audit.")
+
+
 def _config(
     *,
     phase: AlignmentPhase,
@@ -1017,8 +1057,17 @@ def _config(
                 "webdataset_root": str(audio_data_audit["webdataset_root"]),
                 "webdataset_length_index_path": str(audio_data_audit["length_index_path"]),
                 "webdataset_bucket_manifest_path": str(bucket_manifest),
+                "webdataset_split": "train",
             }
         )
+    _validate_runtime_data_binding(
+        config=config,
+        phase=phase,
+        bucket_manifest=bucket_manifest,
+        audio_data_audit=audio_data_audit,
+        labeled_webdataset_root=labeled_webdataset_root,
+        labeled_length_index=labeled_length_index,
+    )
     return config
 
 
@@ -1621,9 +1670,7 @@ def main() -> int:
     ):
         target_step = int(segment["target_step"])
         print(
-            f"segment={segment['name']} "
-            f"split={'labeled_train' if phase.requires_labels else segment['split'].name} "
-            f"target_step={target_step}",
+            f"segment={segment['name']} loader_split=train target_step={target_step}",
             flush=True,
         )
         if latest_step >= target_step:
