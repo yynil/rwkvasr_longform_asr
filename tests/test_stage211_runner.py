@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -2987,6 +2989,25 @@ def test_stage211_full_phase_admits_only_receipt_bound_difficulty_manifests(
             manifests=runtime_manifests,
             receipt=receipt,
         )
+
+
+def test_stage211_full_phase_revalidates_manifests_before_every_segment_runner() -> None:
+    tree = ast.parse(inspect.getsource(stage211_full_phase.run_phase))
+    call_lines: dict[str, list[int]] = {
+        "_require_loaded_manifest_bindings": [],
+        "_runner_command": [],
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id in call_lines:
+            call_lines[node.func.id].append(node.lineno)
+
+    revalidation_lines = sorted(call_lines["_require_loaded_manifest_bindings"])
+    runner_lines = sorted(call_lines["_runner_command"])
+    assert len(revalidation_lines) == 2
+    assert len(runner_lines) == 2
+    assert all(revalidation < runner for revalidation, runner in zip(revalidation_lines, runner_lines))
 
 
 def test_stage211_loaded_manifest_receipt_rejects_runtime_manifest_rewrite(

@@ -760,9 +760,10 @@ def run_phase(args: argparse.Namespace) -> Path | None:
         require_training_ready=not args.dry_run,
         verify_part_sha256=False,
     )
+    loaded_manifest_receipt: dict[str, Any] | None = None
     if not args.dry_run:
         validate_stage211_formal_supplemental_profile(supplemental_profile)
-        _validate_loaded_manifest_bindings(
+        loaded_manifest_receipt = _validate_loaded_manifest_bindings(
             manifests=manifests,
             receipt_path=Path(
                 getattr(
@@ -815,6 +816,11 @@ def run_phase(args: argparse.Namespace) -> Path | None:
     current_init = init_checkpoint
     preceding_receipt: Path | None = None
     for index, difficulty in enumerate(STAGE211_AUDIO_CURRICULUM):
+        if loaded_manifest_receipt is not None:
+            _require_loaded_manifest_bindings(
+                manifests=manifests,
+                receipt=loaded_manifest_receipt,
+            )
         run_dir = phase_root / difficulty
         receipt_path = phase_root / "receipts" / f"{difficulty}.json"
         target_step = int(STAGE211_AUDIO_CURRICULUM[difficulty]["steps"])
@@ -916,6 +922,11 @@ def run_phase(args: argparse.Namespace) -> Path | None:
     )
     supplemental_target_step = int(supplemental_profile["steps"])
     supplemental_latest_step = _latest_step(supplemental_run_dir)
+    if loaded_manifest_receipt is not None:
+        _require_loaded_manifest_bindings(
+            manifests=manifests,
+            receipt=loaded_manifest_receipt,
+        )
     supplemental_runner = _runner_command(
         phase=phase,
         difficulty=STAGE211_SUPPLEMENTAL_DIFFICULTY,
