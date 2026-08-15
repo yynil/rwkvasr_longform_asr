@@ -360,6 +360,83 @@ def test_teacher_forced_layer_alignment_uses_teacher_inputs_and_layer_zero_v_fir
     assert encoder.layers[1].time_mixer.forward_mixer.value.weight.grad is not None
 
 
+def test_teacher_forced_layer_alignment_matches_direct_layer_forwards() -> None:
+    torch.manual_seed(2704)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    row_lengths = (5, 3)
+    records: dict[str, dict[str, object]] = {}
+    for utt_id, length in zip(("utt-a", "utt-b"), row_lengths, strict=True):
+        records[utt_id] = {
+            "encoder_layer_hiddens": {
+                "0": {"input": torch.randn(length, 80)},
+                "1": {"input": torch.randn(length, 64)},
+                "2": {"input": torch.randn(length, 64)},
+            }
+        }
+
+    helper_outputs, helper_lengths = _teacher_forced_student_layer_hiddens(
+        model,
+        records,
+        ("utt-a", "utt-b"),
+        layer_ids=(0, 1, 2),
+        missing_policy="error",
+    )
+
+    encoder = model.encoder.sensevoice_encoder
+    direct_inputs: dict[int, torch.Tensor] = {}
+    for layer_id, feature_dim in ((0, 80), (1, 64), (2, 64)):
+        direct_input = torch.zeros(2, max(row_lengths), feature_dim)
+        for sample_idx, (utt_id, length) in enumerate(zip(("utt-a", "utt-b"), row_lengths, strict=True)):
+            direct_input[sample_idx, :length] = records[utt_id]["encoder_layer_hiddens"][str(layer_id)]["input"]
+        direct_inputs[layer_id] = direct_input
+
+    direct_lengths = torch.tensor(row_lengths)
+    direct_outputs: dict[int, dict[str, torch.Tensor]] = {}
+    v_first = None
+    for layer_id, layer in enumerate(encoder.layers):
+        captured: dict[str, torch.Tensor] = {}
+        mixer_handle = layer.time_mixer.register_forward_hook(
+            lambda _module, _args, output, target=captured: target.__setitem__("mixer", output[0])
+        )
+        ffn_handle = layer.feed_forward.register_forward_hook(
+            lambda _module, _args, output, target=captured: target.__setitem__("ffn", output)
+        )
+        try:
+            block, next_v_first, _ = layer(
+                direct_inputs[layer_id],
+                v_first=v_first,
+                lengths=direct_lengths,
+            )
+        finally:
+            mixer_handle.remove()
+            ffn_handle.remove()
+        direct_outputs[layer_id] = {**captured, "block": block}
+        if layer_id == 0:
+            v_first = next_v_first
+
+    assert torch.equal(helper_lengths, direct_lengths)
+    for layer_id in range(3):
+        for component in ("mixer", "ffn", "block"):
+            assert torch.equal(
+                helper_outputs[layer_id][component],
+                direct_outputs[layer_id][component],
+            )
+
+
 def test_layer_hidden_loss_matches_identical_sampled_components() -> None:
     student_hiddens = {
         layer_id: {
