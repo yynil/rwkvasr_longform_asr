@@ -144,6 +144,7 @@ def _run_public_eval(
         "CTC_NUM_WORKERS": "0",
         "CTC_SHARD_STAGE2": "1",
         "CTC_LIMIT": "0",
+        "CTC_TEXT_NORMALIZATION": "ctc",
         "RUN_AR": "0",
         "METRIC_NORMALIZATION": "ctc",
     }

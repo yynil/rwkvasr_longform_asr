@@ -263,6 +263,8 @@ def test_stage211_public_eval_shards_large_second_stage(
     assert len(calls) == 1
     assert calls[0][1] is not None
     assert calls[0][1]["CTC_SHARD_STAGE2"] == "1"
+    assert calls[0][1]["CTC_TEXT_NORMALIZATION"] == "ctc"
+    assert calls[0][1]["METRIC_NORMALIZATION"] == "ctc"
 
 
 def test_stage211_public_eval_preflight_binds_canonical_directories(
@@ -968,6 +970,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert '--inventory "${SUPPLEMENTAL_INVENTORY}"' in script
     assert '--output "${SUPPLEMENTAL_PROFILE_RECEIPT}"' in script
     assert "supplemental inventory and immutable profile receipt validated" in script
+    assert "CTC_TEXT_NORMALIZATION=ctc" in script
 
     main_body = script[script.index("main() {") :]
     readiness_offset = main_body.index("wait_for_supplemental_training_data")
