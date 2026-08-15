@@ -48,7 +48,14 @@ DEFAULT_REPLAY_RECEIPT = (
     Path.home()
     / "rwkvasr_data"
     / "stage211_full_curriculum"
-    / "retention_replay_v1"
+    / "retention_replay_v2"
+    / "receipt.json"
+)
+DEFAULT_STRATIFIED_HIDDEN_RECEIPT = (
+    Path.home()
+    / "rwkvasr_data"
+    / "stage211_full_curriculum"
+    / "stratified_hidden_eval_v2"
     / "receipt.json"
 )
 DEFAULT_PUBLIC_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
@@ -126,6 +133,14 @@ def _finalizer_command(
         str(args.public_manifest_dir),
         "--nano-prediction-dir",
         str(args.nano_prediction_dir),
+        "--stratified-hidden-receipt",
+        str(
+            getattr(
+                args,
+                "stratified_hidden_receipt",
+                DEFAULT_STRATIFIED_HIDDEN_RECEIPT,
+            )
+        ),
         "--devices",
         str(args.devices),
     ]
@@ -431,6 +446,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--replay-receipt", type=Path, default=DEFAULT_REPLAY_RECEIPT)
     parser.add_argument(
+        "--stratified-hidden-receipt",
+        type=Path,
+        default=DEFAULT_STRATIFIED_HIDDEN_RECEIPT,
+    )
+    parser.add_argument(
         "--public-manifest-dir",
         type=Path,
         default=DEFAULT_PUBLIC_MANIFEST_DIR,
@@ -477,6 +497,7 @@ def main() -> int:
         "correction_run_root",
         "correction_gate_root",
         "replay_receipt",
+        "stratified_hidden_receipt",
         "public_manifest_dir",
         "nano_prediction_dir",
         "nano_checkpoint",
@@ -488,9 +509,7 @@ def main() -> int:
         setattr(args, name, value.expanduser().resolve())
     if args.validate_selection_only:
         if not args.selection.is_file():
-            raise ValueError(
-                f"Stage211 selected {_phase(args)} gate is missing: {args.selection}"
-            )
+            raise ValueError(f"Stage211 selected {_phase(args)} gate is missing: {args.selection}")
         selected = _validate_existing_selection(
             args.selection,
             nano_checkpoint=args.nano_checkpoint,

@@ -62,6 +62,8 @@ _STAGE211_ALIGNMENT_STRATIFIED_CELLS = {
     "hard_en",
     "hard_zh",
     "long_zh",
+    "supplemental_en",
+    "supplemental_zh",
 }
 _STAGE211_ALIGNMENT_STRATIFIED_SAMPLES = STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES * len(
     _STAGE211_ALIGNMENT_STRATIFIED_CELLS
@@ -352,9 +354,7 @@ def sha256_file(path: str | Path) -> str:
 def stage211_sft_ctc_suppressed_token_ids() -> tuple[int, ...]:
     tokenizer_model_path = Path(__file__).resolve().parents[3] / _STAGE211_TOKENIZER_MODEL_PATH
     if not tokenizer_model_path.is_file():
-        raise FileNotFoundError(
-            f"Stage211 tokenizer model is unavailable: {tokenizer_model_path}"
-        )
+        raise FileNotFoundError(f"Stage211 tokenizer model is unavailable: {tokenizer_model_path}")
     tokenizer = build_text_tokenizer(
         "sensevoice_tiktoken",
         model_path=str(tokenizer_model_path),
@@ -396,9 +396,7 @@ def stage211_phase_train_config_contract(phase: str) -> dict[str, Any]:
     if phase == "sft":
         suppressed_token_ids = list(stage211_sft_ctc_suppressed_token_ids())
         contract["ctc_suppressed_token_ids"] = suppressed_token_ids
-        contract["ctc_teacher_online_project_ignored_token_ids"] = list(
-            suppressed_token_ids
-        )
+        contract["ctc_teacher_online_project_ignored_token_ids"] = list(suppressed_token_ids)
     return {
         key: list(value) if isinstance(value, list) else value for key, value in contract.items()
     }
@@ -1592,7 +1590,7 @@ def _validate_stage211_stratified_component_summary(
             _stage211_alignment_float(row.get(key), label=f"{label} weak band {band_name} {key}")
     cells = value.get("cells")
     if not isinstance(cells, dict) or set(cells) != _STAGE211_ALIGNMENT_STRATIFIED_CELLS:
-        raise ValueError(f"Stage211 {label} seven-cell coverage mismatch.")
+        raise ValueError(f"Stage211 {label} nine-cell coverage mismatch.")
     for cell_name, row in cells.items():
         if not isinstance(row, dict):
             raise ValueError(f"Stage211 {label} cell {cell_name} is invalid.")
@@ -2366,7 +2364,7 @@ def _validate_stage211_retention_replay_binding(
         label="Stage211 retention replay receipt",
     )
     expected = {
-        "schema_version": 1,
+        "schema_version": 2,
         "pipeline": "stage211",
         "artifact": "retention_replay_manifest",
         "unique_keys": replay.get("samples"),
@@ -2410,38 +2408,45 @@ def _validate_stage211_retention_replay_binding(
         sha256_key="capacity_preflight_sha256",
         label="Stage211 retention replay capacity preflight",
     )
-    source_manifests = replay.get("source_manifests")
-    if not isinstance(source_manifests, dict) or set(source_manifests) != {
-        "easy",
-        "medium",
-        "hard",
-        "long",
-    }:
-        raise ValueError("Stage211 retention replay source coverage mismatch.")
-    for difficulty, record in source_manifests.items():
+    for key, label in (
+        ("base_replay_receipt", "base replay receipt"),
+        ("stratified_hidden_eval", "nine-cell stratified receipt"),
+    ):
+        record = replay.get(key)
         if not isinstance(record, dict):
-            raise ValueError(f"Stage211 retention replay {difficulty} binding is invalid.")
+            raise ValueError(f"Stage211 retention replay {label} binding is invalid.")
         _validate_bound_file(
             record,
             path_key="path",
             sha256_key="sha256",
-            label=f"Stage211 retention replay {difficulty} source manifest",
+            label=f"Stage211 retention replay {label}",
         )
-    exclusions = replay.get("exclusions")
-    if not isinstance(exclusions, list) or len(exclusions) != 2:
-        raise ValueError("Stage211 retention replay exclusions are incomplete.")
-    for index, record in enumerate(exclusions):
-        if not isinstance(record, dict):
-            raise ValueError("Stage211 retention replay exclusion binding is invalid.")
+    supplemental = replay.get("supplemental_inputs")
+    if not isinstance(supplemental, dict):
+        raise ValueError("Stage211 retention replay Supplemental binding is invalid.")
+    for path_key, sha256_key, label in (
+        ("inventory_path", "inventory_sha256", "Supplemental inventory"),
+        ("profile_receipt_path", "profile_receipt_sha256", "Supplemental profile"),
+        ("manifest_path", "manifest_sha256", "Supplemental source manifest"),
+    ):
         _validate_bound_file(
-            record,
-            path_key="path",
-            sha256_key="sha256",
-            label=f"Stage211 retention replay exclusion {index}",
+            supplemental,
+            path_key=path_key,
+            sha256_key=sha256_key,
+            label=f"Stage211 retention replay {label}",
         )
-    output_parts = replay.get("output_parts")
+    source_manifest = replay.get("source_manifest")
+    if not isinstance(source_manifest, dict):
+        raise ValueError("Stage211 retention replay source-manifest binding is invalid.")
+    _validate_bound_file(
+        source_manifest,
+        path_key="path",
+        sha256_key="sha256",
+        label="Stage211 retention replay Supplemental source manifest",
+    )
+    output_parts = replay.get("supplemental_output_parts")
     if not isinstance(output_parts, list) or not output_parts:
-        raise ValueError("Stage211 retention replay output-part coverage is empty.")
+        raise ValueError("Stage211 retention replay Supplemental output coverage is empty.")
     for index, record in enumerate(output_parts):
         if not isinstance(record, dict):
             raise ValueError("Stage211 retention replay output-part binding is invalid.")

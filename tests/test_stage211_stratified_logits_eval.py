@@ -13,12 +13,8 @@ from rwkvasr.eval.stage211_gate import sha256_file
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
-logits_gate = importlib.import_module(
-    "scripts.create_stage211_logits_alignment_gate"
-)
-summarizer = importlib.import_module(
-    "scripts.summarize_stage211_stratified_logits_eval"
-)
+logits_gate = importlib.import_module("scripts.create_stage211_logits_alignment_gate")
+summarizer = importlib.import_module("scripts.summarize_stage211_stratified_logits_eval")
 
 
 def _baseline_metrics() -> dict[str, float]:
@@ -217,20 +213,17 @@ def test_stage211_stratified_logits_summary_governs_gate(tmp_path: Path) -> None
         output_path=summary_path,
     )
 
-    assert summary["macro"]["samples"] == 1792
-    assert summary["macro"]["full_kl_relative_reduction"] == pytest.approx(
-        0.20
-    )
-    assert summary["macro"]["baseline_metrics"]["matched_utterances"] == 1792
+    expected_samples = 256 * len(logits_gate.STRATIFIED_CELLS)
+    assert summary["macro"]["samples"] == expected_samples
+    assert summary["macro"]["full_kl_relative_reduction"] == pytest.approx(0.20)
+    assert summary["macro"]["baseline_metrics"]["matched_utterances"] == expected_samples
     assert set(summary["hidden_component_summaries"]) == {
         "mixer",
         "ffn",
         "block",
     }
-    assert summary["hidden_component_summaries"]["ffn"][
-        "baseline_mean_loss"
-    ] == pytest.approx(1.0)
-    assert summary["decoder_hidden"]["cells"] == 7
+    assert summary["hidden_component_summaries"]["ffn"]["baseline_mean_loss"] == pytest.approx(1.0)
+    assert summary["decoder_hidden"]["cells"] == len(logits_gate.STRATIFIED_CELLS)
     assert summary["decoder_hidden"]["candidate_loss"] == pytest.approx(1.0)
 
     legacy_manifest = tmp_path / "legacy-manifest.json"

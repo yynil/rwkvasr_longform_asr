@@ -280,9 +280,7 @@ def test_stage211_public_eval_preflight_binds_canonical_directories(
         {
             "dataset": dataset,
             "manifest_path": str((manifest_dir / f"{dataset}.jsonl").resolve()),
-            "nano_prediction_path": str(
-                (prediction_dir / f"{dataset}.ctc.jsonl").resolve()
-            ),
+            "nano_prediction_path": str((prediction_dir / f"{dataset}.ctc.jsonl").resolve()),
         }
         for dataset in stage211_phase_finalizer.DATASETS
     ]
@@ -582,6 +580,11 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
         + "\n",
         encoding="utf-8",
     )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "validate_stratified_hidden_eval_v2",
+        lambda path: json.loads(path.read_text(encoding="utf-8")),
+    )
     commands: list[list[str]] = []
     monkeypatch.setattr(
         stage211_phase_finalizer,
@@ -669,7 +672,7 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
         for command in commands
         if str(stage211_phase_finalizer.ALIGNMENT_PAIR_EVAL_SCRIPT) in command
     ]
-    assert len(pair_commands) == 8
+    assert len(pair_commands) == 1 + len(stage211_phase_finalizer.STRATIFIED_HIDDEN_CELLS)
     summary_command = next(
         command
         for command in commands
@@ -711,6 +714,11 @@ def test_stage211_mixer_finalizer_runs_stratified_hidden_gate(
         )
         + "\n",
         encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "validate_stratified_hidden_eval_v2",
+        lambda path: json.loads(path.read_text(encoding="utf-8")),
     )
     commands: list[list[str]] = []
     monkeypatch.setattr(
@@ -766,9 +774,9 @@ def test_stage211_mixer_finalizer_runs_stratified_hidden_gate(
         for command in commands
         if str(stage211_phase_finalizer.ALIGNMENT_PAIR_EVAL_SCRIPT) in command
     ]
-    assert len(pair_commands) == 8
+    assert len(pair_commands) == 1 + len(stage211_phase_finalizer.STRATIFIED_HIDDEN_CELLS)
     sidecar_commands = [command for command in pair_commands if "--eval-bucket-manifest" in command]
-    assert len(sidecar_commands) == 7
+    assert len(sidecar_commands) == len(stage211_phase_finalizer.STRATIFIED_HIDDEN_CELLS)
     assert {
         command[command.index("--eval-bucket-manifest") + 1] for command in sidecar_commands
     } == {str(Path(cell["manifest_path"]).resolve()) for cell in stratified_cells.values()}
@@ -971,7 +979,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert "wait_for_supplemental_training_data()" in script
     assert '--inventory "${SUPPLEMENTAL_INVENTORY}"' in script
     assert '--output "${SUPPLEMENTAL_PROFILE_RECEIPT}"' in script
-    assert "supplemental inventory and immutable profile receipt validated" in script
+    assert "supplemental inventory, profile, nine-cell eval, and replay v2 validated" in script
     assert "CTC_TEXT_NORMALIZATION=ctc" in script
 
     main_body = script[script.index("main() {") :]
@@ -989,9 +997,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
             "run_labeled_sft_phase",
         )
     )
-    post_mixer_branch = main_body[
-        main_body.index("post_mixer)") : main_body.index("block)")
-    ]
+    post_mixer_branch = main_body[main_body.index("post_mixer)") : main_body.index("block)")]
     block_branch = main_body[main_body.index("block)") : main_body.index("logits)")]
     for branch in (post_mixer_branch, block_branch):
         offsets = [
@@ -1029,8 +1035,7 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
     call_log = tmp_path / "calls.log"
     uv = fake_bin / "uv"
     uv.write_text(
-        "#!/usr/bin/env bash\n"
-        'printf \'%s\\n\' "$*" >>"${CALL_LOG}"\n',
+        '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >>"${CALL_LOG}"\n',
         encoding="utf-8",
     )
     uv.chmod(0o755)
@@ -1039,9 +1044,9 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
         "#!/usr/bin/env bash\n"
         'name="$(basename "$3" _selected.json)"\n'
         'case "$2" in\n'
-        '  .checkpoint_path) printf \'/tmp/%s-checkpoint.pt\\n\' "$name" ;;\n'
-        '  .promotion_receipt_path) printf \'/tmp/%s-promotion.json\\n\' "$name" ;;\n'
-        '  .gate_dir) printf \'/tmp/%s-gate\\n\' "$name" ;;\n'
+        "  .checkpoint_path) printf '/tmp/%s-checkpoint.pt\\n' \"$name\" ;;\n"
+        "  .promotion_receipt_path) printf '/tmp/%s-promotion.json\\n' \"$name\" ;;\n"
+        "  .gate_dir) printf '/tmp/%s-gate\\n' \"$name\" ;;\n"
         "  *) exit 2 ;;\n"
         "esac\n",
         encoding="utf-8",
@@ -1049,8 +1054,12 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
     jq.chmod(0o755)
     inventory = tmp_path / "supplemental_inventory.json"
     profile = tmp_path / "supplemental_profile_receipt.json"
+    stratified = tmp_path / "stratified_hidden_eval_v2.json"
+    replay = tmp_path / "retention_replay_v2.json"
     inventory.write_text("{}\n", encoding="utf-8")
     profile.write_text("{}\n", encoding="utf-8")
+    stratified.write_text("{}\n", encoding="utf-8")
+    replay.write_text("{}\n", encoding="utf-8")
 
     subprocess.run(
         ["bash", str(REPO_ROOT / "scripts" / "start_stage211_abcd_after_calibration.sh")],
@@ -1063,6 +1072,8 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
             "STAGE211_REPO_ROOT": str(REPO_ROOT),
             "SUPPLEMENTAL_INVENTORY": str(inventory),
             "SUPPLEMENTAL_PROFILE_RECEIPT": str(profile),
+            "STRATIFIED_HIDDEN_RECEIPT": str(stratified),
+            "RETENTION_REPLAY_RECEIPT": str(replay),
             "MIXER_SELECTION": str(tmp_path / "mixer_selected.json"),
             "BLOCK_SELECTION": str(tmp_path / "block_selected.json"),
             "LOGITS_SELECTION": str(tmp_path / "logits_selected.json"),
@@ -1074,9 +1085,7 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
     )
 
     calls = call_log.read_text(encoding="utf-8").splitlines()
-    full_phase_calls = [
-        call for call in calls if "run_stage211_full_phase_curriculum.py" in call
-    ]
+    full_phase_calls = [call for call in calls if "run_stage211_full_phase_curriculum.py" in call]
     if expected_full_phase is None:
         assert full_phase_calls == []
     else:
@@ -1087,9 +1096,7 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
         and ("--phase mixer" in call or "--phase block" in call)
         for call in calls
     )
-    correction_calls = [
-        call for call in calls if "run_stage211_mixer_retention_loop.py" in call
-    ]
+    correction_calls = [call for call in calls if "run_stage211_mixer_retention_loop.py" in call]
     assert len(correction_calls) == 3
     assert "--phase block" in correction_calls[1]
     assert "--phase logits" in correction_calls[2]
@@ -1117,9 +1124,13 @@ def test_stage211_supervisor_waits_before_setup_when_supplemental_is_not_ready(
     uv.chmod(0o755)
     inventory = tmp_path / "supplemental_inventory.json"
     profile = tmp_path / "supplemental_profile_receipt.json"
+    stratified = tmp_path / "stratified_hidden_eval_v2.json"
+    replay = tmp_path / "retention_replay_v2.json"
     if create_inputs:
         inventory.write_text("{}\n", encoding="utf-8")
         profile.write_text("{}\n", encoding="utf-8")
+        stratified.write_text("{}\n", encoding="utf-8")
+        replay.write_text("{}\n", encoding="utf-8")
 
     result = subprocess.run(
         ["bash", str(REPO_ROOT / "scripts" / "start_stage211_abcd_after_calibration.sh")],
@@ -1130,6 +1141,8 @@ def test_stage211_supervisor_waits_before_setup_when_supplemental_is_not_ready(
             "STAGE211_REPO_ROOT": str(REPO_ROOT),
             "SUPPLEMENTAL_INVENTORY": str(inventory),
             "SUPPLEMENTAL_PROFILE_RECEIPT": str(profile),
+            "STRATIFIED_HIDDEN_RECEIPT": str(stratified),
+            "RETENTION_REPLAY_RECEIPT": str(replay),
             "SUPPLEMENTAL_POLL_SECONDS": "3600",
         },
         text=True,
@@ -1311,7 +1324,9 @@ def test_stage211_hourly_monitor_reports_latest_fixed_eval_without_calling_it_pu
 
     assert result.returncode == 0, result.stderr
     assert "fixed_eval_scope=fixed_hidden_not_public_wer_cer status=ok" in result.stdout
-    assert "sentinel_cell=unknown sentinel_language=unknown sentinel_sources=unknown" in result.stdout
+    assert (
+        "sentinel_cell=unknown sentinel_language=unknown sentinel_sources=unknown" in result.stdout
+    )
     assert "baseline_loss=0.1000000000 latest_step=20 latest_loss=0.1750000000" in result.stdout
     assert "delta_abs=+0.0750000000 delta_pct=+75.0000 trend=regressed" in result.stdout
     assert "eval_samples=256" in result.stdout
@@ -1393,8 +1408,7 @@ def test_stage211_hourly_monitor_identifies_sha_bound_easy_zh_sentinel(
 
     assert changed.returncode == 0, changed.stderr
     assert (
-        "sentinel_cell=unknown sentinel_language=unknown sentinel_sources=unknown"
-        in changed.stdout
+        "sentinel_cell=unknown sentinel_language=unknown sentinel_sources=unknown" in changed.stdout
     )
 
 
@@ -2164,10 +2178,7 @@ def test_stage211_sft_phase_uses_labels_after_logits_with_low_teacher_anchors(
     assert 60_514 in suppressed_token_ids
     assert 60_515 not in suppressed_token_ids
     assert config["ctc_suppressed_token_ids"] == suppressed_token_ids
-    assert (
-        config["ctc_teacher_online_project_ignored_token_ids"]
-        == suppressed_token_ids
-    )
+    assert config["ctc_teacher_online_project_ignored_token_ids"] == suppressed_token_ids
     assert config["step_eval_split"] == "eval"
     assert config["freeze_encoder_except_time_mixer"] is True
     assert config["freeze_ctc_decoder"] is True
@@ -3087,7 +3098,9 @@ def test_stage211_full_phase_revalidates_manifests_before_every_segment_runner()
     runner_lines = sorted(call_lines["_runner_command"])
     assert len(revalidation_lines) == 2
     assert len(runner_lines) == 2
-    assert all(revalidation < runner for revalidation, runner in zip(revalidation_lines, runner_lines))
+    assert all(
+        revalidation < runner for revalidation, runner in zip(revalidation_lines, runner_lines)
+    )
 
 
 def test_stage211_loaded_manifest_receipt_rejects_runtime_manifest_rewrite(
@@ -3197,6 +3210,8 @@ _ALIGNMENT_CELLS = (
     "hard_en",
     "hard_zh",
     "long_zh",
+    "supplemental_en",
+    "supplemental_zh",
 )
 _ALIGNMENT_PHASE_COMPONENTS = {
     "mixer": ("mixer",),
@@ -3479,22 +3494,22 @@ def _write_alignment_evidence_fixture(
             "checkpoints": checkpoint_records,
             "cells": cell_results,
             "macro": {
-                "cells": 7,
-                "samples": 1792,
+                "cells": len(_ALIGNMENT_CELLS),
+                "samples": 256 * len(_ALIGNMENT_CELLS),
                 "baseline_metrics": _alignment_logits_metrics(
                     candidate=False,
-                    matched_utterances=1792,
+                    matched_utterances=256 * len(_ALIGNMENT_CELLS),
                 ),
                 "candidate_metrics": _alignment_logits_metrics(
                     candidate=True,
-                    matched_utterances=1792,
+                    matched_utterances=256 * len(_ALIGNMENT_CELLS),
                 ),
                 "full_kl_relative_reduction": 0.2,
                 "conditional_nonblank_kl_relative_reduction": 0.2,
             },
             "hidden_component_summaries": stratified_components,
             "decoder_hidden": {
-                "cells": 7,
+                "cells": len(_ALIGNMENT_CELLS),
                 "baseline_loss": 1.0,
                 "candidate_loss": 0.5,
                 "relative_change_pct": -50.0,
@@ -3527,8 +3542,8 @@ def _write_alignment_evidence_fixture(
             "checkpoints": checkpoint_records,
             "cells": cell_results,
             "macro": {
-                "cells": 7,
-                "samples": 1792,
+                "cells": len(_ALIGNMENT_CELLS),
+                "samples": 256 * len(_ALIGNMENT_CELLS),
                 "baseline_loss": 1.0,
                 "candidate_loss": 0.5,
                 "relative_change_pct": -50.0,
@@ -3545,7 +3560,7 @@ def _write_alignment_evidence_fixture(
             "component_summaries": stratified_components,
             "decoder_hidden": (
                 {
-                    "cells": 7,
+                    "cells": len(_ALIGNMENT_CELLS),
                     "baseline_loss": 1.0,
                     "candidate_loss": 0.5,
                 }
@@ -4225,29 +4240,22 @@ def _write_retention_correction(
     replay_builder.write_text("# builder\n", encoding="utf-8")
     replay_preflight = replay_root / "capacity.json"
     replay_preflight.write_text("{}\n", encoding="utf-8")
-    source_manifests = {}
-    for difficulty in STAGE211_AUDIO_CURRICULUM:
-        path = replay_root / f"{difficulty}.manifest.json"
-        path.write_text("{}\n", encoding="utf-8")
-        source_manifests[difficulty] = {
-            "path": str(path.resolve()),
-            "sha256": sha256_file(path),
-        }
-    exclusions = []
-    for name in ("stratified", "fixed"):
+    bindings = {}
+    for name in (
+        "base-replay",
+        "stratified-v2",
+        "supplemental-inventory",
+        "supplemental-profile",
+        "supplemental-manifest",
+    ):
         path = replay_root / f"{name}.json"
         path.write_text("{}\n", encoding="utf-8")
-        exclusions.append(
-            {
-                "path": str(path.resolve()),
-                "sha256": sha256_file(path),
-            }
-        )
+        bindings[name] = path
     replay_receipt = replay_root / "receipt.json"
     replay_receipt.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "pipeline": "stage211",
                 "artifact": "retention_replay_manifest",
                 "samples": 8,
@@ -4261,9 +4269,27 @@ def _write_retention_correction(
                 },
                 "capacity_preflight_path": str(replay_preflight.resolve()),
                 "capacity_preflight_sha256": sha256_file(replay_preflight),
-                "source_manifests": source_manifests,
-                "exclusions": exclusions,
-                "output_parts": [
+                "base_replay_receipt": {
+                    "path": str(bindings["base-replay"].resolve()),
+                    "sha256": sha256_file(bindings["base-replay"]),
+                },
+                "stratified_hidden_eval": {
+                    "path": str(bindings["stratified-v2"].resolve()),
+                    "sha256": sha256_file(bindings["stratified-v2"]),
+                },
+                "supplemental_inputs": {
+                    "inventory_path": str(bindings["supplemental-inventory"].resolve()),
+                    "inventory_sha256": sha256_file(bindings["supplemental-inventory"]),
+                    "profile_receipt_path": str(bindings["supplemental-profile"].resolve()),
+                    "profile_receipt_sha256": sha256_file(bindings["supplemental-profile"]),
+                    "manifest_path": str(bindings["supplemental-manifest"].resolve()),
+                    "manifest_sha256": sha256_file(bindings["supplemental-manifest"]),
+                },
+                "source_manifest": {
+                    "path": str(bindings["supplemental-manifest"].resolve()),
+                    "sha256": sha256_file(bindings["supplemental-manifest"]),
+                },
+                "supplemental_output_parts": [
                     {
                         "path": str(replay_part.resolve()),
                         "sha256": sha256_file(replay_part),

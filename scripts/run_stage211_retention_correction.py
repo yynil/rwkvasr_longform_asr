@@ -88,7 +88,7 @@ DEFAULT_REPLAY_RECEIPT = (
     Path.home()
     / "rwkvasr_data"
     / "stage211_full_curriculum"
-    / "retention_replay_v1"
+    / "retention_replay_v2"
     / "receipt.json"
 )
 DEFAULT_OUTPUT_ROOT = (
@@ -130,9 +130,7 @@ def _admit_failed_gate(
     )
     if gate.get("gate_passed") is not False:
         phase_label = "Mixer" if phase == "mixer" else phase.capitalize()
-        raise ValueError(
-            f"Stage211 correction requires an explicitly failed {phase_label} gate."
-        )
+        raise ValueError(f"Stage211 correction requires an explicitly failed {phase_label} gate.")
     coverage = gate.get("full_data_coverage")
     if not isinstance(coverage, dict):
         raise ValueError("Stage211 correction admission gate lacks full-data coverage.")
@@ -288,18 +286,14 @@ def _validate_correction_smoke_marker(
     raw_marker = json.loads(marker_path.read_text(encoding="utf-8"))
     if not isinstance(raw_marker, dict):
         raise ValueError("Stage211 correction smoke marker must be a JSON object.")
-    smoke_checkpoint = Path(
-        str(raw_marker.get("smoke_checkpoint_path") or "")
-    ).resolve()
+    smoke_checkpoint = Path(str(raw_marker.get("smoke_checkpoint_path") or "")).resolve()
     marker = _validate_full_profile_smoke_marker(
         marker_path=marker_path,
         phase=phase,
         smoke_run_dir=smoke_checkpoint.parent,
         init_checkpoint=init_checkpoint,
         easy_manifest=replay_manifest,
-        max_peak_reserved_gib=float(
-            raw_marker.get("max_peak_reserved_gib", float("nan"))
-        ),
+        max_peak_reserved_gib=float(raw_marker.get("max_peak_reserved_gib", float("nan"))),
     )
     expected = {
         "schema_version": 1,
@@ -534,9 +528,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         )
     )
     config_dir = (
-        args.config_dir.expanduser().resolve()
-        / phase_name
-        / f"correction_round_{round_index:02d}"
+        args.config_dir.expanduser().resolve() / phase_name / f"correction_round_{round_index:02d}"
     )
     config_dir.mkdir(parents=True, exist_ok=True)
     smoke_marker_path = _run_correction_smoke(
@@ -556,8 +548,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         phase=phase_name,
     )
     print(
-        f"stage211_post_coverage_correction_smoke phase={phase_name} "
-        f"marker={smoke_marker_path}",
+        f"stage211_post_coverage_correction_smoke phase={phase_name} marker={smoke_marker_path}",
         flush=True,
     )
     if not args.dry_run:

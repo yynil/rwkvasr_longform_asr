@@ -35,6 +35,8 @@ STRATIFIED_CELLS = (
     "hard_en",
     "hard_zh",
     "long_zh",
+    "supplemental_en",
+    "supplemental_zh",
 )
 STRATIFIED_EVAL_SAMPLES = 256 * len(STRATIFIED_CELLS)
 MAX_STRATIFIED_CELL_REGRESSION_PCT = 10.0
@@ -60,8 +62,7 @@ def _component_layers(
     layers = components.get(component_name)
     if not isinstance(layers, dict) or set(layers) != {str(index) for index in LAYER_IDS}:
         raise ValueError(
-            f"Stage211 {phase} hidden report does not contain exactly 70 "
-            f"{component_name} layers."
+            f"Stage211 {phase} hidden report does not contain exactly 70 {component_name} layers."
         )
     return layers
 
@@ -120,12 +121,9 @@ def _summary(
 def _fixed_component_gate_passed(summary: dict[str, Any]) -> bool:
     return (
         float(summary["candidate_mean_loss"]) < float(summary["baseline_mean_loss"])
-        and float(summary["candidate_mean_cosine"])
-        > float(summary["baseline_mean_cosine"])
-        and int(summary["loss_improved_layers"])
-        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
-        and int(summary["cosine_improved_layers"])
-        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and float(summary["candidate_mean_cosine"]) > float(summary["baseline_mean_cosine"])
+        and int(summary["loss_improved_layers"]) >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and int(summary["cosine_improved_layers"]) >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
         and all(
             float(row["candidate_loss"]) < float(row["baseline_loss"])
             and float(row["candidate_cosine"]) > float(row["baseline_cosine"])
@@ -194,9 +192,7 @@ def _eval_part_fingerprint(provenance: dict[str, Any]) -> tuple[tuple[str, int],
 def _checkpoint_step_from_name(path: Path) -> int:
     match = re.fullmatch(r"step-([0-9]+)\.pt", path.name)
     if match is None:
-        raise ValueError(
-            f"Stage211 candidate checkpoint must be named step-N.pt: {path}"
-        )
+        raise ValueError(f"Stage211 candidate checkpoint must be named step-N.pt: {path}")
     return int(match.group(1))
 
 
@@ -236,9 +232,7 @@ def _validated_pair_report(
         "eval_samples": FIXED_EVAL_SAMPLES,
     }
     if any(report.get(key) != value for key, value in expected.items()):
-        raise ValueError(
-            f"Stage211 {phase} {role} alignment checkpoint report binding mismatch."
-        )
+        raise ValueError(f"Stage211 {phase} {role} alignment checkpoint report binding mismatch.")
     logical_step = int(report.get("step", -1))
     checkpoint_step = int(report.get("checkpoint_step", -1))
     if role == "baseline":
@@ -250,16 +244,12 @@ def _validated_pair_report(
     elif role == "candidate":
         expected_step = _checkpoint_step_from_name(checkpoint_path)
         if logical_step != expected_step or checkpoint_step != expected_step:
-            raise ValueError(
-                "Stage211 alignment candidate report/checkpoint step mismatch."
-            )
+            raise ValueError("Stage211 alignment candidate report/checkpoint step mismatch.")
     else:
         raise ValueError(f"Unsupported Stage211 alignment report role: {role!r}")
     pair_eval_id = str(report.get("pair_eval_id") or "")
     if not re.fullmatch(r"[0-9a-f]{64}", pair_eval_id):
-        raise ValueError(
-            f"Stage211 {phase} {role} alignment report has invalid pair_eval_id."
-        )
+        raise ValueError(f"Stage211 {phase} {role} alignment report has invalid pair_eval_id.")
     for prefix, label in (
         ("train_config", "pair train config"),
         ("model_config", "pair model config"),
@@ -276,13 +266,8 @@ def _validated_pair_report(
         label=f"{phase} {role}",
     )
     feature_seed = report.get("feature_seed")
-    if (
-        feature_seed != 0
-        or provenance.get("feature_seed") != feature_seed
-    ):
-        raise ValueError(
-            f"Stage211 {phase} {role} report lacks a matching fixed feature seed."
-        )
+    if feature_seed != 0 or provenance.get("feature_seed") != feature_seed:
+        raise ValueError(f"Stage211 {phase} {role} report lacks a matching fixed feature seed.")
     return provenance
 
 
@@ -296,9 +281,7 @@ def _validate_stratified_component_summary(
     component_name: str,
 ) -> dict[str, Any]:
     if not isinstance(component, dict):
-        raise ValueError(
-            f"Stage211 stratified summary lacks {component_name} component metrics."
-        )
+        raise ValueError(f"Stage211 stratified summary lacks {component_name} component metrics.")
     for key in (
         "baseline_mean_loss",
         "candidate_mean_loss",
@@ -306,19 +289,13 @@ def _validate_stratified_component_summary(
         "candidate_mean_cosine",
     ):
         if not math.isfinite(float(component.get(key, float("nan")))):
-            raise ValueError(
-                f"Stage211 stratified {component_name} component {key} is invalid."
-            )
+            raise ValueError(f"Stage211 stratified {component_name} component {key} is invalid.")
     for key in ("loss_improved_layers", "cosine_improved_layers"):
         value = int(component.get(key, -1))
         if not 0 <= value <= len(LAYER_IDS):
-            raise ValueError(
-                f"Stage211 stratified {component_name} component {key} is invalid."
-            )
+            raise ValueError(f"Stage211 stratified {component_name} component {key} is invalid.")
     layers = component.get("layers")
-    if not isinstance(layers, dict) or set(layers) != {
-        str(index) for index in LAYER_IDS
-    }:
+    if not isinstance(layers, dict) or set(layers) != {str(index) for index in LAYER_IDS}:
         raise ValueError(
             f"Stage211 stratified {component_name} component lacks exact layer coverage."
         )
@@ -334,14 +311,10 @@ def _validate_stratified_component_summary(
                 "candidate_rms_ratio",
             )
         ):
-            raise ValueError(
-                f"Stage211 stratified {component_name} layer is invalid: {layer_id}"
-            )
+            raise ValueError(f"Stage211 stratified {component_name} layer is invalid: {layer_id}")
     weak_bands = component.get("weak_bands")
     if not isinstance(weak_bands, dict) or set(weak_bands) != set(WEAK_BANDS):
-        raise ValueError(
-            f"Stage211 stratified {component_name} weak-band coverage mismatch."
-        )
+        raise ValueError(f"Stage211 stratified {component_name} weak-band coverage mismatch.")
     for band_name, row in weak_bands.items():
         if not isinstance(row, dict) or not all(
             math.isfinite(float(row.get(key, float("nan"))))
@@ -357,9 +330,7 @@ def _validate_stratified_component_summary(
             )
     cells = component.get("cells")
     if not isinstance(cells, dict) or set(cells) != set(STRATIFIED_CELLS):
-        raise ValueError(
-            f"Stage211 stratified {component_name} cell coverage mismatch."
-        )
+        raise ValueError(f"Stage211 stratified {component_name} cell coverage mismatch.")
     for cell_name, row in cells.items():
         if not isinstance(row, dict) or not all(
             math.isfinite(float(row.get(key, float("nan"))))
@@ -371,16 +342,13 @@ def _validate_stratified_component_summary(
                 "candidate_cosine",
             )
         ):
-            raise ValueError(
-                f"Stage211 stratified {component_name} cell is invalid: {cell_name}"
-            )
+            raise ValueError(f"Stage211 stratified {component_name} cell is invalid: {cell_name}")
         if not all(
             0 <= int(row.get(key, -1)) <= len(LAYER_IDS)
             for key in ("layers_loss_improved", "layers_cosine_improved")
         ):
             raise ValueError(
-                f"Stage211 stratified {component_name} cell layer counts are invalid: "
-                f"{cell_name}"
+                f"Stage211 stratified {component_name} cell layer counts are invalid: {cell_name}"
             )
     return component
 
@@ -403,10 +371,7 @@ def _validated_stratified_summary(
     if any(summary.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 stratified hidden summary binding mismatch.")
     receipt_path = Path(str(summary.get("receipt_path") or "")).resolve()
-    if (
-        not receipt_path.is_file()
-        or sha256_file(receipt_path) != summary.get("receipt_sha256")
-    ):
+    if not receipt_path.is_file() or sha256_file(receipt_path) != summary.get("receipt_sha256"):
         raise ValueError("Stage211 stratified hidden receipt is missing or changed.")
     checkpoint_records = summary.get("checkpoints")
     if not isinstance(checkpoint_records, dict):
@@ -424,9 +389,7 @@ def _validated_stratified_summary(
             or not bound_path.is_file()
             or sha256_file(bound_path) != record.get("sha256")
         ):
-            raise ValueError(
-                f"Stage211 stratified summary {role} checkpoint mismatch."
-            )
+            raise ValueError(f"Stage211 stratified summary {role} checkpoint mismatch.")
     cells = summary.get("cells")
     if not isinstance(cells, dict) or set(cells) != set(STRATIFIED_CELLS):
         raise ValueError("Stage211 stratified summary cell coverage mismatch.")
@@ -456,17 +419,10 @@ def _validated_stratified_summary(
                 "relative_change_pct",
             )
         ):
-            raise ValueError(
-                f"Stage211 stratified summary cell is not finite: {cell_name}"
-            )
+            raise ValueError(f"Stage211 stratified summary cell is not finite: {cell_name}")
         manifest_path = Path(str(cell.get("manifest_path") or "")).resolve()
-        if (
-            not manifest_path.is_file()
-            or sha256_file(manifest_path) != cell.get("manifest_sha256")
-        ):
-            raise ValueError(
-                f"Stage211 stratified summary cell manifest changed: {cell_name}"
-            )
+        if not manifest_path.is_file() or sha256_file(manifest_path) != cell.get("manifest_sha256"):
+            raise ValueError(f"Stage211 stratified summary cell manifest changed: {cell_name}")
     macro = summary.get("macro")
     if (
         not isinstance(macro, dict)
@@ -482,9 +438,7 @@ def _validated_stratified_summary(
     if not isinstance(layer_summary, dict):
         raise ValueError("Stage211 stratified summary lacks macro layer metrics.")
     layers = layer_summary.get("layers")
-    if not isinstance(layers, dict) or set(layers) != {
-        str(index) for index in LAYER_IDS
-    }:
+    if not isinstance(layers, dict) or set(layers) != {str(index) for index in LAYER_IDS}:
         raise ValueError("Stage211 stratified summary lacks exact macro layer coverage.")
     for layer_id, row in layers.items():
         if not isinstance(row, dict) or not all(
@@ -496,9 +450,7 @@ def _validated_stratified_summary(
                 "candidate_cosine",
             )
         ):
-            raise ValueError(
-                f"Stage211 stratified macro layer is invalid: {layer_id}"
-            )
+            raise ValueError(f"Stage211 stratified macro layer is invalid: {layer_id}")
     weak_bands = layer_summary.get("weak_bands")
     if not isinstance(weak_bands, dict) or set(weak_bands) != set(WEAK_BANDS):
         raise ValueError("Stage211 stratified summary weak-band coverage mismatch.")
@@ -517,25 +469,18 @@ def _validated_stratified_summary(
             component_name=component_name,
         )
     report_bindings = summary.get("reports")
-    if not isinstance(report_bindings, dict) or set(report_bindings) != set(
-        STRATIFIED_CELLS
-    ):
+    if not isinstance(report_bindings, dict) or set(report_bindings) != set(STRATIFIED_CELLS):
         raise ValueError("Stage211 stratified summary report coverage mismatch.")
     for cell_name, roles in report_bindings.items():
         if not isinstance(roles, dict) or set(roles) != {"baseline", "candidate"}:
-            raise ValueError(
-                f"Stage211 stratified summary report roles mismatch: {cell_name}"
-            )
+            raise ValueError(f"Stage211 stratified summary report roles mismatch: {cell_name}")
         for role, binding in roles.items():
             if not isinstance(binding, dict):
                 raise ValueError(
                     f"Stage211 stratified summary report binding invalid: {cell_name}/{role}"
                 )
             report_path = Path(str(binding.get("path") or "")).resolve()
-            if (
-                not report_path.is_file()
-                or sha256_file(report_path) != binding.get("sha256")
-            ):
+            if not report_path.is_file() or sha256_file(report_path) != binding.get("sha256"):
                 raise ValueError(
                     f"Stage211 stratified report is missing or changed: {cell_name}/{role}"
                 )
@@ -546,15 +491,11 @@ def _stratified_component_gate_passed(component: dict[str, Any]) -> bool:
     cells = component["cells"]
     return (
         float(component["candidate_mean_loss"]) < float(component["baseline_mean_loss"])
-        and float(component["candidate_mean_cosine"])
-        > float(component["baseline_mean_cosine"])
-        and int(component["loss_improved_layers"])
-        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
-        and int(component["cosine_improved_layers"])
-        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and float(component["candidate_mean_cosine"]) > float(component["baseline_mean_cosine"])
+        and int(component["loss_improved_layers"]) >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and int(component["cosine_improved_layers"]) >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
         and all(
-            float(cells[cell_name]["candidate_loss"])
-            < float(cells[cell_name]["baseline_loss"])
+            float(cells[cell_name]["candidate_loss"]) < float(cells[cell_name]["baseline_loss"])
             and int(cells[cell_name]["layers_loss_improved"])
             >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
             and int(cells[cell_name]["layers_cosine_improved"])
@@ -583,8 +524,7 @@ def _stratified_gate_passed(
     layer_summary = summary["layer_summary"]
     weak_bands = layer_summary["weak_bands"]
     hard_cells_pass = all(
-        float(cells[cell_name]["candidate_loss"])
-        < float(cells[cell_name]["baseline_loss"])
+        float(cells[cell_name]["candidate_loss"]) < float(cells[cell_name]["baseline_loss"])
         and int(cells[cell_name]["layers_loss_improved"]) == len(LAYER_IDS)
         and int(cells[cell_name]["layers_cosine_improved"]) == len(LAYER_IDS)
         for cell_name in ("hard_en", "hard_zh")
@@ -604,16 +544,12 @@ def _stratified_gate_passed(
     )
     return (
         float(macro["candidate_loss"]) < float(macro["baseline_loss"])
-        and int(layer_summary["loss_improved_layers"])
-        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
-        and int(layer_summary["cosine_improved_layers"])
-        >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and int(layer_summary["loss_improved_layers"]) >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
+        and int(layer_summary["cosine_improved_layers"]) >= MIN_STRATIFIED_MACRO_IMPROVED_LAYERS
         and hard_cells_pass
-        and float(cells["long_zh"]["candidate_loss"])
-        < float(cells["long_zh"]["baseline_loss"])
+        and float(cells["long_zh"]["candidate_loss"]) < float(cells["long_zh"]["baseline_loss"])
         and all(
-            float(cell["relative_change_pct"])
-            <= MAX_STRATIFIED_CELL_REGRESSION_PCT
+            float(cell["relative_change_pct"]) <= MAX_STRATIFIED_CELL_REGRESSION_PCT
             for cell in cells.values()
         )
         and all(
@@ -656,9 +592,7 @@ def build_gate(
         role="candidate",
         checkpoint_path=checkpoint_path,
     )
-    if _pair_shared_binding(baseline_report) != _pair_shared_binding(
-        candidate_report
-    ):
+    if _pair_shared_binding(baseline_report) != _pair_shared_binding(candidate_report):
         raise ValueError(
             "Stage211 baseline and candidate hidden reports were not produced "
             "by the same paired evaluation."
@@ -743,9 +677,7 @@ def build_gate(
             phase=phase,
         )
     selected_hidden_gate_passed = (
-        bool(stratified_gate_passed)
-        if stratified_gate_passed is not None
-        else legacy_gate_passed
+        bool(stratified_gate_passed) if stratified_gate_passed is not None else legacy_gate_passed
     )
     gate_passed = selected_hidden_gate_passed and (
         component_gate_passed if phase == "block" else True
@@ -763,14 +695,10 @@ def build_gate(
         "legacy_gate_passed": legacy_gate_passed,
         "stratified_gate_passed": stratified_gate_passed,
         "stratified_summary_path": (
-            str(stratified_summary_path)
-            if stratified_summary_path is not None
-            else None
+            str(stratified_summary_path) if stratified_summary_path is not None else None
         ),
         "stratified_summary_sha256": (
-            sha256_file(stratified_summary_path)
-            if stratified_summary_path is not None
-            else None
+            sha256_file(stratified_summary_path) if stratified_summary_path is not None else None
         ),
         "stratified_summary": stratified_summary,
         "baseline_report_path": str(baseline_report_path),

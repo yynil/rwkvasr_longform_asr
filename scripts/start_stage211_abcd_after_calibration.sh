@@ -29,7 +29,8 @@ SFT_OUTPUT_DIR="${SFT_OUTPUT_DIR:-${FULL_OUTPUT_ROOT}/stage211d_labeled_ctc_sft_
 REUSE_COMPLETED_CALIBRATION_EVAL="${REUSE_COMPLETED_CALIBRATION_EVAL:-0}"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${CALIBRATION_EVAL_DIR}/public/reuse_receipt.json}"
 START_STAGE="${START_STAGE:-full}"
-RETENTION_REPLAY_RECEIPT="${RETENTION_REPLAY_RECEIPT:-${METADATA_ROOT}/retention_replay_v1/receipt.json}"
+RETENTION_REPLAY_RECEIPT="${RETENTION_REPLAY_RECEIPT:-${METADATA_ROOT}/retention_replay_v2/receipt.json}"
+STRATIFIED_HIDDEN_RECEIPT="${STRATIFIED_HIDDEN_RECEIPT:-${METADATA_ROOT}/stratified_hidden_eval_v2/receipt.json}"
 RETENTION_RUN_ROOT="${RETENTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211a_mixer_retention_correction}"
 RETENTION_GATE_ROOT="${RETENTION_GATE_ROOT:-${PHASE_GATE_ROOT}/mixer_retention}"
 MIXER_SELECTION="${MIXER_SELECTION:-${PHASE_GATE_ROOT}/mixer_selected.json}"
@@ -70,10 +71,18 @@ wait_for_supplemental_training_data() {
       log "supplemental inventory unavailable; waiting ${SUPPLEMENTAL_POLL_SECONDS}s path=${SUPPLEMENTAL_INVENTORY}"
     elif [[ ! -s "${SUPPLEMENTAL_PROFILE_RECEIPT}" ]]; then
       log "supplemental profile receipt unavailable; waiting ${SUPPLEMENTAL_POLL_SECONDS}s path=${SUPPLEMENTAL_PROFILE_RECEIPT}"
+    elif [[ ! -s "${STRATIFIED_HIDDEN_RECEIPT}" ]]; then
+      log "supplemental nine-cell receipt unavailable; waiting ${SUPPLEMENTAL_POLL_SECONDS}s path=${STRATIFIED_HIDDEN_RECEIPT}"
+    elif [[ ! -s "${RETENTION_REPLAY_RECEIPT}" ]]; then
+      log "supplemental replay v2 receipt unavailable; waiting ${SUPPLEMENTAL_POLL_SECONDS}s path=${RETENTION_REPLAY_RECEIPT}"
     elif uv run python "${REPO_ROOT}/scripts/create_stage211_supplemental_profile_receipt.py" \
-      --inventory "${SUPPLEMENTAL_INVENTORY}" \
-      --output "${SUPPLEMENTAL_PROFILE_RECEIPT}"; then
-      log "supplemental inventory and immutable profile receipt validated"
+        --inventory "${SUPPLEMENTAL_INVENTORY}" \
+        --output "${SUPPLEMENTAL_PROFILE_RECEIPT}" \
+      && uv run python "${REPO_ROOT}/scripts/validate_stage211_supplemental_retention.py" \
+        --stratified-receipt "${STRATIFIED_HIDDEN_RECEIPT}" \
+      && uv run python "${REPO_ROOT}/scripts/validate_stage211_supplemental_retention.py" \
+        --receipt "${RETENTION_REPLAY_RECEIPT}"; then
+      log "supplemental inventory, profile, nine-cell eval, and replay v2 validated"
       return
     else
       log "supplemental readiness validation failed; waiting ${SUPPLEMENTAL_POLL_SECONDS}s"
@@ -223,6 +232,7 @@ run_mixer_retention_loop() {
     --correction-run-root "${RETENTION_RUN_ROOT}" \
     --correction-gate-root "${RETENTION_GATE_ROOT}" \
     --replay-receipt "${RETENTION_REPLAY_RECEIPT}" \
+    --stratified-hidden-receipt "${STRATIFIED_HIDDEN_RECEIPT}" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
@@ -268,6 +278,7 @@ run_block_correction_loop() {
     --correction-run-root "${BLOCK_CORRECTION_RUN_ROOT}" \
     --correction-gate-root "${BLOCK_CORRECTION_GATE_ROOT}" \
     --replay-receipt "${RETENTION_REPLAY_RECEIPT}" \
+    --stratified-hidden-receipt "${STRATIFIED_HIDDEN_RECEIPT}" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
@@ -311,6 +322,7 @@ run_logits_correction_loop() {
     --correction-run-root "${LOGITS_CORRECTION_RUN_ROOT}" \
     --correction-gate-root "${LOGITS_CORRECTION_GATE_ROOT}" \
     --replay-receipt "${RETENTION_REPLAY_RECEIPT}" \
+    --stratified-hidden-receipt "${STRATIFIED_HIDDEN_RECEIPT}" \
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \

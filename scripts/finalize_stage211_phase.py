@@ -20,6 +20,17 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_nano_public_baseline_receipt,
 )
 
+try:
+    from scripts.validate_stage211_supplemental_retention import (
+        validate_stratified_hidden_eval_v2,
+    )
+except ModuleNotFoundError as error:
+    if error.name != "scripts":
+        raise
+    from validate_stage211_supplemental_retention import (  # type: ignore[no-redef]
+        validate_stratified_hidden_eval_v2,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = Path(sys.executable)
@@ -43,7 +54,7 @@ DEFAULT_STRATIFIED_HIDDEN_RECEIPT = (
     Path.home()
     / "rwkvasr_data"
     / "stage211_full_curriculum"
-    / "stratified_hidden_eval_v1"
+    / "stratified_hidden_eval_v2"
     / "receipt.json"
 )
 STRATIFIED_HIDDEN_CELLS = (
@@ -54,6 +65,8 @@ STRATIFIED_HIDDEN_CELLS = (
     "hard_en",
     "hard_zh",
     "long_zh",
+    "supplemental_en",
+    "supplemental_zh",
 )
 DATASETS = (
     "aishell1_test",
@@ -254,15 +267,7 @@ def _run_nano_comparison(
 
 def _stratified_cell_manifests(receipt_path: Path) -> dict[str, Path]:
     receipt_path = receipt_path.expanduser().resolve()
-    receipt = _load_json(
-        receipt_path,
-        label="Stage211 stratified hidden-eval receipt",
-    )
-    if (
-        receipt.get("pipeline") != "stage211"
-        or receipt.get("artifact") != "stratified_hidden_eval_manifest"
-    ):
-        raise ValueError("Invalid Stage211 stratified hidden-eval receipt.")
+    receipt = validate_stratified_hidden_eval_v2(receipt_path)
     cells = receipt.get("cells")
     if not isinstance(cells, dict) or set(cells) != set(STRATIFIED_HIDDEN_CELLS):
         raise ValueError("Stage211 stratified hidden-eval cell coverage mismatch.")

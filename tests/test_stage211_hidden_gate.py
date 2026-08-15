@@ -60,11 +60,7 @@ def _write_report(
         train_config.write_text("{}\n", encoding="utf-8")
         model_config.write_text("{}\n", encoding="utf-8")
         nano_checkpoint.write_bytes(b"nano")
-    checkpoint_step = (
-        int(checkpoint.stem.removeprefix("step-"))
-        if role == "candidate"
-        else 17
-    )
+    checkpoint_step = int(checkpoint.stem.removeprefix("step-")) if role == "candidate" else 17
     component_metrics = component_metrics or {phase: (loss, cosine)}
     layer_components = {
         component_name: {
@@ -104,9 +100,7 @@ def _write_report(
                 part=part,
             ),
             "layer_component_metrics": layer_components,
-            "decoder_hidden_metrics": (
-                {"loss": decoder_loss} if decoder_loss is not None else {}
-            ),
+            "decoder_hidden_metrics": ({"loss": decoder_loss} if decoder_loss is not None else {}),
         },
     )
     return path
@@ -197,8 +191,8 @@ def _write_stratified_summary(
                 },
                 "cells": cells,
                 "macro": {
-                    "cells": 7,
-                    "samples": 1792,
+                    "cells": len(hidden_gate.STRATIFIED_CELLS),
+                    "samples": hidden_gate.STRATIFIED_EVAL_SAMPLES,
                     "baseline_loss": 1.0,
                     "candidate_loss": 0.8,
                     "relative_change_pct": -20.0,
@@ -353,9 +347,7 @@ def test_stage211_block_gate_requires_mixer_ffn_and_block_improvement(
 
     assert rejected["component_gate_passed"] is False
     assert rejected["gate_passed"] is False
-    assert rejected["component_summaries"]["ffn"]["candidate_mean_loss"] == pytest.approx(
-        1.1
-    )
+    assert rejected["component_summaries"]["ffn"]["candidate_mean_loss"] == pytest.approx(1.1)
 
     stratified_summary = tmp_path / "stratified-summary.json"
     stratified_summary.write_text("{}\n", encoding="utf-8")
@@ -494,9 +486,7 @@ def test_stage211_hidden_gate_uses_bound_stratified_result_for_promotion(
     assert report["legacy_gate_passed"] is False
     assert report["stratified_gate_passed"] is True
     assert report["gate_passed"] is True
-    assert report["stratified_summary_sha256"] == sha256_file(
-        stratified_summary
-    )
+    assert report["stratified_summary_sha256"] == sha256_file(stratified_summary)
 
     bound_report = tmp_path / "easy_en_candidate.json"
     bound_report.write_text('{"mutated": true}\n', encoding="utf-8")

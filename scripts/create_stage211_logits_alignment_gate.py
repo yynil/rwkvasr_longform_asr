@@ -90,9 +90,7 @@ def _validated_metrics(
     label: str,
 ) -> dict[str, float]:
     if int(report.get("eval_samples", -1)) != FIXED_EVAL_SAMPLES:
-        raise ValueError(
-            f"Stage211 {label} logits report eval sample count mismatch."
-        )
+        raise ValueError(f"Stage211 {label} logits report eval sample count mismatch.")
     raw_metrics = report.get("logit_metrics")
     if not isinstance(raw_metrics, dict):
         raise ValueError(f"Stage211 {label} report lacks logit_metrics.")
@@ -100,9 +98,7 @@ def _validated_metrics(
     for key in REQUIRED_METRICS:
         value = float(raw_metrics.get(key, float("nan")))
         if not math.isfinite(value):
-            raise ValueError(
-                f"Stage211 {label} logits metric {key} must be finite."
-            )
+            raise ValueError(f"Stage211 {label} logits metric {key} must be finite.")
         metrics[key] = value
     if (
         metrics["selected_frames"] <= 0.0
@@ -133,9 +129,7 @@ def _metric_checks(
         candidate_metrics["conditional_nonblank_kl"],
     )
     checks = {
-        "full_kl_materially_improved": (
-            full_kl_reduction >= MIN_KL_RELATIVE_REDUCTION
-        ),
+        "full_kl_materially_improved": (full_kl_reduction >= MIN_KL_RELATIVE_REDUCTION),
         "conditional_nonblank_kl_materially_improved": (
             conditional_kl_reduction >= MIN_KL_RELATIVE_REDUCTION
         ),
@@ -144,12 +138,10 @@ def _metric_checks(
             <= baseline_metrics["conditional_nonblank_hard_ce"] + TOLERANCE
         ),
         "blank_binary_kl_not_worse": (
-            candidate_metrics["blank_binary_kl"]
-            <= baseline_metrics["blank_binary_kl"] + TOLERANCE
+            candidate_metrics["blank_binary_kl"] <= baseline_metrics["blank_binary_kl"] + TOLERANCE
         ),
         "blank_probability_mae_not_worse": (
-            candidate_metrics["blank_prob_mae"]
-            <= baseline_metrics["blank_prob_mae"] + TOLERANCE
+            candidate_metrics["blank_prob_mae"] <= baseline_metrics["blank_prob_mae"] + TOLERANCE
         ),
         "selected_top1_improved": (
             candidate_metrics["selected_top1_agreement"]
@@ -187,8 +179,7 @@ def _metric_checks(
         ),
         "collapsed_length_ratio_not_farther": (
             abs(candidate_metrics["collapsed_length_ratio"] - 1.0)
-            <= abs(baseline_metrics["collapsed_length_ratio"] - 1.0)
-            + TOLERANCE
+            <= abs(baseline_metrics["collapsed_length_ratio"] - 1.0) + TOLERANCE
         ),
         "complete_exact_coverage": True,
     }
@@ -212,10 +203,7 @@ def _validated_stratified_summary(
     if any(summary.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 stratified logits summary binding mismatch.")
     receipt_path = Path(str(summary.get("receipt_path") or "")).resolve()
-    if (
-        not receipt_path.is_file()
-        or sha256_file(receipt_path) != summary.get("receipt_sha256")
-    ):
+    if not receipt_path.is_file() or sha256_file(receipt_path) != summary.get("receipt_sha256"):
         raise ValueError("Stage211 stratified logits receipt is missing or changed.")
     checkpoints = summary.get("checkpoints")
     if not isinstance(checkpoints, dict):
@@ -233,9 +221,7 @@ def _validated_stratified_summary(
             or not bound_path.is_file()
             or sha256_file(bound_path) != record.get("sha256")
         ):
-            raise ValueError(
-                f"Stage211 stratified logits {role} checkpoint mismatch."
-            )
+            raise ValueError(f"Stage211 stratified logits {role} checkpoint mismatch.")
     cells = summary.get("cells")
     if not isinstance(cells, dict) or set(cells) != set(STRATIFIED_CELLS):
         raise ValueError("Stage211 stratified logits cell coverage mismatch.")
@@ -243,13 +229,8 @@ def _validated_stratified_summary(
         if not isinstance(cell, dict) or int(cell.get("samples", -1)) != FIXED_EVAL_SAMPLES:
             raise ValueError(f"Stage211 stratified logits cell is invalid: {cell_name}")
         manifest_path = Path(str(cell.get("manifest_path") or "")).resolve()
-        if (
-            not manifest_path.is_file()
-            or sha256_file(manifest_path) != cell.get("manifest_sha256")
-        ):
-            raise ValueError(
-                f"Stage211 stratified logits manifest changed: {cell_name}"
-            )
+        if not manifest_path.is_file() or sha256_file(manifest_path) != cell.get("manifest_sha256"):
+            raise ValueError(f"Stage211 stratified logits manifest changed: {cell_name}")
         for role in ("baseline", "candidate"):
             raw_metrics = cell.get(f"{role}_metrics")
             if not isinstance(raw_metrics, dict):
@@ -278,12 +259,10 @@ def _validated_stratified_summary(
             expected_matched=STRATIFIED_EVAL_SAMPLES,
         )
     hidden_component_summaries = summary.get("hidden_component_summaries")
-    if not isinstance(hidden_component_summaries, dict) or set(
-        hidden_component_summaries
-    ) != set(HIDDEN_COMPONENTS):
-        raise ValueError(
-            "Stage211 stratified logits hidden-component coverage mismatch."
-        )
+    if not isinstance(hidden_component_summaries, dict) or set(hidden_component_summaries) != set(
+        HIDDEN_COMPONENTS
+    ):
+        raise ValueError("Stage211 stratified logits hidden-component coverage mismatch.")
     for component_name in HIDDEN_COMPONENTS:
         _validate_stratified_component_summary(
             hidden_component_summaries[component_name],
@@ -298,48 +277,31 @@ def _validated_stratified_summary(
             for key in ("baseline_loss", "candidate_loss", "relative_change_pct")
         )
     ):
-        raise ValueError(
-            "Stage211 stratified logits decoder-hidden summary is invalid."
-        )
+        raise ValueError("Stage211 stratified logits decoder-hidden summary is invalid.")
     decoder_cells = decoder_hidden.get("cell_results")
-    if not isinstance(decoder_cells, dict) or set(decoder_cells) != set(
-        STRATIFIED_CELLS
-    ):
-        raise ValueError(
-            "Stage211 stratified logits decoder-hidden cell coverage mismatch."
-        )
+    if not isinstance(decoder_cells, dict) or set(decoder_cells) != set(STRATIFIED_CELLS):
+        raise ValueError("Stage211 stratified logits decoder-hidden cell coverage mismatch.")
     for cell_name, row in decoder_cells.items():
         if not isinstance(row, dict) or not all(
             math.isfinite(float(row.get(key, float("nan"))))
             for key in ("baseline_loss", "candidate_loss", "relative_change_pct")
         ):
             raise ValueError(
-                "Stage211 stratified logits decoder-hidden cell is invalid: "
-                f"{cell_name}."
+                f"Stage211 stratified logits decoder-hidden cell is invalid: {cell_name}."
             )
     report_bindings = summary.get("reports")
-    if not isinstance(report_bindings, dict) or set(report_bindings) != set(
-        STRATIFIED_CELLS
-    ):
+    if not isinstance(report_bindings, dict) or set(report_bindings) != set(STRATIFIED_CELLS):
         raise ValueError("Stage211 stratified logits report coverage mismatch.")
     for cell_name, roles in report_bindings.items():
         if not isinstance(roles, dict) or set(roles) != {"baseline", "candidate"}:
-            raise ValueError(
-                f"Stage211 stratified logits report roles mismatch: {cell_name}"
-            )
+            raise ValueError(f"Stage211 stratified logits report roles mismatch: {cell_name}")
         for role, binding in roles.items():
             if not isinstance(binding, dict):
-                raise ValueError(
-                    f"Stage211 stratified logits report invalid: {cell_name}/{role}"
-                )
+                raise ValueError(f"Stage211 stratified logits report invalid: {cell_name}/{role}")
             report_path = Path(str(binding.get("path") or "")).resolve()
-            if (
-                not report_path.is_file()
-                or sha256_file(report_path) != binding.get("sha256")
-            ):
+            if not report_path.is_file() or sha256_file(report_path) != binding.get("sha256"):
                 raise ValueError(
-                    f"Stage211 stratified logits report is missing or changed: "
-                    f"{cell_name}/{role}"
+                    f"Stage211 stratified logits report is missing or changed: {cell_name}/{role}"
                 )
     return summary
 
@@ -350,9 +312,7 @@ def _validated_summary_metrics(
     label: str,
     expected_matched: int,
 ) -> dict[str, float]:
-    metrics = {
-        key: float(raw_metrics.get(key, float("nan"))) for key in REQUIRED_METRICS
-    }
+    metrics = {key: float(raw_metrics.get(key, float("nan"))) for key in REQUIRED_METRICS}
     if not all(math.isfinite(value) for value in metrics.values()):
         raise ValueError(f"Stage211 stratified logits {label} metrics are not finite.")
     if (
@@ -381,55 +341,38 @@ def _stratified_gate_passed(summary: dict[str, Any]) -> tuple[bool, dict[str, bo
     hard_cells_improved = all(
         float(cells[cell_name]["candidate_metrics"]["full_kl"])
         < float(cells[cell_name]["baseline_metrics"]["full_kl"])
-        and float(
-            cells[cell_name]["candidate_metrics"]["conditional_nonblank_kl"]
-        )
-        < float(
-            cells[cell_name]["baseline_metrics"]["conditional_nonblank_kl"]
-        )
+        and float(cells[cell_name]["candidate_metrics"]["conditional_nonblank_kl"])
+        < float(cells[cell_name]["baseline_metrics"]["conditional_nonblank_kl"])
         and float(cells[cell_name]["candidate_metrics"]["ctc_token_error_rate"])
         < float(cells[cell_name]["baseline_metrics"]["ctc_token_error_rate"])
         for cell_name in ("hard_en", "hard_zh", "long_zh")
     )
     bounded_cell_token_regression = all(
         float(cell["candidate_metrics"]["ctc_token_error_rate"])
-        <= float(cell["baseline_metrics"]["ctc_token_error_rate"])
-        + MAX_CELL_TOKEN_ERROR_REGRESSION
+        <= float(cell["baseline_metrics"]["ctc_token_error_rate"]) + MAX_CELL_TOKEN_ERROR_REGRESSION
         for cell in cells.values()
     )
     component_retention: dict[str, bool] = {}
     for component_name in HIDDEN_COMPONENTS:
         component = summary["hidden_component_summaries"][component_name]
-        macro_and_weak_retained = all(
-            _hidden_retention_checks(component).values()
-        )
+        macro_and_weak_retained = all(_hidden_retention_checks(component).values())
         cells_retained = all(
             float(row["candidate_loss"])
-            <= float(row["baseline_loss"])
-            * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
-            + TOLERANCE
+            <= float(row["baseline_loss"]) * (1.0 + MAX_HIDDEN_LOSS_REGRESSION) + TOLERANCE
             and float(row["candidate_cosine"])
-            >= float(row["baseline_cosine"])
-            - MAX_HIDDEN_COSINE_REGRESSION
-            - TOLERANCE
+            >= float(row["baseline_cosine"]) - MAX_HIDDEN_COSINE_REGRESSION - TOLERANCE
             for row in component["cells"].values()
         )
         component_retention[f"{component_name}_hidden_retained"] = (
             macro_and_weak_retained and cells_retained
         )
     decoder_hidden = summary["decoder_hidden"]
-    decoder_hidden_retained = (
-        float(decoder_hidden["candidate_loss"])
-        <= float(decoder_hidden["baseline_loss"])
-        * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
-        + TOLERANCE
-        and all(
-            float(row["candidate_loss"])
-            <= float(row["baseline_loss"])
-            * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
-            + TOLERANCE
-            for row in decoder_hidden["cell_results"].values()
-        )
+    decoder_hidden_retained = float(decoder_hidden["candidate_loss"]) <= float(
+        decoder_hidden["baseline_loss"]
+    ) * (1.0 + MAX_HIDDEN_LOSS_REGRESSION) + TOLERANCE and all(
+        float(row["candidate_loss"])
+        <= float(row["baseline_loss"]) * (1.0 + MAX_HIDDEN_LOSS_REGRESSION) + TOLERANCE
+        for row in decoder_hidden["cell_results"].values()
     )
     representative_checks = {
         **checks,
@@ -449,16 +392,11 @@ def _hidden_retention_checks(summary: dict[str, Any]) -> dict[str, bool]:
         "baseline_mean_cosine",
         "candidate_mean_cosine",
     )
-    if not all(
-        math.isfinite(float(summary.get(key, float("nan"))))
-        for key in required_scalars
-    ):
+    if not all(math.isfinite(float(summary.get(key, float("nan")))) for key in required_scalars):
         raise ValueError("Stage211 logits hidden-component summary is not finite.")
     weak_bands = summary.get("weak_bands")
     if not isinstance(weak_bands, dict) or set(weak_bands) != set(WEAK_BANDS):
-        raise ValueError(
-            "Stage211 logits hidden-component weak-band coverage mismatch."
-        )
+        raise ValueError("Stage211 logits hidden-component weak-band coverage mismatch.")
     for band_name, row in weak_bands.items():
         if not isinstance(row, dict) or not all(
             math.isfinite(float(row.get(key, float("nan"))))
@@ -470,30 +408,21 @@ def _hidden_retention_checks(summary: dict[str, Any]) -> dict[str, bool]:
             )
         ):
             raise ValueError(
-                "Stage211 logits hidden-component weak band is not finite: "
-                f"{band_name}."
+                f"Stage211 logits hidden-component weak band is not finite: {band_name}."
             )
     return {
         "mean_loss_retained": float(summary["candidate_mean_loss"])
-        <= float(summary["baseline_mean_loss"])
-        * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
-        + TOLERANCE,
+        <= float(summary["baseline_mean_loss"]) * (1.0 + MAX_HIDDEN_LOSS_REGRESSION) + TOLERANCE,
         "mean_cosine_retained": float(summary["candidate_mean_cosine"])
-        >= float(summary["baseline_mean_cosine"])
-        - MAX_HIDDEN_COSINE_REGRESSION
-        - TOLERANCE,
+        >= float(summary["baseline_mean_cosine"]) - MAX_HIDDEN_COSINE_REGRESSION - TOLERANCE,
         "weak_band_loss_retained": all(
             float(row["candidate_loss"])
-            <= float(row["baseline_loss"])
-            * (1.0 + MAX_HIDDEN_LOSS_REGRESSION)
-            + TOLERANCE
+            <= float(row["baseline_loss"]) * (1.0 + MAX_HIDDEN_LOSS_REGRESSION) + TOLERANCE
             for row in weak_bands.values()
         ),
         "weak_band_cosine_retained": all(
             float(row["candidate_cosine"])
-            >= float(row["baseline_cosine"])
-            - MAX_HIDDEN_COSINE_REGRESSION
-            - TOLERANCE
+            >= float(row["baseline_cosine"]) - MAX_HIDDEN_COSINE_REGRESSION - TOLERANCE
             for row in weak_bands.values()
         ),
     }
@@ -511,15 +440,11 @@ def _decoder_hidden_retention(
         raise ValueError(
             "Stage211 logits gate requires finite decoder-hidden loss in both reports."
         )
-    retained = (
-        candidate_loss
-        <= baseline_loss * (1.0 + MAX_HIDDEN_LOSS_REGRESSION) + TOLERANCE
-    )
+    retained = candidate_loss <= baseline_loss * (1.0 + MAX_HIDDEN_LOSS_REGRESSION) + TOLERANCE
     return {
         "baseline_loss": baseline_loss,
         "candidate_loss": candidate_loss,
-        "relative_change": (candidate_loss - baseline_loss)
-        / max(baseline_loss, 1.0e-12),
+        "relative_change": (candidate_loss - baseline_loss) / max(baseline_loss, 1.0e-12),
         "retained": retained,
     }
 
@@ -554,9 +479,7 @@ def build_gate(
         role="candidate",
         checkpoint_path=checkpoint_path,
     )
-    if _pair_shared_binding(baseline_report) != _pair_shared_binding(
-        candidate_report
-    ):
+    if _pair_shared_binding(baseline_report) != _pair_shared_binding(candidate_report):
         raise ValueError(
             "Stage211 baseline and candidate logits reports were not produced "
             "by the same paired evaluation."
@@ -566,9 +489,7 @@ def build_gate(
             "Stage211 baseline and candidate logits reports do not bind the "
             "same fixed-eval provenance."
         )
-    if _eval_part_fingerprint(baseline_provenance) != _eval_part_fingerprint(
-        candidate_provenance
-    ):
+    if _eval_part_fingerprint(baseline_provenance) != _eval_part_fingerprint(candidate_provenance):
         raise ValueError(
             "Stage211 baseline and candidate logits reports use different eval samples."
         )
@@ -588,9 +509,7 @@ def build_gate(
             rel_tol=0.0,
             abs_tol=TOLERANCE,
         ):
-            raise ValueError(
-                f"Stage211 logits baseline/candidate teacher metric differs: {key}."
-            )
+            raise ValueError(f"Stage211 logits baseline/candidate teacher metric differs: {key}.")
 
     checks, full_kl_reduction, conditional_kl_reduction = _metric_checks(
         baseline_metrics,
@@ -620,8 +539,7 @@ def build_gate(
         candidate_report,
     )
     hidden_retention_passed = all(
-        all(component_checks.values())
-        for component_checks in hidden_retention_checks.values()
+        all(component_checks.values()) for component_checks in hidden_retention_checks.values()
     ) and bool(decoder_hidden_retention["retained"])
     legacy_gate_passed = all(checks.values())
     stratified_summary = None
@@ -634,13 +552,9 @@ def build_gate(
             baseline_checkpoint_path=baseline_checkpoint_path,
             checkpoint_path=checkpoint_path,
         )
-        stratified_gate_passed, stratified_checks = _stratified_gate_passed(
-            stratified_summary
-        )
+        stratified_gate_passed, stratified_checks = _stratified_gate_passed(stratified_summary)
     selected_logits_gate_passed = (
-        bool(stratified_gate_passed)
-        if stratified_gate_passed is not None
-        else legacy_gate_passed
+        bool(stratified_gate_passed) if stratified_gate_passed is not None else legacy_gate_passed
     )
     gate_passed = selected_logits_gate_passed and hidden_retention_passed
     return {
@@ -658,23 +572,17 @@ def build_gate(
         "stratified_gate_passed": stratified_gate_passed,
         "stratified_checks": stratified_checks,
         "stratified_summary_path": (
-            str(stratified_summary_path)
-            if stratified_summary_path is not None
-            else None
+            str(stratified_summary_path) if stratified_summary_path is not None else None
         ),
         "stratified_summary_sha256": (
-            sha256_file(stratified_summary_path)
-            if stratified_summary_path is not None
-            else None
+            sha256_file(stratified_summary_path) if stratified_summary_path is not None else None
         ),
         "stratified_summary": stratified_summary,
         "thresholds": {
             "minimum_kl_relative_reduction": MIN_KL_RELATIVE_REDUCTION,
             "ratio_min": RATIO_MIN,
             "ratio_max": RATIO_MAX,
-            "max_cell_token_error_regression": (
-                MAX_CELL_TOKEN_ERROR_REGRESSION
-            ),
+            "max_cell_token_error_regression": (MAX_CELL_TOKEN_ERROR_REGRESSION),
             "max_hidden_loss_regression": MAX_HIDDEN_LOSS_REGRESSION,
             "max_hidden_cosine_regression": MAX_HIDDEN_COSINE_REGRESSION,
             "tolerance": TOLERANCE,
@@ -693,27 +601,21 @@ def build_gate(
         "baseline_metrics": baseline_metrics,
         "candidate_metrics": candidate_metrics,
         "full_kl_relative_reduction": full_kl_reduction,
-        "conditional_nonblank_kl_relative_reduction": (
-            conditional_kl_reduction
-        ),
+        "conditional_nonblank_kl_relative_reduction": (conditional_kl_reduction),
     }
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
     rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
     if path.is_file() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(
-            f"Refusing to overwrite a different logits gate: {path}"
-        )
+        raise ValueError(f"Refusing to overwrite a different logits gate: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(rendered, encoding="utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Create the independent fixed-audio Stage211C logits-alignment gate."
-        )
+        description=("Create the independent fixed-audio Stage211C logits-alignment gate.")
     )
     parser.add_argument("--baseline-report", type=Path, required=True)
     parser.add_argument("--candidate-report", type=Path, required=True)

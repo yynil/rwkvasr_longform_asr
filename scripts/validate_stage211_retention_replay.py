@@ -195,7 +195,7 @@ def _flatten_nested_counts(payload: Any, *, label: str) -> Counter[tuple[str, st
     return output
 
 
-def validate_retention_replay(
+def _validate_retention_replay_v1(
     receipt_path: Path,
     *,
     expected_cell_targets: Mapping[str, int | None] = DEFAULT_CELL_TARGETS,
@@ -489,6 +489,34 @@ def validate_retention_replay(
         "receipt_sha256": sha256_file(receipt_path),
         "validated_unique_keys": len(selected_keys),
     }
+
+
+def validate_retention_replay(
+    receipt_path: Path,
+    *,
+    expected_cell_targets: Mapping[str, int | None] = DEFAULT_CELL_TARGETS,
+    expected_fixed_eval_samples: int = 256,
+) -> dict[str, Any]:
+    receipt_path = receipt_path.expanduser().resolve()
+    receipt = _load_json(receipt_path, label="Stage211 retention replay receipt")
+    if int(receipt.get("schema_version", -1)) == 2:
+        if expected_cell_targets != DEFAULT_CELL_TARGETS or expected_fixed_eval_samples != 256:
+            raise ValueError("Stage211 replay v2 uses its receipt-bound production targets.")
+        try:
+            from scripts.validate_stage211_supplemental_retention import (
+                validate_supplemental_retention_replay,
+            )
+        except ModuleNotFoundError:
+            from validate_stage211_supplemental_retention import (  # type: ignore[no-redef]
+                validate_supplemental_retention_replay,
+            )
+
+        return validate_supplemental_retention_replay(receipt_path)
+    return _validate_retention_replay_v1(
+        receipt_path,
+        expected_cell_targets=expected_cell_targets,
+        expected_fixed_eval_samples=expected_fixed_eval_samples,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -11,6 +11,7 @@ BASE_PUBLIC_OVERLAP_ROOT="${BASE_PUBLIC_OVERLAP_ROOT:-${HOME}/rwkvasr_data/stage
 BASE_PUBLIC_ARCHIVE_CACHE_DIR="${BASE_PUBLIC_ARCHIVE_CACHE_DIR:-${TMPDIR:-/tmp}/rwkvasr_stage211_base_public_pcm_cache}"
 BASE_PUBLIC_DECODE_WORKERS="${BASE_PUBLIC_DECODE_WORKERS:-4}"
 COMBINED_ROOT="${COMBINED_ROOT:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v2}"
+RETENTION_OUTPUT_ROOT="${RETENTION_OUTPUT_ROOT:-${HOME}/rwkvasr_data/stage211_full_curriculum}"
 USB_COVERAGE_RECEIPT="${USB_COVERAGE_RECEIPT:-${HOME}/rwkvasr_data/stage211_usb_top_level_coverage_v1/coverage_receipt.json}"
 ARCHIVED_SOCIAL_OVERLAP_RECEIPT="${ARCHIVED_SOCIAL_OVERLAP_RECEIPT:-${HOME}/rwkvasr_data/stage211_archived_social_overlap_v1/overlap_receipt.json}"
 ARCHIVED_SOCIAL_OVERLAP_SESSION="${ARCHIVED_SOCIAL_OVERLAP_SESSION:-rwkvasr_stage211_archived_social_overlap}"
@@ -74,3 +75,17 @@ uv run python scripts/build_stage211_combined_supplemental_inventory.py \
 uv run python scripts/create_stage211_supplemental_profile_receipt.py \
   --inventory "${COMBINED_ROOT}/supplemental_inventory.json" \
   --output "${COMBINED_ROOT}/supplemental_profile_receipt.json"
+
+nice -n 10 ionice -c 2 -n 7 uv run python \
+  scripts/build_stage211_supplemental_retention.py \
+  --supplemental-inventory "${COMBINED_ROOT}/supplemental_inventory.json" \
+  --supplemental-profile-receipt "${COMBINED_ROOT}/supplemental_profile_receipt.json" \
+  --output-root "${RETENTION_OUTPUT_ROOT}"
+
+nice -n 10 ionice -c 2 -n 7 uv run python \
+  scripts/validate_stage211_supplemental_retention.py \
+  --stratified-receipt "${RETENTION_OUTPUT_ROOT}/stratified_hidden_eval_v2/receipt.json"
+
+nice -n 10 ionice -c 2 -n 7 uv run python \
+  scripts/validate_stage211_supplemental_retention.py \
+  --receipt "${RETENTION_OUTPUT_ROOT}/retention_replay_v2/receipt.json"
