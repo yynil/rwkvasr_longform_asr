@@ -56,6 +56,56 @@ def _args(tmp_path: Path) -> argparse.Namespace:
     )
 
 
+def test_validate_selection_only_uses_deep_validator_without_running_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    selection = tmp_path / "block-selected.json"
+    selection.write_text("{}\n", encoding="utf-8")
+    nano = tmp_path / "nano.pt"
+    nano.write_bytes(b"nano")
+    calls: list[tuple[Path, Path, str]] = []
+
+    def fake_validate(
+        selection_path: Path,
+        *,
+        nano_checkpoint: Path,
+        phase: str,
+    ) -> dict[str, object]:
+        calls.append((selection_path, nano_checkpoint, phase))
+        return {
+            "phase": phase,
+            "correction_round": 2,
+            "checkpoint_path": str(tmp_path / "block.pt"),
+        }
+
+    monkeypatch.setattr(loop, "_validate_existing_selection", fake_validate)
+    monkeypatch.setattr(
+        loop,
+        "run_retention_loop",
+        lambda args: pytest.fail(f"training loop invoked in validate-only mode: {args}"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(loop.__file__),
+            "--phase",
+            "block",
+            "--selection",
+            str(selection),
+            "--nano-checkpoint",
+            str(nano),
+            "--validate-selection-only",
+        ],
+    )
+
+    assert loop.main() == 0
+    assert calls == [(selection.resolve(), nano.resolve(), "block")]
+    assert "selection validation passed phase=block round=2" in capsys.readouterr().out
+
+
 def test_retention_finalizer_command_binds_all_prior_receipts(tmp_path: Path) -> None:
     args = _args(tmp_path)
     receipts = [tmp_path / "round1.json", tmp_path / "round2.json"]

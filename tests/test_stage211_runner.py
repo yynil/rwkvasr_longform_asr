@@ -5379,6 +5379,8 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert "post_mixer" in script
     assert "tmux kill-session" not in script
     assert '[[ "${BASH_SOURCE[0]}" == "$0" ]]' in script
+    assert "stage211_selection_valid" in script
+    assert "--validate-selection-only" in script
 
 
 def _choose_stage211_continuation_stage(tmp_path: Path, summary: dict[str, object]) -> str:
@@ -5442,6 +5444,59 @@ def test_stage211_continuation_watcher_routes_complete_supplemental_to_post_mixe
         )
         == "post_mixer"
     )
+
+
+@pytest.mark.parametrize(
+    ("validator_exit_code", "expected_stage"),
+    ((0, "sft"), (42, "full")),
+)
+def test_stage211_continuation_watcher_requires_deep_logits_selection_validation(
+    tmp_path: Path,
+    validator_exit_code: int,
+    expected_stage: str,
+) -> None:
+    output_root = tmp_path / "runs"
+    phase_gate_root = tmp_path / "gates"
+    phase_gate_root.mkdir()
+    (phase_gate_root / "logits_selected.json").write_text(
+        '{"pipeline":"stage211","artifact":"phase_gate_selection","phase":"logits"}\n',
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    validator_calls = tmp_path / "validator-calls.log"
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >>"${VALIDATOR_CALLS}"\n'
+        'exit "${VALIDATOR_EXIT_CODE}"\n',
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    script = REPO_ROOT / "scripts" / "watch_stage211_strict_continuation.sh"
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; stage211_choose_start_stage', "_", str(script)],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FULL_OUTPUT_ROOT": str(output_root),
+            "PHASE_GATE_ROOT": str(phase_gate_root),
+            "WATCH_LOG": str(tmp_path / "watch.log"),
+            "VALIDATOR_CALLS": str(validator_calls),
+            "VALIDATOR_EXIT_CODE": str(validator_exit_code),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected_stage
+    validator_command = validator_calls.read_text(encoding="utf-8")
+    assert "--phase logits" in validator_command
+    assert f"--selection {phase_gate_root / 'logits_selected.json'}" in validator_command
+    assert "--validate-selection-only" in validator_command
 
 
 def _run_stage211_continuation_watcher_fixture(

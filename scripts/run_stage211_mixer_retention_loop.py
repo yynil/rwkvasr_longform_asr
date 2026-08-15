@@ -460,6 +460,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--master-port", type=int, default=29641)
     parser.add_argument("--devices", default="0,1,2,3")
+    parser.add_argument(
+        "--validate-selection-only",
+        action="store_true",
+        help="Deep-validate an existing selection without running evaluation or training.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -481,6 +486,24 @@ def main() -> int:
     ):
         value = getattr(args, name)
         setattr(args, name, value.expanduser().resolve())
+    if args.validate_selection_only:
+        if not args.selection.is_file():
+            raise ValueError(
+                f"Stage211 selected {_phase(args)} gate is missing: {args.selection}"
+            )
+        selected = _validate_existing_selection(
+            args.selection,
+            nano_checkpoint=args.nano_checkpoint,
+            phase=_phase(args),
+        )
+        print(
+            "[stage211-correction-loop] selection validation passed "
+            f"phase={selected['phase']} "
+            f"round={selected['correction_round']} "
+            f"checkpoint={selected['checkpoint_path']}",
+            flush=True,
+        )
+        return 0
     run_retention_loop(args)
     return 0
 

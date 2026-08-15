@@ -17,6 +17,8 @@ WATCH_LOG="${WATCH_LOG:-${FULL_OUTPUT_ROOT}/continuation_watch.log}"
 MONITOR_LOG="${MONITOR_LOG:-${FULL_OUTPUT_ROOT}/monitor_hourly.log}"
 BOOTSTRAP_SCRIPT="${BOOTSTRAP_SCRIPT:-${REPO_ROOT}/scripts/start_stage211_abcd_after_calibration.sh}"
 MONITOR_SCRIPT="${MONITOR_SCRIPT:-${REPO_ROOT}/scripts/monitor_stage211_abcd.sh}"
+SELECTION_VALIDATOR_SCRIPT="${SELECTION_VALIDATOR_SCRIPT:-${REPO_ROOT}/scripts/run_stage211_mixer_retention_loop.py}"
+NANO_CHECKPOINT="${NANO_CHECKPOINT:-${HOME}/models/Fun-ASR-Nano-2512-modelscope/model.pt}"
 
 MIXER_COMPLETE="${FULL_OUTPUT_ROOT}/stage211a_mixer_full_data_3ep/curriculum_complete.json"
 MIXER_SELECTION="${PHASE_GATE_ROOT}/mixer_selected.json"
@@ -48,18 +50,27 @@ stage211_json_matches() {
   [[ -s "${path}" ]] && jq -e "${filter}" "${path}" >/dev/null 2>&1
 }
 
+stage211_selection_valid() {
+  local phase="$1"
+  local selection="$2"
+  [[ -s "${selection}" ]] || return 1
+  mkdir -p "$(dirname "${WATCH_LOG}")"
+  (
+    cd "${REPO_ROOT}"
+    uv run python "${SELECTION_VALIDATOR_SCRIPT}" \
+      --phase "${phase}" \
+      --selection "${selection}" \
+      --nano-checkpoint "${NANO_CHECKPOINT}" \
+      --validate-selection-only
+  ) >>"${WATCH_LOG}" 2>&1
+}
+
 stage211_choose_start_stage() {
-  if stage211_json_matches \
-    "${LOGITS_SELECTION}" \
-    '.pipeline == "stage211" and .artifact == "phase_gate_selection" and .phase == "logits"'; then
+  if stage211_selection_valid logits "${LOGITS_SELECTION}"; then
     printf '%s\n' sft
-  elif stage211_json_matches \
-    "${BLOCK_SELECTION}" \
-    '.pipeline == "stage211" and .artifact == "phase_gate_selection" and .phase == "block"'; then
+  elif stage211_selection_valid block "${BLOCK_SELECTION}"; then
     printf '%s\n' logits
-  elif stage211_json_matches \
-    "${MIXER_SELECTION}" \
-    '.pipeline == "stage211" and .artifact == "mixer_gate_selection"'; then
+  elif stage211_selection_valid mixer "${MIXER_SELECTION}"; then
     printf '%s\n' block
   elif stage211_json_matches \
     "${MIXER_COMPLETE}" \
