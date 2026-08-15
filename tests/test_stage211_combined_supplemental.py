@@ -22,6 +22,9 @@ from rwkvasr.eval.stage211_supplemental import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 combined = importlib.import_module("scripts.build_stage211_combined_supplemental_inventory")
+supplemental_profile_receipt = importlib.import_module(
+    "scripts.create_stage211_supplemental_profile_receipt"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -506,6 +509,86 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
         )
         == result
     )
+
+
+def test_formal_stage211_clis_reject_base_only_supplemental_inventory(
+    tmp_path: Path,
+) -> None:
+    _, _, eval_split, fixed_binding = _fixed_eval(tmp_path)
+    base = _base_inventory(
+        tmp_path,
+        eval_split=eval_split,
+        fixed_binding=fixed_binding,
+    )
+    base_manifest = Path(
+        json.loads(base.read_text(encoding="utf-8"))["bucket_manifest_path"]
+    )
+    expected_error = "schema-v2 combined supplemental inventory"
+
+    strict_output = tmp_path / "strict-output"
+    strict = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts/run_stage211_strict_chained_alignment.py"),
+            "--phase",
+            "mixer",
+            "--difficulty",
+            "supplemental_natural",
+            "--full-data-profile",
+            "--supplemental-inventory",
+            str(base),
+            "--bucket-manifest",
+            str(base_manifest),
+            "--output-dir",
+            str(strict_output),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert strict.returncode != 0
+    assert expected_error in strict.stderr
+    assert not strict_output.exists()
+
+    profile_receipt_path = tmp_path / "base-profile-receipt.json"
+    supplemental_profile_receipt.write_immutable_receipt(
+        profile_receipt_path,
+        supplemental_profile_receipt.build_receipt(base),
+    )
+    full_output = tmp_path / "full-output"
+    full_command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/run_stage211_full_phase_curriculum.py"),
+        "--phase",
+        "mixer",
+        "--init-checkpoint",
+        str(tmp_path / "unread-initialization.pt"),
+        "--output-root",
+        str(full_output),
+        "--config-root",
+        str(tmp_path / "configs"),
+        "--easy-manifest",
+        str(base_manifest),
+        "--nano-checkpoint",
+        str(tmp_path / "unread-nano.pt"),
+        "--supplemental-inventory",
+        str(base),
+        "--supplemental-profile-receipt",
+        str(profile_receipt_path),
+    ]
+    for difficulty in ("medium", "hard", "long"):
+        full_command.extend(("--manifest", f"{difficulty}={base_manifest}"))
+    full = subprocess.run(
+        full_command,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert full.returncode != 0
+    assert expected_error in full.stderr
+    assert not full_output.exists()
 
 
 def test_combined_inventory_rejects_changed_component(tmp_path: Path) -> None:
