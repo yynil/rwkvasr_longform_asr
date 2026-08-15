@@ -5496,7 +5496,54 @@ def test_stage211_continuation_watcher_requires_deep_logits_selection_validation
     validator_command = validator_calls.read_text(encoding="utf-8")
     assert "--phase logits" in validator_command
     assert f"--selection {phase_gate_root / 'logits_selected.json'}" in validator_command
+    assert "--nano-checkpoint" in validator_command
     assert "--validate-selection-only" in validator_command
+
+
+def test_stage211_continuation_watcher_falls_back_to_nearest_deep_selection(
+    tmp_path: Path,
+) -> None:
+    phase_gate_root = tmp_path / "gates"
+    phase_gate_root.mkdir()
+    for phase in ("logits", "block", "mixer"):
+        (phase_gate_root / f"{phase}_selected.json").write_text("{}\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    validator_calls = tmp_path / "validator-calls.log"
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >>"${VALIDATOR_CALLS}"\n'
+        'if [[ "$*" == *"--phase logits"* ]]; then exit 42; fi\n'
+        'if [[ "$*" == *"--phase block"* ]]; then exit 0; fi\n'
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    script = REPO_ROOT / "scripts" / "watch_stage211_strict_continuation.sh"
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; stage211_choose_start_stage', "_", str(script)],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FULL_OUTPUT_ROOT": str(tmp_path / "runs"),
+            "PHASE_GATE_ROOT": str(phase_gate_root),
+            "WATCH_LOG": str(tmp_path / "watch.log"),
+            "VALIDATOR_CALLS": str(validator_calls),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "logits"
+    calls = validator_calls.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 2
+    assert "--phase logits" in calls[0]
+    assert "--phase block" in calls[1]
+    assert all("--phase mixer" not in call for call in calls)
 
 
 def _run_stage211_continuation_watcher_fixture(
