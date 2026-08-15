@@ -265,6 +265,50 @@ def test_stage211_public_eval_shards_large_second_stage(
     assert calls[0][1]["CTC_SHARD_STAGE2"] == "1"
 
 
+def test_stage211_public_eval_preflight_binds_canonical_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_dir = tmp_path / "manifests"
+    prediction_dir = tmp_path / "nano" / "predictions"
+    receipt_path = tmp_path / "provenance.json"
+    results = [
+        {
+            "dataset": dataset,
+            "manifest_path": str((manifest_dir / f"{dataset}.jsonl").resolve()),
+            "nano_prediction_path": str(
+                (prediction_dir / f"{dataset}.ctc.jsonl").resolve()
+            ),
+        }
+        for dataset in stage211_phase_finalizer.DATASETS
+    ]
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "validate_stage211_nano_public_baseline_receipt",
+        lambda path: {"results": results, "total_samples": 52_431},
+    )
+
+    validated = stage211_phase_finalizer._validate_public_eval_inputs(
+        manifest_dir=manifest_dir,
+        nano_prediction_dir=prediction_dir,
+        nano_public_baseline_receipt=receipt_path,
+    )
+
+    assert validated["total_samples"] == 52_431
+    with pytest.raises(ValueError, match="public-eval manifest differs"):
+        stage211_phase_finalizer._validate_public_eval_inputs(
+            manifest_dir=tmp_path / "different-manifests",
+            nano_prediction_dir=prediction_dir,
+            nano_public_baseline_receipt=receipt_path,
+        )
+    with pytest.raises(ValueError, match="Nano prediction differs"):
+        stage211_phase_finalizer._validate_public_eval_inputs(
+            manifest_dir=manifest_dir,
+            nano_prediction_dir=tmp_path / "different-predictions",
+            nano_public_baseline_receipt=receipt_path,
+        )
+
+
 def test_stage211_public_enrichment_recomputes_bound_predictions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

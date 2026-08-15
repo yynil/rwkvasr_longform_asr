@@ -17,6 +17,7 @@ from rwkvasr.eval.stage211_gate import (
     load_stage211_post_coverage_correction_receipts,
     sha256_file,
     validate_stage211_full_data_coverage,
+    validate_stage211_nano_public_baseline_receipt,
 )
 
 
@@ -153,6 +154,50 @@ def _run_public_eval(
     )
 
 
+def _validate_public_eval_inputs(
+    *,
+    manifest_dir: Path,
+    nano_prediction_dir: Path,
+    nano_public_baseline_receipt: Path,
+) -> dict[str, Any]:
+    receipt = validate_stage211_nano_public_baseline_receipt(
+        nano_public_baseline_receipt,
+    )
+    raw_results = receipt.get("results")
+    if not isinstance(raw_results, list) or len(raw_results) != len(DATASETS):
+        raise ValueError("Stage211 Nano public-baseline preflight dataset count mismatch.")
+    by_dataset = {
+        str(result.get("dataset")): result
+        for result in raw_results
+        if isinstance(result, dict)
+    }
+    if len(by_dataset) != len(DATASETS) or set(by_dataset) != set(DATASETS):
+        raise ValueError("Stage211 Nano public-baseline preflight dataset set mismatch.")
+    manifest_dir = manifest_dir.expanduser().resolve()
+    nano_prediction_dir = nano_prediction_dir.expanduser().resolve()
+    for dataset in DATASETS:
+        result = by_dataset[dataset]
+        expected_manifest = (manifest_dir / f"{dataset}.jsonl").resolve()
+        recorded_manifest = Path(str(result.get("manifest_path") or "")).resolve()
+        if recorded_manifest != expected_manifest:
+            raise ValueError(
+                f"Stage211 {dataset} public-eval manifest differs from the Nano baseline."
+            )
+        expected_prediction = (nano_prediction_dir / f"{dataset}.ctc.jsonl").resolve()
+        recorded_prediction = Path(str(result.get("nano_prediction_path") or "")).resolve()
+        if recorded_prediction != expected_prediction:
+            raise ValueError(
+                f"Stage211 {dataset} Nano prediction differs from the public baseline."
+            )
+    print(
+        "[stage211-finalize] public input preflight passed "
+        f"datasets={len(DATASETS)} samples={receipt['total_samples']} "
+        f"receipt={nano_public_baseline_receipt}",
+        flush=True,
+    )
+    return receipt
+
+
 def _run_nano_comparison(
     *,
     checkpoint: Path,
@@ -232,6 +277,12 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         if args.nano_public_baseline_receipt is not None
         else (nano_prediction_dir.parent / "provenance_receipt.json").resolve()
     )
+    if not bool(args.dry_run):
+        _validate_public_eval_inputs(
+            manifest_dir=manifest_dir,
+            nano_prediction_dir=nano_prediction_dir,
+            nano_public_baseline_receipt=nano_public_baseline_receipt,
+        )
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None

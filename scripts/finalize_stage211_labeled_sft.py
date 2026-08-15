@@ -28,6 +28,7 @@ try:
         DEFAULT_PUBLIC_MANIFEST_DIR,
         _run_nano_comparison,
         _run_public_eval,
+        _validate_public_eval_inputs,
     )
     from scripts.run_stage211_labeled_sft import _validate_completion
     from scripts.run_stage211_strict_chained_alignment import (
@@ -43,6 +44,7 @@ except ModuleNotFoundError as error:
         DEFAULT_PUBLIC_MANIFEST_DIR,
         _run_nano_comparison,
         _run_public_eval,
+        _validate_public_eval_inputs,
     )
     from run_stage211_labeled_sft import _validate_completion
     from run_stage211_strict_chained_alignment import (
@@ -341,6 +343,17 @@ def finalize_sft(args: argparse.Namespace) -> Path:
     comparison_md = output_dir / "nano_comparison.md"
     manifest_dir = args.public_manifest_dir.expanduser().resolve()
     nano_prediction_dir = args.nano_prediction_dir.expanduser().resolve()
+    nano_public_baseline_receipt_path = (
+        args.nano_public_baseline_receipt.expanduser().resolve()
+        if args.nano_public_baseline_receipt is not None
+        else (nano_prediction_dir.parent / "provenance_receipt.json").resolve()
+    )
+    if not bool(args.dry_run):
+        _validate_public_eval_inputs(
+            manifest_dir=manifest_dir,
+            nano_prediction_dir=nano_prediction_dir,
+            nano_public_baseline_receipt=nano_public_baseline_receipt_path,
+        )
     _run_public_eval(
         checkpoint=checkpoint,
         output_dir=public_output,
@@ -398,11 +411,6 @@ def finalize_sft(args: argparse.Namespace) -> Path:
     validate_stage211_public_overlap_binding(
         public_overlap_binding,
         public_benchmark=candidate_benchmark,
-    )
-    nano_public_baseline_receipt_path = (
-        args.nano_public_baseline_receipt.expanduser().resolve()
-        if args.nano_public_baseline_receipt is not None
-        else (nano_prediction_dir.parent / "provenance_receipt.json").resolve()
     )
     nano_public_baseline = validate_stage211_nano_public_baseline_receipt(
         nano_public_baseline_receipt_path,
