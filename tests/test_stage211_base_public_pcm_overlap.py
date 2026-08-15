@@ -400,6 +400,33 @@ def test_base_public_pcm_audit_is_resumable_and_fail_closed(
             )
 
 
+def test_base_public_pcm_parallel_decode_matches_serial_bytes(tmp_path: Path) -> None:
+    inventory_path, _ = _fixture(tmp_path)
+    base = audit.validate_base_inventory(inventory_path)
+
+    fingerprints: dict[int, dict[str, bytes]] = {}
+    for decode_workers in (1, 3):
+        output_root = tmp_path / f"audit_{decode_workers}"
+        audit.build_location_index(base=base, output_root=output_root)
+        location_index = audit.validate_location_index(output_root, base=base)
+        result = audit.run_archive_worker(
+            location_index=location_index,
+            output_root=output_root,
+            worker_index=0,
+            num_workers=1,
+            max_archives=None,
+            archive_cache_dir=tmp_path / f"cache_{decode_workers}",
+            decode_workers=decode_workers,
+        )
+        assert result == {"assigned": 5, "created": 5}
+        fingerprints[decode_workers] = {
+            path.name: path.read_bytes()
+            for path in (output_root / "archive_fingerprints").glob("archive_*.jsonl")
+        }
+
+    assert fingerprints[3] == fingerprints[1]
+
+
 def test_base_public_pcm_audit_rejects_changed_archive_fingerprint(tmp_path: Path) -> None:
     inventory_path, _ = _fixture(tmp_path)
     base = audit.validate_base_inventory(inventory_path)
@@ -449,6 +476,7 @@ def test_base_public_pcm_archive_cache_is_removed_after_decode_failure(
             num_workers=1,
             max_archives=1,
             archive_cache_dir=cache_dir,
+            decode_workers=3,
         )
 
     assert cache_dir.is_dir()

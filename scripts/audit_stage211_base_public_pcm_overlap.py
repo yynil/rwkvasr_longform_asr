@@ -9,6 +9,7 @@ import math
 import os
 import sqlite3
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -136,6 +137,53 @@ def _canonical_line(payload: dict[str, Any]) -> bytes:
     return (
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode("utf-8")
+
+
+def _canonical_pcm_fingerprint_bytes(audio_bytes: bytes) -> tuple[str, int]:
+    return canonical_pcm_fingerprint(io.BytesIO(audio_bytes))
+
+
+def _write_archive_fingerprint_batch(
+    *,
+    target: Any,
+    archive_index: int,
+    records: list[tuple[tuple[Any, ...], Any, bytes]],
+    executor: ThreadPoolExecutor | None,
+) -> tuple[int, int, int]:
+    audio_payloads = [record[2] for record in records]
+    decoded = (
+        list(executor.map(_canonical_pcm_fingerprint_bytes, audio_payloads))
+        if executor is not None
+        else [_canonical_pcm_fingerprint_bytes(payload) for payload in audio_payloads]
+    )
+    duration_ms = 0
+    pcm_samples = 0
+    for (indexed_row, entry, audio_bytes), (fingerprint, samples) in zip(
+        records,
+        decoded,
+        strict=True,
+    ):
+        row_duration_ms = int(indexed_row[3])
+        if samples <= 0 or row_duration_ms <= 0:
+            raise ValueError(f"Stage211 base archive PCM duration changed: {entry.key}")
+        target.write(
+            _canonical_line(
+                {
+                    "archive_index": archive_index,
+                    "audio_member_sha256": _sha256_bytes(audio_bytes),
+                    "canonical_pcm_sha256": fingerprint,
+                    "duration_ms": row_duration_ms,
+                    "key": entry.key,
+                    "pcm_samples": samples,
+                    "source_dataset": str(indexed_row[2]),
+                    "storage_kind": entry.storage_kind,
+                    "utt_id": entry.utt_id,
+                }
+            )
+        )
+        duration_ms += row_duration_ms
+        pcm_samples += samples
+    return len(records), duration_ms, pcm_samples
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -891,7 +939,10 @@ def fingerprint_base_archive(
     output_root: Path,
     archive_index: int,
     archive_cache_dir: Path | None = None,
+    decode_workers: int = 1,
 ) -> str:
+    if decode_workers <= 0:
+        raise ValueError("Stage211 base PCM decode_workers must be positive.")
     archives = location_index["archives"]
     if not 0 <= archive_index < len(archives):
         raise ValueError(f"Stage211 base PCM archive index is out of range: {archive_index}")
@@ -921,6 +972,11 @@ def fingerprint_base_archive(
     rows = 0
     duration_ms = 0
     pcm_samples = 0
+    executor = (
+        ThreadPoolExecutor(max_workers=decode_workers, thread_name_prefix="stage211-pcm")
+        if decode_workers > 1
+        else None
+    )
     try:
         with _archive_read_path(
             source_path=shard_path,
@@ -942,33 +998,39 @@ def fingerprint_base_archive(
                 f"FROM entries WHERE shard_path = ? ORDER BY {order}"
             )
             with temporary.open("wb") as target:
+                pending: list[tuple[tuple[Any, ...], Any, bytes]] = []
+                batch_size = max(1, decode_workers * 2)
                 for indexed_row in connection.execute(query, (str(shard_path),)):
                     entry = _entry_from_index_row(indexed_row)
                     if str(indexed_row[2]) != archive["source_dataset"]:
                         raise ValueError(f"Stage211 base archive source changed: {shard_path}")
                     audio_bytes, _ = _read_indexed_entry_payload(reader, entry)
-                    fingerprint, samples = canonical_pcm_fingerprint(io.BytesIO(audio_bytes))
-                    row_duration_ms = int(indexed_row[3])
-                    if samples <= 0 or row_duration_ms <= 0:
-                        raise ValueError(f"Stage211 base archive PCM duration changed: {entry.key}")
-                    target.write(
-                        _canonical_line(
-                            {
-                                "archive_index": archive_index,
-                                "audio_member_sha256": _sha256_bytes(audio_bytes),
-                                "canonical_pcm_sha256": fingerprint,
-                                "duration_ms": row_duration_ms,
-                                "key": entry.key,
-                                "pcm_samples": samples,
-                                "source_dataset": str(indexed_row[2]),
-                                "storage_kind": entry.storage_kind,
-                                "utt_id": entry.utt_id,
-                            }
+                    pending.append((tuple(indexed_row), entry, audio_bytes))
+                    if len(pending) >= batch_size:
+                        batch_rows, batch_duration_ms, batch_pcm_samples = (
+                            _write_archive_fingerprint_batch(
+                                target=target,
+                                archive_index=archive_index,
+                                records=pending,
+                                executor=executor,
+                            )
+                        )
+                        rows += batch_rows
+                        duration_ms += batch_duration_ms
+                        pcm_samples += batch_pcm_samples
+                        pending.clear()
+                if pending:
+                    batch_rows, batch_duration_ms, batch_pcm_samples = (
+                        _write_archive_fingerprint_batch(
+                            target=target,
+                            archive_index=archive_index,
+                            records=pending,
+                            executor=executor,
                         )
                     )
-                    rows += 1
-                    duration_ms += row_duration_ms
-                    pcm_samples += samples
+                    rows += batch_rows
+                    duration_ms += batch_duration_ms
+                    pcm_samples += batch_pcm_samples
             reader.close()
             reader = None
     except BaseException:
@@ -977,6 +1039,8 @@ def fingerprint_base_archive(
     finally:
         if reader is not None:
             reader.close()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         connection.close()
     if rows != int(archive["rows"]) or duration_ms != int(archive["duration_ms"]):
         temporary.unlink(missing_ok=True)
@@ -1028,6 +1092,7 @@ def run_archive_worker(
     num_workers: int,
     max_archives: int | None,
     archive_cache_dir: Path | None = None,
+    decode_workers: int = 1,
 ) -> dict[str, int]:
     if num_workers <= 0 or not 0 <= worker_index < num_workers:
         raise ValueError("worker-index must satisfy 0 <= worker-index < num-workers")
@@ -1045,6 +1110,7 @@ def run_archive_worker(
             output_root=output_root,
             archive_index=archive_index,
             archive_cache_dir=archive_cache_dir,
+            decode_workers=decode_workers,
         )
         counts[status] += 1
         print(
@@ -1351,6 +1417,7 @@ def _parse_args() -> argparse.Namespace:
     archive_worker.add_argument("--num-workers", type=int, default=1)
     archive_worker.add_argument("--max-archives", type=int, default=None)
     archive_worker.add_argument("--archive-cache-dir", type=Path, default=None)
+    archive_worker.add_argument("--decode-workers", type=int, default=1)
     subparsers.add_parser("public")
     subparsers.add_parser("finalize")
     all_parser = subparsers.add_parser("all")
@@ -1358,6 +1425,7 @@ def _parse_args() -> argparse.Namespace:
     all_parser.add_argument("--num-workers", type=int, default=1)
     all_parser.add_argument("--max-archives", type=int, default=None)
     all_parser.add_argument("--archive-cache-dir", type=Path, default=None)
+    all_parser.add_argument("--decode-workers", type=int, default=1)
     return parser.parse_args()
 
 
@@ -1403,6 +1471,7 @@ def main() -> int:
                 if args.archive_cache_dir is not None
                 else None
             ),
+            decode_workers=int(args.decode_workers),
         )
         print(f"[stage211-base-public-pcm] archive_result={result}", flush=True)
     if args.command in {"finalize", "all"}:
