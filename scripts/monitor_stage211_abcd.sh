@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SUPERVISOR_SESSION="${SUPERVISOR_SESSION:-rwkvasr_stage211_abcd_strict_supervisor}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${HOME}/rwkvasr_runs/stage211_full_alignment}"
 CALIBRATION_ROOT="${CALIBRATION_ROOT:-${HOME}/rwkvasr_runs/sensevoice_rwkv_stage211a_recovery_stage210a30000_nanomlpfrozen_teacherforced_mixeronly_easy1490h_1ep_lr3e6_wd0_4x4090}"
 CALIBRATION_EVAL_ROOT="${CALIBRATION_EVAL_ROOT:-${HOME}/rwkvasr_eval/stage211_calibration_selected_full}"
 PHASE_GATE_ROOT="${PHASE_GATE_ROOT:-${HOME}/rwkvasr_eval/stage211_phase_gates}"
 MONITOR_LOG="${MONITOR_LOG:-${OUTPUT_ROOT}/monitor_hourly.log}"
+BASE_PUBLIC_OVERLAP_ROOT="${BASE_PUBLIC_OVERLAP_ROOT:-${HOME}/rwkvasr_data/stage211_base_public_pcm_overlap_v1}"
+SUPPLEMENTAL_PROGRESS_REPORTER="${SUPPLEMENTAL_PROGRESS_REPORTER:-${REPO_ROOT}/scripts/report_stage211_base_public_pcm_progress.py}"
+MONITOR_PYTHON="${MONITOR_PYTHON:-${REPO_ROOT}/.venv/bin/python3}"
 POLL_SECONDS="${POLL_SECONDS:-3600}"
 RECENT_LOG_MINUTES="${RECENT_LOG_MINUTES:-90}"
 MONITOR_ONCE="${MONITOR_ONCE:-0}"
@@ -141,6 +146,15 @@ stage211_recent_logs() {
   done
 }
 
+stage211_recent_formal_training_logs() {
+  local log_path
+  while IFS= read -r -d '' log_path; do
+    if rg -q -F "${ATTEMPT_MARKER}" "${log_path}" 2>/dev/null; then
+      printf '%s\0' "${log_path}"
+    fi
+  done < <(stage211_recent_logs "$@")
+}
+
 stage211_emit_snapshot() {
   local log_path latest_record errors prediction_path
   printf '\n===== %s =====\n' "$(date --iso-8601=seconds)"
@@ -170,6 +184,15 @@ stage211_emit_snapshot() {
     find "${CALIBRATION_EVAL_ROOT}" "${PHASE_GATE_ROOT}" \
       -type f -name '*.ctc.jsonl' -print0 2>/dev/null
   )
+  printf '%s\n' '-- supplemental exact PCM audit --'
+  if [[ -x "${MONITOR_PYTHON}" && -f "${SUPPLEMENTAL_PROGRESS_REPORTER}" && \
+    -s "${BASE_PUBLIC_OVERLAP_ROOT}/manifest_location_index.sqlite" ]]; then
+    nice -n 10 "${MONITOR_PYTHON}" "${SUPPLEMENTAL_PROGRESS_REPORTER}" \
+      --output-root "${BASE_PUBLIC_OVERLAP_ROOT}" 2>&1 || true
+  else
+    printf 'unavailable root=%s reporter=%s python=%s\n' \
+      "${BASE_PUBLIC_OVERLAP_ROOT}" "${SUPPLEMENTAL_PROGRESS_REPORTER}" "${MONITOR_PYTHON}"
+  fi
   printf '%s\n' '-- recent training records --'
   while IFS= read -r -d '' log_path; do
     latest_record="$(stage211_latest_training_record "${log_path}")"
@@ -185,7 +208,7 @@ stage211_emit_snapshot() {
     else
       printf '%s none\n' "${log_path}"
     fi
-  done < <(stage211_recent_logs "${OUTPUT_ROOT}")
+  done < <(stage211_recent_formal_training_logs "${OUTPUT_ROOT}")
   printf '%s\n' '-- GPUs --'
   nvidia-smi \
     --query-gpu=index,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw \

@@ -1145,6 +1145,39 @@ def test_stage211_hourly_monitor_scopes_errors_to_latest_attempt(
     assert "online_layer_frame_delta=1" in failed.stdout
 
 
+def test_stage211_hourly_monitor_classifies_only_formal_training_logs(
+    tmp_path: Path,
+) -> None:
+    monitor_script = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+    formal_log = tmp_path / "formal.log"
+    formal_log.write_text(
+        "[rwkvasr] Distributed init complete. world_size=4\n"
+        "[deepspeed-train] step=10 loss=0.1000\n",
+        encoding="utf-8",
+    )
+    supplemental_log = tmp_path / "supplemental.log"
+    supplemental_log.write_text("Traceback from a controlled audit restart\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; while IFS= read -r -d "" path; do basename "$path"; done '
+            '< <(stage211_recent_formal_training_logs "$2")',
+            "stage211-monitor-test",
+            str(monitor_script),
+            str(tmp_path),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["formal.log"]
+
+
 def test_stage211_hourly_monitor_reports_bound_live_progress(
     tmp_path: Path,
 ) -> None:
