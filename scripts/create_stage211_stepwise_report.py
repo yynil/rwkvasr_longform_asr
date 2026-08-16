@@ -72,6 +72,12 @@ REQUESTED_TO_INTERNAL_STAGE = {
     "logits": "logits",
     "sft": "sft",
 }
+REQUESTED_STAGE_OBJECTIVES = {
+    "rwkv_layer": "hidden_states",
+    "block": "hidden_states",
+    "logits": "ctc_logits",
+    "sft": "labeled_ctc_sft",
+}
 STAGE_LABELS = {
     "calibration": "Calibration",
     "mixer": "Layer / Mixer (A)",
@@ -376,6 +382,103 @@ def _language_metric_summaries(
             }
         )
     return summaries
+
+
+def _requested_alignment_views(
+    *,
+    dataset_results: list[dict[str, Any]],
+    language_metric_summaries: list[dict[str, Any]],
+    stage_records: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    stage_records_by_name = {str(row["stage"]): row for row in stage_records}
+    summaries_by_name = {str(row["name"]): row for row in language_metric_summaries}
+    english = summaries_by_name.get("english_wer")
+    chinese = summaries_by_name.get("chinese_cer")
+    if english is None or chinese is None:
+        raise ValueError("Stage211 requested-stage view lacks English WER or Chinese CER.")
+
+    calibration_record = stage_records_by_name["calibration"]
+    initial_calibration_result = {
+        "stage": "calibration",
+        "role": "initial_baseline",
+        "checkpoint_path": calibration_record["checkpoint_path"],
+        "checkpoint_sha256": calibration_record["checkpoint_sha256"],
+        "source_report_path": calibration_record["source_report_path"],
+        "source_report_sha256": calibration_record["source_report_sha256"],
+        "english_wer": _finite_float(
+            english["stages"]["calibration"], label="calibration English WER"
+        ),
+        "chinese_cer": _finite_float(
+            chinese["stages"]["calibration"], label="calibration Chinese CER"
+        ),
+    }
+
+    requested_alignment_results = []
+    for requested_stage in REQUESTED_ALIGNMENT_STAGE_ORDER:
+        internal_stage = REQUESTED_TO_INTERNAL_STAGE[requested_stage]
+        record = stage_records_by_name[internal_stage]
+        requested_alignment_results.append(
+            {
+                "stage": requested_stage,
+                "internal_stage": internal_stage,
+                "label": record["label"],
+                "objective": REQUESTED_STAGE_OBJECTIVES[requested_stage],
+                "checkpoint_path": record["checkpoint_path"],
+                "checkpoint_sha256": record["checkpoint_sha256"],
+                "source_report_path": record["source_report_path"],
+                "source_report_sha256": record["source_report_sha256"],
+                "gate_passed": record["gate_passed"],
+                "english_wer": _finite_float(
+                    english["stages"][internal_stage],
+                    label=f"{requested_stage} English WER",
+                ),
+                "chinese_cer": _finite_float(
+                    chinese["stages"][internal_stage],
+                    label=f"{requested_stage} Chinese CER",
+                ),
+            }
+        )
+
+    requested_language_metric_summaries = []
+    for summary in language_metric_summaries:
+        requested_language_metric_summaries.append(
+            {
+                **{key: value for key, value in summary.items() if key != "stages"},
+                "initial_calibration_error_rate": _finite_float(
+                    summary["stages"]["calibration"],
+                    label=f"{summary['name']} calibration metric",
+                ),
+                "stages": {
+                    requested_stage: _finite_float(
+                        summary["stages"][REQUESTED_TO_INTERNAL_STAGE[requested_stage]],
+                        label=f"{summary['name']} {requested_stage} metric",
+                    )
+                    for requested_stage in REQUESTED_ALIGNMENT_STAGE_ORDER
+                },
+            }
+        )
+
+    requested_dataset_results = []
+    for row in dataset_results:
+        requested_dataset_results.append(
+            {
+                **{key: value for key, value in row.items() if key != "stages"},
+                "initial_calibration": dict(row["stages"]["calibration"]),
+                "stages": {
+                    requested_stage: dict(
+                        row["stages"][REQUESTED_TO_INTERNAL_STAGE[requested_stage]]
+                    )
+                    for requested_stage in REQUESTED_ALIGNMENT_STAGE_ORDER
+                },
+            }
+        )
+
+    return (
+        initial_calibration_result,
+        requested_alignment_results,
+        requested_language_metric_summaries,
+        requested_dataset_results,
+    )
 
 
 def _phase_initial_checkpoint(report: dict[str, Any]) -> tuple[Path, str]:
@@ -1466,6 +1569,16 @@ def build_stepwise_report(
             preflight_smoke=None,
         ),
     ]
+    (
+        initial_calibration_result,
+        requested_alignment_results,
+        requested_alignment_language_metric_summaries,
+        requested_alignment_dataset_results,
+    ) = _requested_alignment_views(
+        dataset_results=dataset_results,
+        language_metric_summaries=language_metric_summaries,
+        stage_records=stage_records,
+    )
     coverage_results = [
         _coverage_record(
             stage=stage,
@@ -1491,6 +1604,13 @@ def build_stepwise_report(
         "strict_stage_order": list(STAGE_ORDER),
         "requested_alignment_stage_order": list(REQUESTED_ALIGNMENT_STAGE_ORDER),
         "requested_to_internal_stage": dict(REQUESTED_TO_INTERNAL_STAGE),
+        "all_requested_alignment_metrics_complete": True,
+        "initial_calibration_result": initial_calibration_result,
+        "requested_alignment_results": requested_alignment_results,
+        "requested_alignment_language_metric_summaries": (
+            requested_alignment_language_metric_summaries
+        ),
+        "requested_alignment_dataset_results": requested_alignment_dataset_results,
         "checkpoint_chain_passed": True,
         "nano_initialization_chain_passed": True,
         "nano_initialization_source_chain_passed": initialization["loader_source_chain_passed"],
@@ -1551,8 +1671,9 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines = [
         "# Stage211 Stepwise Alignment Results",
         "",
-        "Strict order: Calibration -> Layer/Mixer (A) -> Block (B) -> "
-        "Logits (C) -> Labeled CTC SFT (D)",
+        "Initial baseline: Calibration",
+        "",
+        "Requested alignment order: RWKV Layer -> Block -> Logits -> Labeled CTC SFT",
         "",
         f"Nano teacher SHA-256: `{report['nano_teacher_checkpoint_sha256']}`",
         "",
@@ -1592,14 +1713,30 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"unknown tokens: `{int(report['ctc_label_proof']['ctc_unk_tokens'])}`, "
         "non-pronunciation logits suppressed: `true`",
         "",
-        "## Language Macro Metrics",
+        "## Requested Alignment Results",
         "",
-        "Aggregation: `unweighted_dataset_macro`.",
-        "",
-        "| Language | Metric | Datasets | Samples | Nano | Calibration | Layer A | "
-        "Block B | Logits C | SFT D |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Stage | Internal phase | Objective | English WER | Chinese CER | Gate |",
+        "|---|---|---|---:|---:|---:|",
     ]
+    for result in report["requested_alignment_results"]:
+        lines.append(
+            f"| `{result['stage']}` | `{result['internal_stage']}` | "
+            f"`{result['objective']}` | {float(result['english_wer']) * 100.0:.3f}% | "
+            f"{float(result['chinese_cer']) * 100.0:.3f}% | "
+            f"`{str(result['gate_passed']).lower()}` |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Language Macro Metrics",
+            "",
+            "Aggregation: `unweighted_dataset_macro`.",
+            "",
+            "| Language | Metric | Datasets | Samples | Nano | Calibration | Layer A | "
+            "Block B | Logits C | SFT D |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        )
+    )
     for summary in report["language_metric_summaries"]:
         stages = summary["stages"]
         lines.append(

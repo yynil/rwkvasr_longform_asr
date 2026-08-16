@@ -1663,6 +1663,33 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "logits": "logits",
         "sft": "sft",
     }
+    assert report["all_requested_alignment_metrics_complete"] is True
+    assert report["initial_calibration_result"]["role"] == "initial_baseline"
+    assert report["initial_calibration_result"]["checkpoint_sha256"] == sha256_file(
+        checkpoints["calibration"]
+    )
+    assert [row["stage"] for row in report["requested_alignment_results"]] == [
+        "rwkv_layer",
+        "block",
+        "logits",
+        "sft",
+    ]
+    assert [row["internal_stage"] for row in report["requested_alignment_results"]] == [
+        "mixer",
+        "block",
+        "logits",
+        "sft",
+    ]
+    assert [row["objective"] for row in report["requested_alignment_results"]] == [
+        "hidden_states",
+        "hidden_states",
+        "ctc_logits",
+        "labeled_ctc_sft",
+    ]
+    assert all(
+        row["gate_passed"] is True and len(row["checkpoint_sha256"]) == 64
+        for row in report["requested_alignment_results"]
+    )
     assert report["checkpoint_chain_passed"] is True
     assert report["nano_initialization_chain_passed"] is True
     assert report["nano_initialization_source_chain_passed"] is True
@@ -1731,7 +1758,12 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     language_summaries = {
         summary["name"]: summary for summary in report["language_metric_summaries"]
     }
+    requested_language_summaries = {
+        summary["name"]: summary
+        for summary in report["requested_alignment_language_metric_summaries"]
+    }
     assert set(language_summaries) == {"english_wer", "chinese_cer"}
+    assert set(requested_language_summaries) == {"english_wer", "chinese_cer"}
     for name, language, metric, dataset_count in (
         ("english_wer", "en", "wer", 3),
         ("chinese_cer", "zh", "cer", 2),
@@ -1753,6 +1785,28 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
             assert summary["stages"][stage] == pytest.approx(
                 sum(row["stages"][stage]["student_error_rate"] for row in rows) / dataset_count
             )
+        requested_summary = requested_language_summaries[name]
+        assert requested_summary["initial_calibration_error_rate"] == pytest.approx(
+            summary["stages"]["calibration"]
+        )
+        assert list(requested_summary["stages"]) == report["requested_alignment_stage_order"]
+        for requested_stage, internal_stage in report["requested_to_internal_stage"].items():
+            assert requested_summary["stages"][requested_stage] == pytest.approx(
+                summary["stages"][internal_stage]
+            )
+    requested_results = {row["stage"]: row for row in report["requested_alignment_results"]}
+    assert requested_results["rwkv_layer"]["english_wer"] == pytest.approx(
+        requested_language_summaries["english_wer"]["stages"]["rwkv_layer"]
+    )
+    assert requested_results["rwkv_layer"]["chinese_cer"] == pytest.approx(
+        requested_language_summaries["chinese_cer"]["stages"]["rwkv_layer"]
+    )
+    assert len(report["requested_alignment_dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
+    assert all(
+        list(row["stages"]) == report["requested_alignment_stage_order"]
+        and "initial_calibration" in row
+        for row in report["requested_alignment_dataset_results"]
+    )
     assert report["public_overlap_chain_passed"] is True
     assert report["public_overlap_receipt_sha256"] == sha256_file(
         tmp_path / "public-overlap-receipt.json"
@@ -1799,6 +1853,10 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     )
     assert "Layer A" in output_markdown.read_text(encoding="utf-8")
     assert "SFT D" in output_markdown.read_text(encoding="utf-8")
+    assert "Requested alignment order: RWKV Layer -> Block -> Logits" in (
+        output_markdown.read_text(encoding="utf-8")
+    )
+    assert "## Requested Alignment Results" in output_markdown.read_text(encoding="utf-8")
     assert "Language Macro Metrics" in output_markdown.read_text(encoding="utf-8")
     assert "unweighted_dataset_macro" in output_markdown.read_text(encoding="utf-8")
     assert "Per-Dataset Metrics" in output_markdown.read_text(encoding="utf-8")
