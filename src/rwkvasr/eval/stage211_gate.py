@@ -25,7 +25,7 @@ from rwkvasr.eval.stage211_supplemental import (
 )
 
 
-STAGE211_PHASE_GATE_SCHEMA_VERSION = 3
+STAGE211_PHASE_GATE_SCHEMA_VERSION = 4
 STAGE211_NANO_PUBLIC_BASELINE_SCHEMA_VERSION = 1
 STAGE211_TRAJECTORY_RETENTION_SCHEMA_VERSION = 1
 STAGE211_STEP_EVAL_CADENCE_SCHEMA_VERSION = 1
@@ -149,6 +149,28 @@ def stage211_phase_gate_decision(
     if phase == "logits":
         return alignment_gate_passed and all_datasets_pass and trajectory_retention_gate_passed
     raise ValueError(f"Stage211 phase {phase!r} cannot promote.")
+
+
+def build_stage211_correction_round_promotion_gate(
+    completed_rounds: int,
+) -> dict[str, Any]:
+    completed_rounds = int(completed_rounds)
+    if not 0 <= completed_rounds <= STAGE211_RETENTION_CORRECTION_MAX_ROUNDS:
+        raise ValueError("Stage211 completed correction-round count is invalid.")
+    correction_started = completed_rounds > 0
+    gate_passed = (
+        not correction_started
+        or completed_rounds >= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
+    )
+    return {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "correction_round_promotion_gate",
+        "correction_started": correction_started,
+        "completed_rounds": completed_rounds,
+        "guaranteed_rounds": STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
+        "gate_passed": gate_passed,
+    }
 
 
 _STAGE211_LOGITS_IDENTICAL_TEACHER_METRICS = (
@@ -5110,12 +5132,31 @@ def validate_stage211_phase_gate_report(
             "replayed WER/CER evidence."
         )
     datasets_passed = benchmark.get("all_datasets_pass") is True
-    expected_gate_passed = stage211_phase_gate_decision(
+    expected_metric_gate_passed = stage211_phase_gate_decision(
         phase=expected_phase,
         alignment_gate_passed=alignment_gate_passed,
         public_progress_gate_passed=public_progress_gate_passed,
         trajectory_retention_gate_passed=trajectory_retention_gate_passed,
         all_datasets_pass=datasets_passed,
+    )
+    metric_gate_passed = report.get("metric_gate_passed")
+    if not isinstance(metric_gate_passed, bool):
+        raise ValueError("Stage211 phase gate lacks a boolean metric-only decision.")
+    if metric_gate_passed != expected_metric_gate_passed:
+        raise ValueError("Stage211 phase metric-only decision is inconsistent with its sub-gates.")
+    corrections = coverage.get("post_coverage_corrections", [])
+    if not isinstance(corrections, list):
+        raise ValueError("Stage211 phase gate correction coverage is invalid.")
+    expected_correction_round_promotion = build_stage211_correction_round_promotion_gate(
+        len(corrections)
+    )
+    _validate_stage211_replayed_value(
+        report.get("correction_round_promotion"),
+        expected_correction_round_promotion,
+        label=f"{expected_phase} guaranteed correction-round promotion gate",
+    )
+    expected_gate_passed = expected_metric_gate_passed and bool(
+        expected_correction_round_promotion["gate_passed"]
     )
     if expected_phase in {"mixer", "block"}:
         if require_passed and not public_progress_gate_passed:

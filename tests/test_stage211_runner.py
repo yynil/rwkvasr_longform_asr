@@ -29,6 +29,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
     STAGE211_RETENTION_CORRECTION_EPOCHS,
     STAGE211_RETENTION_CORRECTION_LR,
+    build_stage211_correction_round_promotion_gate,
     build_stage211_correction_layer_focus,
     build_stage211_full_data_coverage,
     build_stage211_step_eval_cadence,
@@ -2016,6 +2017,37 @@ def test_stage211_logits_requires_every_dataset_nano_proximity() -> None:
         )
         is True
     )
+
+
+@pytest.mark.parametrize(
+    ("completed_rounds", "correction_started", "gate_passed"),
+    (
+        (0, False, True),
+        (1, True, False),
+        (2, True, False),
+        (3, True, True),
+        (32, True, True),
+    ),
+)
+def test_stage211_correction_round_promotion_requires_three_complete_rounds(
+    completed_rounds: int,
+    correction_started: bool,
+    gate_passed: bool,
+) -> None:
+    result = build_stage211_correction_round_promotion_gate(completed_rounds)
+
+    assert result["completed_rounds"] == completed_rounds
+    assert result["correction_started"] is correction_started
+    assert result["guaranteed_rounds"] == 3
+    assert result["gate_passed"] is gate_passed
+
+
+@pytest.mark.parametrize("completed_rounds", (-1, 33))
+def test_stage211_correction_round_promotion_rejects_invalid_counts(
+    completed_rounds: int,
+) -> None:
+    with pytest.raises(ValueError, match="correction-round count"):
+        build_stage211_correction_round_promotion_gate(completed_rounds)
 
 
 def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
@@ -4856,6 +4888,8 @@ def _write_valid_phase_gate(
                 "checkpoint_path": str(checkpoint.resolve()),
                 "checkpoint_sha256": sha256_file(checkpoint),
                 "gate_passed": True,
+                "metric_gate_passed": True,
+                "correction_round_promotion": (build_stage211_correction_round_promotion_gate(0)),
                 "alignment_gate_passed": True,
                 "public_progress_gate_passed": True,
                 "trajectory_retention_gate_passed": True,
@@ -4992,6 +5026,7 @@ def test_stage211_phase_gate_fails_trajectory_regression_from_best_prior(
 
     gate["trajectory_retention"] = trajectory
     gate["trajectory_retention_gate_passed"] = False
+    gate["metric_gate_passed"] = False
     gate["gate_passed"] = False
     gate["step_eval_cadence"] = build_stage211_step_eval_cadence(
         phase="mixer",
@@ -5054,7 +5089,33 @@ def test_stage211_phase_gate_builder_emits_trajectory_retention(
     ]
     assert report["step_eval_cadence"]["complete"] is True
     assert report["step_eval_cadence"]["interval_steps"] == 10_000
+    assert report["metric_gate_passed"] is True
+    assert report["correction_round_promotion"] == (
+        build_stage211_correction_round_promotion_gate(0)
+    )
     assert report["gate_passed"] is True
+
+
+def test_stage211_phase_gate_rejects_tampered_correction_round_promotion(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_path = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    gate["correction_round_promotion"]["gate_passed"] = False
+    gate_path.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="guaranteed correction-round promotion gate"):
+        validate_stage211_phase_gate_report(
+            gate_path,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
 
 
 def test_stage211_phase_gate_rejects_incomplete_or_inconsistent_step_eval_cadence(
@@ -5195,6 +5256,7 @@ def _write_failed_phase_gate(gate_report: Path) -> Path:
     alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
     report["alignment_report"]["sha256"] = sha256_file(alignment_path)
     report["alignment_gate_passed"] = False
+    report["metric_gate_passed"] = False
     report["gate_passed"] = False
     failed_gate = gate_report.with_name("failed_phase_gate.json")
     failed_gate.write_text(json.dumps(report) + "\n", encoding="utf-8")
@@ -5600,7 +5662,9 @@ def _write_corrected_phase_gate(
         {
             "checkpoint_path": str(checkpoint.resolve()),
             "checkpoint_sha256": sha256_file(checkpoint),
-            "gate_passed": True,
+            "gate_passed": False,
+            "metric_gate_passed": True,
+            "correction_round_promotion": (build_stage211_correction_round_promotion_gate(1)),
             "alignment_gate_passed": True,
         }
     )
@@ -5733,7 +5797,11 @@ def test_stage211_phase_gate_validates_retention_correction_chain(
         corrected_gate,
         expected_phase="mixer",
         checkpoint_path=corrected_checkpoint,
+        require_passed=False,
     )
+    assert validated["metric_gate_passed"] is True
+    assert validated["correction_round_promotion"]["gate_passed"] is False
+    assert validated["gate_passed"] is False
     assert (
         validated["full_data_coverage"]["segments"]
         == json.loads(failed_gate.read_text(encoding="utf-8"))["full_data_coverage"]["segments"]
@@ -5748,6 +5816,7 @@ def test_stage211_phase_gate_validates_retention_correction_chain(
             corrected_gate,
             expected_phase="mixer",
             checkpoint_path=corrected_checkpoint,
+            require_passed=False,
         )
 
 
@@ -5791,6 +5860,7 @@ def test_stage211_phase_gate_rejects_mutated_correction_focus_summary(
             corrected_gate,
             expected_phase="mixer",
             checkpoint_path=corrected_checkpoint,
+            require_passed=False,
         )
 
 
@@ -5837,6 +5907,7 @@ def test_stage211_phase_gate_rejects_correction_checkpoint_chain_break(
             corrected_gate,
             expected_phase="mixer",
             checkpoint_path=corrected_checkpoint,
+            require_passed=False,
         )
 
 

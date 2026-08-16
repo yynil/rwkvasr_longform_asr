@@ -86,9 +86,7 @@ def _write_progress_gate(
     gate: dict[str, object] = {
         "gate_passed": False,
         "trajectory_retention": {"candidate_loss": trajectory_loss},
-        "public_benchmark": {
-            "results": [{"student_error_rate": public_error} for _ in range(5)]
-        },
+        "public_benchmark": {"results": [{"student_error_rate": public_error} for _ in range(5)]},
         "alignment_report": {
             "path": str(alignment.resolve()),
             "sha256": loop.sha256_file(alignment),
@@ -219,7 +217,7 @@ def test_phase_correction_commands_preserve_phase_objective(
     assert selection["checkpoint_sha256"] == loop.sha256_file(checkpoint)
 
 
-def test_retention_loop_runs_failed_round_then_passing_round(
+def test_retention_loop_requires_three_complete_rounds_before_promotion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -227,7 +225,8 @@ def test_retention_loop_runs_failed_round_then_passing_round(
     init_checkpoint = tmp_path / "long.pt"
     round1_checkpoint = tmp_path / "round1.pt"
     round2_checkpoint = tmp_path / "round2.pt"
-    for path in (init_checkpoint, round1_checkpoint, round2_checkpoint):
+    round3_checkpoint = tmp_path / "round3.pt"
+    for path in (init_checkpoint, round1_checkpoint, round2_checkpoint, round3_checkpoint):
         path.write_bytes(path.name.encode())
     original_gate = args.original_gate_dir / "phase_gate.json"
     original_gate.write_text("{}\n", encoding="utf-8")
@@ -239,7 +238,9 @@ def test_retention_loop_runs_failed_round_then_passing_round(
         if path.parent.name == "round_01":
             return {"gate_passed": False, "checkpoint_path": str(round1_checkpoint)}
         if path.parent.name == "round_02":
-            return {"gate_passed": True, "checkpoint_path": str(round2_checkpoint)}
+            return {"gate_passed": False, "checkpoint_path": str(round2_checkpoint)}
+        if path.parent.name == "round_03":
+            return {"gate_passed": True, "checkpoint_path": str(round3_checkpoint)}
         raise AssertionError(path)
 
     def fake_run(
@@ -259,7 +260,7 @@ def test_retention_loop_runs_failed_round_then_passing_round(
             gate_dir = Path(command[command.index("--output-dir") + 1])
             gate_dir.mkdir(parents=True, exist_ok=True)
             (gate_dir / "phase_gate.json").write_text("{}\n", encoding="utf-8")
-            return 1 if gate_dir.name == "round_01" else 0
+            return 0 if gate_dir.name == "round_03" else 1
         raise AssertionError(command)
 
     def fake_ensure_promotion(**kwargs: object) -> Path:
@@ -276,16 +277,49 @@ def test_retention_loop_runs_failed_round_then_passing_round(
 
     assert selected == args.selection
     selection = json.loads(args.selection.read_text(encoding="utf-8"))
-    assert selection["correction_round"] == 2
-    assert selection["checkpoint_path"] == str(round2_checkpoint.resolve())
+    assert selection["correction_round"] == 3
+    assert selection["checkpoint_path"] == str(round3_checkpoint.resolve())
     correction_commands = [
         command for command in commands if str(loop.CORRECTION_RUNNER) in command
     ]
-    assert len(correction_commands) == 2
+    assert len(correction_commands) == 3
     finalizer_commands = [command for command in commands if str(loop.FINALIZER) in command]
-    assert len(finalizer_commands) == 2
-    round2_finalizer = finalizer_commands[-1]
-    assert round2_finalizer.count("--post-coverage-correction-receipt") == 2
+    assert len(finalizer_commands) == 3
+    round3_finalizer = finalizer_commands[-1]
+    assert round3_finalizer.count("--post-coverage-correction-receipt") == 3
+
+
+def test_retention_loop_rejects_promotion_before_guaranteed_rounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _args(tmp_path)
+    initial_checkpoint = tmp_path / "initial.pt"
+    round1_checkpoint = tmp_path / "round1.pt"
+    initial_checkpoint.write_bytes(b"initial")
+    round1_checkpoint.write_bytes(b"round1")
+    original_gate = args.original_gate_dir / "phase_gate.json"
+    original_gate.write_text("{}\n", encoding="utf-8")
+    round1_run = args.correction_run_root / "round_01"
+    round1_run.mkdir(parents=True)
+    (round1_run / "correction_receipt.json").write_text("{}\n", encoding="utf-8")
+    round1_gate = args.correction_gate_root / "round_01" / "phase_gate.json"
+    round1_gate.parent.mkdir(parents=True)
+    round1_gate.write_text("{}\n", encoding="utf-8")
+
+    def fake_validate_gate(path: Path) -> dict[str, object]:
+        if path == original_gate:
+            return {"gate_passed": False, "checkpoint_path": str(initial_checkpoint)}
+        if path == round1_gate:
+            return {"gate_passed": True, "checkpoint_path": str(round1_checkpoint)}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(loop, "_validate_gate", fake_validate_gate)
+
+    with pytest.raises(ValueError, match="passed before the guaranteed 3 correction rounds"):
+        loop.run_retention_loop(args)
+
+    assert not args.selection.exists()
 
 
 def test_correction_extension_requires_strict_deterministic_progress(
@@ -484,9 +518,7 @@ def test_retention_loop_stops_after_guaranteed_rounds_without_progress(
 
     with pytest.raises(ValueError, match="correction stalled after round 3"):
         loop.run_retention_loop(args)
-    decision_path = (
-        args.correction_gate_root / "round_03" / "correction_extension_decision.json"
-    )
+    decision_path = args.correction_gate_root / "round_03" / "correction_extension_decision.json"
     assert decision_path.is_file()
     assert json.loads(decision_path.read_text(encoding="utf-8"))["continue_training"] is False
 
@@ -555,11 +587,9 @@ def test_retention_loop_uses_progress_decision_before_round_four(
     assert selection["correction_round"] == 4
     assert selection["checkpoint_path"] == str(checkpoints[4].resolve())
     decision = json.loads(
-        (
-            args.correction_gate_root
-            / "round_03"
-            / "correction_extension_decision.json"
-        ).read_text(encoding="utf-8")
+        (args.correction_gate_root / "round_03" / "correction_extension_decision.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert decision["continue_training"] is True
 

@@ -393,6 +393,11 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
 
         gate = _validate_gate_for_phase(gate_path, phase=phase)
         if gate.get("gate_passed") is True:
+            if 0 < round_index < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+                raise ValueError(
+                    f"Stage211 {phase} gate passed before the guaranteed "
+                    f"{STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS} correction rounds."
+                )
             promotion = _ensure_promotion(
                 gate_dir=gate_dir,
                 gate=gate,
@@ -422,9 +427,8 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
             raise ValueError(
                 f"Stage211 failed {phase_label} gate must not have a promotion receipt."
             )
-        if (
-            round_index >= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
-            and round_index < int(args.max_rounds)
+        if round_index >= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS and round_index < int(
+            args.max_rounds
         ):
             prior_gate = _validate_gate_for_phase(prior_gate_path, phase=phase)
             decision = _correction_extension_decision(

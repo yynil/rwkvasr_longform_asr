@@ -14,6 +14,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
+    build_stage211_correction_round_promotion_gate,
     build_stage211_full_data_coverage,
     build_stage211_step_eval_cadence,
     build_stage211_trajectory_retention_gate,
@@ -423,13 +424,17 @@ def build_phase_gate(
         supplemental_segment=supplemental_coverage,
         post_coverage_corrections=correction_receipts,
     )
-    gate_passed = stage211_phase_gate_decision(
+    metric_gate_passed = stage211_phase_gate_decision(
         phase=phase,
         alignment_gate_passed=alignment_gate_passed,
         public_progress_gate_passed=public_progress_gate_passed,
         trajectory_retention_gate_passed=trajectory_retention_gate_passed,
         all_datasets_pass=benchmark.get("all_datasets_pass") is True,
     )
+    correction_round_promotion = build_stage211_correction_round_promotion_gate(
+        len(correction_receipts)
+    )
+    gate_passed = metric_gate_passed and correction_round_promotion["gate_passed"]
     final_checkpoint_sha256 = sha256_file(checkpoint_path)
     report = {
         "schema_version": STAGE211_PHASE_GATE_SCHEMA_VERSION,
@@ -439,6 +444,8 @@ def build_phase_gate(
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": final_checkpoint_sha256,
         "gate_passed": gate_passed,
+        "metric_gate_passed": metric_gate_passed,
+        "correction_round_promotion": correction_round_promotion,
         "alignment_gate_passed": alignment_gate_passed,
         "public_progress_gate_passed": public_progress_gate_passed,
         "trajectory_retention_gate_passed": trajectory_retention_gate_passed,
