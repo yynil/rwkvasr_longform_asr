@@ -974,6 +974,11 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert '--mixer-gate-selection "${MIXER_SELECTION}"' in script
     assert '--block-gate-selection "${BLOCK_SELECTION}"' in script
     assert '--logits-gate-selection "${LOGITS_SELECTION}"' in script
+    assert (
+        'LABELED_ROOT="${LABELED_ROOT:-${HOME}/rwkvasr_data/stage211_sft_full_labeled_v2}"'
+        in script
+    )
+    assert '--labeled-profile-receipt "${LABELED_PROFILE_RECEIPT}"' in script
     assert "post_mixer)" in script
     assert 'SUPPLEMENTAL_POLL_SECONDS="${SUPPLEMENTAL_POLL_SECONDS:-3600}"' in script
     assert "wait_for_supplemental_training_data()" in script
@@ -2884,8 +2889,22 @@ def _write_minimal_labeled_data(tmp_path: Path) -> tuple[Path, Path, Path]:
     return webdataset_root, length_index, manifest
 
 
-def test_stage211_sft_labeled_data_audit_and_epoch_estimate(tmp_path: Path) -> None:
+def test_stage211_sft_labeled_data_audit_and_epoch_estimate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     webdataset_root, length_index, manifest = _write_minimal_labeled_data(tmp_path)
+    preparation = stage211._label_preparation_proof(
+        webdataset_root=webdataset_root,
+        length_index_path=length_index,
+    )
+    preparation.update(
+        {
+            "source_counts": {"unknown": 2},
+            "language_counts": {"unknown": 2},
+        }
+    )
+    monkeypatch.setattr(stage211, "_label_preparation_proof", lambda **_kwargs: preparation)
 
     audit = stage211._audit_labeled_data(
         webdataset_root=webdataset_root,

@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,12 +63,7 @@ DEFAULT_CONFIG_DIR = REPO_ROOT / "configs" / "generated" / "stage211_strict_chai
 NANO_CHECKPOINT = Path(
     os.environ.get(
         "RWKVASR_NANO_CHECKPOINT",
-        str(
-            Path.home()
-            / "models"
-            / "Fun-ASR-Nano-2512-modelscope"
-            / "model.pt"
-        ),
+        str(Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"),
     )
 )
 DEFAULT_STAGE211_OUTPUT_ROOT = Path(
@@ -90,6 +86,37 @@ FIXED_HIDDEN_EVAL_SAMPLES = 256
 STAGE211_LABELED_TOTAL_SAMPLES = 285_302
 STAGE211_LABELED_SOURCE_COUNTS = {"aishell3": 63_262, "librispeech": 222_040}
 STAGE211_LABELED_LANGUAGE_COUNTS = {"en": 222_040, "zh": 63_262}
+STAGE211_FULL_LABELED_INPUT_SAMPLES = 1_430_801
+STAGE211_FULL_LABELED_INPUT_SOURCE_COUNTS = {
+    "aishell3": 63_262,
+    "commonvoice_cn": 32_754,
+    "commonvoice_en": 1_112_745,
+    "librispeech": 222_040,
+}
+STAGE211_FULL_LABELED_INPUT_LANGUAGE_COUNTS = {
+    "en": 1_334_785,
+    "zh": 96_016,
+}
+STAGE211_FULL_LABELED_REJECTED_SOURCE_SPLITS = (
+    "dev",
+    "eval",
+    "test",
+    "valid",
+    "validation",
+)
+STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANES = {
+    "aishell3": 2,
+    "commonvoice_cn": 1,
+    "commonvoice_en": 35,
+    "librispeech": 7,
+}
+STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANGUAGES = {
+    "aishell3": "zh",
+    "commonvoice_cn": "zh",
+    "commonvoice_en": "en",
+    "librispeech": "en",
+}
+STAGE211_FULL_LABELED_INTERLEAVE_FIELD = "stage211_sft_interleave_lane"
 LEGACY_CURRICULUM_STEPS = {
     "easy": 30_064,
     "medium": 1_010_185,
@@ -288,9 +315,7 @@ def _segments(
     return [
         {
             **source,
-            "name": (
-                f"{phase.name}_smoke_2steps" if smoke else formal_name
-            ),
+            "name": (f"{phase.name}_smoke_2steps" if smoke else formal_name),
             "difficulty": difficulty,
             "split_steps": target_step,
             "target_step": target_step,
@@ -323,13 +348,8 @@ def _phase_gate_nano_teacher_sha256(gate_report: dict[str, Any]) -> str:
         for segment in segments
         if isinstance(segment, dict)
     }
-    if (
-        len(teacher_sha256_values) != 1
-        or len(next(iter(teacher_sha256_values), "")) != 64
-    ):
-        raise ValueError(
-            "Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256."
-        )
+    if len(teacher_sha256_values) != 1 or len(next(iter(teacher_sha256_values), "")) != 64:
+        raise ValueError("Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256.")
     return next(iter(teacher_sha256_values))
 
 
@@ -342,13 +362,11 @@ def _validate_target_nano_teacher_checkpoint(
     nano_checkpoint_path = nano_checkpoint_path.expanduser().resolve()
     if not nano_checkpoint_path.is_file() or nano_checkpoint_path.stat().st_size <= 0:
         raise ValueError(
-            f"Stage211 {label} Nano teacher checkpoint is missing or empty: "
-            f"{nano_checkpoint_path}"
+            f"Stage211 {label} Nano teacher checkpoint is missing or empty: {nano_checkpoint_path}"
         )
     if _sha256_file(nano_checkpoint_path) != recorded_sha256:
         raise ValueError(
-            f"Stage211 {label} Nano teacher checkpoint SHA-256 differs from "
-            "the preceding stage."
+            f"Stage211 {label} Nano teacher checkpoint SHA-256 differs from the preceding stage."
         )
     return nano_checkpoint_path
 
@@ -374,9 +392,7 @@ def _build_promotion_receipt(
         expected_phase=source_phase,
         checkpoint_path=checkpoint_path,
     )
-    nano_teacher_checkpoint_sha256 = _phase_gate_nano_teacher_sha256(
-        gate_report
-    )
+    nano_teacher_checkpoint_sha256 = _phase_gate_nano_teacher_sha256(gate_report)
     return {
         "schema_version": PROMOTION_RECEIPT_SCHEMA_VERSION,
         "pipeline": "stage211",
@@ -448,16 +464,9 @@ def _validate_promotion_receipt(
         expected_phase=str(expected_source),
         checkpoint_path=checkpoint_path,
     )
-    nano_teacher_checkpoint_sha256 = _phase_gate_nano_teacher_sha256(
-        gate_report
-    )
-    if (
-        receipt.get("nano_teacher_checkpoint_sha256")
-        != nano_teacher_checkpoint_sha256
-    ):
-        raise ValueError(
-            "Stage211 promotion receipt Nano teacher checkpoint SHA-256 mismatch."
-        )
+    nano_teacher_checkpoint_sha256 = _phase_gate_nano_teacher_sha256(gate_report)
+    if receipt.get("nano_teacher_checkpoint_sha256") != nano_teacher_checkpoint_sha256:
+        raise ValueError("Stage211 promotion receipt Nano teacher checkpoint SHA-256 mismatch.")
     if nano_checkpoint_path is not None:
         _validate_target_nano_teacher_checkpoint(
             recorded_sha256=nano_teacher_checkpoint_sha256,
@@ -512,9 +521,7 @@ def _validate_curriculum_receipt(
                 f"expected={expected!r} actual={receipt.get(key)!r}"
             )
     checkpoint_path = checkpoint_path.resolve()
-    recorded_checkpoint = Path(
-        str(receipt.get("completion_checkpoint_path") or "")
-    ).resolve()
+    recorded_checkpoint = Path(str(receipt.get("completion_checkpoint_path") or "")).resolve()
     if recorded_checkpoint != checkpoint_path:
         raise ValueError(
             "Stage211 curriculum receipt checkpoint path mismatch: "
@@ -525,17 +532,11 @@ def _validate_curriculum_receipt(
     validate_stage211_runtime_epoch_coverage(
         receipt.get("runtime_epoch_coverage"),
         epochs=STAGE211_FULL_DATA_EPOCHS,
-        steps_per_epoch=int(
-            STAGE211_AUDIO_CURRICULUM[expected_difficulty]["steps_per_epoch"]
-        ),
+        steps_per_epoch=int(STAGE211_AUDIO_CURRICULUM[expected_difficulty]["steps_per_epoch"]),
         label=f"{phase}/{expected_difficulty}",
     )
-    recorded_teacher_sha256 = str(
-        receipt.get("nano_teacher_checkpoint_sha256") or ""
-    )
-    recorded_teacher_path = Path(
-        str(receipt.get("nano_teacher_checkpoint_path") or "")
-    ).resolve()
+    recorded_teacher_sha256 = str(receipt.get("nano_teacher_checkpoint_sha256") or "")
+    recorded_teacher_path = Path(str(receipt.get("nano_teacher_checkpoint_path") or "")).resolve()
     if (
         len(recorded_teacher_sha256) != 64
         or not recorded_teacher_path.is_file()
@@ -543,8 +544,7 @@ def _validate_curriculum_receipt(
         or _sha256_file(recorded_teacher_path) != recorded_teacher_sha256
     ):
         raise ValueError(
-            "Stage211 curriculum receipt Nano teacher checkpoint is unavailable "
-            "or changed."
+            "Stage211 curriculum receipt Nano teacher checkpoint is unavailable or changed."
         )
     if nano_checkpoint_path is not None:
         _validate_target_nano_teacher_checkpoint(
@@ -631,9 +631,6 @@ def _label_preparation_proof(
         "frontend_downsample": "sensevoice_lfr6",
         "drop_unk_token": True,
         "unk_token_id": None,
-        "num_input_samples": STAGE211_LABELED_TOTAL_SAMPLES,
-        "num_kept_samples": STAGE211_LABELED_TOTAL_SAMPLES,
-        "num_dropped_samples": 0,
     }
     if any(summary.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 SFT label-preparation summary contract mismatch.")
@@ -644,6 +641,134 @@ def _label_preparation_proof(
     if tokenizer_model_path != expected_tokenizer or not tokenizer_model_path.is_file():
         raise ValueError("Stage211 SFT label-preparation tokenizer binding mismatch.")
     counts = summary.get("counts")
+    if not isinstance(counts, dict):
+        raise ValueError("Stage211 SFT label-preparation counts are unavailable.")
+    full_profile = summary.get("forbid_stage211_non_pronunciation_tokens") is True
+    source_filter_proof: dict[str, Any] | None = None
+    if full_profile:
+        expected_full = {
+            "num_input_samples": STAGE211_FULL_LABELED_INPUT_SAMPLES,
+            "forbid_stage211_non_pronunciation_tokens": True,
+            "forbidden_token_ids_count": STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
+            "forbidden_token_ids_sha256": STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
+            "reject_source_splits": list(STAGE211_FULL_LABELED_REJECTED_SOURCE_SPLITS),
+            "fail_on_error": True,
+            "interleave_source_lanes": STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANES,
+        }
+        if any(summary.get(key) != value for key, value in expected_full.items()):
+            raise ValueError("Stage211 SFT full label-preparation safety contract mismatch.")
+        source_root = Path(str(summary.get("source_root") or "")).resolve()
+        source_length_index = Path(str(summary.get("source_length_index_path") or "")).resolve()
+        if (
+            source_length_index != source_root / "webdataset_lengths.jsonl"
+            or not source_length_index.is_file()
+            or source_length_index.stat().st_size <= 0
+        ):
+            raise ValueError("Stage211 SFT full source length-index binding mismatch.")
+        source_filter_path = source_root / ".filter_complete.json"
+        if not source_filter_path.is_file() or source_filter_path.stat().st_size <= 0:
+            raise ValueError("Stage211 SFT full source-filter receipt is unavailable.")
+        source_filter = json.loads(source_filter_path.read_text(encoding="utf-8"))
+        expected_filter = {
+            "sources": STAGE211_FULL_LABELED_INPUT_SOURCE_COUNTS,
+            "num_samples": STAGE211_FULL_LABELED_INPUT_SAMPLES,
+            "excluded_splits": list(STAGE211_FULL_LABELED_REJECTED_SOURCE_SPLITS),
+            "min_duration": 0.5,
+            "max_duration": 20.0,
+            "min_speech_ratio": 0.25,
+        }
+        if not isinstance(source_filter, dict) or any(
+            source_filter.get(key) != value for key, value in expected_filter.items()
+        ):
+            raise ValueError("Stage211 SFT full source-filter receipt contract mismatch.")
+        input_by_source = counts.get("input_by_source")
+        input_by_language = counts.get("input_by_language")
+        kept_by_source = counts.get("kept_by_source")
+        kept_by_language = counts.get("kept_by_language")
+        dropped_by_source = counts.get("dropped_by_source")
+        dropped_by_language = counts.get("dropped_by_language")
+        dropped_by_reason = counts.get("dropped_by_reason")
+        if input_by_source != STAGE211_FULL_LABELED_INPUT_SOURCE_COUNTS:
+            raise ValueError("Stage211 SFT full input source counts mismatch.")
+        if input_by_language != STAGE211_FULL_LABELED_INPUT_LANGUAGE_COUNTS:
+            raise ValueError("Stage211 SFT full input language counts mismatch.")
+        for name, input_counts, kept_counts, dropped_counts in (
+            ("source", input_by_source, kept_by_source, dropped_by_source),
+            ("language", input_by_language, kept_by_language, dropped_by_language),
+        ):
+            if not isinstance(kept_counts, dict) or not isinstance(dropped_counts, dict):
+                raise ValueError(f"Stage211 SFT full {name} accounting is unavailable.")
+            for key, input_count in input_counts.items():
+                if int(kept_counts.get(key, 0)) + int(dropped_counts.get(key, 0)) != int(
+                    input_count
+                ):
+                    raise ValueError(f"Stage211 SFT full {name} accounting mismatch for {key}.")
+        num_kept = int(summary.get("num_kept_samples", -1))
+        num_dropped = int(summary.get("num_dropped_samples", -1))
+        if (
+            num_kept <= 0
+            or num_dropped < 0
+            or num_kept + num_dropped != STAGE211_FULL_LABELED_INPUT_SAMPLES
+            or not isinstance(dropped_by_reason, dict)
+            or sum(int(value) for value in dropped_by_reason.values()) != num_dropped
+            or any(str(reason).startswith("error:") for reason in dropped_by_reason)
+        ):
+            raise ValueError("Stage211 SFT full accepted/dropped accounting mismatch.")
+        source_split_labels = counts.get("source_split_labels")
+        rejected_labels = counts.get("rejected_source_split_labels")
+        if not isinstance(source_split_labels, dict) or not isinstance(rejected_labels, dict):
+            raise ValueError("Stage211 SFT full source-split accounting is unavailable.")
+        if (
+            any(
+                int(source_split_labels.get(split, 0)) > 0
+                for split in STAGE211_FULL_LABELED_REJECTED_SOURCE_SPLITS
+            )
+            or rejected_labels
+        ):
+            raise ValueError("Stage211 SFT full input still contains a public source split.")
+        interleave_lane_counts = counts.get("kept_by_interleave_lane")
+        if not isinstance(interleave_lane_counts, dict):
+            raise ValueError("Stage211 SFT full interleave-lane accounting is unavailable.")
+        expected_lane_names = {
+            (
+                f"{STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANGUAGES[source]}:"
+                f"{source}:lane_{lane_id:02d}"
+            )
+            for source, lane_count in STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANES.items()
+            for lane_id in range(lane_count)
+        }
+        if (
+            set(interleave_lane_counts) != expected_lane_names
+            or any(int(count) <= 0 for count in interleave_lane_counts.values())
+            or sum(int(count) for count in interleave_lane_counts.values()) != num_kept
+        ):
+            raise ValueError("Stage211 SFT full interleave-lane coverage mismatch.")
+        for source, lane_count in STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANES.items():
+            language = STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANGUAGES[source]
+            source_lane_samples = sum(
+                int(interleave_lane_counts[f"{language}:{source}:lane_{lane_id:02d}"])
+                for lane_id in range(lane_count)
+            )
+            if source_lane_samples != int(kept_by_source.get(source, 0)):
+                raise ValueError(
+                    f"Stage211 SFT full interleave-lane source count mismatch for {source}."
+                )
+        source_filter_proof = {
+            "path": str(source_filter_path.resolve()),
+            "sha256": _sha256_file(source_filter_path),
+            "source_root": str(source_root),
+            "source_length_index_path": str(source_length_index),
+            "source_length_index_sha256": _sha256_file(source_length_index),
+            **expected_filter,
+        }
+    else:
+        expected_legacy_summary = {
+            "num_input_samples": STAGE211_LABELED_TOTAL_SAMPLES,
+            "num_kept_samples": STAGE211_LABELED_TOTAL_SAMPLES,
+            "num_dropped_samples": 0,
+        }
+        if any(summary.get(key) != value for key, value in expected_legacy_summary.items()):
+            raise ValueError("Stage211 SFT legacy label-preparation size mismatch.")
     expected_counts = {
         "input_by_split": {"eval": 1_434, "train": 283_868},
         "kept_by_split": {"eval": 1_434, "train": 283_868},
@@ -667,20 +792,32 @@ def _label_preparation_proof(
         "dropped_unk_tokens_by_source": {},
         "dropped_unk_tokens_by_language": {},
     }
-    if not isinstance(counts, dict) or any(
-        counts.get(key) != value for key, value in expected_counts.items()
-    ):
+    if not full_profile and any(counts.get(key) != value for key, value in expected_counts.items()):
         raise ValueError("Stage211 SFT label-preparation source/language counts mismatch.")
     if not log_path.is_file() or log_path.stat().st_size <= 0:
         raise ValueError(f"Stage211 SFT label-preparation log is unavailable: {log_path}")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    for marker in (
+    markers = [
         "tokenizer_type=sensevoice_tiktoken",
         "text_normalization=ctc",
         "frontend_downsample=sensevoice_lfr6",
         "drop_unk_token=1",
         "CTC-aligned clean preprocessing complete",
-    ):
+    ]
+    if full_profile:
+        markers.extend(
+            (
+                "forbid_stage211_non_pronunciation_tokens=1",
+                "reject_source_splits=dev,eval,test,valid,validation",
+                "fail_on_error=1",
+                (
+                    "interleave_source_lanes="
+                    "aishell3:2,commonvoice_cn:1,commonvoice_en:35,librispeech:7"
+                ),
+                f"bucket_source_field={STAGE211_FULL_LABELED_INTERLEAVE_FIELD}",
+            )
+        )
+    for marker in markers:
         if marker not in log_text:
             raise ValueError(f"Stage211 SFT label-preparation log lacks {marker!r}.")
     return {
@@ -695,16 +832,31 @@ def _label_preparation_proof(
         "frontend_downsample": "sensevoice_lfr6",
         "drop_unk_token": True,
         "ctc_unk_tokens": 0,
+        "profile_schema_version": 2 if full_profile else 1,
+        "input_samples": int(summary["num_input_samples"]),
+        "accepted_samples": int(summary["num_kept_samples"]),
+        "dropped_samples": int(summary["num_dropped_samples"]),
         "non_pronunciation_target_policy": "ctc_normalization",
         "non_pronunciation_logit_policy": "tokenizer_special_tokens_suppressed",
-        "ctc_suppressed_token_ids_count": (
-            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
+        "ctc_suppressed_token_ids_count": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT),
+        "ctc_suppressed_token_ids_sha256": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256),
+        "source_counts": dict(
+            counts["kept_by_source"] if full_profile else STAGE211_LABELED_SOURCE_COUNTS
         ),
-        "ctc_suppressed_token_ids_sha256": (
-            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
+        "language_counts": dict(
+            counts["kept_by_language"] if full_profile else STAGE211_LABELED_LANGUAGE_COUNTS
         ),
-        "source_counts": dict(STAGE211_LABELED_SOURCE_COUNTS),
-        "language_counts": dict(STAGE211_LABELED_LANGUAGE_COUNTS),
+        "dropped_by_reason": dict(counts.get("dropped_by_reason") or {}),
+        "interleave_source_lanes": (
+            dict(STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANES) if full_profile else None
+        ),
+        "interleave_source_field": (
+            STAGE211_FULL_LABELED_INTERLEAVE_FIELD if full_profile else None
+        ),
+        "interleave_lane_counts": (
+            dict(sorted(counts["kept_by_interleave_lane"].items())) if full_profile else None
+        ),
+        "source_filter": source_filter_proof,
     }
 
 
@@ -722,7 +874,19 @@ def _audit_labeled_data(
     if not length_index_path.is_file():
         raise FileNotFoundError(str(length_index_path))
 
+    preparation = _label_preparation_proof(
+        webdataset_root=webdataset_root,
+        length_index_path=length_index_path,
+    )
+    full_profile = int(preparation.get("profile_schema_version", 1)) == 2
     manifest = load_webdataset_bucket_manifest(bucket_manifest_path)
+    raw_manifest = json.loads(bucket_manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_manifest, dict):
+        raise ValueError("Stage211 SFT bucket manifest must be a JSON object.")
+    if full_profile and raw_manifest.get("source_field") != (
+        STAGE211_FULL_LABELED_INTERLEAVE_FIELD
+    ):
+        raise ValueError("Stage211 SFT full bucket manifest has the wrong interleave field.")
     recorded_index = Path(manifest.source_length_index_path).resolve()
     if recorded_index != length_index_path:
         raise ValueError(
@@ -737,12 +901,31 @@ def _audit_labeled_data(
         raise ValueError(
             f"Stage211 SFT requires non-empty train and eval bucket splits: {manifest_counts}"
         )
+    if full_profile:
+        manifest_lane_counts: Counter[str] = Counter()
+        for buckets in manifest.splits.values():
+            for bucket in buckets:
+                for part in bucket.parts:
+                    if part.source_label is None or not part.source_label.strip():
+                        raise ValueError(
+                            "Stage211 SFT full bucket manifest has an unlabeled interleave part."
+                        )
+                    manifest_lane_counts[part.source_label.strip()] += int(part.num_samples)
+        if dict(sorted(manifest_lane_counts.items())) != preparation["interleave_lane_counts"]:
+            raise ValueError(
+                "Stage211 SFT full bucket-manifest interleave coverage differs from "
+                "preparation proof."
+            )
 
     split_counts = {"train": 0, "eval": 0}
     seen_ids: dict[str, str] = {}
     total_frames = 0
     total_tokens = 0
     total_unk_tokens = 0
+    total_forbidden_tokens = 0
+    source_counts: Counter[str] = Counter()
+    language_counts: Counter[str] = Counter()
+    interleave_lane_counts: Counter[str] = Counter()
     required_fields = (
         "json_member",
         "normalized_text_chars",
@@ -751,6 +934,12 @@ def _audit_labeled_data(
         "ctc_required_frames",
         "ctc_logit_frames",
     )
+    if full_profile:
+        required_fields = (
+            *required_fields,
+            "ctc_forbidden_tokens",
+            STAGE211_FULL_LABELED_INTERLEAVE_FIELD,
+        )
     with length_index_path.open("r", encoding="utf-8") as source:
         for line_number, line in enumerate(source, start=1):
             if not line.strip():
@@ -780,6 +969,7 @@ def _audit_labeled_data(
             normalized_chars = int(row["normalized_text_chars"])
             ctc_tokens = int(row["ctc_num_tokens"])
             ctc_unk_tokens = int(row["ctc_unk_tokens"])
+            ctc_forbidden_tokens = int(row.get("ctc_forbidden_tokens", 0))
             required_frames = int(row["ctc_required_frames"])
             logit_frames = int(row["ctc_logit_frames"])
             num_frames = int(row.get("num_frames") or 0)
@@ -788,6 +978,7 @@ def _audit_labeled_data(
                 or normalized_chars <= 0
                 or ctc_tokens <= 0
                 or ctc_unk_tokens != 0
+                or ctc_forbidden_tokens != 0
                 or required_frames <= 0
                 or logit_frames <= 0
                 or required_frames > logit_frames
@@ -801,11 +992,43 @@ def _audit_labeled_data(
             total_frames += num_frames
             total_tokens += ctc_tokens
             total_unk_tokens += ctc_unk_tokens
+            total_forbidden_tokens += ctc_forbidden_tokens
+            source_name = str(row.get("source_dataset") or "unknown")
+            language = str(row.get("language") or "unknown")
+            source_counts[source_name] += 1
+            language_counts[language] += 1
+            if full_profile:
+                lane_name = str(row[STAGE211_FULL_LABELED_INTERLEAVE_FIELD])
+                lane_count = STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANES.get(source_name)
+                expected_language = STAGE211_FULL_LABELED_INTERLEAVE_SOURCE_LANGUAGES.get(
+                    source_name
+                )
+                expected_lanes = {
+                    f"{expected_language}:{source_name}:lane_{lane_id:02d}"
+                    for lane_id in range(lane_count or 0)
+                }
+                if language != expected_language or lane_name not in expected_lanes:
+                    raise ValueError(
+                        f"Stage211 SFT row {line_number} has an invalid interleave lane "
+                        f"for source={source_name!r} language={language!r}."
+                    )
+                interleave_lane_counts[lane_name] += 1
 
     if split_counts != manifest_counts:
         raise ValueError(
             "Stage211 SFT length-index and bucket-manifest counts differ: "
             f"index={split_counts} manifest={manifest_counts}"
+        )
+    if dict(sorted(source_counts.items())) != preparation["source_counts"]:
+        raise ValueError("Stage211 SFT length-index source counts differ from preparation proof.")
+    if dict(sorted(language_counts.items())) != preparation["language_counts"]:
+        raise ValueError("Stage211 SFT length-index language counts differ from preparation proof.")
+    if (
+        full_profile
+        and dict(sorted(interleave_lane_counts.items())) != preparation["interleave_lane_counts"]
+    ):
+        raise ValueError(
+            "Stage211 SFT length-index interleave-lane counts differ from preparation proof."
         )
     estimated_steps = estimate_bucket_manifest_steps(
         manifest,
@@ -832,6 +1055,7 @@ def _audit_labeled_data(
         "total_hours": total_frames / 100.0 / 3600.0,
         "ctc_tokens": total_tokens,
         "ctc_unk_tokens": total_unk_tokens,
+        "ctc_forbidden_tokens": total_forbidden_tokens,
         "unique_utterance_ids": len(seen_ids),
         "pronunciation_target_samples": sum(split_counts.values()),
         "ctc_feasible_samples": sum(split_counts.values()),
@@ -839,10 +1063,10 @@ def _audit_labeled_data(
         "tail_padding_samples_per_epoch": tail_padding_samples,
         "tail_padding_sample_exposures": tail_padding_samples,
         "executed_sample_exposures": split_counts["train"] + tail_padding_samples,
-        "label_preparation": _label_preparation_proof(
-            webdataset_root=webdataset_root,
-            length_index_path=length_index_path,
-        ),
+        "source_counts": dict(sorted(source_counts.items())),
+        "language_counts": dict(sorted(language_counts.items())),
+        "interleave_lane_counts": dict(sorted(interleave_lane_counts.items())),
+        "label_preparation": preparation,
     }
 
 
@@ -952,9 +1176,7 @@ def _config(
             "ctc_loss_weight": float(phase.ctc_weight),
             "decoder_loss_weight": 0.0,
             "ctc_suppress_non_pronunciation_tokens": bool(phase.requires_labels),
-            "ctc_teacher_online_model_path": str(
-                nano_checkpoint.expanduser().resolve().parent
-            ),
+            "ctc_teacher_online_model_path": str(nano_checkpoint.expanduser().resolve().parent),
             "funasr_nano_ctc_init_checkpoint_path": None,
             "funasr_nano_ctc_init_load_encoder": False,
             "funasr_nano_ctc_init_load_encoder_attention": False,
@@ -1011,16 +1233,12 @@ def _config(
             }
         )
         deepspeed_config = dict(config["deepspeed"])
-        gradient_accumulation = int(
-            deepspeed_config.get("gradient_accumulation_steps", 1)
-        )
+        gradient_accumulation = int(deepspeed_config.get("gradient_accumulation_steps", 1))
         deepspeed_config.update(
             {
                 "train_micro_batch_size_per_gpu": STAGE211_FULL_DATA_BATCH_SIZE,
                 "train_batch_size": (
-                    STAGE211_FULL_DATA_BATCH_SIZE
-                    * TRAIN_WORLD_SIZE
-                    * gradient_accumulation
+                    STAGE211_FULL_DATA_BATCH_SIZE * TRAIN_WORLD_SIZE * gradient_accumulation
                 ),
             }
         )
@@ -1034,9 +1252,7 @@ def _config(
         config.update(
             {
                 "ctc_suppressed_token_ids": suppressed_token_ids,
-                "ctc_teacher_online_project_ignored_token_ids": list(
-                    suppressed_token_ids
-                ),
+                "ctc_teacher_online_project_ignored_token_ids": list(suppressed_token_ids),
                 "webdataset_root": str(labeled_webdataset_root),
                 "webdataset_index_path": None,
                 "webdataset_length_index_path": str(labeled_length_index),
@@ -1204,14 +1420,10 @@ def _record_or_validate_provenance(
     if curriculum_difficulty is not None:
         payload["curriculum_difficulty"] = curriculum_difficulty
         payload["curriculum_receipt_path"] = (
-            curriculum_receipt.get("receipt_path")
-            if curriculum_receipt is not None
-            else None
+            curriculum_receipt.get("receipt_path") if curriculum_receipt is not None else None
         )
         payload["curriculum_receipt_sha256"] = (
-            curriculum_receipt.get("receipt_sha256")
-            if curriculum_receipt is not None
-            else None
+            curriculum_receipt.get("receipt_sha256") if curriculum_receipt is not None else None
         )
     if full_data_profile:
         payload["full_data_profile"] = True
@@ -1281,27 +1493,18 @@ def _validate_resume_provenance(
         curriculum_difficulty is not None and curriculum_difficulty != "easy"
     )
     if is_curriculum_continuation:
-        curriculum_receipt_path = Path(
-            str(curriculum_receipt_path_value or "")
-        ).resolve()
+        curriculum_receipt_path = Path(str(curriculum_receipt_path_value or "")).resolve()
         if (
             not curriculum_receipt_path.is_file()
             or _sha256_file(curriculum_receipt_path) != curriculum_receipt_sha256
         ):
-            raise ValueError(
-                "Stage211 resume curriculum-receipt provenance is missing or changed."
-            )
-    elif (
-        curriculum_receipt_path_value is not None
-        or curriculum_receipt_sha256 is not None
-    ):
+            raise ValueError("Stage211 resume curriculum-receipt provenance is missing or changed.")
+    elif curriculum_receipt_path_value is not None or curriculum_receipt_sha256 is not None:
         raise ValueError("Stage211 easy/SFT provenance must not contain a curriculum receipt.")
 
     receipt_path_value = payload.get("promotion_receipt_path")
     receipt_sha256 = payload.get("promotion_receipt_sha256")
-    requires_promotion = (
-        _preceding_phase(phase.name) is not None and not is_curriculum_continuation
-    )
+    requires_promotion = _preceding_phase(phase.name) is not None and not is_curriculum_continuation
     if not requires_promotion:
         if receipt_path_value is not None or receipt_sha256 is not None:
             raise ValueError(
@@ -1369,8 +1572,7 @@ def main() -> int:
     is_supplemental = difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY
     if is_supplemental and args.supplemental_inventory is None:
         parser.error(
-            f"--difficulty {STAGE211_SUPPLEMENTAL_DIFFICULTY} requires "
-            "--supplemental-inventory"
+            f"--difficulty {STAGE211_SUPPLEMENTAL_DIFFICULTY} requires --supplemental-inventory"
         )
     if not is_supplemental and args.supplemental_inventory is not None:
         parser.error("--supplemental-inventory is valid only for supplemental_natural")
@@ -1413,9 +1615,10 @@ def main() -> int:
         )
         if not args.dry_run:
             validate_stage211_formal_supplemental_profile(supplemental_profile)
-        if Path(str(supplemental_profile["bucket_manifest_path"])).resolve() != Path(
-            bucket_manifest
-        ).resolve():
+        if (
+            Path(str(supplemental_profile["bucket_manifest_path"])).resolve()
+            != Path(bucket_manifest).resolve()
+        ):
             raise ValueError(
                 "Stage211 supplemental inventory does not bind the requested bucket manifest."
             )
@@ -1440,9 +1643,7 @@ def main() -> int:
                 supplemental_profile["rows"]
             ):
                 raise ValueError("Stage211 supplemental manifest train-row count mismatch.")
-            if int(audio_data_audit["split_samples"].get("eval", 0)) != (
-                FIXED_HIDDEN_EVAL_SAMPLES
-            ):
+            if int(audio_data_audit["split_samples"].get("eval", 0)) != (FIXED_HIDDEN_EVAL_SAMPLES):
                 raise ValueError("Stage211 supplemental manifest fixed-eval count mismatch.")
     elif not args.dry_run:
         audio_data_audit = _audit_audio_bucket_storage(bucket_manifest)
@@ -1450,14 +1651,10 @@ def main() -> int:
         expected_coverage = STAGE211_AUDIO_CURRICULUM[difficulty]
         actual_rows = int(audio_data_audit["split_samples"].get("train", 0))
         audit_batch_size = (
-            STAGE211_FULL_DATA_BATCH_SIZE
-            if args.full_data_profile
-            else TRAIN_BATCH_SIZE
+            STAGE211_FULL_DATA_BATCH_SIZE if args.full_data_profile else TRAIN_BATCH_SIZE
         )
         audit_frame_budget = (
-            STAGE211_FULL_DATA_FRAME_BUDGET
-            if args.full_data_profile
-            else TRAIN_FRAME_BUDGET
+            STAGE211_FULL_DATA_FRAME_BUDGET if args.full_data_profile else TRAIN_FRAME_BUDGET
         )
         actual_steps_per_epoch = estimate_bucket_manifest_steps(
             manifest,
@@ -1489,9 +1686,7 @@ def main() -> int:
                 world_size=TRAIN_WORLD_SIZE,
                 frame_budget=audit_frame_budget,
             )
-            expected_tail_padding = int(
-                expected_coverage["tail_padding_samples_per_epoch"]
-            )
+            expected_tail_padding = int(expected_coverage["tail_padding_samples_per_epoch"])
             if actual_tail_padding != expected_tail_padding:
                 raise ValueError(
                     f"Stage211 {difficulty} manifest tail-padding mismatch: "
@@ -1548,9 +1743,7 @@ def main() -> int:
                 checkpoint_path=init_checkpoint,
                 nano_checkpoint_path=args.nano_checkpoint,
             )
-            if args.full_data_profile and curriculum_receipt.get(
-                "full_data_profile"
-            ) is not True:
+            if args.full_data_profile and curriculum_receipt.get("full_data_profile") is not True:
                 raise ValueError(
                     "Stage211 full-data curriculum continuation requires a "
                     "full-data predecessor receipt."

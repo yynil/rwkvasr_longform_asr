@@ -24,7 +24,8 @@ FULL_CONFIG_ROOT="${FULL_CONFIG_ROOT:-${HOME}/rwkvasr_configs/stage211_full_alig
 NANO_CHECKPOINT="${NANO_CHECKPOINT:-${HOME}/models/Fun-ASR-Nano-2512-modelscope/model.pt}"
 MASTER_PORT="${MASTER_PORT:-29631}"
 PHASE_GATE_ROOT="${PHASE_GATE_ROOT:-${HOME}/rwkvasr_eval/stage211_phase_gates}"
-LABELED_ROOT="${LABELED_ROOT:-/media/usbhd/training_data/asr/curriculum/clean_ctc_voxbox_webdataset/stages/easy_clean_librispeech_aishell3_ctc_norm_aligned_sensevoice_lfr6_svtok}"
+LABELED_ROOT="${LABELED_ROOT:-${HOME}/rwkvasr_data/stage211_sft_full_labeled_v2}"
+LABELED_PROFILE_RECEIPT="${LABELED_PROFILE_RECEIPT:-${LABELED_ROOT}/stage211_labeled_profile_receipt.json}"
 SFT_OUTPUT_DIR="${SFT_OUTPUT_DIR:-${FULL_OUTPUT_ROOT}/stage211d_labeled_ctc_sft_1ep}"
 REUSE_COMPLETED_CALIBRATION_EVAL="${REUSE_COMPLETED_CALIBRATION_EVAL:-0}"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${CALIBRATION_EVAL_DIR}/public/reuse_receipt.json}"
@@ -349,6 +350,7 @@ run_labeled_sft_phase() {
     --labeled-webdataset-root "${LABELED_ROOT}" \
     --labeled-length-index "${LABELED_ROOT}/webdataset_lengths.jsonl" \
     --bucket-manifest "${LABELED_ROOT}/webdataset_buckets_audio_text/manifest.json" \
+    --labeled-profile-receipt "${LABELED_PROFILE_RECEIPT}" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --master-port "$((MASTER_PORT + 3))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"

@@ -30,6 +30,9 @@ try:
         DEFAULT_TOKENIZER_SOURCE,
         validate_completed_correction,
     )
+    from scripts.create_stage211_labeled_profile_receipt import (
+        validate_receipt as validate_labeled_profile_receipt,
+    )
     from scripts.run_stage211_labeled_sft import (
         LABELED_EXPECTED,
         _validate_completion as _validate_sft_completion,
@@ -46,6 +49,9 @@ except ModuleNotFoundError as error:
         DEFAULT_CORRECTION_RECEIPT,
         DEFAULT_TOKENIZER_SOURCE,
         validate_completed_correction,
+    )
+    from create_stage211_labeled_profile_receipt import (  # type: ignore[no-redef]
+        validate_receipt as validate_labeled_profile_receipt,
     )
     from run_stage211_labeled_sft import (
         LABELED_EXPECTED,
@@ -329,9 +335,7 @@ def _language_metric_summaries(
         ]
         expected_count = 3 if language == "en" else 2
         if len(rows) != expected_count:
-            raise ValueError(
-                f"Stage211 {name} macro requires exactly {expected_count} datasets."
-            )
+            raise ValueError(f"Stage211 {name} macro requires exactly {expected_count} datasets.")
         stage_values = {
             stage: sum(float(row["stages"][stage]["student_error_rate"]) for row in rows)
             / len(rows)
@@ -346,8 +350,7 @@ def _language_metric_summaries(
                 "datasets": [str(row["dataset"]) for row in rows],
                 "dataset_count": len(rows),
                 "sample_count": sum(int(row["sample_count"]) for row in rows),
-                "nano_error_rate": sum(float(row["nano_error_rate"]) for row in rows)
-                / len(rows),
+                "nano_error_rate": sum(float(row["nano_error_rate"]) for row in rows) / len(rows),
                 "stages": stage_values,
             }
         )
@@ -408,7 +411,35 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
     audit = coverage.get("labeled_data_audit")
     if not isinstance(audit, dict):
         raise ValueError("Stage211 SFT coverage lacks the full labeled-data audit.")
-    for key, expected in LABELED_EXPECTED.items():
+    profile_path_value = coverage.get("labeled_profile_receipt_path")
+    profile_binding: dict[str, Any] = {}
+    if profile_path_value is not None:
+        profile_path = Path(str(profile_path_value)).resolve()
+        if coverage.get("labeled_profile_receipt_sha256") != sha256_file(profile_path):
+            raise ValueError("Stage211 SFT labeled profile receipt changed.")
+        profile = validate_labeled_profile_receipt(
+            profile_path,
+            labeled_root=Path(str(coverage.get("labeled_webdataset_root") or "")),
+            length_index=Path(str(coverage.get("length_index_path") or "")),
+            bucket_manifest=Path(str(coverage.get("bucket_manifest_path") or "")),
+        )
+        if profile.get("labeled_data_audit") != audit:
+            raise ValueError("Stage211 SFT audit differs from its full-labeled profile.")
+        labeled_expected = dict(profile["expected"])
+        expected_source_counts = labeled_expected["source_counts"]
+        expected_language_counts = labeled_expected["language_counts"]
+        profile_binding = {
+            "labeled_profile_schema_version": int(profile["schema_version"]),
+            "labeled_profile_receipt_path": str(profile_path),
+            "labeled_profile_receipt_sha256": sha256_file(profile_path),
+            "all_accepted_unique_rows_required": True,
+            "source_language_interleave_required": True,
+        }
+    else:
+        labeled_expected = dict(LABELED_EXPECTED)
+        expected_source_counts = STAGE211_LABELED_SOURCE_COUNTS
+        expected_language_counts = STAGE211_LABELED_LANGUAGE_COUNTS
+    for key, expected in labeled_expected.items():
         audit_value = audit.get(key)
         coverage_value = coverage.get(key)
         if key == "total_hours":
@@ -429,12 +460,8 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
     if coverage.get("ctc_suppress_non_pronunciation_tokens") is not True:
         raise ValueError("Stage211 SFT did not suppress non-pronunciation CTC logits.")
     expected_support = {
-        "ctc_suppressed_token_ids_count": (
-            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
-        ),
-        "ctc_suppressed_token_ids_sha256": (
-            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
-        ),
+        "ctc_suppressed_token_ids_count": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT),
+        "ctc_suppressed_token_ids_sha256": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256),
         "teacher_projection_support_matches_student": True,
     }
     for key, expected in expected_support.items():
@@ -451,14 +478,10 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
         "ctc_unk_tokens": 0,
         "non_pronunciation_target_policy": "ctc_normalization",
         "non_pronunciation_logit_policy": "tokenizer_special_tokens_suppressed",
-        "ctc_suppressed_token_ids_count": (
-            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
-        ),
-        "ctc_suppressed_token_ids_sha256": (
-            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
-        ),
-        "source_counts": STAGE211_LABELED_SOURCE_COUNTS,
-        "language_counts": STAGE211_LABELED_LANGUAGE_COUNTS,
+        "ctc_suppressed_token_ids_count": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT),
+        "ctc_suppressed_token_ids_sha256": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256),
+        "source_counts": expected_source_counts,
+        "language_counts": expected_language_counts,
     }
     for key, expected in expected_preparation.items():
         if preparation.get(key) != expected:
@@ -486,6 +509,8 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
         "ctc_feasible_samples": int(audit["ctc_feasible_samples"]),
         "ctc_tokens": int(audit["ctc_tokens"]),
         "ctc_unk_tokens": int(audit["ctc_unk_tokens"]),
+        "ctc_forbidden_tokens": int(audit.get("ctc_forbidden_tokens", 0)),
+        **profile_binding,
         **expected_preparation,
         "summary_path": str(preparation["summary_path"]),
         "summary_sha256": str(preparation["summary_sha256"]),
@@ -1140,9 +1165,7 @@ def build_stepwise_report(
         "requested_to_internal_stage": dict(REQUESTED_TO_INTERNAL_STAGE),
         "checkpoint_chain_passed": True,
         "nano_initialization_chain_passed": True,
-        "nano_initialization_source_chain_passed": initialization[
-            "loader_source_chain_passed"
-        ],
+        "nano_initialization_source_chain_passed": initialization["loader_source_chain_passed"],
         "ctc_label_normalization_chain_passed": True,
         "ctc_label_proof": ctc_label_proof,
         "public_metric_definition_chain_passed": True,
