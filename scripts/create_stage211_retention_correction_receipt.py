@@ -352,9 +352,7 @@ def build_receipt(
             str(extension_decision_path) if extension_decision_path is not None else None
         ),
         "correction_extension_decision_sha256": (
-            sha256_file(extension_decision_path)
-            if extension_decision_path is not None
-            else None
+            sha256_file(extension_decision_path) if extension_decision_path is not None else None
         ),
     }
     if any(provenance.get(key) != value for key, value in expected_provenance.items()):
@@ -440,6 +438,12 @@ def build_receipt(
         "smoke_marker_sha256": sha256_file(smoke_marker_path),
         "layer_focus_path": str(layer_focus_path),
         "layer_focus_sha256": sha256_file(layer_focus_path),
+        "layer_focus_strategy": str(layer_focus["strategy"]),
+        "failed_layer_count": int(layer_focus["failed_layer_count"]),
+        "dynamic_layer_limit": int(layer_focus["dynamic_layer_limit"]),
+        "adaptive_dynamic_layer_limit": int(layer_focus["adaptive_dynamic_layer_limit"]),
+        "minimum_rotating_layer_slots": int(layer_focus["minimum_rotating_slots"]),
+        "adaptive_rotating_layer_slots_target": int(layer_focus["adaptive_rotating_slots_target"]),
         "boundary_layer_ids": list(layer_focus["boundary_layer_ids"]),
         "selected_failure_layer_ids": list(layer_focus["selected_failure_layer_ids"]),
         "all_failed_layer_ids": list(layer_focus["all_failed_layer_ids"]),
@@ -454,9 +458,7 @@ def build_receipt(
             str(extension_decision_path) if extension_decision_path is not None else None
         ),
         "correction_extension_decision_sha256": (
-            sha256_file(extension_decision_path)
-            if extension_decision_path is not None
-            else None
+            sha256_file(extension_decision_path) if extension_decision_path is not None else None
         ),
         "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint),
         "nano_teacher_checkpoint_sha256": nano_teacher_sha256,

@@ -235,11 +235,15 @@ def test_create_stage211_retention_correction_receipt(
     admission_gate = tmp_path / "failed-gate.json"
     admission_gate.write_text("{}\n", encoding="utf-8")
     boundary_layer_ids = list(
-        stage211_phase_train_config_contract(phase)[
-            "ctc_teacher_online_layer_boundary_ids"
-        ]
+        stage211_phase_train_config_contract(phase)["ctc_teacher_online_layer_boundary_ids"]
     )
     layer_focus_payload = {
+        "strategy": "static_hard_anchors" if phase == "logits" else "uniform_full_rotation",
+        "failed_layer_count": 0,
+        "dynamic_layer_limit": 3 if phase == "logits" else 5,
+        "adaptive_dynamic_layer_limit": 3 if phase == "logits" else 5,
+        "minimum_rotating_slots": 1 if phase == "logits" else 3,
+        "adaptive_rotating_slots_target": 1 if phase == "logits" else 3,
         "boundary_layer_ids": boundary_layer_ids,
         "selected_failure_layer_ids": [],
         "all_failed_layer_ids": [],
@@ -410,6 +414,16 @@ def test_create_stage211_retention_correction_receipt(
     assert receipt["nano_teacher_checkpoint_sha256"] == nano_sha256
     assert receipt["smoke_marker_sha256"] == correction.sha256_file(smoke_marker)
     assert receipt["layer_focus_sha256"] == correction.sha256_file(layer_focus)
+    assert receipt["layer_focus_strategy"] == layer_focus_payload["strategy"]
+    assert receipt["failed_layer_count"] == 0
+    assert (
+        receipt["adaptive_dynamic_layer_limit"]
+        == layer_focus_payload["adaptive_dynamic_layer_limit"]
+    )
+    assert (
+        receipt["adaptive_rotating_layer_slots_target"]
+        == layer_focus_payload["adaptive_rotating_slots_target"]
+    )
     assert receipt["boundary_layer_ids"] == boundary_layer_ids
     assert receipt["correction_extension_decision_path"] is None
     assert receipt["correction_extension_decision_sha256"] is None

@@ -628,9 +628,7 @@ def test_stage211_public_prediction_receipt_rejects_unbound_or_non_ctc_rows(
     elif mutation == "wrong_checkpoint":
         other_checkpoint = tmp_path / "other.pt"
         other_checkpoint.write_bytes(b"other")
-        row["inference_provenance"], _ = stage211_test_student_ctc_context(
-            other_checkpoint
-        )
+        row["inference_provenance"], _ = stage211_test_student_ctc_context(other_checkpoint)
     elif mutation == "wrong_blank":
         row["inference_provenance"] = {
             **provenance,
@@ -5472,6 +5470,14 @@ def _write_retention_correction(
         "smoke_marker_sha256": sha256_file(smoke_marker),
         "layer_focus_path": str(layer_focus.resolve()),
         "layer_focus_sha256": sha256_file(layer_focus),
+        "layer_focus_strategy": str(layer_focus_payload["strategy"]),
+        "failed_layer_count": int(layer_focus_payload["failed_layer_count"]),
+        "dynamic_layer_limit": int(layer_focus_payload["dynamic_layer_limit"]),
+        "adaptive_dynamic_layer_limit": int(layer_focus_payload["adaptive_dynamic_layer_limit"]),
+        "minimum_rotating_layer_slots": int(layer_focus_payload["minimum_rotating_slots"]),
+        "adaptive_rotating_layer_slots_target": int(
+            layer_focus_payload["adaptive_rotating_slots_target"]
+        ),
         "boundary_layer_ids": list(layer_focus_payload["boundary_layer_ids"]),
         "selected_failure_layer_ids": list(layer_focus_payload["selected_failure_layer_ids"]),
         "all_failed_layer_ids": list(layer_focus_payload["all_failed_layer_ids"]),
@@ -5738,6 +5744,49 @@ def test_stage211_phase_gate_validates_retention_correction_chain(
 
     replay_part.write_text("tampered\n", encoding="utf-8")
     with pytest.raises(ValueError, match="output part 0 SHA-256 mismatch"):
+        validate_stage211_phase_gate_report(
+            corrected_gate,
+            expected_phase="mixer",
+            checkpoint_path=corrected_checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_correction_focus_summary(
+    tmp_path: Path,
+) -> None:
+    original_checkpoint = tmp_path / "long-complete.pt"
+    original_checkpoint.write_bytes(b"long-complete")
+    failed_gate = _write_failed_phase_gate(
+        _write_valid_phase_gate(
+            tmp_path,
+            phase="mixer",
+            checkpoint=original_checkpoint,
+        )
+    )
+    corrected_checkpoint = tmp_path / "retention-complete.pt"
+    corrected_checkpoint.write_bytes(b"retention-complete")
+    correction, _ = _write_retention_correction(
+        tmp_path,
+        failed_gate=failed_gate,
+        completion_checkpoint=corrected_checkpoint,
+    )
+    receipt_path = Path(str(correction["receipt_path"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["failed_layer_count"] = int(receipt["failed_layer_count"]) + 1
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    correction = {
+        **receipt,
+        "receipt_path": str(receipt_path.resolve()),
+        "receipt_sha256": sha256_file(receipt_path),
+    }
+    corrected_gate = _write_corrected_phase_gate(
+        tmp_path,
+        failed_gate=failed_gate,
+        checkpoint=corrected_checkpoint,
+        correction=correction,
+    )
+
+    with pytest.raises(ValueError, match="layer-focus summary mismatch"):
         validate_stage211_phase_gate_report(
             corrected_gate,
             expected_phase="mixer",
@@ -7173,9 +7222,9 @@ def _run_stage211_continuation_watcher_fixture(
         'sft_coverage=\'{"unique_or_train_rows":1418201,"evaluation_rows":7142,"hours_per_epoch":2421.999430555555,"epochs":1,"row_exposures":1418201,"hour_exposures":2421.999430555555,"steps":37506,"tail_padding_sample_exposures":567,"executed_sample_exposures":1418768}\'\n'
         'if [[ "${SFT_CORRECTION_MODE}" == corrected ]]; then\n'
         '  sft_correction=\'{"schema_version":1,"applied":true,"rounds":1,"unique_rows_per_round":191024,"row_exposures":191024,"hour_exposures":309.737461,"steps":5147,"tail_padding_sample_exposures":432,"executed_sample_exposures":191456,"language_row_exposures":{"en":95512,"zh":95512},"source_row_exposures":{"aishell3":62952,"commonvoice_cn":32560,"commonvoice_en":47756,"librispeech":47756},"full_sft_completion_path":"/proof/sft_complete.json","full_sft_completion_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","correction_profile_path":"/proof/correction_profile.json","correction_profile_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","initial_checkpoint_path":"/proof/full_sft.pt","initial_checkpoint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","final_checkpoint_path":"/proof/corrected.pt","final_checkpoint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","round_receipts":[{"round":1,"receipt_path":"/proof/round1.json","receipt_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","init_checkpoint_path":"/proof/full_sft.pt","init_checkpoint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","completion_checkpoint_path":"/proof/corrected.pt","completion_checkpoint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","row_exposures":191024,"hour_exposures":309.737461,"steps":5147,"tail_padding_sample_exposures":432,"executed_sample_exposures":191456}]}\'\n'
-        'else\n'
+        "else\n"
         '  sft_correction=\'{"schema_version":1,"applied":false,"rounds":0,"unique_rows_per_round":0,"row_exposures":0,"hour_exposures":0,"steps":0,"tail_padding_sample_exposures":0,"executed_sample_exposures":0,"language_row_exposures":{},"source_row_exposures":{},"round_receipts":[]}\'\n'
-        'fi\n'
+        "fi\n"
         'jq -c --argjson trajectory "${trajectory}" --argjson phase_cadence "${phase_cadence}" --argjson sft_cadence "${sft_cadence}" --argjson full_labeled_profile "${full_labeled_profile}" --argjson sft_coverage "${sft_coverage}" --argjson sft_correction "${sft_correction}" \'.alignment_results |= map(. + {trajectory_retention: $trajectory, step_eval_cadence: $phase_cadence}) | (.coverage_results[] | select(.stage == "sft")).step_eval_cadence = $sft_cadence | (.coverage_results[] | select(.stage == "sft")) += ($sft_coverage + {correction_rounds:$sft_correction.rounds,correction_row_exposures:$sft_correction.row_exposures,correction_hour_exposures:$sft_correction.hour_exposures,correction_steps:$sft_correction.steps,correction_tail_padding_sample_exposures:$sft_correction.tail_padding_sample_exposures,correction_executed_sample_exposures:$sft_correction.executed_sample_exposures,effective_row_exposures:($sft_coverage.row_exposures + $sft_correction.row_exposures),effective_hour_exposures:($sft_coverage.hour_exposures + $sft_correction.hour_exposures),effective_steps:($sft_coverage.steps + $sft_correction.steps),effective_tail_padding_sample_exposures:($sft_coverage.tail_padding_sample_exposures + $sft_correction.tail_padding_sample_exposures),effective_executed_sample_exposures:($sft_coverage.executed_sample_exposures + $sft_correction.executed_sample_exposures),correction:$sft_correction}) | .sft_correction_evidence = $sft_correction | .ctc_label_proof += $full_labeled_profile | .requested_alignment_language_metric_summaries |= map(. + {nano_error_rate: 0.1}) | .initial_calibration_result += {nano_english_wer: 0.1, nano_chinese_cer: 0.1} | .initial_calibration_result.english_wer_gap_to_nano = (.initial_calibration_result.english_wer - .initial_calibration_result.nano_english_wer) | .initial_calibration_result.chinese_cer_gap_to_nano = (.initial_calibration_result.chinese_cer - .initial_calibration_result.nano_chinese_cer) | .requested_alignment_results |= map(. + {nano_english_wer: 0.1, nano_chinese_cer: 0.1} | .english_wer_gap_to_nano = (.english_wer - .nano_english_wer) | .chinese_cer_gap_to_nano = (.chinese_cer - .nano_chinese_cer))\' "${output_json}" >"${output_json}.tmp"\n'
         'mv "${output_json}.tmp" "${output_json}"\n'
         'if [[ "${UV_MODE}" == missing_alignment ]]; then\n'
@@ -7241,9 +7290,7 @@ def _run_stage211_continuation_watcher_fixture(
             "TMUX_STATE": str(tmp_path / "tmux-state"),
             "FINAL_REPORT_PATH": str(final_report),
             "UV_MODE": uv_mode,
-            "SFT_CORRECTION_MODE": (
-                "corrected" if corrected_final_report else "uncorrected"
-            ),
+            "SFT_CORRECTION_MODE": ("corrected" if corrected_final_report else "uncorrected"),
             "PHASE_GATE_ROOT": str(phase_gate_root),
             "FULL_OUTPUT_ROOT": str(tmp_path / "runs"),
             "WATCH_LOG": str(tmp_path / "watch.log"),

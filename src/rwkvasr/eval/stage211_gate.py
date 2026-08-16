@@ -3838,6 +3838,12 @@ def _validate_stage211_correction_train_config(
     if resolve_stage211_nano_teacher_checkpoint(config) != nano_teacher_checkpoint:
         raise ValueError(f"Stage211 {phase} correction train config uses another Nano teacher.")
     expected_focus_fields = {
+        "layer_focus_strategy": "strategy",
+        "failed_layer_count": "failed_layer_count",
+        "dynamic_layer_limit": "dynamic_layer_limit",
+        "adaptive_dynamic_layer_limit": "adaptive_dynamic_layer_limit",
+        "minimum_rotating_layer_slots": "minimum_rotating_slots",
+        "adaptive_rotating_layer_slots_target": "adaptive_rotating_slots_target",
         "boundary_layer_ids": "boundary_layer_ids",
         "selected_failure_layer_ids": "selected_failure_layer_ids",
         "all_failed_layer_ids": "all_failed_layer_ids",
