@@ -20,8 +20,10 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
     STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
+    build_stage211_correction_layer_focus,
     sha256_file,
     stage211_post_coverage_correction_lr,
+    validate_stage211_correction_layer_focus,
     validate_stage211_correction_extension_decision,
     validate_stage211_phase_gate_report,
 )
@@ -228,6 +230,7 @@ def _provenance_payload(
     init_checkpoint: Path,
     nano_checkpoint: Path,
     smoke_marker: Path,
+    layer_focus: Path,
     extension_decision: Path | None,
     steps_per_epoch: int,
     phase: str = "mixer",
@@ -251,6 +254,8 @@ def _provenance_payload(
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
         "smoke_marker_path": str(smoke_marker),
         "smoke_marker_sha256": sha256_file(smoke_marker),
+        "layer_focus_path": str(layer_focus),
+        "layer_focus_sha256": sha256_file(layer_focus),
         "correction_extension_decision_path": (
             str(extension_decision) if extension_decision is not None else None
         ),
@@ -270,6 +275,7 @@ def _correction_config_metadata(
     round_index: int,
     replay_receipt: Path,
     admission_gate: Path,
+    layer_focus: Path,
     phase: str = "mixer",
 ) -> dict[str, Any]:
     return {
@@ -277,6 +283,8 @@ def _correction_config_metadata(
         "stage211_post_coverage_correction_round": round_index,
         "stage211_post_coverage_replay_receipt_path": str(replay_receipt),
         "stage211_post_coverage_admission_gate_path": str(admission_gate),
+        "stage211_post_coverage_layer_focus_path": str(layer_focus),
+        "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
         "stage211_post_coverage_original_coverage_unchanged": True,
     }
 
@@ -289,6 +297,7 @@ def _validate_correction_smoke_marker(
     replay_receipt: Path,
     replay_manifest: Path,
     admission_gate: Path,
+    layer_focus: Path,
     nano_checkpoint: Path,
     phase: str = "mixer",
 ) -> dict[str, Any]:
@@ -312,6 +321,8 @@ def _validate_correction_smoke_marker(
         "replay_receipt_sha256": sha256_file(replay_receipt),
         "admission_gate_path": str(admission_gate),
         "admission_gate_sha256": sha256_file(admission_gate),
+        "layer_focus_path": str(layer_focus),
+        "layer_focus_sha256": sha256_file(layer_focus),
         "nano_teacher_checkpoint_path": str(nano_checkpoint),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
     }
@@ -338,6 +349,8 @@ def _run_correction_smoke(
     replay_receipt: Path,
     replay_manifest: Path,
     admission_gate: Path,
+    layer_focus: Path,
+    layer_focus_payload: dict[str, Any],
     init_checkpoint: Path,
     nano_checkpoint: Path,
     audio_data_audit: dict[str, Any],
@@ -357,6 +370,7 @@ def _run_correction_smoke(
             replay_receipt=replay_receipt,
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
+            layer_focus=layer_focus,
             nano_checkpoint=nano_checkpoint,
             phase=phase,
         )
@@ -384,12 +398,14 @@ def _run_correction_smoke(
         audio_data_audit=audio_data_audit,
         full_data_profile=True,
         post_coverage_correction=True,
+        correction_layer_boundary_ids=layer_focus_payload["boundary_layer_ids"],
     )
     config.update(
         _correction_config_metadata(
             round_index=round_index,
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
+            layer_focus=layer_focus,
             phase=phase,
         )
     )
@@ -424,6 +440,8 @@ def _run_correction_smoke(
             "replay_receipt_sha256": sha256_file(replay_receipt),
             "admission_gate_path": str(admission_gate),
             "admission_gate_sha256": sha256_file(admission_gate),
+            "layer_focus_path": str(layer_focus),
+            "layer_focus_sha256": sha256_file(layer_focus),
             "nano_teacher_checkpoint_path": str(nano_checkpoint),
             "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
         }
@@ -436,6 +454,7 @@ def _run_correction_smoke(
         replay_receipt=replay_receipt,
         replay_manifest=replay_manifest,
         admission_gate=admission_gate,
+        layer_focus=layer_focus,
         nano_checkpoint=nano_checkpoint,
         phase=phase,
     )
@@ -511,6 +530,19 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         dry_run=bool(args.dry_run),
     )
     run_dir.mkdir(parents=True, exist_ok=True)
+    layer_focus_path = run_dir / "correction_layer_focus.json"
+    layer_focus = build_stage211_correction_layer_focus(
+        phase=phase_name,
+        admission_gate_path=admission_gate,
+        admission_gate=admitted_gate,
+    )
+    _write_immutable_json(layer_focus_path, layer_focus)
+    layer_focus = validate_stage211_correction_layer_focus(
+        layer_focus_path,
+        phase=phase_name,
+        admission_gate_path=admission_gate,
+        admission_gate=admitted_gate,
+    )
     latest_step = _latest_step(run_dir)
     if latest_step <= 0 and not args.skip_nano_weight_audit:
         audit = _audit_nano_non_attention_exact(
@@ -539,12 +571,14 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         audio_data_audit=audio_data_audit,
         full_data_profile=True,
         post_coverage_correction=True,
+        correction_layer_boundary_ids=layer_focus["boundary_layer_ids"],
     )
     config.update(
         _correction_config_metadata(
             round_index=round_index,
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
+            layer_focus=layer_focus_path,
             phase=phase_name,
         )
     )
@@ -559,6 +593,8 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         replay_receipt=replay_receipt,
         replay_manifest=replay_manifest,
         admission_gate=admission_gate,
+        layer_focus=layer_focus_path,
+        layer_focus_payload=layer_focus,
         init_checkpoint=init_checkpoint,
         nano_checkpoint=nano_checkpoint,
         audio_data_audit=audio_data_audit,
@@ -589,6 +625,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             init_checkpoint=init_checkpoint,
             nano_checkpoint=nano_checkpoint,
             smoke_marker=smoke_marker_path,
+            layer_focus=layer_focus_path,
             extension_decision=extension_decision,
             steps_per_epoch=steps_per_epoch,
             phase=phase_name,
@@ -606,6 +643,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         "stage211_post_coverage_correction "
         f"phase={phase_name} round={round_index} rows={replay['validated_unique_keys']} "
         f"steps={steps_per_epoch} tail_padding={tail_padding} "
+        f"focus_layers={','.join(str(value) for value in layer_focus['boundary_layer_ids']) or '-'} "
         f"latest_step={latest_step} run_dir={run_dir}",
         flush=True,
     )

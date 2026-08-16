@@ -98,6 +98,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
     replay_receipt = tmp_path / "replay.json"
     replay_manifest = tmp_path / "manifest.json"
     admission_gate = tmp_path / "failed-gate.json"
+    layer_focus = tmp_path / "layer-focus.json"
     nano_checkpoint = tmp_path / "nano.pt"
     smoke_dir = tmp_path / "smoke"
     smoke_log_dir = smoke_dir / "logs"
@@ -109,6 +110,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
         (replay_receipt, b"replay"),
         (replay_manifest, b"manifest"),
         (admission_gate, b"gate"),
+        (layer_focus, b"focus"),
         (nano_checkpoint, b"nano"),
     ):
         path.write_bytes(content)
@@ -143,6 +145,8 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
                 "replay_receipt_sha256": correction.sha256_file(replay_receipt),
                 "admission_gate_path": str(admission_gate.resolve()),
                 "admission_gate_sha256": correction.sha256_file(admission_gate),
+                "layer_focus_path": str(layer_focus.resolve()),
+                "layer_focus_sha256": correction.sha256_file(layer_focus),
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
             }
@@ -158,6 +162,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
         replay_receipt=replay_receipt,
         replay_manifest=replay_manifest,
         admission_gate=admission_gate,
+        layer_focus=layer_focus,
         nano_checkpoint=nano_checkpoint,
     )
     assert marker["correction_round"] == 1
@@ -171,6 +176,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
             replay_receipt=replay_receipt,
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
+            layer_focus=layer_focus,
             nano_checkpoint=nano_checkpoint,
         )
 
@@ -186,6 +192,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
             replay_receipt=replay_receipt,
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
+            layer_focus=layer_focus,
             nano_checkpoint=nano_checkpoint,
         )
 
@@ -201,6 +208,8 @@ def test_retention_correction_resume_requires_smoke_marker(
             replay_receipt=tmp_path / "replay.json",
             replay_manifest=tmp_path / "manifest.json",
             admission_gate=tmp_path / "gate.json",
+            layer_focus=tmp_path / "focus.json",
+            layer_focus_payload={"boundary_layer_ids": []},
             init_checkpoint=tmp_path / "init.pt",
             nano_checkpoint=tmp_path / "nano.pt",
             audio_data_audit={},
@@ -225,6 +234,19 @@ def test_create_stage211_retention_correction_receipt(
     replay_receipt.write_text("{}\n", encoding="utf-8")
     admission_gate = tmp_path / "failed-gate.json"
     admission_gate.write_text("{}\n", encoding="utf-8")
+    boundary_layer_ids = list(
+        stage211_phase_train_config_contract(phase)[
+            "ctc_teacher_online_layer_boundary_ids"
+        ]
+    )
+    layer_focus_payload = {
+        "boundary_layer_ids": boundary_layer_ids,
+        "selected_failure_layer_ids": [],
+        "all_failed_layer_ids": [],
+        "rotating_slots": 12 - len(boundary_layer_ids) if phase == "logits" else 8,
+    }
+    layer_focus = tmp_path / "layer-focus.json"
+    layer_focus.write_text(json.dumps(layer_focus_payload) + "\n", encoding="utf-8")
     init_checkpoint = tmp_path / "init.pt"
     completion_checkpoint = tmp_path / "step-1.pt"
     torch.save({"step": 0, "model": {"weight": torch.zeros(1)}}, init_checkpoint)
@@ -255,6 +277,8 @@ def test_create_stage211_retention_correction_receipt(
                 "replay_receipt_sha256": correction.sha256_file(replay_receipt),
                 "admission_gate_path": str(admission_gate.resolve()),
                 "admission_gate_sha256": correction.sha256_file(admission_gate),
+                "layer_focus_path": str(layer_focus.resolve()),
+                "layer_focus_sha256": correction.sha256_file(layer_focus),
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
                 "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
@@ -288,6 +312,8 @@ def test_create_stage211_retention_correction_receipt(
             "stage211_post_coverage_correction_phase": phase,
             "stage211_post_coverage_replay_receipt_path": str(replay_receipt.resolve()),
             "stage211_post_coverage_admission_gate_path": str(admission_gate.resolve()),
+            "stage211_post_coverage_layer_focus_path": str(layer_focus.resolve()),
+            "stage211_post_coverage_layer_focus_sha256": correction.sha256_file(layer_focus),
             "stage211_post_coverage_original_coverage_unchanged": True,
             "stage211_post_coverage_smoke_marker_path": str(smoke_marker.resolve()),
             "stage211_post_coverage_smoke_marker_sha256": correction.sha256_file(smoke_marker),
@@ -305,6 +331,8 @@ def test_create_stage211_retention_correction_receipt(
         "replay_receipt_sha256": correction.sha256_file(replay_receipt),
         "admission_gate_path": str(admission_gate.resolve()),
         "admission_gate_sha256": correction.sha256_file(admission_gate),
+        "layer_focus_path": str(layer_focus.resolve()),
+        "layer_focus_sha256": correction.sha256_file(layer_focus),
         "init_checkpoint_path": str(init_checkpoint.resolve()),
         "init_checkpoint_sha256": correction.sha256_file(init_checkpoint),
         "replay_manifest_path": str(manifest.resolve()),
@@ -349,6 +377,11 @@ def test_create_stage211_retention_correction_receipt(
     )
     monkeypatch.setattr(
         correction,
+        "validate_stage211_correction_layer_focus",
+        lambda *args, **kwargs: layer_focus_payload,
+    )
+    monkeypatch.setattr(
+        correction,
         "audit_stage211_runtime_epoch_coverage",
         lambda **kwargs: {"complete": True, "epochs": kwargs["epochs"]},
     )
@@ -376,6 +409,8 @@ def test_create_stage211_retention_correction_receipt(
     assert receipt["learning_rate"] == correction_lr
     assert receipt["nano_teacher_checkpoint_sha256"] == nano_sha256
     assert receipt["smoke_marker_sha256"] == correction.sha256_file(smoke_marker)
+    assert receipt["layer_focus_sha256"] == correction.sha256_file(layer_focus)
+    assert receipt["boundary_layer_ids"] == boundary_layer_ids
     assert receipt["correction_extension_decision_path"] is None
     assert receipt["correction_extension_decision_sha256"] is None
 

@@ -25,7 +25,8 @@ from rwkvasr.eval.stage211_gate import (
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
     stage211_post_coverage_correction_lr,
-    stage211_phase_train_config_contract,
+    stage211_post_coverage_train_config_contract,
+    validate_stage211_correction_layer_focus,
     validate_stage211_correction_extension_decision,
     validate_stage211_phase_gate_report,
 )
@@ -76,6 +77,7 @@ def _validate_correction_smoke_marker(
     replay_receipt: Path,
     replay_manifest: Path,
     admission_gate: Path,
+    layer_focus: Path,
     init_checkpoint: Path,
     nano_checkpoint: Path,
     phase: str = "mixer",
@@ -96,6 +98,8 @@ def _validate_correction_smoke_marker(
         "replay_receipt_sha256": sha256_file(replay_receipt),
         "admission_gate_path": str(admission_gate),
         "admission_gate_sha256": sha256_file(admission_gate),
+        "layer_focus_path": str(layer_focus),
+        "layer_focus_sha256": sha256_file(layer_focus),
         "nano_teacher_checkpoint_path": str(nano_checkpoint),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
     }
@@ -129,19 +133,22 @@ def _validate_correction_train_config(
     replay_manifest: Path,
     replay_receipt: Path,
     admission_gate: Path,
+    layer_focus: Path,
+    layer_focus_payload: dict[str, Any],
     init_checkpoint: Path,
     smoke_marker: Path,
     phase: str = "mixer",
 ) -> None:
-    correction_lr = stage211_post_coverage_correction_lr(phase)
     configured_phase = config.get("stage211_post_coverage_correction_phase", "mixer")
     if configured_phase != phase:
         raise ValueError(
             "Stage211 correction train config phase mismatch: "
             f"actual={configured_phase!r} expected={phase!r}"
         )
-    contract = stage211_phase_train_config_contract(phase)
-    contract["lr"] = correction_lr
+    contract = stage211_post_coverage_train_config_contract(
+        phase,
+        boundary_layer_ids=layer_focus_payload["boundary_layer_ids"],
+    )
     for key, expected in contract.items():
         actual = config.get(key)
         if type(actual) is not type(expected) or actual != expected:
@@ -167,6 +174,8 @@ def _validate_correction_train_config(
         "stage211_post_coverage_correction_round": round_index,
         "stage211_post_coverage_replay_receipt_path": str(replay_receipt),
         "stage211_post_coverage_admission_gate_path": str(admission_gate),
+        "stage211_post_coverage_layer_focus_path": str(layer_focus),
+        "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
         "stage211_post_coverage_original_coverage_unchanged": True,
         "stage211_post_coverage_smoke_marker_path": str(smoke_marker),
         "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
@@ -304,6 +313,17 @@ def build_receipt(
         smoke_marker_path
     ):
         raise ValueError("Stage211 correction provenance smoke marker is unavailable or changed.")
+    layer_focus_path = Path(str(provenance.get("layer_focus_path") or "")).resolve()
+    if not layer_focus_path.is_file() or provenance.get("layer_focus_sha256") != sha256_file(
+        layer_focus_path
+    ):
+        raise ValueError("Stage211 correction provenance layer focus is unavailable or changed.")
+    layer_focus = validate_stage211_correction_layer_focus(
+        layer_focus_path,
+        phase=phase,
+        admission_gate_path=admission_gate_path,
+        admission_gate=admission_gate,
+    )
     expected_provenance = {
         "schema_version": 1,
         "pipeline": "stage211",
@@ -326,6 +346,8 @@ def build_receipt(
         "early_stopping": False,
         "smoke_marker_path": str(smoke_marker_path),
         "smoke_marker_sha256": sha256_file(smoke_marker_path),
+        "layer_focus_path": str(layer_focus_path),
+        "layer_focus_sha256": sha256_file(layer_focus_path),
         "correction_extension_decision_path": (
             str(extension_decision_path) if extension_decision_path is not None else None
         ),
@@ -349,6 +371,8 @@ def build_receipt(
         replay_manifest=replay_manifest,
         replay_receipt=replay_receipt_path,
         admission_gate=admission_gate_path,
+        layer_focus=layer_focus_path,
+        layer_focus_payload=layer_focus,
         init_checkpoint=init_checkpoint_path,
         smoke_marker=smoke_marker_path,
         phase=phase,
@@ -368,6 +392,7 @@ def build_receipt(
         replay_receipt=replay_receipt_path,
         replay_manifest=replay_manifest,
         admission_gate=admission_gate_path,
+        layer_focus=layer_focus_path,
         init_checkpoint=init_checkpoint_path,
         nano_checkpoint=nano_teacher_checkpoint,
         phase=phase,
@@ -413,6 +438,12 @@ def build_receipt(
         "train_config_sha256": sha256_file(train_config_path),
         "smoke_marker_path": str(smoke_marker_path),
         "smoke_marker_sha256": sha256_file(smoke_marker_path),
+        "layer_focus_path": str(layer_focus_path),
+        "layer_focus_sha256": sha256_file(layer_focus_path),
+        "boundary_layer_ids": list(layer_focus["boundary_layer_ids"]),
+        "selected_failure_layer_ids": list(layer_focus["selected_failure_layer_ids"]),
+        "all_failed_layer_ids": list(layer_focus["all_failed_layer_ids"]),
+        "rotating_layer_slots": int(layer_focus["rotating_slots"]),
         "replay_receipt_path": str(replay_receipt_path),
         "replay_receipt_sha256": sha256_file(replay_receipt_path),
         "bucket_manifest_path": str(replay_manifest),

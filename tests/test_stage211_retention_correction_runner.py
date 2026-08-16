@@ -97,6 +97,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     init_checkpoint = tmp_path / "init.pt"
     nano_checkpoint = tmp_path / "model.pt"
     smoke_marker = tmp_path / "smoke.json"
+    layer_focus = tmp_path / "focus.json"
     for path in (
         replay_receipt,
         replay_manifest,
@@ -104,6 +105,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
         init_checkpoint,
         nano_checkpoint,
         smoke_marker,
+        layer_focus,
     ):
         path.write_bytes(path.name.encode())
     run_dir = tmp_path / "run"
@@ -117,6 +119,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
         init_checkpoint=init_checkpoint,
         nano_checkpoint=nano_checkpoint,
         smoke_marker=smoke_marker,
+        layer_focus=layer_focus,
         extension_decision=None,
         steps_per_epoch=99,
     )
@@ -129,6 +132,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     assert provenance["early_stopping"] is False
     assert len(provenance["admission_gate_sha256"]) == 64
     assert provenance["smoke_marker_sha256"] == runner.sha256_file(smoke_marker)
+    assert provenance["layer_focus_sha256"] == runner.sha256_file(layer_focus)
     assert provenance["correction_extension_decision_path"] is None
     assert provenance["correction_extension_decision_sha256"] is None
 
@@ -151,6 +155,7 @@ def test_stage211_downstream_correction_provenance_records_phase_objective_with_
             "init.pt",
             "model.pt",
             "smoke.json",
+            "focus.json",
         )
     }
     for path in inputs.values():
@@ -165,6 +170,7 @@ def test_stage211_downstream_correction_provenance_records_phase_objective_with_
         init_checkpoint=inputs["init.pt"],
         nano_checkpoint=inputs["model.pt"],
         smoke_marker=inputs["smoke.json"],
+        layer_focus=inputs["focus.json"],
         extension_decision=None,
         steps_per_epoch=321,
         phase=phase,

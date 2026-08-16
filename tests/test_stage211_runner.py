@@ -29,10 +29,12 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
     STAGE211_RETENTION_CORRECTION_EPOCHS,
     STAGE211_RETENTION_CORRECTION_LR,
+    build_stage211_correction_layer_focus,
     build_stage211_full_data_coverage,
     build_stage211_trajectory_retention_gate,
     sha256_file,
     stage211_post_coverage_correction_exposure,
+    stage211_post_coverage_train_config_contract,
     stage211_phase_train_config_contract,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_loaded_manifest_receipt,
@@ -3782,7 +3784,21 @@ def _write_alignment_evidence_fixture(
         report_bindings[cell_name] = {}
         for role in ("baseline", "candidate"):
             report_path = tmp_path / f"{phase}-{cell_name}-{role}.json"
-            report_path.write_text("{}\n", encoding="utf-8")
+            candidate = role == "candidate"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "phase": phase,
+                        "role": role,
+                        "layer_components": {
+                            component: _alignment_layers(candidate=candidate)
+                            for component in components
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             report_bindings[cell_name][role] = {
                 "path": str(report_path.resolve()),
                 "sha256": sha256_file(report_path),
@@ -5016,6 +5032,16 @@ def _write_retention_correction(
         + "\n",
         encoding="utf-8",
     )
+    layer_focus_payload = build_stage211_correction_layer_focus(
+        phase="mixer",
+        admission_gate_path=failed_gate,
+        admission_gate=failed,
+    )
+    layer_focus = replay_root / "layer-focus.json"
+    layer_focus.write_text(
+        json.dumps(layer_focus_payload) + "\n",
+        encoding="utf-8",
+    )
 
     smoke_checkpoint = replay_root / "smoke-step-2.pt"
     smoke_log = replay_root / "smoke.log"
@@ -5039,6 +5065,8 @@ def _write_retention_correction(
                 "replay_receipt_sha256": sha256_file(replay_receipt),
                 "admission_gate_path": str(failed_gate.resolve()),
                 "admission_gate_sha256": sha256_file(failed_gate),
+                "layer_focus_path": str(layer_focus.resolve()),
+                "layer_focus_sha256": sha256_file(layer_focus),
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
                 "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
@@ -5056,7 +5084,10 @@ def _write_retention_correction(
     run_dir = tmp_path / "retention-round-01"
     run_dir.mkdir()
     train_config = run_dir / "train_config.yaml"
-    config = stage211_phase_train_config_contract("mixer")
+    config = stage211_post_coverage_train_config_contract(
+        "mixer",
+        boundary_layer_ids=layer_focus_payload["boundary_layer_ids"],
+    )
     config.update(
         {
             "lr": STAGE211_RETENTION_CORRECTION_LR,
@@ -5072,8 +5103,11 @@ def _write_retention_correction(
             "ctc_teacher_online_model_path": str(nano_checkpoint.parent.resolve()),
             "init_checkpoint_path": str(init_checkpoint.resolve()),
             "stage211_post_coverage_correction_round": 1,
+            "stage211_post_coverage_correction_phase": "mixer",
             "stage211_post_coverage_replay_receipt_path": str(replay_receipt.resolve()),
             "stage211_post_coverage_admission_gate_path": str(failed_gate.resolve()),
+            "stage211_post_coverage_layer_focus_path": str(layer_focus.resolve()),
+            "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
             "stage211_post_coverage_original_coverage_unchanged": True,
             "stage211_post_coverage_smoke_marker_path": str(smoke_marker.resolve()),
             "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
@@ -5081,7 +5115,21 @@ def _write_retention_correction(
     )
     save_yaml(train_config, config)
     provenance = run_dir / "stage211_correction_provenance.json"
-    provenance.write_text("{}\n", encoding="utf-8")
+    provenance.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "retention_correction_run",
+                "phase": "mixer",
+                "round": 1,
+                "layer_focus_path": str(layer_focus.resolve()),
+                "layer_focus_sha256": sha256_file(layer_focus),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     epoch_checkpoint = run_dir / "epoch-1.pt"
     epoch_checkpoint.write_bytes(b"epoch-1")
     correction = {
@@ -5115,6 +5163,14 @@ def _write_retention_correction(
         "train_config_sha256": sha256_file(train_config),
         "smoke_marker_path": str(smoke_marker.resolve()),
         "smoke_marker_sha256": sha256_file(smoke_marker),
+        "layer_focus_path": str(layer_focus.resolve()),
+        "layer_focus_sha256": sha256_file(layer_focus),
+        "boundary_layer_ids": list(layer_focus_payload["boundary_layer_ids"]),
+        "selected_failure_layer_ids": list(
+            layer_focus_payload["selected_failure_layer_ids"]
+        ),
+        "all_failed_layer_ids": list(layer_focus_payload["all_failed_layer_ids"]),
+        "rotating_layer_slots": int(layer_focus_payload["rotating_slots"]),
         "replay_receipt_path": str(replay_receipt.resolve()),
         "replay_receipt_sha256": sha256_file(replay_receipt),
         "bucket_manifest_path": str(replay_manifest.resolve()),

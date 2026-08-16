@@ -28,6 +28,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
     stage211_phase_train_config_contract,
     stage211_post_coverage_correction_lr,
+    stage211_post_coverage_train_config_contract,
     stage211_sft_ctc_suppressed_token_ids,
     validate_stage211_phase_train_config,
     validate_stage211_phase_gate_report,
@@ -1206,6 +1207,7 @@ def _config(
     full_data_profile: bool = False,
     batch_profile_admission: dict[str, Any] | None = None,
     post_coverage_correction: bool = False,
+    correction_layer_boundary_ids: tuple[int, ...] | list[int] | None = None,
 ) -> dict[str, Any]:
     config = _stage210n_config(
         segment=segment,
@@ -1253,9 +1255,15 @@ def _config(
             "ctc_teacher_online_layer_block_loss_weight": float(phase.block_weight),
             "ctc_teacher_online_layer_sample_count": int(phase.layer_sample_count),
             "ctc_teacher_online_layer_boundary_ids": (
-                list(HARD_LAYER_IDS) if phase.include_hard_layers else []
+                [int(value) for value in correction_layer_boundary_ids]
+                if correction_layer_boundary_ids is not None
+                else (list(HARD_LAYER_IDS) if phase.include_hard_layers else [])
             ),
-            "ctc_teacher_online_layer_include_boundaries": bool(phase.include_hard_layers),
+            "ctc_teacher_online_layer_include_boundaries": (
+                bool(correction_layer_boundary_ids)
+                if correction_layer_boundary_ids is not None
+                else bool(phase.include_hard_layers)
+            ),
             "ctc_teacher_online_layer_input_mode": str(phase.input_mode),
             "ctc_teacher_online_frame_balance_mode": "all",
             "ctc_teacher_online_blank_frame_balance_mode": "all",
@@ -1387,8 +1395,20 @@ def _config(
                 f"Stage211 {phase.name} correction LR mismatch: "
                 f"actual={phase.lr} expected={expected_lr}"
             )
-        correction_contract = stage211_phase_train_config_contract(phase.name)
-        correction_contract["lr"] = expected_lr
+        if phase.name in {"mixer", "block", "logits"}:
+            if correction_layer_boundary_ids is None:
+                raise ValueError(
+                    "Stage211 correction requires explicit gate-derived layer focus."
+                )
+            correction_contract = stage211_post_coverage_train_config_contract(
+                phase.name,
+                boundary_layer_ids=correction_layer_boundary_ids,
+            )
+        else:
+            if correction_layer_boundary_ids is not None:
+                raise ValueError("Stage211 SFT correction does not accept hidden-layer focus.")
+            correction_contract = stage211_phase_train_config_contract(phase.name)
+            correction_contract["lr"] = expected_lr
         for key, expected in correction_contract.items():
             actual = config.get(key)
             if type(actual) is not type(expected) or actual != expected:

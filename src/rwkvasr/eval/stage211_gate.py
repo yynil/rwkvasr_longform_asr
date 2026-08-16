@@ -36,6 +36,8 @@ STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS = 3
 STAGE211_RETENTION_CORRECTION_MAX_ROUNDS = 32
 STAGE211_RETENTION_CORRECTION_EPOCHS = 1
 STAGE211_RETENTION_CORRECTION_LR = 1.0e-6
+STAGE211_CORRECTION_LAYER_FOCUS_SCHEMA_VERSION = 1
+STAGE211_HARD_LAYER_IDS = (0, 11, 12, 17, 20, 49, 50, 69)
 STAGE211_POST_COVERAGE_CORRECTION_LRS = {
     "mixer": STAGE211_RETENTION_CORRECTION_LR,
     "block": 1.0e-6,
@@ -86,6 +88,16 @@ _STAGE211_LOGITS_MAX_CELL_TOKEN_ERROR_REGRESSION = 0.03
 _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION = 0.10
 _STAGE211_LOGITS_MAX_HIDDEN_COSINE_REGRESSION = 0.01
 _STAGE211_ALIGNMENT_TOLERANCE = 1.0e-12
+_STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS = {
+    "mixer": 5,
+    "block": 5,
+    "logits": 3,
+}
+_STAGE211_CORRECTION_MIN_ROTATING_SLOTS = {
+    "mixer": 3,
+    "block": 3,
+    "logits": 1,
+}
 _STAGE211_LOGITS_REQUIRED_METRICS = (
     "full_kl",
     "conditional_nonblank_kl",
@@ -339,7 +351,7 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_sequence_loss_weight": 0.0,
         "ctc_teacher_online_nonblank_window_loss_weight": 0.0,
         "ctc_teacher_online_layer_sample_count": 12,
-        "ctc_teacher_online_layer_boundary_ids": [0, 11, 12, 17, 20, 49, 50, 69],
+        "ctc_teacher_online_layer_boundary_ids": list(STAGE211_HARD_LAYER_IDS),
         "ctc_teacher_online_layer_include_boundaries": True,
         "ctc_teacher_online_keep_full_log_probs_on_device": True,
     },
@@ -360,7 +372,7 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_sequence_loss_weight": 0.0,
         "ctc_teacher_online_nonblank_window_loss_weight": 0.0,
         "ctc_teacher_online_layer_sample_count": 8,
-        "ctc_teacher_online_layer_boundary_ids": [0, 11, 12, 17, 20, 49, 50, 69],
+        "ctc_teacher_online_layer_boundary_ids": list(STAGE211_HARD_LAYER_IDS),
         "ctc_teacher_online_layer_include_boundaries": True,
         "ctc_teacher_online_keep_full_log_probs_on_device": False,
     },
@@ -435,6 +447,41 @@ def stage211_post_coverage_correction_lr(phase: str) -> float:
         raise ValueError(
             f"Unsupported Stage211 post-coverage correction phase: {phase!r}"
         ) from error
+
+
+def stage211_post_coverage_train_config_contract(
+    phase: str,
+    *,
+    boundary_layer_ids: tuple[int, ...] | list[int],
+) -> dict[str, Any]:
+    if phase not in _STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS:
+        raise ValueError(f"Unsupported Stage211 correction focus phase: {phase!r}")
+    layer_ids = [int(value) for value in boundary_layer_ids]
+    if (
+        layer_ids != sorted(set(layer_ids))
+        or any(layer_id not in _STAGE211_ALIGNMENT_LAYER_IDS for layer_id in layer_ids)
+    ):
+        raise ValueError("Stage211 correction boundary layer IDs are invalid.")
+    contract = stage211_phase_train_config_contract(phase)
+    contract["lr"] = stage211_post_coverage_correction_lr(phase)
+    sample_count = int(contract["ctc_teacher_online_layer_sample_count"])
+    if phase == "logits":
+        if not set(STAGE211_HARD_LAYER_IDS).issubset(layer_ids):
+            raise ValueError("Stage211 Logits correction must retain every hard-layer anchor.")
+        max_boundaries = len(STAGE211_HARD_LAYER_IDS) + int(
+            _STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS[phase]
+        )
+    else:
+        max_boundaries = int(_STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS[phase])
+    rotating_slots = sample_count - len(layer_ids)
+    if (
+        len(layer_ids) > max_boundaries
+        or rotating_slots < _STAGE211_CORRECTION_MIN_ROTATING_SLOTS[phase]
+    ):
+        raise ValueError("Stage211 correction layer focus does not preserve rotating coverage.")
+    contract["ctc_teacher_online_layer_boundary_ids"] = layer_ids
+    contract["ctc_teacher_online_layer_include_boundaries"] = bool(layer_ids)
+    return contract
 
 
 def validate_stage211_phase_train_config(
@@ -562,6 +609,342 @@ def stage211_correction_progress_metrics(
         "public_macro_student_error": sum(public_errors) / len(public_errors),
         "alignment_mean_candidate_loss": sum(alignment_losses) / len(alignment_losses),
     }
+
+
+def _stage211_record_correction_layer_failures(
+    records: dict[int, dict[str, Any]],
+    *,
+    scope: str,
+    component: str,
+    baseline_layers: dict[str, dict[str, Any]],
+    candidate_layers: dict[str, dict[str, Any]],
+) -> None:
+    for layer_id in _STAGE211_ALIGNMENT_LAYER_IDS:
+        baseline = baseline_layers[str(layer_id)]
+        candidate = candidate_layers[str(layer_id)]
+        baseline_loss = _stage211_alignment_float(
+            baseline.get("loss"),
+            label=f"correction focus {scope}/{component}/layer-{layer_id} baseline loss",
+        )
+        candidate_loss = _stage211_alignment_float(
+            candidate.get("loss"),
+            label=f"correction focus {scope}/{component}/layer-{layer_id} candidate loss",
+        )
+        baseline_cosine = _stage211_alignment_float(
+            baseline.get("cosine"),
+            label=f"correction focus {scope}/{component}/layer-{layer_id} baseline cosine",
+        )
+        candidate_cosine = _stage211_alignment_float(
+            candidate.get("cosine"),
+            label=f"correction focus {scope}/{component}/layer-{layer_id} candidate cosine",
+        )
+        loss_failed = candidate_loss >= baseline_loss - _STAGE211_ALIGNMENT_TOLERANCE
+        cosine_failed = candidate_cosine <= baseline_cosine + _STAGE211_ALIGNMENT_TOLERANCE
+        if not loss_failed and not cosine_failed:
+            continue
+        row = records.setdefault(
+            layer_id,
+            {
+                "layer_id": layer_id,
+                "failed_loss_comparisons": 0,
+                "failed_cosine_comparisons": 0,
+                "loss_relative_regression_sum": 0.0,
+                "loss_relative_regression_max": 0.0,
+                "cosine_regression_sum": 0.0,
+                "cosine_regression_max": 0.0,
+                "components": set(),
+                "scopes": set(),
+            },
+        )
+        row["components"].add(component)
+        row["scopes"].add(scope)
+        if loss_failed:
+            relative_regression = max(
+                0.0,
+                (candidate_loss - baseline_loss) / max(abs(baseline_loss), 1.0e-12),
+            )
+            row["failed_loss_comparisons"] += 1
+            row["loss_relative_regression_sum"] += relative_regression
+            row["loss_relative_regression_max"] = max(
+                row["loss_relative_regression_max"], relative_regression
+            )
+        if cosine_failed:
+            cosine_regression = max(0.0, baseline_cosine - candidate_cosine)
+            row["failed_cosine_comparisons"] += 1
+            row["cosine_regression_sum"] += cosine_regression
+            row["cosine_regression_max"] = max(
+                row["cosine_regression_max"], cosine_regression
+            )
+
+
+def _stage211_correction_focus_report_pair(
+    records: dict[int, dict[str, Any]],
+    *,
+    phase: str,
+    scope: str,
+    baseline_report: dict[str, Any],
+    candidate_report: dict[str, Any],
+) -> None:
+    for component in _STAGE211_ALIGNMENT_PHASE_COMPONENTS[phase]:
+        baseline_layers = _stage211_alignment_component_layers(
+            baseline_report,
+            phase=phase,
+            role=f"{scope}/baseline",
+            component=component,
+        )
+        candidate_layers = _stage211_alignment_component_layers(
+            candidate_report,
+            phase=phase,
+            role=f"{scope}/candidate",
+            component=component,
+        )
+        _stage211_record_correction_layer_failures(
+            records,
+            scope=scope,
+            component=component,
+            baseline_layers=baseline_layers,
+            candidate_layers=candidate_layers,
+        )
+
+
+def build_stage211_correction_layer_focus(
+    *,
+    phase: str,
+    admission_gate_path: Path,
+    admission_gate: dict[str, Any],
+) -> dict[str, Any]:
+    if phase not in _STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS:
+        raise ValueError(f"Unsupported Stage211 correction focus phase: {phase!r}")
+    admission_gate_path = admission_gate_path.expanduser().resolve()
+    if not admission_gate_path.is_file() or admission_gate_path.stat().st_size <= 0:
+        raise ValueError(f"Stage211 correction focus admission gate is unavailable: {admission_gate_path}")
+    if admission_gate.get("gate_passed") is not False:
+        raise ValueError("Stage211 correction focus requires an explicitly failed admission gate.")
+    alignment_binding = admission_gate.get("alignment_report")
+    if not isinstance(alignment_binding, dict):
+        raise ValueError("Stage211 correction focus lacks an alignment-report binding.")
+    alignment_path = _validate_bound_file(
+        alignment_binding,
+        path_key="path",
+        sha256_key="sha256",
+        label=f"Stage211 {phase} correction-focus alignment report",
+    )
+    alignment = _load_json_object(
+        alignment_path,
+        label=f"Stage211 {phase} correction-focus alignment report",
+    )
+    if alignment.get("phase") != phase:
+        raise ValueError("Stage211 correction-focus alignment phase mismatch.")
+    summary_path = _validate_bound_file(
+        alignment,
+        path_key="stratified_summary_path",
+        sha256_key="stratified_summary_sha256",
+        label=f"Stage211 {phase} correction-focus stratified summary",
+    )
+    summary = _load_json_object(
+        summary_path,
+        label=f"Stage211 {phase} correction-focus stratified summary",
+    )
+    _validate_stage211_replayed_value(
+        alignment.get("stratified_summary"),
+        summary,
+        label=f"{phase} correction-focus embedded stratified summary",
+    )
+
+    components = _STAGE211_ALIGNMENT_PHASE_COMPONENTS[phase]
+    summary_component_key = (
+        "hidden_component_summaries" if phase == "logits" else "component_summaries"
+    )
+    summary_components = summary.get(summary_component_key)
+    if not isinstance(summary_components, dict) or set(summary_components) != set(components):
+        raise ValueError("Stage211 correction-focus component coverage mismatch.")
+
+    records: dict[int, dict[str, Any]] = {}
+    fixed_reports: dict[str, dict[str, str]] = {}
+    fixed_sources: dict[str, dict[str, Any]] = {}
+    for role in ("baseline", "candidate"):
+        report_path = _validate_bound_file(
+            alignment,
+            path_key=f"{role}_report_path",
+            sha256_key=f"{role}_report_sha256",
+            label=f"Stage211 {phase} correction-focus fixed {role} report",
+        )
+        fixed_reports[role] = {
+            "path": str(report_path),
+            "sha256": sha256_file(report_path),
+        }
+        fixed_sources[role] = _load_json_object(
+            report_path,
+            label=f"Stage211 {phase} correction-focus fixed {role} report",
+        )
+    _stage211_correction_focus_report_pair(
+        records,
+        phase=phase,
+        scope="fixed",
+        baseline_report=fixed_sources["baseline"],
+        candidate_report=fixed_sources["candidate"],
+    )
+
+    for component in components:
+        component_summary = _validate_stage211_stratified_component_summary(
+            summary_components[component],
+            label=f"{phase} correction-focus stratified {component}",
+        )
+        macro_baseline = {
+            layer_id: {
+                "loss": row["baseline_loss"],
+                "cosine": row["baseline_cosine"],
+            }
+            for layer_id, row in component_summary["layers"].items()
+        }
+        macro_candidate = {
+            layer_id: {
+                "loss": row["candidate_loss"],
+                "cosine": row["candidate_cosine"],
+            }
+            for layer_id, row in component_summary["layers"].items()
+        }
+        _stage211_record_correction_layer_failures(
+            records,
+            scope="stratified_macro",
+            component=component,
+            baseline_layers=macro_baseline,
+            candidate_layers=macro_candidate,
+        )
+
+    report_bindings = summary.get("reports")
+    if not isinstance(report_bindings, dict) or set(report_bindings) != (
+        _STAGE211_ALIGNMENT_STRATIFIED_CELLS
+    ):
+        raise ValueError("Stage211 correction-focus nine-cell report coverage mismatch.")
+    canonical_report_bindings: dict[str, dict[str, dict[str, str]]] = {}
+    for cell_name in sorted(_STAGE211_ALIGNMENT_STRATIFIED_CELLS):
+        roles = report_bindings[cell_name]
+        if not isinstance(roles, dict) or set(roles) != {"baseline", "candidate"}:
+            raise ValueError(f"Stage211 correction-focus report roles mismatch: {cell_name}.")
+        cell_sources: dict[str, dict[str, Any]] = {}
+        canonical_report_bindings[cell_name] = {}
+        for role in ("baseline", "candidate"):
+            binding = roles[role]
+            if not isinstance(binding, dict):
+                raise ValueError(
+                    f"Stage211 correction-focus report binding is invalid: {cell_name}/{role}."
+                )
+            report_path = _validate_bound_file(
+                binding,
+                path_key="path",
+                sha256_key="sha256",
+                label=f"Stage211 {phase} correction-focus report {cell_name}/{role}",
+            )
+            canonical_report_bindings[cell_name][role] = {
+                "path": str(report_path),
+                "sha256": sha256_file(report_path),
+            }
+            cell_sources[role] = _load_json_object(
+                report_path,
+                label=f"Stage211 {phase} correction-focus report {cell_name}/{role}",
+            )
+        _stage211_correction_focus_report_pair(
+            records,
+            phase=phase,
+            scope=f"stratified:{cell_name}",
+            baseline_report=cell_sources["baseline"],
+            candidate_report=cell_sources["candidate"],
+        )
+
+    ranking: list[dict[str, Any]] = []
+    for layer_id, raw in records.items():
+        row = dict(raw)
+        row["failed_signal_count"] = int(row["failed_loss_comparisons"]) + int(
+            row["failed_cosine_comparisons"]
+        )
+        row["components"] = sorted(row["components"])
+        row["scopes"] = sorted(row["scopes"])
+        ranking.append(row)
+    ranking.sort(
+        key=lambda row: (
+            -int(row["failed_signal_count"]),
+            -float(row["loss_relative_regression_sum"]),
+            -float(row["loss_relative_regression_max"]),
+            -float(row["cosine_regression_sum"]),
+            -float(row["cosine_regression_max"]),
+            -int(row["layer_id"]),
+        )
+    )
+    for position, row in enumerate(ranking, start=1):
+        row["ranking_position"] = position
+
+    mandatory_layer_ids = list(STAGE211_HARD_LAYER_IDS) if phase == "logits" else []
+    dynamic_limit = int(_STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS[phase])
+    selected_failure_layer_ids = [
+        int(row["layer_id"])
+        for row in ranking
+        if int(row["layer_id"]) not in mandatory_layer_ids
+    ][:dynamic_limit]
+    boundary_layer_ids = sorted({*mandatory_layer_ids, *selected_failure_layer_ids})
+    contract = stage211_post_coverage_train_config_contract(
+        phase,
+        boundary_layer_ids=boundary_layer_ids,
+    )
+    sample_count = int(contract["ctc_teacher_online_layer_sample_count"])
+    rotating_slots = sample_count - len(boundary_layer_ids)
+    return {
+        "schema_version": STAGE211_CORRECTION_LAYER_FOCUS_SCHEMA_VERSION,
+        "pipeline": "stage211",
+        "artifact": "post_coverage_correction_layer_focus",
+        "phase": phase,
+        "strategy": (
+            "gate_ranked_failed_layers_with_rotation"
+            if ranking
+            else ("static_hard_anchors" if phase == "logits" else "uniform_full_rotation")
+        ),
+        "sample_count": sample_count,
+        "dynamic_layer_limit": dynamic_limit,
+        "minimum_rotating_slots": int(_STAGE211_CORRECTION_MIN_ROTATING_SLOTS[phase]),
+        "rotating_slots": rotating_slots,
+        "required_components": list(components),
+        "evaluated_scopes": [
+            "fixed",
+            "stratified_macro",
+            *(f"stratified:{cell}" for cell in sorted(_STAGE211_ALIGNMENT_STRATIFIED_CELLS)),
+        ],
+        "mandatory_layer_ids": mandatory_layer_ids,
+        "all_failed_layer_ids": sorted(records),
+        "ranked_failed_layer_ids": [int(row["layer_id"]) for row in ranking],
+        "selected_failure_layer_ids": selected_failure_layer_ids,
+        "boundary_layer_ids": boundary_layer_ids,
+        "ranking": ranking,
+        "admission_gate_path": str(admission_gate_path),
+        "admission_gate_sha256": sha256_file(admission_gate_path),
+        "alignment_report_path": str(alignment_path),
+        "alignment_report_sha256": sha256_file(alignment_path),
+        "stratified_summary_path": str(summary_path),
+        "stratified_summary_sha256": sha256_file(summary_path),
+        "fixed_report_bindings": fixed_reports,
+        "stratified_report_bindings": canonical_report_bindings,
+    }
+
+
+def validate_stage211_correction_layer_focus(
+    focus_path: Path,
+    *,
+    phase: str,
+    admission_gate_path: Path,
+    admission_gate: dict[str, Any],
+) -> dict[str, Any]:
+    focus_path = focus_path.expanduser().resolve()
+    focus = _load_json_object(
+        focus_path,
+        label=f"Stage211 {phase} correction-layer focus",
+    )
+    rebuilt = build_stage211_correction_layer_focus(
+        phase=phase,
+        admission_gate_path=admission_gate_path,
+        admission_gate=admission_gate,
+    )
+    if focus != rebuilt:
+        raise ValueError("Stage211 correction-layer focus differs from failed-gate evidence.")
+    return focus
 
 
 def build_stage211_correction_extension_decision(
@@ -2907,7 +3290,7 @@ def _validate_stage211_correction_train_config(
     manifest_path: Path,
     init_checkpoint: Path,
     nano_teacher_checkpoint: Path,
-) -> None:
+) -> dict[str, Any]:
     phase = str(correction.get("phase") or "")
     train_config_path = _validate_bound_file(
         correction,
@@ -2921,8 +3304,20 @@ def _validate_stage211_correction_train_config(
         raise ValueError(
             f"Stage211 {phase} correction train config phase mismatch: actual={configured_phase!r}"
         )
-    contract = stage211_phase_train_config_contract(phase)
-    contract["lr"] = stage211_post_coverage_correction_lr(phase)
+    layer_focus_path = _validate_bound_file(
+        correction,
+        path_key="layer_focus_path",
+        sha256_key="layer_focus_sha256",
+        label=f"Stage211 {phase} correction layer focus",
+    )
+    layer_focus = _load_json_object(
+        layer_focus_path,
+        label=f"Stage211 {phase} correction layer focus",
+    )
+    contract = stage211_post_coverage_train_config_contract(
+        phase,
+        boundary_layer_ids=layer_focus.get("boundary_layer_ids", []),
+    )
     for key, expected in contract.items():
         actual = config.get(key)
         if type(actual) is not type(expected) or actual != expected:
@@ -2947,6 +3342,8 @@ def _validate_stage211_correction_train_config(
         "stage211_post_coverage_admission_gate_path": str(
             Path(str(correction["admission_gate_path"])).resolve()
         ),
+        "stage211_post_coverage_layer_focus_path": str(layer_focus_path),
+        "stage211_post_coverage_layer_focus_sha256": str(correction["layer_focus_sha256"]),
         "stage211_post_coverage_original_coverage_unchanged": True,
         "stage211_post_coverage_smoke_marker_path": str(
             Path(str(correction["smoke_marker_path"])).resolve()
@@ -2971,6 +3368,19 @@ def _validate_stage211_correction_train_config(
         )
     if resolve_stage211_nano_teacher_checkpoint(config) != nano_teacher_checkpoint:
         raise ValueError(f"Stage211 {phase} correction train config uses another Nano teacher.")
+    expected_focus_fields = {
+        "boundary_layer_ids": "boundary_layer_ids",
+        "selected_failure_layer_ids": "selected_failure_layer_ids",
+        "all_failed_layer_ids": "all_failed_layer_ids",
+        "rotating_layer_slots": "rotating_slots",
+    }
+    for correction_key, focus_key in expected_focus_fields.items():
+        if correction.get(correction_key) != layer_focus.get(focus_key):
+            raise ValueError(
+                f"Stage211 {phase} correction receipt layer-focus summary mismatch: "
+                f"key={correction_key}"
+            )
+    return layer_focus
 
 
 def _validate_stage211_correction_smoke_marker(
@@ -3007,6 +3417,8 @@ def _validate_stage211_correction_smoke_marker(
         "replay_receipt_sha256": str(correction["replay_receipt_sha256"]),
         "admission_gate_path": str(admission_gate),
         "admission_gate_sha256": sha256_file(admission_gate),
+        "layer_focus_path": str(Path(str(correction["layer_focus_path"])).resolve()),
+        "layer_focus_sha256": str(correction["layer_focus_sha256"]),
         "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
     }
@@ -3156,13 +3568,36 @@ def _validate_stage211_post_coverage_corrections(
             raise ValueError(
                 f"Stage211 {phase} correction round {round_index} uses another Nano teacher."
             )
-        _validate_bound_file(
+        provenance_path = _validate_bound_file(
             correction,
             path_key="provenance_path",
             sha256_key="provenance_sha256",
             label=f"Stage211 {phase} correction round {round_index} provenance",
         )
-        _validate_stage211_correction_train_config(
+        provenance = _load_json_object(
+            provenance_path,
+            label=f"Stage211 {phase} correction round {round_index} provenance",
+        )
+        expected_provenance_focus = {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "retention_correction_run",
+            "phase": phase,
+            "round": round_index,
+            "layer_focus_path": str(
+                Path(str(correction.get("layer_focus_path") or "")).resolve()
+            ),
+            "layer_focus_sha256": str(correction.get("layer_focus_sha256") or ""),
+        }
+        if any(
+            provenance.get(key) != value
+            for key, value in expected_provenance_focus.items()
+        ):
+            raise ValueError(
+                f"Stage211 {phase} correction round {round_index} provenance "
+                "layer-focus binding mismatch."
+            )
+        configured_layer_focus = _validate_stage211_correction_train_config(
             correction,
             manifest_path=replay_manifest_path,
             init_checkpoint=init_checkpoint,
@@ -3184,6 +3619,16 @@ def _validate_stage211_post_coverage_corrections(
         if admission_gate.get("gate_passed") is not False:
             raise ValueError(
                 f"Stage211 {phase} correction round {round_index} admission gate passed."
+            )
+        replayed_layer_focus = validate_stage211_correction_layer_focus(
+            Path(str(correction["layer_focus_path"])).resolve(),
+            phase=phase,
+            admission_gate_path=admission_gate_path,
+            admission_gate=admission_gate,
+        )
+        if configured_layer_focus != replayed_layer_focus:
+            raise ValueError(
+                f"Stage211 {phase} correction round {round_index} layer-focus replay mismatch."
             )
         if round_index > STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
             extension_decision_path = _validate_bound_file(
