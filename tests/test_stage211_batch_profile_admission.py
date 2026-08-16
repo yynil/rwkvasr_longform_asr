@@ -251,7 +251,13 @@ def _profile_row(
     }
 
 
-def _report(tmp_path: Path, *, phase: str = "mixer") -> Path:
+def _report(
+    tmp_path: Path,
+    *,
+    phase: str = "mixer",
+    baseline_batch_size: int = 36,
+    baseline_frame_budget: int = 24_000,
+) -> Path:
     init_checkpoint = _write(tmp_path / "init.pt", "checkpoint")
     manifest = _write(tmp_path / "manifest.json", "{}\n")
     eval_part = _write(tmp_path / "fixed_eval.jsonl", "{}\n" * 256)
@@ -267,8 +273,8 @@ def _report(tmp_path: Path, *, phase: str = "mixer") -> Path:
     baseline = _profile_row(
         tmp_path,
         name="baseline",
-        batch_size=36,
-        frame_budget=24_000,
+        batch_size=baseline_batch_size,
+        frame_budget=baseline_frame_budget,
         steps_per_epoch=1000,
         projected_seconds=3000.0,
         loss=0.10,
@@ -376,6 +382,42 @@ def test_measured_phase_specific_profile_can_be_admitted(tmp_path: Path) -> None
         "batch_size": 48,
         "frame_budget": 42_000,
     }
+
+
+def test_logits_preflight_accepts_safe_and_legacy_baselines(tmp_path: Path) -> None:
+    safe_report = _report(
+        tmp_path / "safe",
+        phase="logits",
+        baseline_batch_size=12,
+        baseline_frame_budget=8_000,
+    )
+    legacy_report = _report(tmp_path / "legacy", phase="logits")
+
+    safe = validate_stage211_batch_profile_preflight(safe_report, phase="logits")
+    legacy = validate_stage211_batch_profile_preflight(legacy_report, phase="logits")
+
+    safe_baseline = next(
+        row["profile"] for row in safe["profiles"] if row["profile"]["name"] == "baseline"
+    )
+    legacy_baseline = next(
+        row["profile"] for row in legacy["profiles"] if row["profile"]["name"] == "baseline"
+    )
+    assert safe_baseline["batch_size"] == 12
+    assert safe_baseline["frame_budget"] == 8_000
+    assert legacy_baseline["batch_size"] == 36
+    assert legacy_baseline["frame_budget"] == 24_000
+
+
+def test_mixer_preflight_rejects_logits_safe_baseline(tmp_path: Path) -> None:
+    report_path = _report(
+        tmp_path,
+        phase="mixer",
+        baseline_batch_size=12,
+        baseline_frame_budget=8_000,
+    )
+
+    with pytest.raises(ValueError, match="baseline is unsupported for this phase"):
+        validate_stage211_batch_profile_preflight(report_path, phase="mixer")
 
 
 @pytest.mark.parametrize(

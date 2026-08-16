@@ -67,6 +67,16 @@ DEFAULT_PROFILES = (
     BatchProfile("batch160_frames140k", 160, 140_000),
     BatchProfile("batch192_frames168k", 192, 168_000),
 )
+LOGITS_DEFAULT_PROFILES = (
+    BatchProfile("baseline", 12, 8_000),
+    BatchProfile("batch24_frames16k", 24, 16_000),
+    BatchProfile("batch36_frames24k", 36, 24_000),
+    *DEFAULT_PROFILES[1:],
+)
+
+
+def default_profiles_for_phase(phase: str) -> tuple[BatchProfile, ...]:
+    return LOGITS_DEFAULT_PROFILES if str(phase) == "logits" else DEFAULT_PROFILES
 
 
 @dataclass(frozen=True)
@@ -859,7 +869,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    profiles = args.profile or list(DEFAULT_PROFILES)
+    profiles = args.profile or list(default_profiles_for_phase(args.phase))
     if len({profile.name for profile in profiles}) != len(profiles):
         parser.error("profile names must be unique")
     if args.baseline_profile not in {profile.name for profile in profiles}:

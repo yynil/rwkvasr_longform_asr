@@ -632,12 +632,23 @@ def validate_stage211_batch_profile_preflight(
     if decision == "keep_baseline" and selected_name != baseline_name:
         raise ValueError("Stage211 batch preflight baseline selection names a candidate.")
     baseline_profile = by_name[baseline_name]["profile"]
-    if baseline_profile != {
-        "name": baseline_name,
-        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
-        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
-    }:
-        raise ValueError("Stage211 batch preflight baseline differs from the legacy profile.")
+    supported_baselines = [
+        {
+            "name": baseline_name,
+            "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+            "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        }
+    ]
+    if phase == "logits":
+        supported_baselines.append(
+            {
+                "name": baseline_name,
+                "batch_size": 12,
+                "frame_budget": 8_000,
+            }
+        )
+    if baseline_profile not in supported_baselines:
+        raise ValueError("Stage211 batch preflight baseline is unsupported for this phase.")
     baseline = _validate_safe_profile(by_name[baseline_name], report=report, phase=phase)
     baseline_summary = baseline["summary"]
     baseline_seconds = float(baseline_summary["projected_full_coverage_seconds"])
