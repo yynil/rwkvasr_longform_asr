@@ -1252,6 +1252,10 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
             "epochs": epochs,
             "row_exposures": int(coverage["train_samples"]) * epochs,
             "hour_exposures": total_hours * epochs,
+            "steps": int(coverage["estimated_train_steps"]),
+            "tail_padding_sample_exposures": int(
+                coverage["tail_padding_sample_exposures"]
+            ),
             "executed_sample_exposures": int(coverage["executed_sample_exposures"]),
             "correction_rounds": 0,
             "correction_row_exposures": 0,

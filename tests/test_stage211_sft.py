@@ -2185,6 +2185,14 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert (
         report["coverage_results"][-1]["unique_or_train_rows"] == LABELED_EXPECTED["train_samples"]
     )
+    assert (
+        report["coverage_results"][-1]["steps"]
+        == LABELED_EXPECTED["estimated_train_steps"]
+    )
+    assert (
+        report["coverage_results"][-1]["tail_padding_sample_exposures"]
+        == LABELED_EXPECTED["tail_padding_sample_exposures"]
+    )
     assert report["coverage_results"][-1]["step_eval_cadence"] == {
         "complete": True,
         "interval_steps": STAGE211_SFT_STEP_EVAL_INTERVAL,

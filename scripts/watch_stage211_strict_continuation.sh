@@ -95,6 +95,13 @@ stage211_periodic_cadence_results_valid() {
     '([.alignment_results[].step_eval_cadence | (.complete == true and .interval_steps == 10000 and .eval_samples_per_report == 256 and .source_count == (.sources | length) and .source_count >= 5 and .total_reports == ([.sources[].report_count] | add) and all(.sources[]; .terminal_step > 0 and .report_count > 0 and .eval_samples_per_report == 256))] | all) and ([.coverage_results[] | select(.stage == "sft")] | length) == 1 and ([.coverage_results[] | select(.stage == "sft") | .step_eval_cadence | (.complete == true and .interval_steps == 2000 and .eval_samples_per_report == 256 and .source_order == ["labeled_sft"] and .source_count == 1 and .total_reports == ([.sources[].report_count] | add) and all(.sources[]; .source == "labeled_sft" and .terminal_step > 0 and .report_count > 0 and .eval_samples_per_report == 256))] | all)'
 }
 
+stage211_full_labeled_profile_valid() {
+  local path="$1"
+  stage211_json_matches \
+    "${path}" \
+    '.ctc_label_proof as $labels | ([.coverage_results[] | select(.stage == "sft")] | length) == 1 and $labels.labeled_profile_schema_version == 2 and ($labels.labeled_profile_receipt_sha256 | length) == 64 and $labels.all_accepted_unique_rows_required == true and $labels.source_language_interleave_required == true and $labels.train_samples == 1418201 and $labels.eval_samples == 7142 and $labels.total_samples == 1425343 and $labels.unique_utterance_ids == 1425343 and $labels.pronunciation_target_samples == 1425343 and $labels.ctc_feasible_samples == 1425343 and $labels.ctc_tokens == 21711995 and $labels.ctc_unk_tokens == 0 and $labels.ctc_forbidden_tokens == 0 and $labels.source_counts == {"aishell3":63262,"commonvoice_cn":32712,"commonvoice_en":1109477,"librispeech":219892} and $labels.language_counts == {"en":1329369,"zh":95974} and ([.coverage_results[] | select(.stage == "sft") | (.unique_or_train_rows == 1418201 and .evaluation_rows == 7142 and .hours_per_epoch == 2421.999430555555 and .epochs == 1 and .row_exposures == 1418201 and .hour_exposures == 2421.999430555555 and .steps == 37506 and .tail_padding_sample_exposures == 567 and .executed_sample_exposures == 1418768 and .step_eval_cadence.interval_steps == 2000 and .step_eval_cadence.source_order == ["labeled_sft"] and .step_eval_cadence.source_count == 1 and .step_eval_cadence.total_reports == 19 and .step_eval_cadence.sources[0].terminal_step == 37506 and .step_eval_cadence.sources[0].report_count == 19)] | all)'
+}
+
 stage211_requested_nano_gaps_valid() {
   local path="$1"
   stage211_json_matches \
@@ -153,6 +160,10 @@ stage211_final_candidate_valid() {
   fi
   if ! stage211_periodic_cadence_results_valid "${final_stepwise_report}"; then
     stage211_log "final Stage211 periodic fixed-eval proof failed validation source=${final_report}"
+    return 1
+  fi
+  if ! stage211_full_labeled_profile_valid "${final_stepwise_report}"; then
+    stage211_log "final Stage211 full-labeled profile proof failed validation source=${final_report}"
     return 1
   fi
   if ! stage211_requested_nano_gaps_valid "${final_stepwise_report}"; then
