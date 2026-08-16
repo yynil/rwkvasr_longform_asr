@@ -41,6 +41,50 @@ def test_profiled_controller_binds_only_fresh_supplemental_admission(
     assert "--promotion-receipt" not in command
 
 
+def test_profiled_controller_omits_admission_for_retained_legacy_baseline(
+    tmp_path: Path,
+) -> None:
+    command = handoff._profiled_controller_command(
+        initial_checkpoint=tmp_path / "initial.pt",
+        output_root=tmp_path / "runs",
+        config_root=tmp_path / "configs",
+        metadata_root=tmp_path / "metadata",
+        easy_manifest=tmp_path / "easy.json",
+        nano_checkpoint=tmp_path / "model.pt",
+        inventory=tmp_path / "inventory.json",
+        profile_receipt=tmp_path / "profile.json",
+        admission_path=None,
+        master_port=29631,
+    )
+
+    assert "--batch-profile-admission" not in command
+    assert command[command.index("--master-port") + 1] == "29631"
+
+
+def test_supplemental_profile_admission_routing_is_fail_closed() -> None:
+    retained_baseline = {
+        "selection_decision": "keep_baseline",
+        "selected_profile_row": {
+            "profile": {"name": "baseline", "batch_size": 36, "frame_budget": 24_000}
+        },
+    }
+    admitted_candidate = {
+        **retained_baseline,
+        "selection_decision": "admit_candidate",
+    }
+    wrong_retained_baseline = {
+        **retained_baseline,
+        "selected_profile_row": {
+            "profile": {"name": "baseline", "batch_size": 12, "frame_budget": 8_000}
+        },
+    }
+
+    assert not handoff._supplemental_profile_requires_admission(retained_baseline)
+    assert handoff._supplemental_profile_requires_admission(admitted_candidate)
+    with pytest.raises(ValueError, match="differs from the formal default"):
+        handoff._supplemental_profile_requires_admission(wrong_retained_baseline)
+
+
 def test_boundary_preflight_keeps_all_three_default_profiles(tmp_path: Path) -> None:
     command = handoff._preflight_command(
         base_config=tmp_path / "base.yaml",

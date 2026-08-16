@@ -303,10 +303,10 @@ def _profiled_controller_command(
     nano_checkpoint: Path,
     inventory: Path,
     profile_receipt: Path,
-    admission_path: Path,
+    admission_path: Path | None,
     master_port: int,
 ) -> list[str]:
-    return [
+    command = [
         str(PYTHON),
         str(FULL_PHASE_CONTROLLER),
         "--phase",
@@ -327,17 +327,41 @@ def _profiled_controller_command(
         str(inventory),
         "--supplemental-profile-receipt",
         str(profile_receipt),
-        "--batch-profile-admission",
-        f"{STAGE211_SUPPLEMENTAL_DIFFICULTY}={admission_path}",
-        "--master-port",
-        str(master_port),
-        "--final-checkpoint-path-output",
-        str(
-            output_root
-            / "stage211a_mixer_full_data_3ep"
-            / "final_checkpoint_with_supplemental.txt"
-        ),
     ]
+    if admission_path is not None:
+        command.extend(
+            (
+                "--batch-profile-admission",
+                f"{STAGE211_SUPPLEMENTAL_DIFFICULTY}={admission_path}",
+            )
+        )
+    command.extend(
+        (
+            "--master-port",
+            str(master_port),
+            "--final-checkpoint-path-output",
+            str(
+                output_root
+                / "stage211a_mixer_full_data_3ep"
+                / "final_checkpoint_with_supplemental.txt"
+            ),
+        )
+    )
+    return command
+
+
+def _supplemental_profile_requires_admission(report: dict[str, object]) -> bool:
+    if report["selection_decision"] != "keep_baseline":
+        return True
+    selected = report["selected_profile_row"]
+    if not isinstance(selected, dict) or not isinstance(selected.get("profile"), dict):
+        raise ValueError("Stage211 Supplemental preflight selected profile is invalid.")
+    profile = selected["profile"]
+    if int(profile["batch_size"]) != 36 or int(profile["frame_budget"]) != 24_000:
+        raise ValueError(
+            "Stage211 Supplemental retained baseline differs from the formal default."
+        )
+    return False
 
 
 def _supervisor_command(
@@ -537,7 +561,11 @@ def main() -> int:
     preflight_root = phase_root / "batch_profile_preflight" / f"supplemental-{init_sha[:16]}"
     report_path = preflight_root / "batch_throughput_preflight.json"
     if report_path.is_file():
-        report = validate_stage211_batch_profile_preflight(report_path, phase="mixer")
+        report = validate_stage211_batch_profile_preflight(
+            report_path,
+            phase="mixer",
+            require_candidate=False,
+        )
         if (
             Path(str(report["init_checkpoint_path"])).resolve() != long_checkpoint.resolve()
             or Path(str(report["bucket_manifest_path"])).resolve() != manifest
@@ -555,30 +583,42 @@ def main() -> int:
             ),
             log_path=handoff_log,
         )
-        validate_stage211_batch_profile_preflight(report_path, phase="mixer")
+        report = validate_stage211_batch_profile_preflight(
+            report_path,
+            phase="mixer",
+            require_candidate=False,
+        )
 
-    admission_path = phase_root / "batch_profile_preflight" / "supplemental-admission.json"
-    _run(
-        _admission_command(
-            report_path=report_path,
-            admission_path=admission_path,
-            admitted_by=str(args.admitted_by),
-            reason=str(args.reason),
-        ),
-        log_path=handoff_log,
-    )
-    admission = validate_stage211_batch_profile_admission(
-        admission_path,
-        phase="mixer",
-        expected_init_checkpoint=long_checkpoint,
-        expected_bucket_manifest=manifest,
-    )
-    print(
-        "[stage211-profiled-handoff] admitted Supplemental profile "
-        f"name={admission['selected_profile']['name']} "
-        f"steps={admission['selected_coverage']['full_coverage_steps']}",
-        flush=True,
-    )
+    admission_path: Path | None = None
+    if _supplemental_profile_requires_admission(report):
+        admission_path = phase_root / "batch_profile_preflight" / "supplemental-admission.json"
+        _run(
+            _admission_command(
+                report_path=report_path,
+                admission_path=admission_path,
+                admitted_by=str(args.admitted_by),
+                reason=str(args.reason),
+            ),
+            log_path=handoff_log,
+        )
+        admission = validate_stage211_batch_profile_admission(
+            admission_path,
+            phase="mixer",
+            expected_init_checkpoint=long_checkpoint,
+            expected_bucket_manifest=manifest,
+        )
+        print(
+            "[stage211-profiled-handoff] admitted Supplemental profile "
+            f"name={admission['selected_profile']['name']} "
+            f"steps={admission['selected_coverage']['full_coverage_steps']}",
+            flush=True,
+        )
+    else:
+        print(
+            "[stage211-profiled-handoff] retained measured Supplemental baseline "
+            "profile=baseline batch_size=36 frame_budget=24000",
+            flush=True,
+        )
 
     _run(
         _profiled_controller_command(
