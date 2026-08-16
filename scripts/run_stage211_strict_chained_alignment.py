@@ -89,6 +89,7 @@ TRAIN_WORLD_SIZE = STAGE211_FULL_DATA_WORLD_SIZE
 TRAIN_FRAME_BUDGET = 8_000
 FORMAL_RESUME_SAVE_INTERVAL = 2_000
 FIXED_HIDDEN_EVAL_SAMPLES = 256
+STAGE211_WANDB_PROJECT = "rwkvasr_longform_asr_gigaspeech_wenetspeech"
 STAGE211_LABELED_TOTAL_SAMPLES = 285_302
 STAGE211_LABELED_SOURCE_COUNTS = {"aishell3": 63_262, "librispeech": 222_040}
 STAGE211_LABELED_LANGUAGE_COUNTS = {"en": 222_040, "zh": 63_262}
@@ -1289,6 +1290,8 @@ def _config(
             ),
             "step_eval_cache_batches": True,
             "step_eval_feature_seed": 0,
+            "wandb_enabled": not smoke,
+            "wandb_project": STAGE211_WANDB_PROJECT,
             "wandb_run_name": f"{output_dir.name}_{segment['name']}",
         }
     )

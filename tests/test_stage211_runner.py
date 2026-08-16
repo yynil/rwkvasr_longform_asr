@@ -2404,6 +2404,35 @@ def test_stage211_config_uses_explicit_nano_checkpoint_parent(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("phase_name", tuple(stage211.PHASES))
+def test_stage211_formal_runs_enable_segment_scoped_wandb(
+    tmp_path: Path,
+    phase_name: str,
+) -> None:
+    config = _config_for_phase(tmp_path, phase_name)
+    phase = stage211.PHASES[phase_name]
+    segment = stage211._segments(
+        phase=phase,
+        smoke=False,
+        formal_steps=12_045 if phase.requires_labels else None,
+    )[0]
+
+    assert config["wandb_enabled"] is True
+    assert config["wandb_project"] == stage211.STAGE211_WANDB_PROJECT
+    assert config["wandb_run_name"] == f"{phase_name}_{segment['name']}"
+
+
+@pytest.mark.parametrize("phase_name", tuple(stage211.PHASES))
+def test_stage211_smoke_runs_do_not_publish_wandb(
+    tmp_path: Path,
+    phase_name: str,
+) -> None:
+    config = _config_for_phase(tmp_path, phase_name, smoke=True)
+
+    assert config["wandb_enabled"] is False
+    assert config["wandb_project"] == stage211.STAGE211_WANDB_PROJECT
+
+
+@pytest.mark.parametrize("phase_name", tuple(stage211.PHASES))
 def test_stage211_freezes_nano_non_attention_path_in_every_phase(
     tmp_path: Path,
     phase_name: str,
