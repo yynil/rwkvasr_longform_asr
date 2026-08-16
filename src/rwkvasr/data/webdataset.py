@@ -54,6 +54,9 @@ class WebDatasetConfig:
     decoded_batch_prefetch: int = 2
     max_open_shards_per_worker: int = 8
     bucket_source_interleave: bool = False
+    length_bucket_schedule_block_size: int = 1
+    bucket_source_interleave_block_size: int = 1
+    bucket_serialize_reads: bool = False
     append_eos: bool = False
     text_normalization: str = "none"
     decoder_append_eos: bool = False

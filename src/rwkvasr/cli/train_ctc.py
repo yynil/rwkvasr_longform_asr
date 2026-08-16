@@ -61,6 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-open-shards-per-worker", default=None, type=int)
     parser.add_argument("--bucket-source-interleave", dest="bucket_source_interleave", action="store_true", default=None)
     parser.add_argument("--no-bucket-source-interleave", dest="bucket_source_interleave", action="store_false")
+    parser.add_argument("--length-bucket-schedule-block-size", default=None, type=int)
+    parser.add_argument("--bucket-source-interleave-block-size", default=None, type=int)
+    parser.add_argument("--bucket-serialize-reads", dest="bucket_serialize_reads", action="store_true", default=None)
+    parser.add_argument("--no-bucket-serialize-reads", dest="bucket_serialize_reads", action="store_false")
     parser.add_argument("--lr", default=None, type=float)
     parser.add_argument("--weight-decay", default=None, type=float)
     parser.add_argument("--beta1", default=None, type=float)
@@ -210,6 +214,9 @@ def _resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "decoded_batch_prefetch",
         "max_open_shards_per_worker",
         "bucket_source_interleave",
+        "length_bucket_schedule_block_size",
+        "bucket_source_interleave_block_size",
+        "bucket_serialize_reads",
         "lr",
         "weight_decay",
         "beta1",

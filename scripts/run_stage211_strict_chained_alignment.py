@@ -1299,6 +1299,14 @@ def _config(
                 "webdataset_skip_decode_errors": False,
             }
         )
+        if not phase.requires_labels:
+            config.update(
+                {
+                    "length_bucket_schedule_block_size": 64,
+                    "bucket_source_interleave_block_size": 64,
+                    "bucket_serialize_reads": True,
+                }
+            )
         deepspeed_config = dict(config["deepspeed"])
         gradient_accumulation = int(deepspeed_config.get("gradient_accumulation_steps", 1))
         deepspeed_config.update(

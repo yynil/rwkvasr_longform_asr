@@ -236,7 +236,14 @@ def _part_source_label(part: WebDatasetBucketPart) -> str:
 
 
 class _SourceInterleavedBucketEntryStream:
-    def __init__(self, manifest_path: Path, bucket: WebDatasetBucket, *, epoch: int):
+    def __init__(
+        self,
+        manifest_path: Path,
+        bucket: WebDatasetBucket,
+        *,
+        epoch: int,
+        batches_per_source: int = 1,
+    ):
         grouped_parts: "OrderedDict[str, list[WebDatasetBucketPart]]" = OrderedDict()
         for part in bucket.parts:
             grouped_parts.setdefault(_part_source_label(part), []).append(part)
@@ -251,11 +258,14 @@ class _SourceInterleavedBucketEntryStream:
             streams = streams[offset:] + streams[:offset]
         self._streams = streams
         self._cursor = 0
+        self._batches_per_source = max(1, int(batches_per_source))
+        self._source_batches = 0
 
     def reset(self) -> None:
         for _, stream in self._streams:
             stream.reset()
         self._cursor = 0
+        self._source_batches = 0
 
     def take(self, num_entries: int) -> list[WebDatasetLengthEntry]:
         entries: list[WebDatasetLengthEntry] = []
@@ -265,10 +275,21 @@ class _SourceInterleavedBucketEntryStream:
             chunk = stream.take(num_entries - len(entries))
             if chunk:
                 entries.extend(chunk)
-                self._cursor = (index + 1) % len(self._streams)
+                if len(entries) >= num_entries:
+                    self._source_batches += 1
+                    if self._source_batches >= self._batches_per_source:
+                        self._cursor = (index + 1) % len(self._streams)
+                        self._source_batches = 0
+                    else:
+                        self._cursor = index
+                else:
+                    # A short take exhausted this source. Fill from the next source.
+                    self._cursor = (index + 1) % len(self._streams)
+                    self._source_batches = 0
                 continue
             stream.reset()
             self._streams.pop(index)
+            self._source_batches = 0
             if self._streams:
                 self._cursor = index % len(self._streams)
         return entries
@@ -337,6 +358,11 @@ class BucketedWebDatasetBatchLoader:
         self.num_workers = max(1, int(num_workers))
         self.decoded_batch_prefetch = max(0, int(self.config.decoded_batch_prefetch))
         self.max_open_shards_per_worker = max(1, int(self.config.max_open_shards_per_worker))
+        self.schedule_block_size = max(1, int(self.config.length_bucket_schedule_block_size))
+        self.source_interleave_block_size = max(
+            1, int(self.config.bucket_source_interleave_block_size)
+        )
+        self.serialize_reads = bool(self.config.bucket_serialize_reads)
         self.rank = int(rank)
         self.world_size = max(1, int(world_size))
         self.collator = FeatureCollator()
@@ -362,12 +388,16 @@ class BucketedWebDatasetBatchLoader:
         return math.ceil(bucket.num_samples / global_batch)
 
     def _build_schedule(self) -> list[int]:
-        schedule: list[int] = []
+        schedule_blocks: list[list[int]] = []
         for bucket in self.manifest.splits.get(self._split_name(), ()):
-            schedule.extend([bucket.bucket_id] * self._bucket_steps(bucket))
+            bucket_steps = self._bucket_steps(bucket)
+            schedule_blocks.extend(
+                [bucket.bucket_id] * min(self.schedule_block_size, bucket_steps - offset)
+                for offset in range(0, bucket_steps, self.schedule_block_size)
+            )
         if self.config.shuffle_shards:
-            random.Random(self.config.seed + self.epoch).shuffle(schedule)
-        return schedule
+            random.Random(self.config.seed + self.epoch).shuffle(schedule_blocks)
+        return [bucket_id for block in schedule_blocks for bucket_id in block]
 
     def __len__(self) -> int:
         return len(self._build_schedule())
@@ -382,6 +412,7 @@ class BucketedWebDatasetBatchLoader:
                     self.manifest.manifest_path,
                     bucket,
                     epoch=self.epoch,
+                    batches_per_source=self.source_interleave_block_size,
                 )
             else:
                 streams[bucket_id] = _BucketEntryStream(self.manifest.manifest_path, bucket.parts)
@@ -454,6 +485,23 @@ class BucketedWebDatasetBatchLoader:
     ) -> ASRBatch | None:
         if executor is None:
             samples = [self._decode_entry(entry, reader_pool) for entry in local_entries]
+        elif self.serialize_reads:
+            futures = []
+            for entry in local_entries:
+                payload = self._read_entry_payload(entry, reader_pool)
+                if payload is None:
+                    continue
+                audio_bytes, metadata_bytes, tar_path = payload
+                futures.append(
+                    executor.submit(
+                        self._decode_entry_payload,
+                        entry,
+                        audio_bytes,
+                        metadata_bytes,
+                        tar_path,
+                    )
+                )
+            samples = [future.result() for future in futures]
         else:
             samples = list(executor.map(lambda entry: self._decode_entry(entry, reader_pool), local_entries))
         decoded_samples = [sample for sample in samples if sample is not None]
@@ -619,17 +667,38 @@ class BucketedWebDatasetBatchLoader:
         row.setdefault("num_frames", int(entry.num_frames))
         return row
 
-    def _decode_entry(
+    def _read_entry_payload(
         self,
         entry: WebDatasetLengthEntry,
         reader_pool: _ThreadLocalTarReaderPool,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[bytes, bytes, Path] | None:
         try:
             reader = reader_pool.get(
                 entry.shard_name,
                 storage_kind=entry.storage_kind,
             )
             audio_bytes, metadata_bytes = _read_indexed_entry_payload(reader, entry)
+            return audio_bytes, metadata_bytes, Path(reader.shard_path)
+        except Exception as exc:
+            if not self.config.skip_decode_errors:
+                raise
+            log_webdataset_decode_skip(
+                key=entry.key,
+                shard_name=entry.shard_name,
+                audio_member=entry.audio_member,
+                json_member=entry.json_member,
+                exc=exc,
+            )
+            return None
+
+    def _decode_entry_payload(
+        self,
+        entry: WebDatasetLengthEntry,
+        audio_bytes: bytes,
+        metadata_bytes: bytes,
+        tar_path: Path,
+    ) -> dict[str, Any] | None:
+        try:
             sample = decode_webdataset_sample(
                 key=entry.key,
                 audio_bytes=audio_bytes,
@@ -668,7 +737,7 @@ class BucketedWebDatasetBatchLoader:
             sample["ctc_teacher_audio_row"] = self._ctc_teacher_audio_row(
                 entry,
                 sample,
-                tar_path=reader.shard_path,
+                tar_path=tar_path,
             )
             if entry.storage_kind != "tar":
                 sample["ctc_teacher_audio_row"]["_audio_bytes"] = audio_bytes
@@ -684,6 +753,22 @@ class BucketedWebDatasetBatchLoader:
                 exc=exc,
             )
             return None
+
+    def _decode_entry(
+        self,
+        entry: WebDatasetLengthEntry,
+        reader_pool: _ThreadLocalTarReaderPool,
+    ) -> dict[str, Any] | None:
+        payload = self._read_entry_payload(entry, reader_pool)
+        if payload is None:
+            return None
+        audio_bytes, metadata_bytes, tar_path = payload
+        return self._decode_entry_payload(
+            entry,
+            audio_bytes,
+            metadata_bytes,
+            tar_path,
+        )
 
 
 def build_bucketed_webdataset_loader(

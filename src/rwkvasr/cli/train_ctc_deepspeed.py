@@ -289,6 +289,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-open-shards-per-worker", default=None, type=int)
     parser.add_argument("--bucket-source-interleave", dest="bucket_source_interleave", action="store_true", default=None)
     parser.add_argument("--no-bucket-source-interleave", dest="bucket_source_interleave", action="store_false")
+    parser.add_argument("--length-bucket-schedule-block-size", default=None, type=int)
+    parser.add_argument("--bucket-source-interleave-block-size", default=None, type=int)
+    parser.add_argument("--bucket-serialize-reads", dest="bucket_serialize_reads", action="store_true", default=None)
+    parser.add_argument("--no-bucket-serialize-reads", dest="bucket_serialize_reads", action="store_false")
     parser.add_argument("--device", default=None)
     parser.add_argument("--encoder-init-checkpoint-path", default=None)
     parser.add_argument("--init-checkpoint-path", default=None)
@@ -536,6 +540,9 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "decoded_batch_prefetch",
         "max_open_shards_per_worker",
         "bucket_source_interleave",
+        "length_bucket_schedule_block_size",
+        "bucket_source_interleave_block_size",
+        "bucket_serialize_reads",
         "device",
         "encoder_init_checkpoint_path",
         "init_checkpoint_path",

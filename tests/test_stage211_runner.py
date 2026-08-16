@@ -3005,6 +3005,9 @@ def test_stage211_medium_config_uses_fixed_eval_split(tmp_path: Path) -> None:
     assert config["skip_oversized_samples"] is False
     assert config["webdataset_skip_decode_errors"] is False
     assert config["length_bucket_frame_budget"] == 24_000
+    assert config["length_bucket_schedule_block_size"] == 64
+    assert config["bucket_source_interleave_block_size"] == 64
+    assert config["bucket_serialize_reads"] is True
     assert config["deepspeed"]["train_micro_batch_size_per_gpu"] == 36
     assert config["deepspeed"]["train_batch_size"] == 144
     assert config["step_eval_split"] == "eval"
