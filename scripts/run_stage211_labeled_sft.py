@@ -28,14 +28,12 @@ from rwkvasr.eval.stage211_runtime import (
 
 try:
     from scripts.run_stage211_strict_chained_alignment import (
-        _audit_labeled_data,
         _label_preparation_proof,
     )
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
     from run_stage211_strict_chained_alignment import (
-        _audit_labeled_data,
         _label_preparation_proof,
     )
 
@@ -425,6 +423,7 @@ def _validate_completion(
     completion_path: Path,
     *,
     checkpoint_path: Path | None = None,
+    require_full_profile: bool = False,
 ) -> tuple[dict[str, Any], Path]:
     completion = _load_json(completion_path, label="Stage211D completion report")
     labeled_root = Path(str(completion.get("labeled_webdataset_root") or "")).resolve()
@@ -444,8 +443,18 @@ def _validate_completion(
             length_index=length_index,
             bucket_manifest=bucket_manifest,
         )
+        if (
+            labeled_profile.get("schema_version") != 2
+            or labeled_profile.get("all_accepted_unique_rows_required") is not True
+            or labeled_profile.get("source_language_interleave_required") is not True
+        ):
+            raise ValueError("Stage211D formal labeled profile contract mismatch.")
         labeled_expected = dict(labeled_profile["expected"])
     else:
+        if require_full_profile:
+            raise ValueError(
+                "Stage211D formal completion must bind its schema-v2 full-labeled profile."
+            )
         labeled_expected = dict(LABELED_EXPECTED)
     expected = {
         "schema_version": 1,
@@ -567,36 +576,25 @@ def run_sft(args: argparse.Namespace) -> Path | None:
         if not exists:
             raise FileNotFoundError(f"Stage211D {label} is unavailable: {path}")
     requested_profile = getattr(args, "labeled_profile_receipt", None)
-    if requested_profile is not None:
-        labeled_profile_path = requested_profile.expanduser().resolve()
-        labeled_profile = validate_labeled_profile_receipt(
-            labeled_profile_path,
-            labeled_root=labeled_root,
-            length_index=length_index,
-            bucket_manifest=bucket_manifest,
+    if requested_profile is None:
+        raise ValueError(
+            "Stage211D formal training requires its schema-v2 full-labeled profile."
         )
-        labeled_expected = dict(labeled_profile["expected"])
-        audit = _validate_labeled_audit(
-            dict(labeled_profile["labeled_data_audit"]),
-            labeled_root=labeled_root,
-            length_index=length_index,
-            bucket_manifest=bucket_manifest,
-            expected_metrics=labeled_expected,
-        )
-    else:
-        labeled_profile_path = None
-        labeled_expected = dict(LABELED_EXPECTED)
-        audit = _validate_labeled_audit(
-            _audit_labeled_data(
-                webdataset_root=labeled_root,
-                length_index_path=length_index,
-                bucket_manifest_path=bucket_manifest,
-            ),
-            labeled_root=labeled_root,
-            length_index=length_index,
-            bucket_manifest=bucket_manifest,
-            expected_metrics=labeled_expected,
-        )
+    labeled_profile_path = requested_profile.expanduser().resolve()
+    labeled_profile = validate_labeled_profile_receipt(
+        labeled_profile_path,
+        labeled_root=labeled_root,
+        length_index=length_index,
+        bucket_manifest=bucket_manifest,
+    )
+    labeled_expected = dict(labeled_profile["expected"])
+    audit = _validate_labeled_audit(
+        dict(labeled_profile["labeled_data_audit"]),
+        labeled_root=labeled_root,
+        length_index=length_index,
+        bucket_manifest=bucket_manifest,
+        expected_metrics=labeled_expected,
+    )
     init_checkpoint, promotion_receipt = _resolve_chain_inputs(
         output_dir=output_dir,
         requested_checkpoint=args.init_checkpoint,
@@ -779,7 +777,11 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             ),
         },
     )
-    _validate_completion(completion_path, checkpoint_path=completion_checkpoint)
+    _validate_completion(
+        completion_path,
+        checkpoint_path=completion_checkpoint,
+        require_full_profile=True,
+    )
     if args.final_checkpoint_path_output is not None:
         path_output = args.final_checkpoint_path_output.expanduser().resolve()
         path_output.parent.mkdir(parents=True, exist_ok=True)

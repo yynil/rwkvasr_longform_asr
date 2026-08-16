@@ -55,7 +55,10 @@ def _run(command: list[str], *, dry_run: bool) -> None:
 def run_loop(args: argparse.Namespace) -> Path | None:
     full_completion_path = args.full_sft_completion.expanduser().resolve()
     full_failed_report_path = args.full_sft_failed_report.expanduser().resolve()
-    full_completion, full_checkpoint = validate_full_sft_completion(full_completion_path)
+    full_completion, full_checkpoint = validate_full_sft_completion(
+        full_completion_path,
+        require_full_profile=True,
+    )
     full_profile_path = Path(
         str(full_completion.get("labeled_profile_receipt_path") or "")
     ).resolve()

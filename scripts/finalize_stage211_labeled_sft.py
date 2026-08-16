@@ -380,7 +380,10 @@ def finalize_sft(args: argparse.Namespace) -> Path:
         if args.completion_report is not None
         else (run_dir / "sft_complete.json").resolve()
     )
-    completion, checkpoint = _validate_completion(completion_path)
+    completion, checkpoint = _validate_completion(
+        completion_path,
+        require_full_profile=True,
+    )
     init_checkpoint = Path(str(completion["init_checkpoint_path"])).resolve()
     nano_teacher_checkpoint = Path(str(completion["nano_teacher_checkpoint_path"])).resolve()
     promotion_receipt_path = Path(str(completion["logits_promotion_receipt_path"])).resolve()

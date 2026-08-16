@@ -29,6 +29,7 @@ GLOBAL_DEDUP_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "stage211_global_dedup
 sys.path.insert(0, str(REPO_ROOT))
 sft_runner = importlib.import_module("scripts.run_stage211_labeled_sft")
 sft_finalizer = importlib.import_module("scripts.finalize_stage211_labeled_sft")
+sft_correction_loop = importlib.import_module("scripts.run_stage211_sft_correction_loop")
 stepwise_report = importlib.import_module("scripts.create_stage211_stepwise_report")
 public_compare = importlib.import_module("scripts.compare_public_ctc_with_nano")
 LABELED_EXPECTED = sft_runner.LABELED_EXPECTED
@@ -216,6 +217,31 @@ def test_stage211_sft_runner_command_distinguishes_fresh_and_resume(
     assert "--promotion-receipt" not in resumed
 
 
+def test_stage211_sft_formal_runner_requires_full_labeled_profile(tmp_path: Path) -> None:
+    root, length_index, manifest = _labeled_paths(tmp_path)
+    nano_checkpoint = tmp_path / "nano.pt"
+    nano_checkpoint.write_bytes(b"nano")
+    args = SimpleNamespace(
+        output_dir=tmp_path / "run",
+        config_dir=tmp_path / "configs",
+        labeled_webdataset_root=root,
+        labeled_length_index=length_index,
+        bucket_manifest=manifest,
+        labeled_profile_receipt=None,
+        nano_checkpoint=nano_checkpoint,
+        init_checkpoint=None,
+        logits_promotion_receipt=None,
+        dry_run=False,
+        smoke_only=False,
+        master_port=29634,
+        max_peak_reserved_gib=22.0,
+        final_checkpoint_path_output=None,
+    )
+
+    with pytest.raises(ValueError, match="schema-v2 full-labeled profile"):
+        sft_runner.run_sft(args)
+
+
 def test_stage211_sft_formal_progress_detection_is_fail_closed(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -252,8 +278,31 @@ def test_stage211_sft_refuses_retroactive_smoke_marker(
     torch.save({"step": 0}, init_checkpoint)
     promotion_receipt.write_text("{}\n", encoding="utf-8")
     nano_checkpoint.write_bytes(b"nano")
-    audit = _labeled_audit(root, length_index, manifest)
-    monkeypatch.setattr(sft_runner, "_audit_labeled_data", lambda **_: audit)
+    profile_path = root / "stage211_labeled_profile_receipt.json"
+    profile_path.write_text("{}\n", encoding="utf-8")
+    dynamic_expected = {
+        **LABELED_EXPECTED,
+        "train_samples": LABELED_EXPECTED["train_samples"] + 100,
+        "total_samples": LABELED_EXPECTED["total_samples"] + 100,
+        "estimated_train_steps": LABELED_EXPECTED["estimated_train_steps"] + 4,
+    }
+    audit = {
+        **_labeled_audit(root, length_index, manifest),
+        **dynamic_expected,
+    }
+    profile = {
+        "schema_version": 2,
+        "all_accepted_unique_rows_required": True,
+        "source_language_interleave_required": True,
+        "expected": dynamic_expected,
+        "labeled_data_audit": audit,
+    }
+    monkeypatch.setattr(
+        sft_runner,
+        "validate_labeled_profile_receipt",
+        lambda path, **_kwargs: profile if path == profile_path.resolve() else None,
+    )
+
     monkeypatch.setattr(
         sft_runner,
         "_resolve_chain_inputs",
@@ -270,6 +319,7 @@ def test_stage211_sft_refuses_retroactive_smoke_marker(
         labeled_webdataset_root=root,
         labeled_length_index=length_index,
         bucket_manifest=manifest,
+        labeled_profile_receipt=profile_path,
         nano_checkpoint=nano_checkpoint,
         init_checkpoint=init_checkpoint,
         logits_promotion_receipt=promotion_receipt,
@@ -419,6 +469,11 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
 
     assert loaded == completion
     assert checkpoint == artifacts["completion_checkpoint"].resolve()
+    with pytest.raises(ValueError, match="schema-v2 full-labeled profile"):
+        sft_runner._validate_completion(
+            completion_path,
+            require_full_profile=True,
+        )
 
     completion["labeled_data_audit"]["ctc_unk_tokens"] = 1
     completion_path.write_text(
@@ -459,6 +514,76 @@ def _public_benchmark(error_rates: dict[str, float]) -> dict[str, object]:
             for dataset in STAGE211_PUBLIC_BENCHMARKS
         ]
     }
+
+
+def test_stage211_sft_finalizer_requires_full_profile_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def reject_completion(
+        path: Path,
+        *,
+        checkpoint_path: Path | None = None,
+        require_full_profile: bool = False,
+    ) -> tuple[dict[str, object], Path]:
+        observed.update(
+            path=path,
+            checkpoint_path=checkpoint_path,
+            require_full_profile=require_full_profile,
+        )
+        raise RuntimeError("stop after completion admission")
+
+    monkeypatch.setattr(sft_finalizer, "_validate_completion", reject_completion)
+    args = SimpleNamespace(
+        run_dir=tmp_path / "run",
+        completion_report=None,
+    )
+
+    with pytest.raises(RuntimeError, match="completion admission"):
+        sft_finalizer.finalize_sft(args)
+
+    assert observed["path"] == (tmp_path / "run" / "sft_complete.json").resolve()
+    assert observed["checkpoint_path"] is None
+    assert observed["require_full_profile"] is True
+
+
+def test_stage211_sft_correction_requires_full_profile_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def reject_completion(
+        path: Path,
+        *,
+        checkpoint_path: Path | None = None,
+        require_full_profile: bool = False,
+    ) -> tuple[dict[str, object], Path]:
+        observed.update(
+            path=path,
+            checkpoint_path=checkpoint_path,
+            require_full_profile=require_full_profile,
+        )
+        raise RuntimeError("stop after full-SFT admission")
+
+    monkeypatch.setattr(
+        sft_correction_loop,
+        "validate_full_sft_completion",
+        reject_completion,
+    )
+    args = SimpleNamespace(
+        full_sft_completion=tmp_path / "sft_complete.json",
+        full_sft_failed_report=tmp_path / "failed.json",
+    )
+
+    with pytest.raises(RuntimeError, match="full-SFT admission"):
+        sft_correction_loop.run_loop(args)
+
+    assert observed["path"] == (tmp_path / "sft_complete.json").resolve()
+    assert observed["checkpoint_path"] is None
+    assert observed["require_full_profile"] is True
 
 
 def test_stage211_sft_public_gate_requires_zero_dataset_regressions() -> None:
@@ -1612,13 +1737,24 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         reports["metric_tokenizer_source"],
     )
     sft_payload = json.loads(reports["sft"].read_text(encoding="utf-8"))
+    completion_validation_modes: list[bool] = []
+
+    def validate_sft_completion(
+        path: Path,
+        checkpoint_path: Path | None = None,
+        require_full_profile: bool = False,
+    ) -> tuple[dict[str, object], Path | None]:
+        del path
+        completion_validation_modes.append(require_full_profile)
+        return (
+            sft_payload["labeled_data_coverage"],
+            checkpoint_path,
+        )
+
     monkeypatch.setattr(
         stepwise_report,
         "_validate_sft_completion",
-        lambda path, checkpoint_path=None: (
-            sft_payload["labeled_data_coverage"],
-            checkpoint_path,
-        ),
+        validate_sft_completion,
     )
     monkeypatch.setattr(
         stepwise_report,
@@ -1643,6 +1779,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         output_markdown=output_markdown,
         public_metric_correction_receipt_path=reports["metric_correction"],
     )
+    assert completion_validation_modes == [True]
 
     assert report["strict_stage_order"] == [
         "calibration",

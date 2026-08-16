@@ -297,6 +297,7 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
     completion, completion_checkpoint = _validate_sft_completion(
         completion_path,
         checkpoint_path=checkpoint,
+        require_full_profile=True,
     )
     if completion_checkpoint != checkpoint or coverage != completion:
         raise ValueError(
