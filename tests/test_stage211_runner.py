@@ -53,6 +53,7 @@ public_compare = importlib.import_module("scripts.compare_public_ctc_with_nano")
 stage211_phase_gate = importlib.import_module("scripts.create_stage211_phase_gate")
 stage211_full_phase = importlib.import_module("scripts.run_stage211_full_phase_curriculum")
 stage211_phase_finalizer = importlib.import_module("scripts.finalize_stage211_phase")
+stage211_stepwise_report = importlib.import_module("scripts.create_stage211_stepwise_report")
 stage211_calibration_eval = importlib.import_module("scripts.validate_stage211_calibration_eval")
 stage211_supplemental_profile_receipt = importlib.import_module(
     "scripts.create_stage211_supplemental_profile_receipt"
@@ -4357,6 +4358,41 @@ def _write_valid_phase_gate(
     return gate_report
 
 
+@pytest.mark.parametrize("phase", ("mixer", "block", "logits"))
+def test_stage211_stepwise_alignment_disclosure_accepts_deep_phase_evidence(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    checkpoint = tmp_path / "step-10.pt"
+    checkpoint.write_bytes(f"{phase}-checkpoint".encode())
+    gate_path = _write_valid_phase_gate(
+        tmp_path,
+        phase=phase,
+        checkpoint=checkpoint,
+    )
+    gate = validate_stage211_phase_gate_report(
+        gate_path,
+        expected_phase=phase,
+        checkpoint_path=checkpoint,
+    )
+
+    disclosure = stage211_stepwise_report._alignment_result(
+        phase=phase,
+        phase_report=gate,
+    )
+
+    assert disclosure["gate_passed"] is True
+    assert disclosure["fixed_eval_samples"] == 256
+    assert disclosure["stratified_samples"] == 2_304
+    assert disclosure["stratified_cells"] == list(stage211_stepwise_report.ALIGNMENT_CELLS)
+    if phase == "logits":
+        assert disclosure["fixed"]["metrics"]["full_kl"]["candidate"] == pytest.approx(0.8)
+        assert set(disclosure["fixed"]["hidden_components"]) == {"mixer", "ffn", "block"}
+    else:
+        expected_components = {"mixer"} if phase == "mixer" else {"mixer", "ffn", "block"}
+        assert set(disclosure["fixed"]["components"]) == expected_components
+
+
 def _write_failed_phase_gate(gate_report: Path) -> Path:
     report = json.loads(gate_report.read_text(encoding="utf-8"))
     alignment_path = Path(report["alignment_report"]["path"])
@@ -6130,7 +6166,10 @@ def _run_stage211_continuation_watcher_fixture(
         '  macro_stages=\'{"calibration":0.5,"mixer":0.4,"block":0.3,"logits":0.2,"sft":0.1}\'\n'
         '  dataset_proof=\'"public_metric_stage_order":["calibration","mixer","block","logits","sft"],"all_stage_public_metrics_complete":true,"english_wer_datasets":["en1","en2","en3"],"chinese_cer_datasets":["zh1","zh2"],"language_metric_summaries":[{"name":"english_wer","language":"en","metric":"wer","aggregation":"unweighted_dataset_macro","datasets":["en1","en2","en3"],"dataset_count":3,"sample_count":3,"nano_error_rate":0.1,"stages":\'"${macro_stages}"\'},{"name":"chinese_cer","language":"zh","metric":"cer","aggregation":"unweighted_dataset_macro","datasets":["zh1","zh2"],"dataset_count":2,"sample_count":2,"nano_error_rate":0.1,"stages":\'"${macro_stages}"\'}],"dataset_results":[{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"en","metric":"wer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'},{"language":"zh","metric":"cer","stages":\'"${stages}"\'}]\'\n'
         "fi\n"
-        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_initialization_chain_passed":true,"nano_initialization_source_chain_passed":true,"ctc_label_normalization_chain_passed":true,"ctc_label_proof":{"full_length_index_audit_passed":true,"ctc_suppress_non_pronunciation_tokens":true,"ctc_suppressed_token_ids_count":2114,"ctc_suppressed_token_ids_sha256":"76a68d03bb2dc486c214fd44891f3e3e2c36286d79fea1e69c8e74d7767d5a09","teacher_projection_support_matches_student":true,"ctc_unk_tokens":0},"public_metric_definition_chain_passed":true,"public_metric_tokenizer_contract":"unicode_alnum_words_basic_cjk_chars_v1","public_metric_correction_receipt_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","public_metric_tokenizer_source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"supplemental_dedupe_proof":{"inventory_schema_version":2,"inventory_artifact":"stage211_supplemental_combined_inventory","mode":"source_identity_plus_known_corpus_exclusion","source_sets_disjoint":true,"content_fingerprint_complete":false,"base_public_overlap_normalized_pcm_exact_complete":true,"base_public_overlap_scan_order":"manifest_location_index_archive_order_v1","base_public_overlap_rows":0,"base_public_overlap_scanned_rows":1,"base_public_overlap_receipt_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","social_normalized_pcm_exact_complete":true,"social_public_overlap_mode":"normalized_pcm_exact","archived_social_exact_duplicate_exclusion_complete":true,"archived_social_unique_members":0,"archived_social_overlap_receipt_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","usb_top_level_classification_complete":true,"usb_natural_audio_resolution_complete":true,"usb_unresolved_natural_entries":[],"usb_top_level_coverage_receipt_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","near_duplicate_complete":false,"component_inventories":{"base_natural":{},"social_vad":{}},"known_overlap_exclusions":["llaso_gigaspeech","llaso_librispeech"]},"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],\'"${dataset_proof}"\'}\' >"${output_json}"\n'
+        'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_initialization_chain_passed":true,"nano_initialization_source_chain_passed":true,"ctc_label_normalization_chain_passed":true,"ctc_label_proof":{"full_length_index_audit_passed":true,"ctc_suppress_non_pronunciation_tokens":true,"ctc_suppressed_token_ids_count":2114,"ctc_suppressed_token_ids_sha256":"76a68d03bb2dc486c214fd44891f3e3e2c36286d79fea1e69c8e74d7767d5a09","teacher_projection_support_matches_student":true,"ctc_unk_tokens":0},"public_metric_definition_chain_passed":true,"public_metric_tokenizer_contract":"unicode_alnum_words_basic_cjk_chars_v1","public_metric_correction_receipt_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","public_metric_tokenizer_source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"supplemental_dedupe_proof":{"inventory_schema_version":2,"inventory_artifact":"stage211_supplemental_combined_inventory","mode":"source_identity_plus_known_corpus_exclusion","source_sets_disjoint":true,"content_fingerprint_complete":false,"base_public_overlap_normalized_pcm_exact_complete":true,"base_public_overlap_scan_order":"manifest_location_index_archive_order_v1","base_public_overlap_rows":0,"base_public_overlap_scanned_rows":1,"base_public_overlap_receipt_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","social_normalized_pcm_exact_complete":true,"social_public_overlap_mode":"normalized_pcm_exact","archived_social_exact_duplicate_exclusion_complete":true,"archived_social_unique_members":0,"archived_social_overlap_receipt_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","usb_top_level_classification_complete":true,"usb_natural_audio_resolution_complete":true,"usb_unresolved_natural_entries":[],"usb_top_level_coverage_receipt_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","near_duplicate_complete":false,"component_inventories":{"base_natural":{},"social_vad":{}},"known_overlap_exclusions":["llaso_gigaspeech","llaso_librispeech"]},"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],"all_stage_alignment_results_complete":true,"alignment_results":[{"stage":"mixer","gate_passed":true,"stratified_gate_passed":true,"fixed_eval_samples":256,"stratified_samples":2304,"stratified_cells":["easy_en","easy_zh","medium_en","medium_zh","hard_en","hard_zh","long_zh","supplemental_en","supplemental_zh"],"source_report_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"stage":"block","gate_passed":true,"stratified_gate_passed":true,"fixed_eval_samples":256,"stratified_samples":2304,"stratified_cells":["easy_en","easy_zh","medium_en","medium_zh","hard_en","hard_zh","long_zh","supplemental_en","supplemental_zh"],"source_report_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"stage":"logits","gate_passed":true,"stratified_gate_passed":true,"fixed_eval_samples":256,"stratified_samples":2304,"stratified_cells":["easy_en","easy_zh","medium_en","medium_zh","hard_en","hard_zh","long_zh","supplemental_en","supplemental_zh"],"source_report_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}],\'"${dataset_proof}"\'}\' >"${output_json}"\n'
+        'if [[ "${UV_MODE}" == missing_alignment ]]; then\n'
+        '  sed -i \'s/"all_stage_alignment_results_complete":true/"all_stage_alignment_results_complete":false/\' "${output_json}"\n'
+        "fi\n"
         "printf '%s\\n' '# stepwise' >\"${output_markdown}\"\n",
         encoding="utf-8",
     )
@@ -6246,6 +6285,20 @@ def test_stage211_continuation_watcher_requires_language_macro_metrics(
     result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
         tmp_path,
         uv_mode="missing_language_macro",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "final Stage211 stepwise proof failed validation" in result.stdout
+    assert "START_STAGE=full" in result.stdout
+    assert "new-session" in tmux_calls
+
+
+def test_stage211_continuation_watcher_requires_alignment_disclosure(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="missing_alignment",
     )
 
     assert result.returncode == 0, result.stderr

@@ -721,6 +721,161 @@ def _write_nano_baseline_receipt(
     return receipt
 
 
+def _stepwise_component_summary(*, include_cells: bool) -> dict[str, object]:
+    weak_band = {
+        "baseline_loss": 1.0,
+        "candidate_loss": 0.5,
+        "baseline_cosine": 0.5,
+        "candidate_cosine": 0.8,
+    }
+    result: dict[str, object] = {
+        "baseline_mean_loss": 1.0,
+        "candidate_mean_loss": 0.5,
+        "baseline_mean_cosine": 0.5,
+        "candidate_mean_cosine": 0.8,
+        "loss_improved_layers": 70,
+        "cosine_improved_layers": 70,
+        "weak_bands": {
+            "10-19": dict(weak_band),
+            "20-29": dict(weak_band),
+        },
+    }
+    if include_cells:
+        result["cells"] = {
+            cell_name: {
+                "baseline_loss": 1.0,
+                "candidate_loss": 0.5,
+                "baseline_cosine": 0.5,
+                "candidate_cosine": 0.8,
+                "layers_loss_improved": 70,
+                "layers_cosine_improved": 70,
+            }
+            for cell_name in stepwise_report.ALIGNMENT_CELLS
+        }
+    return result
+
+
+def _stepwise_logits_metrics(*, candidate: bool) -> dict[str, float]:
+    return {
+        "full_kl": 0.8 if candidate else 1.0,
+        "conditional_nonblank_kl": 0.8 if candidate else 1.0,
+        "ctc_token_error_rate": 0.2 if candidate else 0.4,
+        "selected_top1_agreement": 0.8 if candidate else 0.5,
+        "all_top1_agreement": 0.8 if candidate else 0.5,
+        "active_top1_agreement": 0.8 if candidate else 0.5,
+        "nonblank_rate_ratio": 1.0 if candidate else 0.8,
+        "collapsed_length_ratio": 1.0 if candidate else 0.8,
+    }
+
+
+def _write_stepwise_alignment_fixture(
+    tmp_path: Path,
+    *,
+    phase: str,
+    baseline_checkpoint: Path,
+    checkpoint: Path,
+) -> Path:
+    components = ("mixer",) if phase == "mixer" else ("mixer", "ffn", "block")
+    stratified_components = {
+        component: _stepwise_component_summary(include_cells=True) for component in components
+    }
+    if phase == "logits":
+        stratified = {
+            "cells": {
+                cell_name: {
+                    "samples": 256,
+                    "baseline_metrics": _stepwise_logits_metrics(candidate=False),
+                    "candidate_metrics": _stepwise_logits_metrics(candidate=True),
+                }
+                for cell_name in stepwise_report.ALIGNMENT_CELLS
+            },
+            "macro": {
+                "baseline_metrics": _stepwise_logits_metrics(candidate=False),
+                "candidate_metrics": _stepwise_logits_metrics(candidate=True),
+            },
+            "hidden_component_summaries": stratified_components,
+            "decoder_hidden": {
+                "baseline_loss": 1.0,
+                "candidate_loss": 0.9,
+            },
+        }
+    else:
+        stratified = {
+            "cells": {
+                cell_name: {
+                    "samples": 256,
+                    "baseline_loss": 1.0,
+                    "candidate_loss": 0.5,
+                    "layers_loss_improved": 70,
+                    "layers_cosine_improved": 70,
+                }
+                for cell_name in stepwise_report.ALIGNMENT_CELLS
+            },
+            "macro": {
+                "baseline_loss": 1.0,
+                "candidate_loss": 0.5,
+                "relative_change_pct": -50.0,
+            },
+            "component_summaries": stratified_components,
+            "decoder_hidden": (
+                {"baseline_loss": 1.0, "candidate_loss": 0.5}
+                if phase == "block"
+                else None
+            ),
+        }
+    stratified_path = tmp_path / f"{phase}-stratified-alignment.json"
+    stratified_path.write_text(json.dumps(stratified) + "\n", encoding="utf-8")
+    source: dict[str, object] = {
+        "pipeline": "stage211",
+        "artifact": "logits_alignment_gate" if phase == "logits" else "hidden_alignment_gate",
+        "phase": phase,
+        "gate_passed": True,
+        "stratified_gate_passed": True,
+        "stratified_summary_path": str(stratified_path.resolve()),
+        "stratified_summary_sha256": sha256_file(stratified_path),
+        "stratified_summary": stratified,
+        "baseline_checkpoint_path": str(baseline_checkpoint.resolve()),
+        "baseline_checkpoint_sha256": sha256_file(baseline_checkpoint),
+        "checkpoint_path": str(checkpoint.resolve()),
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "baseline_eval_provenance": {"split_samples": 256},
+    }
+    fixed_components = {
+        component: _stepwise_component_summary(include_cells=False) for component in components
+    }
+    if phase == "logits":
+        source.update(
+            {
+                "baseline_metrics": _stepwise_logits_metrics(candidate=False),
+                "candidate_metrics": _stepwise_logits_metrics(candidate=True),
+                "full_kl_relative_reduction": 0.2,
+                "conditional_nonblank_kl_relative_reduction": 0.2,
+                "hidden_component_summaries": fixed_components,
+                "decoder_hidden_retention": {
+                    "baseline_loss": 1.0,
+                    "candidate_loss": 0.9,
+                    "retained": True,
+                },
+            }
+        )
+    else:
+        source.update(
+            {
+                "baseline_eval_loss": 1.0,
+                "candidate_eval_loss": 0.5,
+                "component_summaries": fixed_components,
+                "decoder_hidden": (
+                    {"baseline_loss": 1.0, "candidate_loss": 0.5}
+                    if phase == "block"
+                    else None
+                ),
+            }
+        )
+    path = tmp_path / f"{phase}-alignment-gate.json"
+    path.write_text(json.dumps(source) + "\n", encoding="utf-8")
+    return path
+
+
 def _write_stepwise_inputs(
     tmp_path: Path,
 ) -> tuple[dict[str, Path], dict[str, Path]]:
@@ -963,6 +1118,12 @@ def _write_stepwise_inputs(
             "supplemental_inventory_sha256": sha256_file(supplemental_inventory),
             "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
         }
+        alignment_path = _write_stepwise_alignment_fixture(
+            tmp_path,
+            phase=stage,
+            baseline_checkpoint=checkpoints[previous],
+            checkpoint=checkpoints[stage],
+        )
         gate = tmp_path / f"{stage}-gate.json"
         gate.write_text(
             json.dumps(
@@ -971,6 +1132,16 @@ def _write_stepwise_inputs(
                     "gate_passed": True,
                     "checkpoint_path": str(checkpoints[stage].resolve()),
                     "checkpoint_sha256": sha256_file(checkpoints[stage]),
+                    "alignment_gate_passed": True,
+                    "alignment_report": {
+                        "path": str(alignment_path.resolve()),
+                        "sha256": sha256_file(alignment_path),
+                        "artifact": (
+                            "logits_alignment_gate"
+                            if stage == "logits"
+                            else "hidden_alignment_gate"
+                        ),
+                    },
                     "global_dedup_manifest_path": str(GLOBAL_DEDUP_FIXTURE.resolve()),
                     "global_dedup_manifest_sha256": sha256_file(GLOBAL_DEDUP_FIXTURE),
                     "preflight_smoke": {
@@ -1604,6 +1775,22 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         report["coverage_results"][-1]["unique_or_train_rows"] == LABELED_EXPECTED["train_samples"]
     )
     assert len(report["dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
+    assert report["all_stage_alignment_results_complete"] is True
+    assert [row["stage"] for row in report["alignment_results"]] == [
+        "mixer",
+        "block",
+        "logits",
+    ]
+    assert all(row["stratified_samples"] == 2_304 for row in report["alignment_results"])
+    assert report["alignment_results"][0]["fixed"]["components"]["mixer"][
+        "candidate_mean_loss"
+    ] == pytest.approx(0.5)
+    assert report["alignment_results"][1]["fixed"]["decoder_hidden"][
+        "candidate_loss"
+    ] == pytest.approx(0.5)
+    assert report["alignment_results"][2]["fixed"]["metrics"]["full_kl"][
+        "candidate"
+    ] == pytest.approx(0.8)
     assert report["stages"][-1]["checkpoint_sha256"] == sha256_file(checkpoints["sft"])
     assert report["stages"][0]["gate_passed"] is None
     assert report["stages"][0]["gate_status"] == "baseline"
@@ -1615,6 +1802,12 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "Language Macro Metrics" in output_markdown.read_text(encoding="utf-8")
     assert "unweighted_dataset_macro" in output_markdown.read_text(encoding="utf-8")
     assert "Per-Dataset Metrics" in output_markdown.read_text(encoding="utf-8")
+    assert "Hidden Alignment Metrics" in output_markdown.read_text(encoding="utf-8")
+    assert "Nine-Cell Hidden Alignment" in output_markdown.read_text(encoding="utf-8")
+    assert "Logits Alignment Metrics" in output_markdown.read_text(encoding="utf-8")
+    assert "Nine-Cell Logits Alignment" in output_markdown.read_text(encoding="utf-8")
+    assert "Decoder Hidden Alignment" in output_markdown.read_text(encoding="utf-8")
+    assert "Alignment Evidence" in output_markdown.read_text(encoding="utf-8")
     assert "Training Coverage" in output_markdown.read_text(encoding="utf-8")
     assert "Full Data Segment Proof" in output_markdown.read_text(encoding="utf-8")
     assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")
@@ -1646,6 +1839,21 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert (
         report["nano_public_baseline_checkpoint_sha256"] == report["nano_teacher_checkpoint_sha256"]
     )
+
+    alignment_source = Path(report["alignment_results"][0]["source_report_path"])
+    alignment_text = alignment_source.read_text(encoding="utf-8")
+    alignment_source.write_text(alignment_text + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="alignment report is unavailable or changed"):
+        stepwise_report.build_stepwise_report(
+            initialization_receipt_path=reports["initialization"],
+            calibration_receipt_path=reports["calibration"],
+            mixer_gate_path=reports["mixer"],
+            block_gate_path=reports["block"],
+            logits_gate_path=reports["logits"],
+            sft_final_report_path=reports["sft"],
+            public_metric_correction_receipt_path=reports["metric_correction"],
+        )
+    alignment_source.write_text(alignment_text, encoding="utf-8")
 
     tokenizer_source = reports["metric_tokenizer_source"]
     tokenizer_text = tokenizer_source.read_text(encoding="utf-8")

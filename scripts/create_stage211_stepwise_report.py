@@ -79,6 +79,27 @@ STAGE_LABELS = {
     "logits": "Logits (C)",
     "sft": "Labeled CTC SFT (D)",
 }
+ALIGNMENT_CELLS = (
+    "easy_en",
+    "easy_zh",
+    "medium_en",
+    "medium_zh",
+    "hard_en",
+    "hard_zh",
+    "long_zh",
+    "supplemental_en",
+    "supplemental_zh",
+)
+LOGITS_DISCLOSURE_METRICS = (
+    "full_kl",
+    "conditional_nonblank_kl",
+    "ctc_token_error_rate",
+    "selected_top1_agreement",
+    "all_top1_agreement",
+    "active_top1_agreement",
+    "nonblank_rate_ratio",
+    "collapsed_length_ratio",
+)
 DEFAULT_CALIBRATION_RECEIPT = (
     Path.home()
     / "rwkvasr_eval"
@@ -568,6 +589,309 @@ def _stage_record(
         "preflight_smoke": preflight_smoke,
         "data_coverage": data_coverage,
         "public_benchmark": benchmark,
+    }
+
+
+def _finite_float(value: Any, *, label: str) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"Stage211 {label} must be finite.")
+    return result
+
+
+def _alignment_component_result(
+    raw: Any,
+    *,
+    label: str,
+    include_cells: bool,
+) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(f"Stage211 {label} component summary is missing.")
+    baseline_loss = _finite_float(raw.get("baseline_mean_loss"), label=f"{label} baseline loss")
+    candidate_loss = _finite_float(
+        raw.get("candidate_mean_loss"), label=f"{label} candidate loss"
+    )
+    result: dict[str, Any] = {
+        "baseline_mean_loss": baseline_loss,
+        "candidate_mean_loss": candidate_loss,
+        "relative_loss_reduction": (baseline_loss - candidate_loss)
+        / max(abs(baseline_loss), 1.0e-12),
+        "baseline_mean_cosine": _finite_float(
+            raw.get("baseline_mean_cosine"), label=f"{label} baseline cosine"
+        ),
+        "candidate_mean_cosine": _finite_float(
+            raw.get("candidate_mean_cosine"), label=f"{label} candidate cosine"
+        ),
+        "loss_improved_layers": int(raw.get("loss_improved_layers", -1)),
+        "cosine_improved_layers": int(raw.get("cosine_improved_layers", -1)),
+        "weak_bands": {},
+    }
+    if not 0 <= result["loss_improved_layers"] <= 70 or not 0 <= result[
+        "cosine_improved_layers"
+    ] <= 70:
+        raise ValueError(f"Stage211 {label} improved-layer count is invalid.")
+    weak_bands = raw.get("weak_bands")
+    if not isinstance(weak_bands, dict) or set(weak_bands) != {"10-19", "20-29"}:
+        raise ValueError(f"Stage211 {label} weak-band evidence is incomplete.")
+    for band_name, band in weak_bands.items():
+        if not isinstance(band, dict):
+            raise ValueError(f"Stage211 {label}/{band_name} weak-band evidence is invalid.")
+        result["weak_bands"][band_name] = {
+            key: _finite_float(band.get(key), label=f"{label}/{band_name} {key}")
+            for key in (
+                "baseline_loss",
+                "candidate_loss",
+                "baseline_cosine",
+                "candidate_cosine",
+            )
+        }
+    if include_cells:
+        cells = raw.get("cells")
+        if not isinstance(cells, dict) or set(cells) != set(ALIGNMENT_CELLS):
+            raise ValueError(f"Stage211 {label} component cell coverage is incomplete.")
+        result["cells"] = {
+            cell_name: {
+                key: (
+                    int(cell.get(key, -1))
+                    if key in {"layers_loss_improved", "layers_cosine_improved"}
+                    else _finite_float(
+                        cell.get(key), label=f"{label}/{cell_name} {key}"
+                    )
+                )
+                for key in (
+                    "baseline_loss",
+                    "candidate_loss",
+                    "baseline_cosine",
+                    "candidate_cosine",
+                    "layers_loss_improved",
+                    "layers_cosine_improved",
+                )
+            }
+            for cell_name, cell in cells.items()
+            if isinstance(cell, dict)
+        }
+        if set(result["cells"]) != set(ALIGNMENT_CELLS):
+            raise ValueError(f"Stage211 {label} component cells are invalid.")
+    return result
+
+
+def _logits_metric_pairs(
+    baseline: Any,
+    candidate: Any,
+    *,
+    label: str,
+) -> dict[str, dict[str, float]]:
+    if not isinstance(baseline, dict) or not isinstance(candidate, dict):
+        raise ValueError(f"Stage211 {label} logits metrics are missing.")
+    return {
+        metric: {
+            "baseline": _finite_float(
+                baseline.get(metric), label=f"{label} baseline {metric}"
+            ),
+            "candidate": _finite_float(
+                candidate.get(metric), label=f"{label} candidate {metric}"
+            ),
+        }
+        for metric in LOGITS_DISCLOSURE_METRICS
+    }
+
+
+def _decoder_result(raw: Any, *, label: str) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"Stage211 {label} decoder-hidden evidence is invalid.")
+    baseline_loss = _finite_float(raw.get("baseline_loss"), label=f"{label} baseline loss")
+    candidate_loss = _finite_float(raw.get("candidate_loss"), label=f"{label} candidate loss")
+    return {
+        "baseline_loss": baseline_loss,
+        "candidate_loss": candidate_loss,
+        "relative_change": (candidate_loss - baseline_loss) / max(abs(baseline_loss), 1.0e-12),
+        **({"retained": bool(raw["retained"])} if "retained" in raw else {}),
+    }
+
+
+def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, Any]:
+    record = phase_report.get("alignment_report")
+    if not isinstance(record, dict):
+        raise ValueError(f"Stage211 {phase} phase report lacks alignment evidence.")
+    source_path = Path(str(record.get("path") or "")).expanduser().resolve()
+    if not source_path.is_file() or sha256_file(source_path) != record.get("sha256"):
+        raise ValueError(f"Stage211 {phase} alignment report is unavailable or changed.")
+    source = _load_json(source_path, label=f"Stage211 {phase} alignment report")
+    expected_artifact = "logits_alignment_gate" if phase == "logits" else "hidden_alignment_gate"
+    if (
+        source.get("pipeline") != "stage211"
+        or source.get("artifact") != expected_artifact
+        or source.get("phase") != phase
+        or source.get("gate_passed") is not True
+        or phase_report.get("alignment_gate_passed") is not True
+    ):
+        raise ValueError(f"Stage211 {phase} alignment disclosure source did not pass.")
+    stratified = source.get("stratified_summary")
+    if not isinstance(stratified, dict) or set(stratified.get("cells", {})) != set(
+        ALIGNMENT_CELLS
+    ):
+        raise ValueError(f"Stage211 {phase} alignment disclosure lacks nine-cell evidence.")
+    common = {
+        "stage": phase,
+        "label": STAGE_LABELS[phase],
+        "objective": "ctc_logits" if phase == "logits" else "hidden_states",
+        "gate_passed": True,
+        "source_report_path": str(source_path),
+        "source_report_sha256": sha256_file(source_path),
+        "baseline_checkpoint_path": str(source["baseline_checkpoint_path"]),
+        "baseline_checkpoint_sha256": str(source["baseline_checkpoint_sha256"]),
+        "checkpoint_path": str(source["checkpoint_path"]),
+        "checkpoint_sha256": str(source["checkpoint_sha256"]),
+        "fixed_eval_samples": int(source.get("baseline_eval_provenance", {}).get("split_samples", -1)),
+        "stratified_gate_passed": source.get("stratified_gate_passed") is True,
+        "stratified_summary_path": str(source.get("stratified_summary_path") or ""),
+        "stratified_summary_sha256": str(source.get("stratified_summary_sha256") or ""),
+        "stratified_cells": list(ALIGNMENT_CELLS),
+        "stratified_samples": sum(
+            int(cell.get("samples", -1))
+            for cell in stratified["cells"].values()
+            if isinstance(cell, dict)
+        ),
+    }
+    if common["fixed_eval_samples"] != 256 or common["stratified_samples"] != 256 * len(
+        ALIGNMENT_CELLS
+    ):
+        raise ValueError(f"Stage211 {phase} alignment disclosure sample coverage mismatch.")
+    if phase in {"mixer", "block"}:
+        components = source.get("component_summaries")
+        stratified_components = stratified.get("component_summaries")
+        required_components = ("mixer",) if phase == "mixer" else ("mixer", "ffn", "block")
+        if (
+            not isinstance(components, dict)
+            or set(components) != set(required_components)
+            or not isinstance(stratified_components, dict)
+            or set(stratified_components) != set(required_components)
+        ):
+            raise ValueError(f"Stage211 {phase} alignment component coverage mismatch.")
+        cells = {}
+        for cell_name, cell in stratified["cells"].items():
+            if not isinstance(cell, dict):
+                raise ValueError(f"Stage211 {phase}/{cell_name} alignment cell is invalid.")
+            cells[cell_name] = {
+                "samples": int(cell.get("samples", -1)),
+                "baseline_loss": _finite_float(
+                    cell.get("baseline_loss"), label=f"{phase}/{cell_name} baseline loss"
+                ),
+                "candidate_loss": _finite_float(
+                    cell.get("candidate_loss"), label=f"{phase}/{cell_name} candidate loss"
+                ),
+                "layers_loss_improved": int(cell.get("layers_loss_improved", -1)),
+                "layers_cosine_improved": int(cell.get("layers_cosine_improved", -1)),
+            }
+        return {
+            **common,
+            "fixed": {
+                "baseline_eval_loss": _finite_float(
+                    source.get("baseline_eval_loss"), label=f"{phase} baseline eval loss"
+                ),
+                "candidate_eval_loss": _finite_float(
+                    source.get("candidate_eval_loss"), label=f"{phase} candidate eval loss"
+                ),
+                "components": {
+                    name: _alignment_component_result(
+                        components[name], label=f"{phase}/fixed/{name}", include_cells=False
+                    )
+                    for name in required_components
+                },
+                "decoder_hidden": _decoder_result(
+                    source.get("decoder_hidden"), label=f"{phase}/fixed decoder"
+                ),
+            },
+            "stratified": {
+                "macro": {
+                    key: _finite_float(
+                        stratified.get("macro", {}).get(key), label=f"{phase}/macro {key}"
+                    )
+                    for key in ("baseline_loss", "candidate_loss", "relative_change_pct")
+                },
+                "cells": cells,
+                "components": {
+                    name: _alignment_component_result(
+                        stratified_components[name],
+                        label=f"{phase}/stratified/{name}",
+                        include_cells=True,
+                    )
+                    for name in required_components
+                },
+                "decoder_hidden": _decoder_result(
+                    stratified.get("decoder_hidden"), label=f"{phase}/stratified decoder"
+                ),
+            },
+        }
+
+    hidden_components = source.get("hidden_component_summaries")
+    stratified_hidden = stratified.get("hidden_component_summaries")
+    required_hidden = ("mixer", "ffn", "block")
+    if (
+        not isinstance(hidden_components, dict)
+        or set(hidden_components) != set(required_hidden)
+        or not isinstance(stratified_hidden, dict)
+        or set(stratified_hidden) != set(required_hidden)
+    ):
+        raise ValueError("Stage211 logits hidden-retention disclosure is incomplete.")
+    logits_cells = {}
+    for cell_name, cell in stratified["cells"].items():
+        if not isinstance(cell, dict):
+            raise ValueError(f"Stage211 logits/{cell_name} alignment cell is invalid.")
+        logits_cells[cell_name] = {
+            "samples": int(cell.get("samples", -1)),
+            "metrics": _logits_metric_pairs(
+                cell.get("baseline_metrics"),
+                cell.get("candidate_metrics"),
+                label=f"logits/{cell_name}",
+            ),
+        }
+    return {
+        **common,
+        "fixed": {
+            "metrics": _logits_metric_pairs(
+                source.get("baseline_metrics"), source.get("candidate_metrics"), label="logits/fixed"
+            ),
+            "full_kl_relative_reduction": _finite_float(
+                source.get("full_kl_relative_reduction"), label="logits fixed full-KL reduction"
+            ),
+            "conditional_nonblank_kl_relative_reduction": _finite_float(
+                source.get("conditional_nonblank_kl_relative_reduction"),
+                label="logits fixed conditional-KL reduction",
+            ),
+            "hidden_components": {
+                name: _alignment_component_result(
+                    hidden_components[name],
+                    label=f"logits/fixed/{name}",
+                    include_cells=False,
+                )
+                for name in required_hidden
+            },
+            "decoder_hidden": _decoder_result(
+                source.get("decoder_hidden_retention"), label="logits/fixed decoder"
+            ),
+        },
+        "stratified": {
+            "metrics": _logits_metric_pairs(
+                stratified.get("macro", {}).get("baseline_metrics"),
+                stratified.get("macro", {}).get("candidate_metrics"),
+                label="logits/stratified macro",
+            ),
+            "cells": logits_cells,
+            "hidden_components": {
+                name: _alignment_component_result(
+                    stratified_hidden[name],
+                    label=f"logits/stratified/{name}",
+                    include_cells=True,
+                )
+                for name in required_hidden
+            },
+            "decoder_hidden": _decoder_result(
+                stratified.get("decoder_hidden"), label="logits/stratified decoder"
+            ),
+        },
     }
 
 
@@ -1153,6 +1477,10 @@ def build_stepwise_report(
         )
         for stage in ("mixer", "block", "logits", "sft")
     ]
+    alignment_results = [
+        _alignment_result(phase=phase, phase_report=phase_reports[phase])
+        for phase in ("mixer", "block", "logits")
+    ]
     ctc_label_proof = _sft_ctc_label_proof(sft["labeled_data_coverage"])
     return {
         "schema_version": 1,
@@ -1207,12 +1535,14 @@ def build_stepwise_report(
         ),
         "public_metric_stage_order": list(STAGE_ORDER),
         "all_stage_public_metrics_complete": True,
+        "all_stage_alignment_results_complete": True,
         "english_wer_datasets": english_wer_datasets,
         "chinese_cer_datasets": chinese_cer_datasets,
         "language_metric_summaries": language_metric_summaries,
         "checkpoint_chain": chain,
         "stages": stage_records,
         "coverage_results": coverage_results,
+        "alignment_results": alignment_results,
         "dataset_results": dataset_results,
     }
 
@@ -1304,6 +1634,147 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{float(stages['block']['student_error_rate']) * 100.0:.3f}% | "
             f"{float(stages['logits']['student_error_rate']) * 100.0:.3f}% | "
             f"{final:.3f}% | {final - nano:+.3f} pt |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Hidden Alignment Metrics",
+            "",
+            "| Stage | Scope | Component | Baseline loss | Candidate loss | "
+            "Baseline cosine | Candidate cosine | Loss improved layers | "
+            "Cosine improved layers |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|",
+        )
+    )
+    for alignment in report["alignment_results"]:
+        if alignment["stage"] not in {"mixer", "block"}:
+            continue
+        for scope in ("fixed", "stratified"):
+            for component_name, component in alignment[scope]["components"].items():
+                lines.append(
+                    f"| {alignment['label']} | {scope} | `{component_name}` | "
+                    f"{float(component['baseline_mean_loss']):.6f} | "
+                    f"{float(component['candidate_mean_loss']):.6f} | "
+                    f"{float(component['baseline_mean_cosine']):.6f} | "
+                    f"{float(component['candidate_mean_cosine']):.6f} | "
+                    f"{int(component['loss_improved_layers'])}/70 | "
+                    f"{int(component['cosine_improved_layers'])}/70 |"
+                )
+    lines.extend(
+        (
+            "",
+            "## Nine-Cell Hidden Alignment",
+            "",
+            "| Stage | Cell | Samples | Baseline loss | Candidate loss | "
+            "Loss improved layers | Cosine improved layers |",
+            "|---|---|---:|---:|---:|---:|---:|",
+        )
+    )
+    for alignment in report["alignment_results"]:
+        if alignment["stage"] not in {"mixer", "block"}:
+            continue
+        for cell_name, cell in alignment["stratified"]["cells"].items():
+            lines.append(
+                f"| {alignment['label']} | `{cell_name}` | {int(cell['samples'])} | "
+                f"{float(cell['baseline_loss']):.6f} | "
+                f"{float(cell['candidate_loss']):.6f} | "
+                f"{int(cell['layers_loss_improved'])}/70 | "
+                f"{int(cell['layers_cosine_improved'])}/70 |"
+            )
+    logits_alignment = next(
+        alignment for alignment in report["alignment_results"] if alignment["stage"] == "logits"
+    )
+    lines.extend(
+        (
+            "",
+            "## Logits Alignment Metrics",
+            "",
+            "| Scope | Metric | Baseline | Candidate |",
+            "|---|---|---:|---:|",
+        )
+    )
+    for scope in ("fixed", "stratified"):
+        for metric, values in logits_alignment[scope]["metrics"].items():
+            lines.append(
+                f"| {scope} | `{metric}` | {float(values['baseline']):.6f} | "
+                f"{float(values['candidate']):.6f} |"
+            )
+    lines.extend(
+        (
+            "",
+            "## Nine-Cell Logits Alignment",
+            "",
+            "| Cell | Samples | Full KL baseline | Full KL candidate | "
+            "Conditional KL baseline | Conditional KL candidate | "
+            "CTC token error baseline | CTC token error candidate |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        )
+    )
+    for cell_name, cell in logits_alignment["stratified"]["cells"].items():
+        metrics = cell["metrics"]
+        lines.append(
+            f"| `{cell_name}` | {int(cell['samples'])} | "
+            f"{float(metrics['full_kl']['baseline']):.6f} | "
+            f"{float(metrics['full_kl']['candidate']):.6f} | "
+            f"{float(metrics['conditional_nonblank_kl']['baseline']):.6f} | "
+            f"{float(metrics['conditional_nonblank_kl']['candidate']):.6f} | "
+            f"{float(metrics['ctc_token_error_rate']['baseline']):.6f} | "
+            f"{float(metrics['ctc_token_error_rate']['candidate']):.6f} |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Logits Hidden Retention",
+            "",
+            "| Scope | Component | Baseline loss | Candidate loss | Baseline cosine | "
+            "Candidate cosine |",
+            "|---|---|---:|---:|---:|---:|",
+        )
+    )
+    for scope in ("fixed", "stratified"):
+        for component_name, component in logits_alignment[scope]["hidden_components"].items():
+            lines.append(
+                f"| {scope} | `{component_name}` | "
+                f"{float(component['baseline_mean_loss']):.6f} | "
+                f"{float(component['candidate_mean_loss']):.6f} | "
+                f"{float(component['baseline_mean_cosine']):.6f} | "
+                f"{float(component['candidate_mean_cosine']):.6f} |"
+            )
+    lines.extend(
+        (
+            "",
+            "## Decoder Hidden Alignment",
+            "",
+            "| Stage | Scope | Baseline loss | Candidate loss | Relative change |",
+            "|---|---|---:|---:|---:|",
+        )
+    )
+    for alignment in report["alignment_results"]:
+        for scope in ("fixed", "stratified"):
+            decoder = alignment[scope].get("decoder_hidden")
+            if decoder is None:
+                continue
+            lines.append(
+                f"| {alignment['label']} | {scope} | "
+                f"{float(decoder['baseline_loss']):.6f} | "
+                f"{float(decoder['candidate_loss']):.6f} | "
+                f"{float(decoder['relative_change']) * 100.0:+.3f}% |"
+            )
+    lines.extend(
+        (
+            "",
+            "## Alignment Evidence",
+            "",
+            "| Stage | Fixed samples | Stratified samples | Cells | Report SHA-256 | Gate |",
+            "|---|---:|---:|---:|---|---:|",
+        )
+    )
+    for alignment in report["alignment_results"]:
+        lines.append(
+            f"| {alignment['label']} | {int(alignment['fixed_eval_samples'])} | "
+            f"{int(alignment['stratified_samples']):,} | "
+            f"{len(alignment['stratified_cells'])} | "
+            f"`{alignment['source_report_sha256']}` | pass |"
         )
     lines.extend(
         (
