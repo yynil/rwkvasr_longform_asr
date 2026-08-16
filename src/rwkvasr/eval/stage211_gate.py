@@ -39,7 +39,7 @@ STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS = 3
 STAGE211_RETENTION_CORRECTION_MAX_ROUNDS = 32
 STAGE211_RETENTION_CORRECTION_EPOCHS = 1
 STAGE211_RETENTION_CORRECTION_LR = 1.0e-6
-STAGE211_CORRECTION_LAYER_FOCUS_SCHEMA_VERSION = 1
+STAGE211_CORRECTION_LAYER_FOCUS_SCHEMA_VERSION = 2
 STAGE211_HARD_LAYER_IDS = (0, 11, 12, 17, 20, 49, 50, 69)
 STAGE211_POST_COVERAGE_CORRECTION_LRS = {
     "mixer": STAGE211_RETENTION_CORRECTION_LR,
@@ -974,31 +974,56 @@ def build_stage211_correction_layer_focus(
     for position, row in enumerate(ranking, start=1):
         row["ranking_position"] = position
 
+    failed_layer_count = len(ranking)
     mandatory_layer_ids = list(STAGE211_HARD_LAYER_IDS) if phase == "logits" else []
     dynamic_limit = int(_STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS[phase])
+    base_contract = stage211_phase_train_config_contract(phase)
+    sample_count = int(base_contract["ctc_teacher_online_layer_sample_count"])
+    minimum_rotating_slots = int(_STAGE211_CORRECTION_MIN_ROTATING_SLOTS[phase])
+    if phase == "logits":
+        adaptive_rotating_slots_target = minimum_rotating_slots
+        adaptive_dynamic_limit = dynamic_limit
+    else:
+        adaptive_rotating_slots_target = min(
+            sample_count,
+            max(
+                minimum_rotating_slots,
+                math.ceil(sample_count * failed_layer_count / len(_STAGE211_ALIGNMENT_LAYER_IDS)),
+            ),
+        )
+        adaptive_dynamic_limit = min(
+            dynamic_limit,
+            sample_count - adaptive_rotating_slots_target,
+        )
     selected_failure_layer_ids = [
         int(row["layer_id"]) for row in ranking if int(row["layer_id"]) not in mandatory_layer_ids
-    ][:dynamic_limit]
+    ][:adaptive_dynamic_limit]
     boundary_layer_ids = sorted({*mandatory_layer_ids, *selected_failure_layer_ids})
-    contract = stage211_post_coverage_train_config_contract(
+    stage211_post_coverage_train_config_contract(
         phase,
         boundary_layer_ids=boundary_layer_ids,
     )
-    sample_count = int(contract["ctc_teacher_online_layer_sample_count"])
     rotating_slots = sample_count - len(boundary_layer_ids)
+    if not ranking:
+        strategy = "static_hard_anchors" if phase == "logits" else "uniform_full_rotation"
+    elif phase != "logits" and not boundary_layer_ids:
+        strategy = "broad_failure_uniform_full_rotation"
+    elif phase != "logits" and adaptive_dynamic_limit < dynamic_limit:
+        strategy = "gate_ranked_failed_layers_with_adaptive_rotation"
+    else:
+        strategy = "gate_ranked_failed_layers_with_rotation"
     return {
         "schema_version": STAGE211_CORRECTION_LAYER_FOCUS_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "post_coverage_correction_layer_focus",
         "phase": phase,
-        "strategy": (
-            "gate_ranked_failed_layers_with_rotation"
-            if ranking
-            else ("static_hard_anchors" if phase == "logits" else "uniform_full_rotation")
-        ),
+        "strategy": strategy,
         "sample_count": sample_count,
+        "failed_layer_count": failed_layer_count,
         "dynamic_layer_limit": dynamic_limit,
-        "minimum_rotating_slots": int(_STAGE211_CORRECTION_MIN_ROTATING_SLOTS[phase]),
+        "adaptive_dynamic_layer_limit": adaptive_dynamic_limit,
+        "minimum_rotating_slots": minimum_rotating_slots,
+        "adaptive_rotating_slots_target": adaptive_rotating_slots_target,
         "rotating_slots": rotating_slots,
         "required_components": list(components),
         "evaluated_scopes": [

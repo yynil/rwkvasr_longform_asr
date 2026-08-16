@@ -213,6 +213,9 @@ def test_stage211_correction_focus_pins_top_five_and_preserves_rotation(
     assert focus["all_failed_layer_ids"] == sorted(failed)
     assert focus["selected_failure_layer_ids"] == [69, 68, 65, 64, 55]
     assert focus["boundary_layer_ids"] == [55, 64, 65, 68, 69]
+    assert focus["failed_layer_count"] == 6
+    assert focus["adaptive_dynamic_layer_limit"] == 5
+    assert focus["adaptive_rotating_slots_target"] == 3
     assert focus["rotating_slots"] == 3
     selections = {
         layer_id
@@ -226,6 +229,62 @@ def test_stage211_correction_focus_pins_top_five_and_preserves_rotation(
         )
     }
     assert selections == set(range(70))
+
+
+@pytest.mark.parametrize("phase", ("mixer", "block"))
+def test_stage211_correction_focus_uses_uniform_rotation_for_broad_failure(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    gate_path, gate = _focus_fixture(tmp_path, phase=phase, failed=set(range(70)))
+
+    focus = build_stage211_correction_layer_focus(
+        phase=phase,
+        admission_gate_path=gate_path,
+        admission_gate=gate,
+    )
+
+    assert focus["strategy"] == "broad_failure_uniform_full_rotation"
+    assert focus["failed_layer_count"] == 70
+    assert focus["adaptive_dynamic_layer_limit"] == 0
+    assert focus["adaptive_rotating_slots_target"] == 8
+    assert focus["selected_failure_layer_ids"] == []
+    assert focus["boundary_layer_ids"] == []
+    assert focus["rotating_slots"] == 8
+    selections = {
+        layer_id
+        for step in range(9)
+        for layer_id in _select_layer_hidden_ids(
+            step=step,
+            num_layers=70,
+            sample_count=8,
+            boundary_ids=focus["boundary_layer_ids"],
+            include_boundaries=False,
+        )
+    }
+    assert selections == set(range(70))
+
+
+@pytest.mark.parametrize("phase", ("mixer", "block"))
+def test_stage211_correction_focus_scales_rotation_with_failure_breadth(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    gate_path, gate = _focus_fixture(tmp_path, phase=phase, failed=set(range(35)))
+
+    focus = build_stage211_correction_layer_focus(
+        phase=phase,
+        admission_gate_path=gate_path,
+        admission_gate=gate,
+    )
+
+    assert focus["strategy"] == "gate_ranked_failed_layers_with_adaptive_rotation"
+    assert focus["failed_layer_count"] == 35
+    assert focus["adaptive_dynamic_layer_limit"] == 4
+    assert focus["adaptive_rotating_slots_target"] == 4
+    assert focus["selected_failure_layer_ids"] == [34, 33, 32, 31]
+    assert focus["boundary_layer_ids"] == [31, 32, 33, 34]
+    assert focus["rotating_slots"] == 4
 
 
 def test_stage211_logits_focus_retains_hard_anchors_and_one_rotating_slot(
@@ -246,6 +305,24 @@ def test_stage211_logits_focus_retains_hard_anchors_and_one_rotating_slot(
     assert focus["rotating_slots"] == 1
 
 
+def test_stage211_logits_focus_names_static_anchors_without_hidden_failure(
+    tmp_path: Path,
+) -> None:
+    gate_path, gate = _focus_fixture(tmp_path, phase="logits", failed=set())
+
+    focus = build_stage211_correction_layer_focus(
+        phase="logits",
+        admission_gate_path=gate_path,
+        admission_gate=gate,
+    )
+
+    assert focus["strategy"] == "static_hard_anchors"
+    assert focus["failed_layer_count"] == 0
+    assert focus["boundary_layer_ids"] == list(STAGE211_HARD_LAYER_IDS)
+    assert focus["adaptive_rotating_slots_target"] == 1
+    assert focus["rotating_slots"] == 4
+
+
 def test_stage211_correction_focus_preserves_uniform_schedule_without_hidden_failure(
     tmp_path: Path,
 ) -> None:
@@ -258,6 +335,9 @@ def test_stage211_correction_focus_preserves_uniform_schedule_without_hidden_fai
     )
 
     assert focus["strategy"] == "uniform_full_rotation"
+    assert focus["failed_layer_count"] == 0
+    assert focus["adaptive_dynamic_layer_limit"] == 5
+    assert focus["adaptive_rotating_slots_target"] == 3
     assert focus["boundary_layer_ids"] == []
     assert focus["rotating_slots"] == 8
 
@@ -280,9 +360,7 @@ def test_stage211_correction_focus_includes_failed_trajectory_layers(tmp_path: P
     assert focus["all_failed_layer_ids"] == sorted(trajectory_failed)
     assert focus["selected_failure_layer_ids"] == [69, 68, 55]
     assert focus["trajectory_evidence"]["failure_signals_used"] is True
-    assert all(
-        "trajectory_retention" in row["scopes"] for row in focus["ranking"]
-    )
+    assert all("trajectory_retention" in row["scopes"] for row in focus["ranking"])
 
 
 def test_stage211_correction_focus_replay_rejects_modified_selection(tmp_path: Path) -> None:
