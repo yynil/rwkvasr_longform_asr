@@ -47,6 +47,13 @@ class BatchProfile:
     frame_budget: int
 
 
+DEFAULT_PROFILES = (
+    BatchProfile("baseline", 36, 24_000),
+    BatchProfile("batch48_frames42k", 48, 42_000),
+    BatchProfile("batch64_frames56k", 64, 56_000),
+)
+
+
 @dataclass(frozen=True)
 class TrainTelemetry:
     step: int
@@ -551,10 +558,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    profiles = args.profile or [
-        BatchProfile("baseline", 36, 24_000),
-        BatchProfile("batch48_frames42k", 48, 42_000),
-    ]
+    profiles = args.profile or list(DEFAULT_PROFILES)
     if len({profile.name for profile in profiles}) != len(profiles):
         parser.error("profile names must be unique")
     if args.baseline_profile not in {profile.name for profile in profiles}:

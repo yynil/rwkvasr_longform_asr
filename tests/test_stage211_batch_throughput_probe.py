@@ -11,6 +11,14 @@ sys.path.insert(0, str(REPO_ROOT))
 probe = importlib.import_module("scripts.benchmark_stage211_batch_profiles")
 
 
+def test_default_profiles_cover_baseline_and_two_larger_candidates() -> None:
+    assert probe.DEFAULT_PROFILES == (
+        probe.BatchProfile("baseline", 36, 24_000),
+        probe.BatchProfile("batch48_frames42k", 48, 42_000),
+        probe.BatchProfile("batch64_frames56k", 64, 56_000),
+    )
+
+
 def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> None:
     profile = probe.parse_profile("larger:48:42000")
     checkpoint = tmp_path / "init.pt"
