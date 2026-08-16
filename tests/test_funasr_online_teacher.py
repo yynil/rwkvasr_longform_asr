@@ -48,6 +48,42 @@ class _InplaceFakeNanoEncoder(_FakeNanoEncoder):
         return super().forward(x, lengths)
 
 
+class _NativeNanoEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        from funasr.models.sense_voice.model import (
+            EncoderLayerSANM,
+            MultiHeadedAttentionSANM,
+            PositionwiseFeedForward,
+        )
+
+        first = EncoderLayerSANM(
+            8,
+            4,
+            MultiHeadedAttentionSANM(2, 8, 4, 0.0, 3, 0),
+            PositionwiseFeedForward(4, 12, 0.0),
+            0.0,
+        )
+        second = EncoderLayerSANM(
+            4,
+            4,
+            MultiHeadedAttentionSANM(2, 4, 4, 0.0, 3, 0),
+            PositionwiseFeedForward(4, 12, 0.0),
+            0.0,
+        )
+        self.encoders0 = nn.ModuleList([first])
+        self.encoders = nn.ModuleList([second])
+        self.tp_encoders = nn.ModuleList()
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor):
+        steps = torch.arange(x.size(1), device=x.device)
+        mask = steps.unsqueeze(0) < lengths.unsqueeze(1)
+        mask = mask.unsqueeze(1)
+        for layer in (*self.encoders0, *self.encoders):
+            x, mask = layer(x, mask)[:2]
+        return x, lengths
+
+
 class _FakeCTCDecoder(nn.Module):
     def forward(self, x: torch.Tensor, lengths: torch.Tensor):
         return x, lengths
@@ -125,6 +161,38 @@ def test_capture_funasr_encoder_hiddens_collects_requested_components() -> None:
             assert captured["layers"][layer_id][component].shape == (2, 5, 6)
             assert not captured["layers"][layer_id][component].requires_grad
     assert torch.equal(captured["layers"][0]["input"], features)
+
+
+def test_capture_funasr_encoder_hiddens_matches_native_sanm_component_semantics() -> None:
+    torch.manual_seed(2706)
+    encoder = _NativeNanoEncoder().eval()
+    features = torch.randn(2, 6, 8)
+    lengths = torch.tensor([6, 4], dtype=torch.long)
+
+    with _capture_funasr_encoder_hiddens(
+        encoder,
+        (0, 1),
+        capture_input=False,
+    ) as captured:
+        encoder(features, lengths)
+
+    steps = torch.arange(features.size(1))
+    mask = (steps.unsqueeze(0) < lengths.unsqueeze(1)).unsqueeze(1)
+    layers = (*encoder.encoders0, *encoder.encoders)
+    for layer_id, layer in enumerate(layers):
+        components = captured["layers"][layer_id]
+        layer_input = components["input"]
+        normalized = layer.norm1(layer_input)
+        expected_mixer = layer.self_attn(normalized, mask)
+        expected_post_mixer = expected_mixer
+        if layer.in_size == layer.size:
+            expected_post_mixer = layer_input + expected_mixer
+        expected_ffn = layer.feed_forward(layer.norm2(expected_post_mixer))
+        expected_block = expected_post_mixer + expected_ffn
+
+        torch.testing.assert_close(components["mixer"], expected_mixer, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(components["ffn"], expected_ffn, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(components["block"], expected_block, rtol=0.0, atol=0.0)
 
 
 def test_capture_funasr_encoder_hiddens_rejects_invalid_layer() -> None:
@@ -249,9 +317,7 @@ def test_feature_records_project_ignored_tokens_before_ctc_distribution_outputs(
     teacher.audio_rows = {}
     with torch.no_grad():
         teacher.model.ctc.ctc_lo.weight.zero_()
-        teacher.model.ctc.ctc_lo.bias.copy_(
-            torch.tensor([20.0, 5.0, 2.0, 1.0, 0.0, -1.0, 4.0])
-        )
+        teacher.model.ctc.ctc_lo.bias.copy_(torch.tensor([20.0, 5.0, 2.0, 1.0, 0.0, -1.0, 4.0]))
 
     record = teacher.feature_records(
         ["utt-projected"],
