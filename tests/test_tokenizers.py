@@ -48,7 +48,9 @@ class _EchoCharTokenizer:
 def _install_fake_whisper(monkeypatch) -> None:
     fake_tokenizer_module = types.ModuleType("whisper.tokenizer")
 
-    def fake_get_tokenizer(*, multilingual: bool, language: str | None = None, task: str | None = None):
+    def fake_get_tokenizer(
+        *, multilingual: bool, language: str | None = None, task: str | None = None
+    ):
         assert multilingual is True
         assert language in {None, "zh"}
         assert task in {None, "transcribe"}
@@ -112,11 +114,15 @@ def test_build_text_tokenizer_creates_whisper_default(monkeypatch) -> None:
     assert tokenizer.vocab_size == 50000
 
 
-def test_manifest_dataset_defaults_to_whisper_tokenizer_for_text(monkeypatch, tmp_path: Path) -> None:
+def test_manifest_dataset_defaults_to_whisper_tokenizer_for_text(
+    monkeypatch, tmp_path: Path
+) -> None:
     _install_fake_whisper(monkeypatch)
     manifest_path = tmp_path / "manifest.jsonl"
     with manifest_path.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps({"utt_id": "utt-0", "text": "你好", "feature_path": "feat.pt"}) + "\n")
+        handle.write(
+            json.dumps({"utt_id": "utt-0", "text": "你好", "feature_path": "feat.pt"}) + "\n"
+        )
 
     dataset = ASRManifestDataset(manifest_path)
 
@@ -180,7 +186,9 @@ def test_manifest_dataset_decoder_target_preserves_runtime_punctuation(tmp_path:
     ]
 
 
-def test_manifest_dataset_decoder_target_language_confirmation_can_correct_metadata(tmp_path: Path) -> None:
+def test_manifest_dataset_decoder_target_language_confirmation_can_correct_metadata(
+    tmp_path: Path,
+) -> None:
     manifest_path = tmp_path / "manifest.jsonl"
     with manifest_path.open("w", encoding="utf-8") as handle:
         handle.write(
@@ -207,7 +215,9 @@ def test_manifest_dataset_decoder_target_language_confirmation_can_correct_metad
         decoder_target_prefix_use_language=True,
     )
 
-    prompt = "".join(chr(token_id) for token_id in dataset.entries[0].decoder_prompt_before_audio_token_ids or [])
+    prompt = "".join(
+        chr(token_id) for token_id in dataset.entries[0].decoder_prompt_before_audio_token_ids or []
+    )
     target = "".join(chr(token_id) for token_id in dataset.entries[0].decoder_token_ids or [])
 
     assert "English" in prompt
@@ -271,7 +281,8 @@ def test_sensevoice_tiktoken_ctc_suppresses_non_pronunciation_units(tmp_path: Pa
     assert nospeech_id in suppressed
     assert timestamp_id not in suppressed
     assert ord(" ") in suppressed
-    assert 255 in suppressed
+    assert 255 not in suppressed
+    assert tokenizer.decode([255]) == ""
     assert text_id not in suppressed
 
     project_blank_id = tokenizer.vocab_size
@@ -280,6 +291,25 @@ def test_sensevoice_tiktoken_ctc_suppresses_non_pronunciation_units(tmp_path: Pa
     assert all(int(token_id) in project_suppressed for token_id in special_tokens.values())
     assert timestamp_id in project_suppressed
     assert text_id not in project_suppressed
+
+
+def test_real_sensevoice_tiktoken_preserves_composable_rare_chinese_bytes() -> None:
+    pytest.importorskip("tiktoken")
+    vocab_path = (
+        Path(__file__).resolve().parents[1]
+        / "assets"
+        / "fun-asr-nano-2512"
+        / "multilingual.tiktoken"
+    )
+    if not vocab_path.is_file():
+        pytest.skip(f"canonical SenseVoice tokenizer is unavailable: {vocab_path}")
+    tokenizer = SenseVoiceTiktokenTokenizer(str(vocab_path))
+    text = "溦捘"
+    token_ids = tokenizer.encode(text)
+    suppressed = set(tokenizer.ctc_suppressed_token_ids(blank_id=60_515))
+
+    assert tokenizer.decode(token_ids) == text
+    assert not suppressed.intersection(token_ids)
 
 
 def test_build_text_tokenizer_creates_sensevoice_tiktoken(tmp_path: Path) -> None:
@@ -383,7 +413,9 @@ def test_manifest_dataset_can_append_rwkv_eos(tmp_path: Path) -> None:
 
     manifest_path = tmp_path / "manifest.jsonl"
     with manifest_path.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps({"utt_id": "utt-0", "text": "你好", "feature_path": "feat.pt"}) + "\n")
+        handle.write(
+            json.dumps({"utt_id": "utt-0", "text": "你好", "feature_path": "feat.pt"}) + "\n"
+        )
 
     dataset = ASRManifestDataset(
         manifest_path,

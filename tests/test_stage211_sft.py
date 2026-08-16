@@ -1495,15 +1495,16 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert report["checkpoint_chain_passed"] is True
     assert report["nano_initialization_chain_passed"] is True
     assert report["nano_initialization_source_chain_passed"] is True
-    assert [
-        row["mode"] for row in report["initialization_proof"]["loader_source_validation"]
-    ] == ["exact_file_sha256", "exact_file_sha256"]
+    assert [row["mode"] for row in report["initialization_proof"]["loader_source_validation"]] == [
+        "exact_file_sha256",
+        "exact_file_sha256",
+    ]
     assert report["ctc_label_normalization_chain_passed"] is True
     assert report["ctc_label_proof"]["full_length_index_audit_passed"] is True
     assert report["ctc_label_proof"]["text_normalization"] == "ctc"
     assert report["ctc_label_proof"]["ctc_unk_tokens"] == 0
     assert report["ctc_label_proof"]["ctc_suppress_non_pronunciation_tokens"] is True
-    assert report["ctc_label_proof"]["ctc_suppressed_token_ids_count"] == 3_629
+    assert report["ctc_label_proof"]["ctc_suppressed_token_ids_count"] == 2_114
     assert (
         report["ctc_label_proof"]["ctc_suppressed_token_ids_sha256"]
         == STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
@@ -1579,8 +1580,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         )
         for stage in report["public_metric_stage_order"]:
             assert summary["stages"][stage] == pytest.approx(
-                sum(row["stages"][stage]["student_error_rate"] for row in rows)
-                / dataset_count
+                sum(row["stages"][stage]["student_error_rate"] for row in rows) / dataset_count
             )
     assert report["public_overlap_chain_passed"] is True
     assert report["public_overlap_receipt_sha256"] == sha256_file(
