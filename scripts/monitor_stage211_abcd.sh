@@ -14,6 +14,16 @@ SUPPLEMENTAL_PROGRESS_REPORTER="${SUPPLEMENTAL_PROGRESS_REPORTER:-${REPO_ROOT}/s
 SOCIAL_PCM_INVENTORY="${SOCIAL_PCM_INVENTORY:-${HOME}/rwkvasr_data/stage211_social_vad_materialized_v1/materialized_inventory.json}"
 SOCIAL_PCM_OUTPUT_ROOT="${SOCIAL_PCM_OUTPUT_ROOT:-${HOME}/rwkvasr_data/stage211_social_vad_filtered_v1}"
 SOCIAL_PCM_PROGRESS_REPORTER="${SOCIAL_PCM_PROGRESS_REPORTER:-${REPO_ROOT}/scripts/report_stage211_social_pcm_progress.py}"
+SFT_LABELED_ROOT="${SFT_LABELED_ROOT:-${HOME}/rwkvasr_data/stage211_sft_full_labeled_v2}"
+SFT_PREPARATION_LOG="${SFT_PREPARATION_LOG:-${SFT_LABELED_ROOT}/prepare_ctc_aligned.log}"
+SFT_FINALIZER_LOG="${SFT_FINALIZER_LOG:-${SFT_LABELED_ROOT}_finalize.log}"
+SFT_PROFILE_RECEIPT="${SFT_PROFILE_RECEIPT:-${SFT_LABELED_ROOT}/stage211_labeled_profile_receipt.json}"
+SFT_EXPECTED_INPUT_SAMPLES="${SFT_EXPECTED_INPUT_SAMPLES:-1430801}"
+SUPPLEMENTAL_COMBINED_ROOT="${SUPPLEMENTAL_COMBINED_ROOT:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v2}"
+SUPPLEMENTAL_COMBINED_INVENTORY="${SUPPLEMENTAL_COMBINED_INVENTORY:-${SUPPLEMENTAL_COMBINED_ROOT}/supplemental_inventory.json}"
+SUPPLEMENTAL_COMBINED_PROFILE="${SUPPLEMENTAL_COMBINED_PROFILE:-${SUPPLEMENTAL_COMBINED_ROOT}/supplemental_profile_receipt.json}"
+SUPPLEMENTAL_NINE_CELL_RECEIPT="${SUPPLEMENTAL_NINE_CELL_RECEIPT:-${HOME}/rwkvasr_data/stage211_full_curriculum/stratified_hidden_eval_v2/receipt.json}"
+SUPPLEMENTAL_REPLAY_RECEIPT="${SUPPLEMENTAL_REPLAY_RECEIPT:-${HOME}/rwkvasr_data/stage211_full_curriculum/retention_replay_v2/receipt.json}"
 MONITOR_PYTHON="${MONITOR_PYTHON:-${REPO_ROOT}/.venv/bin/python3}"
 POLL_SECONDS="${POLL_SECONDS:-3600}"
 RECENT_LOG_MINUTES="${RECENT_LOG_MINUTES:-90}"
@@ -247,6 +257,62 @@ stage211_emit_social_pcm_progress() {
   fi
 }
 
+stage211_emit_artifact_status() {
+  local label="$1"
+  local path="$2"
+  local sha256
+  if [[ -s "${path}" ]]; then
+    sha256="$(sha256sum "${path}" 2>/dev/null | awk '{print $1}')"
+    printf '%s=ready path=%s sha256=%s\n' "${label}" "${path}" "${sha256:-unavailable}"
+  else
+    printf '%s=pending path=%s\n' "${label}" "${path}"
+  fi
+}
+
+stage211_emit_sft_readiness() {
+  local latest_record processed=0 kept=0 progress state finalizer_record
+  latest_record="$(
+    rg 'ctc-align progress processed=[0-9]+ kept=[0-9]+' "${SFT_PREPARATION_LOG}" \
+      2>/dev/null | tail -n 1 || true
+  )"
+  if [[ -n "${latest_record}" ]]; then
+    processed="$(sed -nE 's/.*processed=([0-9]+).*/\1/p' <<<"${latest_record}")"
+    kept="$(sed -nE 's/.*kept=([0-9]+).*/\1/p' <<<"${latest_record}")"
+  fi
+  processed="${processed:-0}"
+  kept="${kept:-0}"
+  if rg -q -F 'CTC-aligned clean preprocessing complete' "${SFT_PREPARATION_LOG}" 2>/dev/null; then
+    state=complete
+    processed="${SFT_EXPECTED_INPUT_SAMPLES}"
+  elif pgrep -f "build_ctc_aligned_stage_lengths.py.*--output-dir ${SFT_LABELED_ROOT}" \
+    >/dev/null 2>&1; then
+    state=active
+  else
+    state=incomplete
+  fi
+  progress="$(
+    awk -v processed="${processed}" -v expected="${SFT_EXPECTED_INPUT_SAMPLES}" \
+      'BEGIN { printf "%.4f", (expected > 0 ? 100.0 * processed / expected : 0.0) }'
+  )"
+  printf 'sft_labeled_preparation=%s processed=%s expected=%s progress_pct=%s kept=%s log=%s\n' \
+    "${state}" "${processed}" "${SFT_EXPECTED_INPUT_SAMPLES}" "${progress}" "${kept}" \
+    "${SFT_PREPARATION_LOG}"
+  stage211_emit_artifact_status sft_labeled_profile "${SFT_PROFILE_RECEIPT}"
+  finalizer_record="$(tail -n 1 "${SFT_FINALIZER_LOG}" 2>/dev/null || true)"
+  printf 'sft_labeled_finalizer=%s\n' "${finalizer_record:-pending}"
+}
+
+stage211_emit_supplemental_readiness() {
+  stage211_emit_artifact_status supplemental_combined_inventory \
+    "${SUPPLEMENTAL_COMBINED_INVENTORY}"
+  stage211_emit_artifact_status supplemental_combined_profile \
+    "${SUPPLEMENTAL_COMBINED_PROFILE}"
+  stage211_emit_artifact_status supplemental_nine_cell_receipt \
+    "${SUPPLEMENTAL_NINE_CELL_RECEIPT}"
+  stage211_emit_artifact_status supplemental_replay_receipt \
+    "${SUPPLEMENTAL_REPLAY_RECEIPT}"
+}
+
 stage211_recent_logs() {
   local root
   for root in "$@"; do
@@ -311,6 +377,10 @@ stage211_emit_snapshot() {
   fi
   printf '%s\n' '-- social exact PCM prefilter --'
   stage211_emit_social_pcm_progress
+  printf '%s\n' '-- supplemental handoff readiness --'
+  stage211_emit_supplemental_readiness
+  printf '%s\n' '-- full labeled SFT readiness --'
+  stage211_emit_sft_readiness
   printf '%s\n' '-- recent training records --'
   while IFS= read -r -d '' log_path; do
     latest_record="$(stage211_latest_training_record "${log_path}")"
