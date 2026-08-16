@@ -69,6 +69,7 @@ def test_postmaterialization_pipeline_waits_for_materialized_inventory(
         "USB_COVERAGE_RECEIPT": str(usb_receipt),
         "ARCHIVED_SOCIAL_OVERLAP_RECEIPT": str(archived_receipt),
         "BASE_PUBLIC_OVERLAP_ROOT": str(tmp_path / "base-overlap"),
+        "BASE_PUBLIC_PREFETCH_NEXT_ARCHIVE": "1",
         "FILTERED_ROOT": str(tmp_path / "filtered"),
         "COMBINED_ROOT": str(tmp_path / "combined"),
     }
@@ -91,6 +92,7 @@ def test_postmaterialization_pipeline_waits_for_materialized_inventory(
     assert wait_index > 0
     assert filter_index > wait_index
     assert calls[0].startswith("uv run python scripts/audit_stage211_base_public_pcm_overlap.py")
+    assert "--prefetch-next-archive" in calls[0]
     assert "social materialized inventory unavailable" in result.stdout
 
 
@@ -103,6 +105,7 @@ def test_postmaterialization_base_audit_uses_low_io_priority() -> None:
         "nice -n 10 ionice -c 2 -n 7 env CUDA_VISIBLE_DEVICES='' uv run python \\\n"
         "  scripts/audit_stage211_base_public_pcm_overlap.py"
     ) in source
+    assert 'BASE_PUBLIC_PREFETCH_NEXT_ARCHIVE="${BASE_PUBLIC_PREFETCH_NEXT_ARCHIVE:-0}"' in source
 
 
 @pytest.fixture(autouse=True)

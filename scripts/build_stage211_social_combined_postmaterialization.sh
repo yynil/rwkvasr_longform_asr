@@ -10,6 +10,7 @@ BASE_INVENTORY="${BASE_INVENTORY:-${HOME}/rwkvasr_data/stage211_supplemental_nat
 BASE_PUBLIC_OVERLAP_ROOT="${BASE_PUBLIC_OVERLAP_ROOT:-${HOME}/rwkvasr_data/stage211_base_public_pcm_overlap_v1}"
 BASE_PUBLIC_ARCHIVE_CACHE_DIR="${BASE_PUBLIC_ARCHIVE_CACHE_DIR:-${TMPDIR:-/tmp}/rwkvasr_stage211_base_public_pcm_cache}"
 BASE_PUBLIC_DECODE_WORKERS="${BASE_PUBLIC_DECODE_WORKERS:-4}"
+BASE_PUBLIC_PREFETCH_NEXT_ARCHIVE="${BASE_PUBLIC_PREFETCH_NEXT_ARCHIVE:-0}"
 COMBINED_ROOT="${COMBINED_ROOT:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v2}"
 RETENTION_OUTPUT_ROOT="${RETENTION_OUTPUT_ROOT:-${HOME}/rwkvasr_data/stage211_full_curriculum}"
 USB_COVERAGE_RECEIPT="${USB_COVERAGE_RECEIPT:-${HOME}/rwkvasr_data/stage211_usb_top_level_coverage_v1/coverage_receipt.json}"
@@ -28,6 +29,13 @@ wait_for_artifact() {
     sleep "${POLL_SECONDS}"
   done
 }
+
+BASE_PUBLIC_PREFETCH_ARGS=()
+case "${BASE_PUBLIC_PREFETCH_NEXT_ARCHIVE}" in
+  1|true|True|TRUE|yes|Yes|YES)
+    BASE_PUBLIC_PREFETCH_ARGS+=(--prefetch-next-archive)
+    ;;
+esac
 
 while tmux has-session -t "${ARCHIVED_SOCIAL_OVERLAP_SESSION}" 2>/dev/null; do
   sleep "${POLL_SECONDS}"
@@ -48,7 +56,8 @@ nice -n 10 ionice -c 2 -n 7 env CUDA_VISIBLE_DEVICES='' uv run python \
   --output-root "${BASE_PUBLIC_OVERLAP_ROOT}" \
   all \
   --archive-cache-dir "${BASE_PUBLIC_ARCHIVE_CACHE_DIR}" \
-  --decode-workers "${BASE_PUBLIC_DECODE_WORKERS}"
+  --decode-workers "${BASE_PUBLIC_DECODE_WORKERS}" \
+  "${BASE_PUBLIC_PREFETCH_ARGS[@]}"
 
 wait_for_artifact "social materialized inventory" "${MATERIALIZED_INVENTORY}"
 

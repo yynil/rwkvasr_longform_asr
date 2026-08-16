@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -404,9 +405,13 @@ def test_base_public_pcm_parallel_decode_matches_serial_bytes(tmp_path: Path) ->
     inventory_path, _ = _fixture(tmp_path)
     base = audit.validate_base_inventory(inventory_path)
 
-    fingerprints: dict[int, dict[str, bytes]] = {}
-    for decode_workers in (1, 3):
-        output_root = tmp_path / f"audit_{decode_workers}"
+    fingerprints: dict[str, dict[str, bytes]] = {}
+    for label, decode_workers, prefetch_next_archive in (
+        ("serial", 1, False),
+        ("parallel", 3, False),
+        ("parallel_prefetch", 3, True),
+    ):
+        output_root = tmp_path / f"audit_{label}"
         audit.build_location_index(base=base, output_root=output_root)
         location_index = audit.validate_location_index(output_root, base=base)
         result = audit.run_archive_worker(
@@ -415,16 +420,101 @@ def test_base_public_pcm_parallel_decode_matches_serial_bytes(tmp_path: Path) ->
             worker_index=0,
             num_workers=1,
             max_archives=None,
-            archive_cache_dir=tmp_path / f"cache_{decode_workers}",
+            archive_cache_dir=tmp_path / f"cache_{label}",
             decode_workers=decode_workers,
+            prefetch_next_archive=prefetch_next_archive,
         )
         assert result == {"assigned": 5, "created": 5}
-        fingerprints[decode_workers] = {
+        fingerprints[label] = {
             path.name: path.read_bytes()
             for path in (output_root / "archive_fingerprints").glob("archive_*.jsonl")
         }
 
-    assert fingerprints[3] == fingerprints[1]
+    assert fingerprints["parallel"] == fingerprints["serial"]
+    assert fingerprints["parallel_prefetch"] == fingerprints["serial"]
+
+
+def test_base_public_pcm_prefetch_overlaps_next_copy_with_current_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory_path, _ = _fixture(tmp_path)
+    base = audit.validate_base_inventory(inventory_path)
+    output_root = tmp_path / "audit"
+    cache_dir = tmp_path / "cache"
+    audit.build_location_index(base=base, output_root=output_root)
+    location_index = audit.validate_location_index(output_root, base=base)
+    prefetch_started = threading.Event()
+    current_decode_started = threading.Event()
+    original_copy = audit._copy_archive_to_cache
+    original_fingerprint = audit._canonical_pcm_fingerprint_bytes
+
+    def observed_copy(**kwargs: object) -> Path:
+        if kwargs["archive_index"] == 1:
+            prefetch_started.set()
+            if not current_decode_started.wait(timeout=5):
+                raise TimeoutError("current decode did not overlap archive prefetch")
+        return original_copy(**kwargs)
+
+    first_decode = True
+
+    def observed_fingerprint(payload: bytes) -> tuple[str, int]:
+        nonlocal first_decode
+        if first_decode:
+            first_decode = False
+            assert prefetch_started.wait(timeout=5)
+            current_decode_started.set()
+        return original_fingerprint(payload)
+
+    monkeypatch.setattr(audit, "_copy_archive_to_cache", observed_copy)
+    monkeypatch.setattr(audit, "_canonical_pcm_fingerprint_bytes", observed_fingerprint)
+
+    result = audit.run_archive_worker(
+        location_index=location_index,
+        output_root=output_root,
+        worker_index=0,
+        num_workers=1,
+        max_archives=2,
+        archive_cache_dir=cache_dir,
+        decode_workers=1,
+        prefetch_next_archive=True,
+    )
+
+    assert result == {"assigned": 2, "created": 2}
+    assert prefetch_started.is_set()
+    assert current_decode_started.is_set()
+    assert list(cache_dir.iterdir()) == []
+
+
+def test_base_public_pcm_serial_worker_preserves_unowned_future_cache(tmp_path: Path) -> None:
+    inventory_path, _ = _fixture(tmp_path)
+    base = audit.validate_base_inventory(inventory_path)
+    output_root = tmp_path / "audit"
+    cache_dir = tmp_path / "cache"
+    audit.build_location_index(base=base, output_root=output_root)
+    location_index = audit.validate_location_index(output_root, base=base)
+    future_archive = location_index["archives"][1]
+    future_cache = audit._copy_archive_to_cache(
+        source_path=Path(future_archive["shard_path"]),
+        cache_dir=cache_dir,
+        archive_index=1,
+        expected_size_bytes=int(future_archive["archive_size_bytes"]),
+        expected_sha256=str(future_archive["archive_sha256"]),
+    )
+
+    result = audit.run_archive_worker(
+        location_index=location_index,
+        output_root=output_root,
+        worker_index=0,
+        num_workers=1,
+        max_archives=1,
+        archive_cache_dir=cache_dir,
+        decode_workers=1,
+        prefetch_next_archive=False,
+    )
+
+    assert result == {"assigned": 1, "created": 1}
+    assert future_cache.is_file()
 
 
 def test_base_public_pcm_audit_rejects_changed_archive_fingerprint(tmp_path: Path) -> None:
@@ -474,9 +564,10 @@ def test_base_public_pcm_archive_cache_is_removed_after_decode_failure(
             output_root=output_root,
             worker_index=0,
             num_workers=1,
-            max_archives=1,
+            max_archives=2,
             archive_cache_dir=cache_dir,
             decode_workers=3,
+            prefetch_next_archive=True,
         )
 
     assert cache_dir.is_dir()

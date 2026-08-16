@@ -68,6 +68,17 @@ def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _archive_cache_path(
+    *,
+    source_path: Path,
+    cache_dir: Path,
+    archive_index: int,
+    expected_sha256: str,
+) -> Path:
+    suffix = "".join(source_path.suffixes) or ".archive"
+    return cache_dir / f"archive_{archive_index:06d}_{expected_sha256[:16]}{suffix}"
+
+
 def _copy_archive_to_cache(
     *,
     source_path: Path,
@@ -77,8 +88,12 @@ def _copy_archive_to_cache(
     expected_sha256: str,
 ) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    suffix = "".join(source_path.suffixes) or ".archive"
-    cache_path = cache_dir / (f"archive_{archive_index:06d}_{expected_sha256[:16]}{suffix}")
+    cache_path = _archive_cache_path(
+        source_path=source_path,
+        cache_dir=cache_dir,
+        archive_index=archive_index,
+        expected_sha256=expected_sha256,
+    )
     if cache_path.is_file():
         if (
             cache_path.stat().st_size != expected_size_bytes
@@ -1093,9 +1108,12 @@ def run_archive_worker(
     max_archives: int | None,
     archive_cache_dir: Path | None = None,
     decode_workers: int = 1,
+    prefetch_next_archive: bool = False,
 ) -> dict[str, int]:
     if num_workers <= 0 or not 0 <= worker_index < num_workers:
         raise ValueError("worker-index must satisfy 0 <= worker-index < num-workers")
+    if prefetch_next_archive and archive_cache_dir is None:
+        raise ValueError("Stage211 base PCM archive prefetch requires an archive cache directory.")
     assigned = [
         int(archive["archive_index"])
         for archive in location_index["archives"]
@@ -1104,20 +1122,69 @@ def run_archive_worker(
     if max_archives is not None:
         assigned = assigned[: int(max_archives)]
     counts: Counter[str] = Counter()
-    for position, archive_index in enumerate(assigned, start=1):
-        status = fingerprint_base_archive(
-            location_index=location_index,
-            output_root=output_root,
+    prefetch_executor = None
+    prefetch_futures: dict[int, Any] = {}
+    scheduled_prefetch_indices: set[int] = set()
+    prefetched_indices = [
+        archive_index
+        for archive_index in assigned
+        if not _archive_paths(output_root, archive_index)[1].is_file()
+    ]
+
+    def submit_prefetch(archive_index: int) -> None:
+        archive = location_index["archives"][archive_index]
+        source_path = Path(str(archive["shard_path"]))
+        prefetch_futures[archive_index] = prefetch_executor.submit(
+            _copy_archive_to_cache,
+            source_path=source_path,
+            cache_dir=archive_cache_dir,
             archive_index=archive_index,
-            archive_cache_dir=archive_cache_dir,
-            decode_workers=decode_workers,
+            expected_size_bytes=int(archive["archive_size_bytes"]),
+            expected_sha256=str(archive["archive_sha256"]),
         )
-        counts[status] += 1
-        print(
-            f"[stage211-base-public-pcm] worker={worker_index}/{num_workers} "
-            f"archives={position}/{len(assigned)} archive_index={archive_index} status={status}",
-            flush=True,
-        )
+        scheduled_prefetch_indices.add(archive_index)
+
+    next_prefetch_position = 0
+    try:
+        if prefetch_next_archive and prefetched_indices:
+            prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="stage211-archive-prefetch",
+            )
+            submit_prefetch(prefetched_indices[0])
+            next_prefetch_position = 1
+        for position, archive_index in enumerate(assigned, start=1):
+            future = prefetch_futures.pop(archive_index, None)
+            if future is not None:
+                future.result()
+                if next_prefetch_position < len(prefetched_indices):
+                    submit_prefetch(prefetched_indices[next_prefetch_position])
+                    next_prefetch_position += 1
+            status = fingerprint_base_archive(
+                location_index=location_index,
+                output_root=output_root,
+                archive_index=archive_index,
+                archive_cache_dir=archive_cache_dir,
+                decode_workers=decode_workers,
+            )
+            counts[status] += 1
+            print(
+                f"[stage211-base-public-pcm] worker={worker_index}/{num_workers} "
+                f"archives={position}/{len(assigned)} archive_index={archive_index} status={status}",
+                flush=True,
+            )
+    finally:
+        if prefetch_executor is not None:
+            prefetch_executor.shutdown(wait=True, cancel_futures=True)
+        if archive_cache_dir is not None:
+            for archive_index in scheduled_prefetch_indices:
+                archive = location_index["archives"][archive_index]
+                _archive_cache_path(
+                    source_path=Path(str(archive["shard_path"])),
+                    cache_dir=archive_cache_dir,
+                    archive_index=archive_index,
+                    expected_sha256=str(archive["archive_sha256"]),
+                ).unlink(missing_ok=True)
     return {"assigned": len(assigned), **dict(sorted(counts.items()))}
 
 
@@ -1418,6 +1485,7 @@ def _parse_args() -> argparse.Namespace:
     archive_worker.add_argument("--max-archives", type=int, default=None)
     archive_worker.add_argument("--archive-cache-dir", type=Path, default=None)
     archive_worker.add_argument("--decode-workers", type=int, default=1)
+    archive_worker.add_argument("--prefetch-next-archive", action="store_true")
     subparsers.add_parser("public")
     subparsers.add_parser("finalize")
     all_parser = subparsers.add_parser("all")
@@ -1426,6 +1494,7 @@ def _parse_args() -> argparse.Namespace:
     all_parser.add_argument("--max-archives", type=int, default=None)
     all_parser.add_argument("--archive-cache-dir", type=Path, default=None)
     all_parser.add_argument("--decode-workers", type=int, default=1)
+    all_parser.add_argument("--prefetch-next-archive", action="store_true")
     return parser.parse_args()
 
 
@@ -1472,6 +1541,7 @@ def main() -> int:
                 else None
             ),
             decode_workers=int(args.decode_workers),
+            prefetch_next_archive=bool(args.prefetch_next_archive),
         )
         print(f"[stage211-base-public-pcm] archive_result={result}", flush=True)
     if args.command in {"finalize", "all"}:
