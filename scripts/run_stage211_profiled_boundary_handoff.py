@@ -32,6 +32,9 @@ PROFILE_BENCHMARK = REPO_ROOT / "scripts" / "benchmark_stage211_batch_profiles.p
 ADMISSION_CREATOR = REPO_ROOT / "scripts" / "create_stage211_batch_profile_admission.py"
 FULL_PHASE_CONTROLLER = REPO_ROOT / "scripts" / "run_stage211_full_phase_curriculum.py"
 CURRICULUM_VALIDATOR = REPO_ROOT / "scripts" / "finalize_stage211_phase.py"
+SUPPLEMENTAL_RETENTION_VALIDATOR = (
+    REPO_ROOT / "scripts" / "validate_stage211_supplemental_retention.py"
+)
 BOOTSTRAP = REPO_ROOT / "scripts" / "start_stage211_abcd_after_calibration.sh"
 
 DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_runs" / "stage211_full_alignment"
@@ -110,6 +113,27 @@ def _wait_for_files(paths: tuple[Path, ...], *, poll_seconds: int) -> None:
             flush=True,
         )
         time.sleep(poll_seconds)
+
+
+def _retention_validation_commands(
+    *,
+    stratified_hidden_receipt: Path,
+    retention_replay_receipt: Path,
+) -> tuple[list[str], list[str]]:
+    return (
+        [
+            str(PYTHON),
+            str(SUPPLEMENTAL_RETENTION_VALIDATOR),
+            "--stratified-receipt",
+            str(stratified_hidden_receipt),
+        ],
+        [
+            str(PYTHON),
+            str(SUPPLEMENTAL_RETENTION_VALIDATOR),
+            "--receipt",
+            str(retention_replay_receipt),
+        ],
+    )
 
 
 def _legacy_controller_state(pid: int) -> str:
@@ -386,6 +410,16 @@ def main() -> int:
         type=Path,
         default=DEFAULT_SUPPLEMENTAL_PROFILE_RECEIPT,
     )
+    parser.add_argument(
+        "--stratified-hidden-receipt",
+        type=Path,
+        default=None,
+    )
+    parser.add_argument(
+        "--retention-replay-receipt",
+        type=Path,
+        default=None,
+    )
     parser.add_argument("--nano-checkpoint", type=Path, default=DEFAULT_NANO_CHECKPOINT)
     parser.add_argument("--master-port", type=int, default=29631)
     parser.add_argument("--preflight-master-port", type=int, default=29731)
@@ -414,6 +448,16 @@ def main() -> int:
     long_manifest = args.long_manifest.expanduser().resolve()
     inventory = args.supplemental_inventory.expanduser().resolve()
     profile_receipt = args.supplemental_profile_receipt.expanduser().resolve()
+    stratified_hidden_receipt = (
+        args.stratified_hidden_receipt.expanduser().resolve()
+        if args.stratified_hidden_receipt is not None
+        else metadata_root / "stratified_hidden_eval_v2" / "receipt.json"
+    )
+    retention_replay_receipt = (
+        args.retention_replay_receipt.expanduser().resolve()
+        if args.retention_replay_receipt is not None
+        else metadata_root / "retention_replay_v2" / "receipt.json"
+    )
     nano_checkpoint = args.nano_checkpoint.expanduser().resolve()
     handoff_log = args.handoff_log.expanduser().resolve()
 
@@ -458,6 +502,20 @@ def main() -> int:
         frame_budget=24_000,
         require_training_ready=True,
         verify_part_sha256=False,
+    )
+    _wait_for_files(
+        (stratified_hidden_receipt, retention_replay_receipt),
+        poll_seconds=int(args.readiness_poll_seconds),
+    )
+    for command in _retention_validation_commands(
+        stratified_hidden_receipt=stratified_hidden_receipt,
+        retention_replay_receipt=retention_replay_receipt,
+    ):
+        _run(command, log_path=handoff_log)
+    print(
+        "[stage211-profiled-handoff] supplemental retention barrier passed "
+        f"stratified={stratified_hidden_receipt} replay={retention_replay_receipt}",
+        flush=True,
     )
     manifest = Path(str(supplemental["bucket_manifest_path"])).resolve()
     _run(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import sys
 from pathlib import Path
 
@@ -97,3 +98,25 @@ def test_long_receipt_binds_exact_hard_to_long_chain(tmp_path: Path) -> None:
     assert command[command.index("--completion-checkpoint") + 1].endswith(
         f"long/step-{long_steps}.pt"
     )
+
+
+def test_retention_barrier_deep_validates_both_receipts_before_preflight(
+    tmp_path: Path,
+) -> None:
+    stratified = tmp_path / "stratified.json"
+    replay = tmp_path / "replay.json"
+    commands = handoff._retention_validation_commands(
+        stratified_hidden_receipt=stratified,
+        retention_replay_receipt=replay,
+    )
+
+    assert commands[0][-2:] == ["--stratified-receipt", str(stratified)]
+    assert commands[1][-2:] == ["--receipt", str(replay)]
+    assert all(str(handoff.SUPPLEMENTAL_RETENTION_VALIDATOR) in command for command in commands)
+
+    source = inspect.getsource(handoff.main)
+    wait_index = source.index("(stratified_hidden_receipt, retention_replay_receipt)")
+    validation_index = source.index("_retention_validation_commands(")
+    template_index = source.index("_template_command(")
+    preflight_index = source.index("_preflight_command(")
+    assert wait_index < validation_index < template_index < preflight_index
