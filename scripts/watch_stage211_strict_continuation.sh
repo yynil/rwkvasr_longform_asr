@@ -88,6 +88,13 @@ stage211_trajectory_results_valid() {
     '(.alignment_results | length) == 3 and ([.alignment_results[] | .stage] == ["mixer", "block", "logits"]) and ([.alignment_results[].trajectory_retention | (.gate_passed == true and .fixed_eval_samples == 256 and .terminal_entries >= 5 and .source_order[:5] == ["easy", "medium", "hard", "long", "supplemental_natural"] and .max_relative_regression_pct == 10.0 and ([.best_prior_loss, .candidate_loss, .relative_regression_pct] | all(.[]; type == "number" and isfinite)))] | all)'
 }
 
+stage211_periodic_cadence_results_valid() {
+  local path="$1"
+  stage211_json_matches \
+    "${path}" \
+    '([.alignment_results[].step_eval_cadence | (.complete == true and .interval_steps == 10000 and .eval_samples_per_report == 256 and .source_count == (.sources | length) and .source_count >= 5 and .total_reports == ([.sources[].report_count] | add) and all(.sources[]; .terminal_step > 0 and .report_count > 0 and .eval_samples_per_report == 256))] | all) and ([.coverage_results[] | select(.stage == "sft")] | length) == 1 and ([.coverage_results[] | select(.stage == "sft") | .step_eval_cadence | (.complete == true and .interval_steps == 2000 and .eval_samples_per_report == 256 and .source_order == ["labeled_sft"] and .source_count == 1 and .total_reports == ([.sources[].report_count] | add) and all(.sources[]; .source == "labeled_sft" and .terminal_step > 0 and .report_count > 0 and .eval_samples_per_report == 256))] | all)'
+}
+
 stage211_choose_start_stage() {
   if stage211_selection_valid logits "${LOGITS_SELECTION}"; then
     printf '%s\n' sft
@@ -135,6 +142,10 @@ stage211_final_candidate_valid() {
   fi
   if ! stage211_trajectory_results_valid "${final_stepwise_report}"; then
     stage211_log "final Stage211 trajectory-retention proof failed validation source=${final_report}"
+    return 1
+  fi
+  if ! stage211_periodic_cadence_results_valid "${final_stepwise_report}"; then
+    stage211_log "final Stage211 periodic fixed-eval proof failed validation source=${final_report}"
     return 1
   fi
 }

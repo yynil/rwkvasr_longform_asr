@@ -7,10 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.eval.stage211_gate import (
+    STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_PUBLIC_BENCHMARKS,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
+    STAGE211_SFT_STEP_EVAL_INTERVAL,
+    STAGE211_STEP_EVAL_INTERVAL,
     sha256_file,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
@@ -712,9 +715,7 @@ def _alignment_component_result(
     if not isinstance(raw, dict):
         raise ValueError(f"Stage211 {label} component summary is missing.")
     baseline_loss = _finite_float(raw.get("baseline_mean_loss"), label=f"{label} baseline loss")
-    candidate_loss = _finite_float(
-        raw.get("candidate_mean_loss"), label=f"{label} candidate loss"
-    )
+    candidate_loss = _finite_float(raw.get("candidate_mean_loss"), label=f"{label} candidate loss")
     result: dict[str, Any] = {
         "baseline_mean_loss": baseline_loss,
         "candidate_mean_loss": candidate_loss,
@@ -730,9 +731,10 @@ def _alignment_component_result(
         "cosine_improved_layers": int(raw.get("cosine_improved_layers", -1)),
         "weak_bands": {},
     }
-    if not 0 <= result["loss_improved_layers"] <= 70 or not 0 <= result[
-        "cosine_improved_layers"
-    ] <= 70:
+    if (
+        not 0 <= result["loss_improved_layers"] <= 70
+        or not 0 <= result["cosine_improved_layers"] <= 70
+    ):
         raise ValueError(f"Stage211 {label} improved-layer count is invalid.")
     weak_bands = raw.get("weak_bands")
     if not isinstance(weak_bands, dict) or set(weak_bands) != {"10-19", "20-29"}:
@@ -758,9 +760,7 @@ def _alignment_component_result(
                 key: (
                     int(cell.get(key, -1))
                     if key in {"layers_loss_improved", "layers_cosine_improved"}
-                    else _finite_float(
-                        cell.get(key), label=f"{label}/{cell_name} {key}"
-                    )
+                    else _finite_float(cell.get(key), label=f"{label}/{cell_name} {key}")
                 )
                 for key in (
                     "baseline_loss",
@@ -789,12 +789,8 @@ def _logits_metric_pairs(
         raise ValueError(f"Stage211 {label} logits metrics are missing.")
     return {
         metric: {
-            "baseline": _finite_float(
-                baseline.get(metric), label=f"{label} baseline {metric}"
-            ),
-            "candidate": _finite_float(
-                candidate.get(metric), label=f"{label} candidate {metric}"
-            ),
+            "baseline": _finite_float(baseline.get(metric), label=f"{label} baseline {metric}"),
+            "candidate": _finite_float(candidate.get(metric), label=f"{label} candidate {metric}"),
         }
         for metric in LOGITS_DISCLOSURE_METRICS
     }
@@ -871,6 +867,14 @@ def _step_eval_cadence_result(
     phase: str,
     phase_report: dict[str, Any],
 ) -> dict[str, Any]:
+    expected_interval = (
+        STAGE211_SFT_STEP_EVAL_INTERVAL if phase == "sft" else STAGE211_STEP_EVAL_INTERVAL
+    )
+    required_prefix = (
+        ["labeled_sft"]
+        if phase == "sft"
+        else ["easy", "medium", "hard", "long", "supplemental_natural"]
+    )
     cadence = phase_report.get("step_eval_cadence")
     if (
         not isinstance(cadence, dict)
@@ -878,13 +882,12 @@ def _step_eval_cadence_result(
         or cadence.get("artifact") != "step_eval_cadence"
         or cadence.get("phase") != phase
         or cadence.get("complete") is not True
-        or int(cadence.get("interval_steps", -1)) != 10_000
-        or int(cadence.get("eval_samples", -1)) != 256
+        or int(cadence.get("interval_steps", -1)) != expected_interval
+        or int(cadence.get("eval_samples", -1)) != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
     ):
         raise ValueError(f"Stage211 {phase} periodic fixed-eval cadence is incomplete.")
     source_order = cadence.get("source_order")
     sources = cadence.get("sources")
-    required_prefix = ["easy", "medium", "hard", "long", "supplemental_natural"]
     if (
         not isinstance(source_order, list)
         or source_order[: len(required_prefix)] != required_prefix
@@ -900,7 +903,7 @@ def _step_eval_cadence_result(
             not isinstance(source, dict)
             or int(source.get("order", -1)) != order
             or source.get("source_name") != source_name
-            or int(source.get("interval_steps", -1)) != 10_000
+            or int(source.get("interval_steps", -1)) != expected_interval
             or int(source.get("expected_report_count", -1))
             != int(source.get("actual_report_count", -2))
         ):
@@ -913,15 +916,15 @@ def _step_eval_cadence_result(
                 "source_kind": str(source.get("source_kind") or ""),
                 "terminal_step": int(source.get("terminal_step", -1)),
                 "report_count": report_count,
-                "eval_samples_per_report": 256,
+                "eval_samples_per_report": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
             }
         )
     if total_reports != int(cadence.get("total_reports", -1)):
         raise ValueError(f"Stage211 {phase} fixed-eval report total is invalid.")
     return {
         "complete": True,
-        "interval_steps": 10_000,
-        "eval_samples_per_report": 256,
+        "interval_steps": expected_interval,
+        "eval_samples_per_report": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
         "source_order": [str(value) for value in source_order],
         "source_count": len(sources),
         "total_reports": total_reports,
@@ -947,9 +950,7 @@ def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, 
     ):
         raise ValueError(f"Stage211 {phase} alignment disclosure source did not pass.")
     stratified = source.get("stratified_summary")
-    if not isinstance(stratified, dict) or set(stratified.get("cells", {})) != set(
-        ALIGNMENT_CELLS
-    ):
+    if not isinstance(stratified, dict) or set(stratified.get("cells", {})) != set(ALIGNMENT_CELLS):
         raise ValueError(f"Stage211 {phase} alignment disclosure lacks nine-cell evidence.")
     common = {
         "stage": phase,
@@ -962,7 +963,9 @@ def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, 
         "baseline_checkpoint_sha256": str(source["baseline_checkpoint_sha256"]),
         "checkpoint_path": str(source["checkpoint_path"]),
         "checkpoint_sha256": str(source["checkpoint_sha256"]),
-        "fixed_eval_samples": int(source.get("baseline_eval_provenance", {}).get("split_samples", -1)),
+        "fixed_eval_samples": int(
+            source.get("baseline_eval_provenance", {}).get("split_samples", -1)
+        ),
         "stratified_gate_passed": source.get("stratified_gate_passed") is True,
         "stratified_summary_path": str(source.get("stratified_summary_path") or ""),
         "stratified_summary_sha256": str(source.get("stratified_summary_sha256") or ""),
@@ -1078,7 +1081,9 @@ def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, 
         **common,
         "fixed": {
             "metrics": _logits_metric_pairs(
-                source.get("baseline_metrics"), source.get("candidate_metrics"), label="logits/fixed"
+                source.get("baseline_metrics"),
+                source.get("candidate_metrics"),
+                label="logits/fixed",
             ),
             "full_kl_relative_reduction": _finite_float(
                 source.get("full_kl_relative_reduction"), label="logits fixed full-KL reduction"
@@ -1237,6 +1242,10 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
             "ctc_tokens": int(coverage["ctc_tokens"]),
             "ctc_unk_tokens": int(coverage["ctc_unk_tokens"]),
             "ctc_label_proof": label_proof,
+            "step_eval_cadence": _step_eval_cadence_result(
+                phase="sft",
+                phase_report=coverage,
+            ),
         }
     raise ValueError(f"Stage211 stage has no training coverage: {stage!r}")
 
@@ -2076,6 +2085,18 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"{int(source['report_count']):,} | "
                 f"{int(source['eval_samples_per_report'])} | pass |"
             )
+    sft_coverage = next(
+        coverage for coverage in report["coverage_results"] if coverage["stage"] == "sft"
+    )
+    sft_cadence = sft_coverage["step_eval_cadence"]
+    for source in sft_cadence["sources"]:
+        lines.append(
+            f"| {sft_coverage['label']} | `{source['source']}` | "
+            f"{int(source['terminal_step']):,} | "
+            f"{int(sft_cadence['interval_steps']):,} | "
+            f"{int(source['report_count']):,} | "
+            f"{int(source['eval_samples_per_report'])} | pass |"
+        )
     lines.extend(
         (
             "",

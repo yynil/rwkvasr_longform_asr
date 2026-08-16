@@ -14,6 +14,8 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
+    STAGE211_SFT_STEP_EVAL_INTERVAL,
+    build_stage211_sft_step_eval_cadence,
     sha256_file,
     stage211_phase_train_config_contract,
 )
@@ -120,6 +122,67 @@ def _labeled_audit(root: Path, length_index: Path, manifest: Path) -> dict[str, 
             length_index_path=length_index,
         ),
     }
+
+
+def _write_sft_step_eval_artifacts(
+    *,
+    run_dir: Path,
+    manifest: Path,
+    terminal_step: int,
+) -> tuple[Path, list[Path]]:
+    eval_part = run_dir / "sft-fixed-eval.jsonl"
+    eval_part.write_text("fixed-eval\n", encoding="utf-8")
+    expected_steps = list(
+        range(
+            STAGE211_SFT_STEP_EVAL_INTERVAL,
+            terminal_step + 1,
+            STAGE211_SFT_STEP_EVAL_INTERVAL,
+        )
+    )
+    if not expected_steps or expected_steps[-1] != terminal_step:
+        expected_steps.append(terminal_step)
+    records = []
+    reports = []
+    for index, step in enumerate(expected_steps, start=1):
+        report_path = run_dir / f"step_eval_layers_step-{step}.yaml"
+        eval_loss = 1.0 / float(index)
+        save_yaml(
+            report_path,
+            {
+                "step": step,
+                "eval_loss": eval_loss,
+                "eval_samples": 256,
+                "eval_provenance": {
+                    "schema_version": 1,
+                    "split": "eval",
+                    "requested_samples": 256,
+                    "split_samples": 256,
+                    "feature_seed": 0,
+                    "bucket_manifest_path": str(manifest.resolve()),
+                    "bucket_manifest_sha256": sha256_file(manifest),
+                    "parts": [
+                        {
+                            "path": str(eval_part.resolve()),
+                            "sha256": sha256_file(eval_part),
+                            "num_samples": 256,
+                        }
+                    ],
+                },
+            },
+        )
+        reports.append(report_path)
+        records.append(
+            {
+                "step": step,
+                "epoch": 1,
+                "eval_loss": eval_loss,
+                "eval_samples": 256,
+                "layer_metrics_path": str(report_path.resolve()),
+            }
+        )
+    metrics_path = run_dir / "step_checkpoint_metrics.yaml"
+    save_yaml(metrics_path, {"step_checkpoints": records})
+    return metrics_path, reports
 
 
 def test_validate_stage211_labeled_audit_exact_contract(tmp_path: Path) -> None:
@@ -359,8 +422,23 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
     artifacts["nano_teacher_checkpoint"].parent.mkdir()
     artifacts["nano_teacher_checkpoint"].write_bytes(b"nano-teacher")
     train_config = stage211_phase_train_config_contract("sft")
-    train_config["ctc_teacher_online_model_path"] = str(artifacts["nano_teacher_checkpoint"].parent)
+    train_config.update(
+        {
+            "ctc_teacher_online_model_path": str(artifacts["nano_teacher_checkpoint"].parent),
+            "max_steps": LABELED_EXPECTED["estimated_train_steps"],
+            "step_eval_every": STAGE211_SFT_STEP_EVAL_INTERVAL,
+            "step_eval_samples": 256,
+            "step_eval_split": "eval",
+            "step_eval_shuffle": False,
+            "step_eval_feature_seed": 0,
+        }
+    )
     save_yaml(artifacts["train_config"], train_config)
+    metrics_path, step_eval_reports = _write_sft_step_eval_artifacts(
+        run_dir=tmp_path,
+        manifest=manifest,
+        terminal_step=LABELED_EXPECTED["estimated_train_steps"],
+    )
     artifacts["logits_promotion_receipt"].write_text("{}\n", encoding="utf-8")
     artifacts["training_log"].write_text("complete\n", encoding="utf-8")
     torch.save({"step": 0}, artifacts["init_checkpoint"])
@@ -420,11 +498,12 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         epoch_checkpoint,
     )
     completion = {
-        "schema_version": 1,
+        "schema_version": sft_runner.SFT_COMPLETION_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "labeled_sft_completion",
         "phase": "sft",
         "complete": True,
+        "run_dir": str(tmp_path.resolve()),
         "epochs": 1,
         "batch_size": 12,
         "world_size": 4,
@@ -460,6 +539,7 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
     for name, path in artifacts.items():
         completion[f"{name}_path"] = str(path)
         completion[f"{name}_sha256"] = sha256_file(path)
+    completion["step_eval_cadence"] = build_stage211_sft_step_eval_cadence(completion)
     completion_path = tmp_path / "sft_complete.json"
     completion_path.write_text(
         json.dumps(completion, sort_keys=True) + "\n",
@@ -497,6 +577,23 @@ def test_validate_stage211_sft_completion_binds_artifacts(tmp_path: Path) -> Non
         json.dumps(completion, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+    metrics_payload = metrics_path.read_text(encoding="utf-8")
+    metrics = sft_runner.load_yaml(metrics_path)
+    metrics["step_checkpoints"].pop()
+    save_yaml(metrics_path, metrics)
+    with pytest.raises(ValueError, match="step-eval cadence mismatch"):
+        sft_runner._validate_completion(completion_path)
+    metrics_path.write_text(metrics_payload, encoding="utf-8")
+
+    terminal_report = step_eval_reports[-1]
+    terminal_report_payload = terminal_report.read_text(encoding="utf-8")
+    report = sft_runner.load_yaml(terminal_report)
+    report["eval_loss"] += 0.1
+    save_yaml(terminal_report, report)
+    with pytest.raises(ValueError, match="report metadata mismatch"):
+        sft_runner._validate_completion(completion_path)
+    terminal_report.write_text(terminal_report_payload, encoding="utf-8")
 
     artifacts["nano_teacher_checkpoint"].write_bytes(b"changed")
     with pytest.raises(ValueError, match="artifact is unavailable or changed"):
@@ -685,12 +782,8 @@ def test_stage211_sft_public_evidence_replays_baseline_candidate_and_progress(
         json.dumps(candidate_receipt) + "\n",
         encoding="utf-8",
     )
-    candidate_source["student_prediction_receipt_path"] = str(
-        candidate_receipt_path.resolve()
-    )
-    candidate_source["student_prediction_receipt_sha256"] = sha256_file(
-        candidate_receipt_path
-    )
+    candidate_source["student_prediction_receipt_path"] = str(candidate_receipt_path.resolve())
+    candidate_source["student_prediction_receipt_sha256"] = sha256_file(candidate_receipt_path)
     baseline_source_path = tmp_path / "baseline-comparison.json"
     candidate_source_path = tmp_path / "candidate-comparison.json"
     baseline_source_path.write_text(json.dumps(baseline_source) + "\n", encoding="utf-8")
@@ -961,9 +1054,7 @@ def _write_stepwise_alignment_fixture(
             },
             "component_summaries": stratified_components,
             "decoder_hidden": (
-                {"baseline_loss": 1.0, "candidate_loss": 0.5}
-                if phase == "block"
-                else None
+                {"baseline_loss": 1.0, "candidate_loss": 0.5} if phase == "block" else None
             ),
         }
     stratified_path = tmp_path / f"{phase}-stratified-alignment.json"
@@ -1008,9 +1099,7 @@ def _write_stepwise_alignment_fixture(
                 "candidate_eval_loss": 0.5,
                 "component_summaries": fixed_components,
                 "decoder_hidden": (
-                    {"baseline_loss": 1.0, "candidate_loss": 0.5}
-                    if phase == "block"
-                    else None
+                    {"baseline_loss": 1.0, "candidate_loss": 0.5} if phase == "block" else None
                 ),
             }
         )
@@ -1387,6 +1476,39 @@ def _write_stepwise_inputs(
         json.dumps({"nano_teacher_checkpoint_sha256": nano_teacher_sha256}) + "\n",
         encoding="utf-8",
     )
+    sft_terminal_step = int(LABELED_EXPECTED["estimated_train_steps"])
+    sft_report_steps = list(
+        range(
+            STAGE211_SFT_STEP_EVAL_INTERVAL,
+            sft_terminal_step + 1,
+            STAGE211_SFT_STEP_EVAL_INTERVAL,
+        )
+    )
+    if not sft_report_steps or sft_report_steps[-1] != sft_terminal_step:
+        sft_report_steps.append(sft_terminal_step)
+    sft_step_eval_cadence = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "step_eval_cadence",
+        "phase": "sft",
+        "complete": True,
+        "interval_steps": STAGE211_SFT_STEP_EVAL_INTERVAL,
+        "eval_samples": 256,
+        "source_order": ["labeled_sft"],
+        "source_count": 1,
+        "total_reports": len(sft_report_steps),
+        "sources": [
+            {
+                "order": 0,
+                "source_kind": "labeled_sft",
+                "source_name": "labeled_sft",
+                "terminal_step": sft_terminal_step,
+                "interval_steps": STAGE211_SFT_STEP_EVAL_INTERVAL,
+                "expected_report_count": len(sft_report_steps),
+                "actual_report_count": len(sft_report_steps),
+            }
+        ],
+    }
 
     sft_report = tmp_path / "sft-final.json"
     sft_report.write_text(
@@ -1436,6 +1558,7 @@ def _write_stepwise_inputs(
                     "init_checkpoint_sha256": sha256_file(checkpoints["logits"]),
                     "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint.resolve()),
                     "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
+                    "step_eval_cadence": sft_step_eval_cadence,
                 },
                 "public_progress": {
                     "gate_passed": True,
@@ -2039,6 +2162,23 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert (
         report["coverage_results"][-1]["unique_or_train_rows"] == LABELED_EXPECTED["train_samples"]
     )
+    assert report["coverage_results"][-1]["step_eval_cadence"] == {
+        "complete": True,
+        "interval_steps": STAGE211_SFT_STEP_EVAL_INTERVAL,
+        "eval_samples_per_report": 256,
+        "source_order": ["labeled_sft"],
+        "source_count": 1,
+        "total_reports": 7,
+        "sources": [
+            {
+                "source": "labeled_sft",
+                "source_kind": "labeled_sft",
+                "terminal_step": LABELED_EXPECTED["estimated_train_steps"],
+                "report_count": 7,
+                "eval_samples_per_report": 256,
+            }
+        ],
+    }
     assert len(report["dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert report["all_stage_alignment_results_complete"] is True
     assert [row["stage"] for row in report["alignment_results"]] == [
@@ -2078,6 +2218,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "Decoder Hidden Alignment" in output_markdown.read_text(encoding="utf-8")
     assert "Alignment Evidence" in output_markdown.read_text(encoding="utf-8")
     assert "Periodic Fixed Evaluation" in output_markdown.read_text(encoding="utf-8")
+    assert "`labeled_sft`" in output_markdown.read_text(encoding="utf-8")
     assert "Training Coverage" in output_markdown.read_text(encoding="utf-8")
     assert "Full Data Segment Proof" in output_markdown.read_text(encoding="utf-8")
     assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")

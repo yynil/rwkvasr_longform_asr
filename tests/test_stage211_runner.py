@@ -494,8 +494,7 @@ def test_stage211_public_prediction_receipt_binds_checkpoint_and_predictions(
     manifest = tmp_path / f"{dataset}.jsonl"
     prediction = tmp_path / f"{dataset}.ctc.jsonl"
     manifest.write_text(
-        '{"utt_id":"one","text":"hello world"}\n'
-        '{"utt_id":"two","text":"speech test"}\n',
+        '{"utt_id":"one","text":"hello world"}\n{"utt_id":"two","text":"speech test"}\n',
         encoding="utf-8",
     )
     prediction.write_text(
@@ -1172,8 +1171,8 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
         "    esac\n"
         "  done\n"
         '  mkdir -p "$(dirname "${output_json}")"\n'
-        '  printf \'{}\\n\' >"${output_json}"\n'
-        '  printf \'# stepwise\\n\' >"${output_markdown}"\n'
+        "  printf '{}\\n' >\"${output_json}\"\n"
+        "  printf '# stepwise\\n' >\"${output_markdown}\"\n"
         "fi\n",
         encoding="utf-8",
     )
@@ -1260,17 +1259,17 @@ def test_stage211_supervisor_corrected_sft_builds_stepwise_report(
         'if [[ "$*" == *finalize_stage211_labeled_sft.py* ]]; then\n'
         '  mkdir -p "${PHASE_GATE_ROOT}/sft" "${SFT_OUTPUT_DIR}"\n'
         "  printf '%s\\n' "
-        "'{\"pipeline\":\"stage211\",\"artifact\":\"final_completion\","
-        "\"complete\":true,\"gate_passed\":false}' "
+        '\'{"pipeline":"stage211","artifact":"final_completion",'
+        '"complete":true,"gate_passed":false}\' '
         '>"${PHASE_GATE_ROOT}/sft/stage211_complete.json"\n'
-        '  printf \'{}\\n\' >"${SFT_OUTPUT_DIR}/sft_complete.json"\n'
+        "  printf '{}\\n' >\"${SFT_OUTPUT_DIR}/sft_complete.json\"\n"
         "  exit 1\n"
         "fi\n"
         'if [[ "$*" == *run_stage211_sft_correction_loop.py* ]]; then\n'
         '  mkdir -p "${SFT_CORRECTED_FINAL_ROOT}"\n'
         "  printf '%s\\n' "
-        "'{\"pipeline\":\"stage211\",\"artifact\":\"final_completion\","
-        "\"complete\":true,\"gate_passed\":true}' "
+        '\'{"pipeline":"stage211","artifact":"final_completion",'
+        '"complete":true,"gate_passed":true}\' '
         '>"${SFT_CORRECTED_FINAL_ROOT}/stage211_complete.json"\n'
         "fi\n"
         'if [[ "$*" == *create_stage211_stepwise_report.py* ]]; then\n'
@@ -1284,8 +1283,8 @@ def test_stage211_supervisor_corrected_sft_builds_stepwise_report(
         "    esac\n"
         "  done\n"
         '  mkdir -p "$(dirname "${output_json}")"\n'
-        '  printf \'{}\\n\' >"${output_json}"\n'
-        '  printf \'# stepwise\\n\' >"${output_markdown}"\n'
+        "  printf '{}\\n' >\"${output_json}\"\n"
+        "  printf '# stepwise\\n' >\"${output_markdown}\"\n"
         "fi\n",
         encoding="utf-8",
     )
@@ -1900,30 +1899,39 @@ def test_stage211_public_progress_requires_macro_and_deletion_improvement() -> N
 def test_stage211_hidden_phases_promote_on_bilingual_progress_before_nano_proximity(
     phase: str,
 ) -> None:
-    assert stage211_gate_module.stage211_phase_gate_decision(
-        phase=phase,
-        alignment_gate_passed=True,
-        public_progress_gate_passed=True,
-        trajectory_retention_gate_passed=True,
-        all_datasets_pass=False,
-    ) is True
+    assert (
+        stage211_gate_module.stage211_phase_gate_decision(
+            phase=phase,
+            alignment_gate_passed=True,
+            public_progress_gate_passed=True,
+            trajectory_retention_gate_passed=True,
+            all_datasets_pass=False,
+        )
+        is True
+    )
 
 
 def test_stage211_logits_requires_every_dataset_nano_proximity() -> None:
-    assert stage211_gate_module.stage211_phase_gate_decision(
-        phase="logits",
-        alignment_gate_passed=True,
-        public_progress_gate_passed=True,
-        trajectory_retention_gate_passed=True,
-        all_datasets_pass=False,
-    ) is False
-    assert stage211_gate_module.stage211_phase_gate_decision(
-        phase="logits",
-        alignment_gate_passed=True,
-        public_progress_gate_passed=False,
-        trajectory_retention_gate_passed=True,
-        all_datasets_pass=True,
-    ) is True
+    assert (
+        stage211_gate_module.stage211_phase_gate_decision(
+            phase="logits",
+            alignment_gate_passed=True,
+            public_progress_gate_passed=True,
+            trajectory_retention_gate_passed=True,
+            all_datasets_pass=False,
+        )
+        is False
+    )
+    assert (
+        stage211_gate_module.stage211_phase_gate_decision(
+            phase="logits",
+            alignment_gate_passed=True,
+            public_progress_gate_passed=False,
+            trajectory_retention_gate_passed=True,
+            all_datasets_pass=True,
+        )
+        is True
+    )
 
 
 def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
@@ -2524,6 +2532,10 @@ def test_stage211_sft_phase_uses_labels_after_logits_with_low_teacher_anchors(
     assert config["ctc_suppressed_token_ids"] == suppressed_token_ids
     assert config["ctc_teacher_online_project_ignored_token_ids"] == suppressed_token_ids
     assert config["step_eval_split"] == "eval"
+    assert config["step_eval_every"] == 2_000
+    assert config["step_eval_samples"] == 256
+    assert config["step_eval_shuffle"] is False
+    assert config["step_eval_feature_seed"] == 0
     assert config["freeze_encoder_except_time_mixer"] is True
     assert config["freeze_ctc_decoder"] is True
     assert config["freeze_ctc_head"] is True
@@ -4244,12 +4256,8 @@ def _write_public_comparison_evidence_fixture(
         json.dumps(candidate_receipt, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    candidate_report["student_prediction_receipt_path"] = str(
-        candidate_receipt_path.resolve()
-    )
-    candidate_report["student_prediction_receipt_sha256"] = sha256_file(
-        candidate_receipt_path
-    )
+    candidate_report["student_prediction_receipt_path"] = str(candidate_receipt_path.resolve())
+    candidate_report["student_prediction_receipt_sha256"] = sha256_file(candidate_receipt_path)
     candidate_report_path.write_text(
         json.dumps(candidate_report) + "\n",
         encoding="utf-8",
@@ -4561,9 +4569,7 @@ def _write_valid_phase_gate(
             load_yaml(
                 Path(str(segments[0]["run_dir"]))
                 / f"step_eval_layers_step-{int(segments[0]['steps'])}.yaml"
-            )[
-                "eval_provenance"
-            ]["parts"]
+            )["eval_provenance"]["parts"]
         ),
     )
     step_eval_cadence = _write_step_eval_cadence_fixture(
@@ -4835,9 +4841,7 @@ def test_stage211_phase_gate_fails_trajectory_regression_from_best_prior(
     )
     gate = json.loads(gate_path.read_text(encoding="utf-8"))
     coverage = gate["full_data_coverage"]
-    candidate_report_path = Path(
-        gate["trajectory_retention"]["candidate"]["eval_report_path"]
-    )
+    candidate_report_path = Path(gate["trajectory_retention"]["candidate"]["eval_report_path"])
     candidate_report = load_yaml(candidate_report_path)
     candidate_report["eval_loss"] = 0.8
     save_yaml(candidate_report_path, candidate_report)
@@ -4908,9 +4912,7 @@ def test_stage211_phase_gate_builder_emits_trajectory_retention(
         baseline_public_comparison_report_path=Path(
             fixture["baseline_public_comparison_report"]["path"]
         ),
-        nano_public_baseline_receipt_path=Path(
-            fixture["nano_public_baseline_receipt_path"]
-        ),
+        nano_public_baseline_receipt_path=Path(fixture["nano_public_baseline_receipt_path"]),
         public_overlap_receipt_path=Path(fixture["public_overlap"]["receipt_path"]),
     )
     assert report["schema_version"] == STAGE211_PHASE_GATE_SCHEMA_VERSION
@@ -4939,9 +4941,7 @@ def test_stage211_phase_gate_rejects_incomplete_or_inconsistent_step_eval_cadenc
     )
     gate = json.loads(gate_path.read_text(encoding="utf-8"))
     hard = next(
-        source
-        for source in gate["step_eval_cadence"]["sources"]
-        if source["source_name"] == "hard"
+        source for source in gate["step_eval_cadence"]["sources"] if source["source_name"] == "hard"
     )
     metrics_path = Path(hard["metrics_path"])
     original_metrics = metrics_path.read_text(encoding="utf-8")
@@ -4999,9 +4999,7 @@ def test_stage211_phase_gate_rejects_mutated_trajectory_terminal_report(
         checkpoint=checkpoint,
     )
     gate = json.loads(gate_path.read_text(encoding="utf-8"))
-    candidate_report_path = Path(
-        gate["trajectory_retention"]["candidate"]["eval_report_path"]
-    )
+    candidate_report_path = Path(gate["trajectory_retention"]["candidate"]["eval_report_path"])
     candidate_report = load_yaml(candidate_report_path)
     candidate_report["eval_loss"] = 0.6
     save_yaml(candidate_report_path, candidate_report)
@@ -5026,9 +5024,7 @@ def test_stage211_trajectory_allows_only_legacy_mixer_easy_missing_seed(
     )
     gate = json.loads(gate_path.read_text(encoding="utf-8"))
     coverage = gate["full_data_coverage"]
-    easy_report_path = Path(
-        gate["trajectory_retention"]["entries"][0]["eval_report_path"]
-    )
+    easy_report_path = Path(gate["trajectory_retention"]["entries"][0]["eval_report_path"])
     easy_report = load_yaml(easy_report_path)
     easy_report["eval_provenance"].pop("feature_seed")
     save_yaml(easy_report_path, easy_report)
@@ -5104,9 +5100,7 @@ def _write_retention_correction(
     replay_manifest = replay_root / "manifest.json"
     replay_part = replay_root / "part.jsonl"
     replay_part.write_text('{"key":"replay-1"}\n', encoding="utf-8")
-    prior_eval_report = Path(
-        str(failed["trajectory_retention"]["entries"][0]["eval_report_path"])
-    )
+    prior_eval_report = Path(str(failed["trajectory_retention"]["entries"][0]["eval_report_path"]))
     prior_eval_provenance = load_yaml(prior_eval_report)["eval_provenance"]
     replay_manifest.write_text(
         json.dumps(
@@ -5120,9 +5114,7 @@ def _write_retention_correction(
                             {
                                 "bucket_id": 0,
                                 "num_samples": 8,
-                                "parts": [
-                                    {"path": str(replay_part.resolve()), "num_samples": 8}
-                                ],
+                                "parts": [{"path": str(replay_part.resolve()), "num_samples": 8}],
                             }
                         ],
                     },
@@ -5351,9 +5343,7 @@ def _write_retention_correction(
         "layer_focus_path": str(layer_focus.resolve()),
         "layer_focus_sha256": sha256_file(layer_focus),
         "boundary_layer_ids": list(layer_focus_payload["boundary_layer_ids"]),
-        "selected_failure_layer_ids": list(
-            layer_focus_payload["selected_failure_layer_ids"]
-        ),
+        "selected_failure_layer_ids": list(layer_focus_payload["selected_failure_layer_ids"]),
         "all_failed_layer_ids": list(layer_focus_payload["all_failed_layer_ids"]),
         "rotating_layer_slots": int(layer_focus_payload["rotating_slots"]),
         "replay_receipt_path": str(replay_receipt.resolve()),
@@ -5499,9 +5489,7 @@ def _write_corrected_phase_gate(
         post_coverage_corrections=[correction],
         checkpoint_path=checkpoint,
     )
-    report["trajectory_retention_gate_passed"] = bool(
-        report["trajectory_retention"]["gate_passed"]
-    )
+    report["trajectory_retention_gate_passed"] = bool(report["trajectory_retention"]["gate_passed"])
     report["step_eval_cadence"] = build_stage211_step_eval_cadence(
         phase="mixer",
         segments=original_segments,
@@ -5514,12 +5502,8 @@ def _write_corrected_phase_gate(
     public_source["student_checkpoint_sha256"] = sha256_file(checkpoint)
     prior_receipt_path = Path(public_source["student_prediction_receipt_path"])
     prior_receipt = json.loads(prior_receipt_path.read_text(encoding="utf-8"))
-    receipt_results = {
-        str(result["dataset"]): result for result in prior_receipt["results"]
-    }
-    public_results = {
-        str(result["dataset"]): result for result in public_source["results"]
-    }
+    receipt_results = {str(result["dataset"]): result for result in prior_receipt["results"]}
+    public_results = {str(result["dataset"]): result for result in public_source["results"]}
     corrected_receipt = build_stage211_student_public_prediction_receipt(
         checkpoint_path=checkpoint,
         manifest_paths={
@@ -5537,12 +5521,8 @@ def _write_corrected_phase_gate(
         json.dumps(corrected_receipt) + "\n",
         encoding="utf-8",
     )
-    public_source["student_prediction_receipt_path"] = str(
-        corrected_receipt_path.resolve()
-    )
-    public_source["student_prediction_receipt_sha256"] = sha256_file(
-        corrected_receipt_path
-    )
+    public_source["student_prediction_receipt_path"] = str(corrected_receipt_path.resolve())
+    public_source["student_prediction_receipt_sha256"] = sha256_file(corrected_receipt_path)
     corrected_public_source_path = tmp_path / "corrected-public-comparison.json"
     corrected_public_source_path.write_text(
         json.dumps(public_source) + "\n",
@@ -6679,9 +6659,15 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert ".requested_alignment_language_metric_summaries" in script
     assert ".requested_alignment_dataset_results" in script
     assert "stage211_trajectory_results_valid" in script
-    assert '.source_order[:5] == ["easy", "medium", "hard", "long", "supplemental_natural"]' in script
+    assert (
+        '.source_order[:5] == ["easy", "medium", "hard", "long", "supplemental_natural"]' in script
+    )
     assert ".terminal_entries >= 5" in script
     assert ".max_relative_regression_pct == 10.0" in script
+    assert "stage211_periodic_cadence_results_valid" in script
+    assert ".interval_steps == 10000" in script
+    assert ".interval_steps == 2000" in script
+    assert '.source_order == ["labeled_sft"]' in script
     assert "post_mixer" in script
     assert "tmux kill-session" not in script
     assert '[[ "${BASH_SOURCE[0]}" == "$0" ]]' in script
@@ -7016,12 +7002,17 @@ def _run_stage211_continuation_watcher_fixture(
         '  requested_proof=\'"all_requested_alignment_metrics_complete":true,"initial_calibration_result":{"role":"initial_baseline","checkpoint_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","english_wer":0.5,"chinese_cer":0.5},"requested_alignment_results":[{"stage":"rwkv_layer","internal_stage":"mixer","gate_passed":true,"checkpoint_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_report_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","english_wer":0.4,"chinese_cer":0.4},{"stage":"block","internal_stage":"block","gate_passed":true,"checkpoint_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_report_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","english_wer":0.3,"chinese_cer":0.3},{"stage":"logits","internal_stage":"logits","gate_passed":true,"checkpoint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","source_report_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","english_wer":0.2,"chinese_cer":0.2},{"stage":"sft","internal_stage":"sft","gate_passed":true,"checkpoint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","source_report_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","english_wer":0.1,"chinese_cer":0.1}],"requested_alignment_language_metric_summaries":[{"name":"english_wer","initial_calibration_error_rate":0.5,"stages":{"rwkv_layer":0.4,"block":0.3,"logits":0.2,"sft":0.1}},{"name":"chinese_cer","initial_calibration_error_rate":0.5,"stages":{"rwkv_layer":0.4,"block":0.3,"logits":0.2,"sft":0.1}}],"requested_alignment_dataset_results":[{"initial_calibration":{"student_error_rate":0.5},"stages":\'"${requested_stage_metrics}"\'},{"initial_calibration":{"student_error_rate":0.5},"stages":\'"${requested_stage_metrics}"\'},{"initial_calibration":{"student_error_rate":0.5},"stages":\'"${requested_stage_metrics}"\'},{"initial_calibration":{"student_error_rate":0.5},"stages":\'"${requested_stage_metrics}"\'},{"initial_calibration":{"student_error_rate":0.5},"stages":\'"${requested_stage_metrics}"\'}]\'\n'
         'printf \'%s\\n\' \'{"pipeline":"stage211","artifact":"stepwise_final_results","complete":true,"gate_passed":true,"strict_stage_order":["calibration","mixer","block","logits","sft"],"requested_alignment_stage_order":["rwkv_layer","block","logits","sft"],"checkpoint_chain_passed":true,"nano_initialization_chain_passed":true,"nano_initialization_source_chain_passed":true,"ctc_label_normalization_chain_passed":true,"ctc_label_proof":{"full_length_index_audit_passed":true,"ctc_suppress_non_pronunciation_tokens":true,"ctc_suppressed_token_ids_count":2114,"ctc_suppressed_token_ids_sha256":"76a68d03bb2dc486c214fd44891f3e3e2c36286d79fea1e69c8e74d7767d5a09","teacher_projection_support_matches_student":true,"ctc_unk_tokens":0},"public_metric_definition_chain_passed":true,"public_metric_tokenizer_contract":"unicode_alnum_words_basic_cjk_chars_v1","public_metric_correction_receipt_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","public_metric_tokenizer_source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","nano_teacher_chain_passed":true,"nano_public_baseline_provenance_passed":true,"supplemental_inventory_chain_passed":true,"supplemental_dedupe_proof":{"inventory_schema_version":2,"inventory_artifact":"stage211_supplemental_combined_inventory","mode":"source_identity_plus_known_corpus_exclusion","source_sets_disjoint":true,"content_fingerprint_complete":false,"base_public_overlap_normalized_pcm_exact_complete":true,"base_public_overlap_scan_order":"manifest_location_index_archive_order_v1","base_public_overlap_rows":0,"base_public_overlap_scanned_rows":1,"base_public_overlap_receipt_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","social_normalized_pcm_exact_complete":true,"social_public_overlap_mode":"normalized_pcm_exact","archived_social_exact_duplicate_exclusion_complete":true,"archived_social_unique_members":0,"archived_social_overlap_receipt_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","usb_top_level_classification_complete":true,"usb_natural_audio_resolution_complete":true,"usb_unresolved_natural_entries":[],"usb_top_level_coverage_receipt_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","near_duplicate_complete":false,"component_inventories":{"base_natural":{},"social_vad":{}},"known_overlap_exclusions":["llaso_gigaspeech","llaso_librispeech"]},"coverage_results":[{"stage":"mixer","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"block","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"logits","training_segments":[{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3},{"epochs":3}]},{"stage":"sft"}],"all_stage_alignment_results_complete":true,"alignment_results":[{"stage":"mixer","gate_passed":true,"stratified_gate_passed":true,"fixed_eval_samples":256,"stratified_samples":2304,"stratified_cells":["easy_en","easy_zh","medium_en","medium_zh","hard_en","hard_zh","long_zh","supplemental_en","supplemental_zh"],"source_report_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"stage":"block","gate_passed":true,"stratified_gate_passed":true,"fixed_eval_samples":256,"stratified_samples":2304,"stratified_cells":["easy_en","easy_zh","medium_en","medium_zh","hard_en","hard_zh","long_zh","supplemental_en","supplemental_zh"],"source_report_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"stage":"logits","gate_passed":true,"stratified_gate_passed":true,"fixed_eval_samples":256,"stratified_samples":2304,"stratified_cells":["easy_en","easy_zh","medium_en","medium_zh","hard_en","hard_zh","long_zh","supplemental_en","supplemental_zh"],"source_report_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}],\'"${requested_proof}"\',\'"${dataset_proof}"\'}\' >"${output_json}"\n'
         'trajectory=\'{"gate_passed":true,"fixed_eval_samples":256,"source_order":["easy","medium","hard","long","supplemental_natural"],"terminal_entries":5,"best_prior_loss":0.1,"candidate_loss":0.105,"relative_regression_pct":5.0,"max_relative_regression_pct":10.0}\'\n'
-        'jq -c --argjson trajectory "${trajectory}" \'.alignment_results |= map(. + {trajectory_retention: $trajectory})\' "${output_json}" >"${output_json}.tmp"\n'
+        'phase_cadence=\'{"complete":true,"interval_steps":10000,"eval_samples_per_report":256,"source_order":["easy","medium","hard","long","supplemental_natural"],"source_count":5,"total_reports":5,"sources":[{"source":"easy","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"medium","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"hard","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"long","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"supplemental_natural","terminal_step":3,"report_count":1,"eval_samples_per_report":256}]}\'\n'
+        'sft_cadence=\'{"complete":true,"interval_steps":2000,"eval_samples_per_report":256,"source_order":["labeled_sft"],"source_count":1,"total_reports":7,"sources":[{"source":"labeled_sft","terminal_step":12045,"report_count":7,"eval_samples_per_report":256}]}\'\n'
+        'jq -c --argjson trajectory "${trajectory}" --argjson phase_cadence "${phase_cadence}" --argjson sft_cadence "${sft_cadence}" \'.alignment_results |= map(. + {trajectory_retention: $trajectory, step_eval_cadence: $phase_cadence}) | (.coverage_results[] | select(.stage == "sft")).step_eval_cadence = $sft_cadence\' "${output_json}" >"${output_json}.tmp"\n'
         'mv "${output_json}.tmp" "${output_json}"\n'
         'if [[ "${UV_MODE}" == missing_alignment ]]; then\n'
         '  sed -i \'s/"all_stage_alignment_results_complete":true/"all_stage_alignment_results_complete":false/\' "${output_json}"\n'
         'elif [[ "${UV_MODE}" == missing_trajectory ]]; then\n'
         '  jq \'del(.alignment_results[1].trajectory_retention)\' "${output_json}" >"${output_json}.tmp"\n'
+        '  mv "${output_json}.tmp" "${output_json}"\n'
+        'elif [[ "${UV_MODE}" == missing_periodic_cadence ]]; then\n'
+        '  jq \'del(.coverage_results[] | select(.stage == "sft") | .step_eval_cadence)\' "${output_json}" >"${output_json}.tmp"\n'
         '  mv "${output_json}.tmp" "${output_json}"\n'
         'elif [[ "${UV_MODE}" == missing_requested_alignment ]]; then\n'
         '  sed -i \'s/"all_requested_alignment_metrics_complete":true/"all_requested_alignment_metrics_complete":false/\' "${output_json}"\n'
@@ -7106,9 +7097,7 @@ def test_stage211_continuation_watcher_accepts_corrected_sft_proof(
     assert result.returncode == 0, result.stderr
     assert "SFT and stepwise proofs pass" in result.stdout
     assert "new-session" not in tmux_calls
-    assert (
-        phase_gate_root / "sft_corrected" / "stage211_stepwise_results.json"
-    ).is_file()
+    assert (phase_gate_root / "sft_corrected" / "stage211_stepwise_results.json").is_file()
 
 
 def test_stage211_continuation_watcher_restarts_after_stepwise_failure(
@@ -7177,6 +7166,20 @@ def test_stage211_continuation_watcher_requires_trajectory_retention(
 
     assert result.returncode == 0, result.stderr
     assert "trajectory-retention proof failed validation" in result.stdout
+    assert "START_STAGE=full" in result.stdout
+    assert "new-session" in tmux_calls
+
+
+def test_stage211_continuation_watcher_requires_periodic_fixed_eval(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="missing_periodic_cadence",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "periodic fixed-eval proof failed validation" in result.stdout
     assert "START_STAGE=full" in result.stdout
     assert "new-session" in tmux_calls
 

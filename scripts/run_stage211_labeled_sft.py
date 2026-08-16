@@ -17,10 +17,12 @@ from rwkvasr.config import load_yaml
 from rwkvasr.eval.stage211_gate import (
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
+    build_stage211_sft_step_eval_cadence,
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
     validate_stage211_phase_train_config,
     validate_stage211_runtime_epoch_coverage,
+    validate_stage211_sft_step_eval_cadence,
 )
 from rwkvasr.eval.stage211_runtime import (
     audit_stage211_runtime_epoch_coverage,
@@ -59,6 +61,7 @@ DEFAULT_OUTPUT_DIR = (
 )
 DEFAULT_CONFIG_DIR = Path.home() / "rwkvasr_configs" / "stage211_full_alignment"
 DEFAULT_NANO_CHECKPOINT = Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
+SFT_COMPLETION_SCHEMA_VERSION = 2
 LABELED_EXPECTED = {
     "train_samples": 283_868,
     "eval_samples": 1_434,
@@ -426,6 +429,9 @@ def _validate_completion(
     require_full_profile: bool = False,
 ) -> tuple[dict[str, Any], Path]:
     completion = _load_json(completion_path, label="Stage211D completion report")
+    run_dir = Path(str(completion.get("run_dir") or "")).expanduser().resolve()
+    if run_dir != completion_path.expanduser().resolve().parent or not run_dir.is_dir():
+        raise ValueError("Stage211D completion run directory mismatch.")
     labeled_root = Path(str(completion.get("labeled_webdataset_root") or "")).resolve()
     length_index = Path(str(completion.get("length_index_path") or "")).resolve()
     bucket_manifest = Path(str(completion.get("bucket_manifest_path") or "")).resolve()
@@ -457,7 +463,7 @@ def _validate_completion(
             )
         labeled_expected = dict(LABELED_EXPECTED)
     expected = {
-        "schema_version": 1,
+        "schema_version": SFT_COMPLETION_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "labeled_sft_completion",
         "phase": "sft",
@@ -516,6 +522,7 @@ def _validate_completion(
     train_config_path = Path(str(completion["train_config_path"])).resolve()
     train_config = load_yaml(train_config_path)
     validate_stage211_phase_train_config(train_config, phase="sft")
+    validate_stage211_sft_step_eval_cadence(completion)
     labeled_audit = completion.get("labeled_data_audit")
     if not isinstance(labeled_audit, dict):
         raise ValueError("Stage211D completion lacks its full labeled-data audit.")
@@ -577,9 +584,7 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             raise FileNotFoundError(f"Stage211D {label} is unavailable: {path}")
     requested_profile = getattr(args, "labeled_profile_receipt", None)
     if requested_profile is None:
-        raise ValueError(
-            "Stage211D formal training requires its schema-v2 full-labeled profile."
-        )
+        raise ValueError("Stage211D formal training requires its schema-v2 full-labeled profile.")
     labeled_profile_path = requested_profile.expanduser().resolve()
     labeled_profile = validate_labeled_profile_receipt(
         labeled_profile_path,
@@ -724,59 +729,61 @@ def run_sft(args: argparse.Namespace) -> Path | None:
         steps_per_epoch=completion_step,
     )
     completion_path = output_dir / "sft_complete.json"
-    _write_immutable_json(
-        completion_path,
-        {
-            "schema_version": 1,
-            "pipeline": "stage211",
-            "artifact": "labeled_sft_completion",
-            "phase": "sft",
-            "complete": True,
-            "epochs": 1,
-            "batch_size": 12,
-            "world_size": 4,
-            "frame_budget": 8_000,
-            "length_bucket_drop_last": False,
-            "skip_oversized_samples": False,
-            "webdataset_skip_decode_errors": False,
-            "ctc_suppress_non_pronunciation_tokens": True,
-            "ctc_suppressed_token_ids_count": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT),
-            "ctc_suppressed_token_ids_sha256": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256),
-            "teacher_projection_support_matches_student": True,
-            **labeled_expected,
-            "labeled_data_audit": audit,
-            "labeled_webdataset_root": str(labeled_root),
-            "bucket_manifest_path": str(bucket_manifest),
-            "bucket_manifest_sha256": sha256_file(bucket_manifest),
-            "length_index_path": str(length_index),
-            "length_index_sha256": sha256_file(length_index),
-            "provenance_path": str(provenance_path),
-            "provenance_sha256": sha256_file(provenance_path),
-            "train_config_path": str(train_config_path),
-            "train_config_sha256": sha256_file(train_config_path),
-            "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint_path),
-            "nano_teacher_checkpoint_sha256": sha256_file(nano_teacher_checkpoint_path),
-            "init_checkpoint_path": str(init_checkpoint),
-            "init_checkpoint_sha256": sha256_file(init_checkpoint),
-            "logits_promotion_receipt_path": str(promotion_receipt),
-            "logits_promotion_receipt_sha256": sha256_file(promotion_receipt),
-            "completion_checkpoint_path": str(completion_checkpoint),
-            "completion_checkpoint_sha256": sha256_file(completion_checkpoint),
-            "training_log_path": str(training_log),
-            "training_log_sha256": sha256_file(training_log),
-            "smoke_marker_path": str(smoke_marker_path),
-            "smoke_marker_sha256": sha256_file(smoke_marker_path),
-            "runtime_epoch_coverage": runtime_epoch_coverage,
-            **(
-                {
-                    "labeled_profile_receipt_path": str(labeled_profile_path),
-                    "labeled_profile_receipt_sha256": sha256_file(labeled_profile_path),
-                }
-                if labeled_profile_path is not None
-                else {}
-            ),
-        },
+    completion_payload = {
+        "schema_version": SFT_COMPLETION_SCHEMA_VERSION,
+        "pipeline": "stage211",
+        "artifact": "labeled_sft_completion",
+        "phase": "sft",
+        "complete": True,
+        "run_dir": str(output_dir),
+        "epochs": 1,
+        "batch_size": 12,
+        "world_size": 4,
+        "frame_budget": 8_000,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
+        "ctc_suppress_non_pronunciation_tokens": True,
+        "ctc_suppressed_token_ids_count": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT),
+        "ctc_suppressed_token_ids_sha256": (STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256),
+        "teacher_projection_support_matches_student": True,
+        **labeled_expected,
+        "labeled_data_audit": audit,
+        "labeled_webdataset_root": str(labeled_root),
+        "bucket_manifest_path": str(bucket_manifest),
+        "bucket_manifest_sha256": sha256_file(bucket_manifest),
+        "length_index_path": str(length_index),
+        "length_index_sha256": sha256_file(length_index),
+        "provenance_path": str(provenance_path),
+        "provenance_sha256": sha256_file(provenance_path),
+        "train_config_path": str(train_config_path),
+        "train_config_sha256": sha256_file(train_config_path),
+        "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint_path),
+        "nano_teacher_checkpoint_sha256": sha256_file(nano_teacher_checkpoint_path),
+        "init_checkpoint_path": str(init_checkpoint),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint),
+        "logits_promotion_receipt_path": str(promotion_receipt),
+        "logits_promotion_receipt_sha256": sha256_file(promotion_receipt),
+        "completion_checkpoint_path": str(completion_checkpoint),
+        "completion_checkpoint_sha256": sha256_file(completion_checkpoint),
+        "training_log_path": str(training_log),
+        "training_log_sha256": sha256_file(training_log),
+        "smoke_marker_path": str(smoke_marker_path),
+        "smoke_marker_sha256": sha256_file(smoke_marker_path),
+        "runtime_epoch_coverage": runtime_epoch_coverage,
+        **(
+            {
+                "labeled_profile_receipt_path": str(labeled_profile_path),
+                "labeled_profile_receipt_sha256": sha256_file(labeled_profile_path),
+            }
+            if labeled_profile_path is not None
+            else {}
+        ),
+    }
+    completion_payload["step_eval_cadence"] = build_stage211_sft_step_eval_cadence(
+        completion_payload
     )
+    _write_immutable_json(completion_path, completion_payload)
     _validate_completion(
         completion_path,
         checkpoint_path=completion_checkpoint,

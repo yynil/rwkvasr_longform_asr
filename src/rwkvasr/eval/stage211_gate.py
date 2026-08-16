@@ -30,6 +30,7 @@ STAGE211_NANO_PUBLIC_BASELINE_SCHEMA_VERSION = 1
 STAGE211_TRAJECTORY_RETENTION_SCHEMA_VERSION = 1
 STAGE211_STEP_EVAL_CADENCE_SCHEMA_VERSION = 1
 STAGE211_STEP_EVAL_INTERVAL = 10_000
+STAGE211_SFT_STEP_EVAL_INTERVAL = 2_000
 STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
@@ -90,9 +91,7 @@ _STAGE211_LOGITS_MAX_CELL_TOKEN_ERROR_REGRESSION = 0.03
 _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION = 0.10
 _STAGE211_LOGITS_MAX_HIDDEN_COSINE_REGRESSION = 0.01
 _STAGE211_ALIGNMENT_TOLERANCE = 1.0e-12
-_STAGE211_STEP_EVAL_REPORT_PATTERN = re.compile(
-    r"^step_eval_layers_step-([1-9][0-9]*)\.yaml$"
-)
+_STAGE211_STEP_EVAL_REPORT_PATTERN = re.compile(r"^step_eval_layers_step-([1-9][0-9]*)\.yaml$")
 _STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS = {
     "mixer": 5,
     "block": 5,
@@ -462,9 +461,8 @@ def stage211_post_coverage_train_config_contract(
     if phase not in _STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS:
         raise ValueError(f"Unsupported Stage211 correction focus phase: {phase!r}")
     layer_ids = [int(value) for value in boundary_layer_ids]
-    if (
-        layer_ids != sorted(set(layer_ids))
-        or any(layer_id not in _STAGE211_ALIGNMENT_LAYER_IDS for layer_id in layer_ids)
+    if layer_ids != sorted(set(layer_ids)) or any(
+        layer_id not in _STAGE211_ALIGNMENT_LAYER_IDS for layer_id in layer_ids
     ):
         raise ValueError("Stage211 correction boundary layer IDs are invalid.")
     contract = stage211_phase_train_config_contract(phase)
@@ -677,9 +675,7 @@ def _stage211_record_correction_layer_failures(
             cosine_regression = max(0.0, baseline_cosine - candidate_cosine)
             row["failed_cosine_comparisons"] += 1
             row["cosine_regression_sum"] += cosine_regression
-            row["cosine_regression_max"] = max(
-                row["cosine_regression_max"], cosine_regression
-            )
+            row["cosine_regression_max"] = max(row["cosine_regression_max"], cosine_regression)
 
 
 def _stage211_correction_focus_report_pair(
@@ -721,13 +717,13 @@ def _stage211_correction_focus_trajectory(
     trajectory = admission_gate.get("trajectory_retention")
     if not isinstance(trajectory, dict):
         raise ValueError("Stage211 correction focus lacks trajectory-retention evidence.")
-    if trajectory.get("phase") != phase or not isinstance(
-        trajectory.get("gate_passed"), bool
-    ):
+    if trajectory.get("phase") != phase or not isinstance(trajectory.get("gate_passed"), bool):
         raise ValueError("Stage211 correction-focus trajectory contract mismatch.")
     entries = trajectory.get("entries")
-    if not isinstance(entries, list) or len(entries) < 2 or any(
-        not isinstance(entry, dict) for entry in entries
+    if (
+        not isinstance(entries, list)
+        or len(entries) < 2
+        or any(not isinstance(entry, dict) for entry in entries)
     ):
         raise ValueError("Stage211 correction-focus trajectory entries are invalid.")
     try:
@@ -767,13 +763,10 @@ def _stage211_correction_focus_trajectory(
         report = load_yaml(report_path)
         if not isinstance(report, dict):
             raise ValueError(
-                f"Stage211 {phase} correction-focus trajectory {role} report "
-                "must be an object."
+                f"Stage211 {phase} correction-focus trajectory {role} report must be an object."
             )
         if int(report.get("step", -1)) != int(entry.get("step", -2)):
-            raise ValueError(
-                f"Stage211 {phase} correction-focus trajectory {role} step mismatch."
-            )
+            raise ValueError(f"Stage211 {phase} correction-focus trajectory {role} step mismatch.")
         sources[role] = report
         reports[role] = {
             "source_name": str(entry.get("source_name") or ""),
@@ -817,7 +810,9 @@ def build_stage211_correction_layer_focus(
         raise ValueError(f"Unsupported Stage211 correction focus phase: {phase!r}")
     admission_gate_path = admission_gate_path.expanduser().resolve()
     if not admission_gate_path.is_file() or admission_gate_path.stat().st_size <= 0:
-        raise ValueError(f"Stage211 correction focus admission gate is unavailable: {admission_gate_path}")
+        raise ValueError(
+            f"Stage211 correction focus admission gate is unavailable: {admission_gate_path}"
+        )
     if admission_gate.get("gate_passed") is not False:
         raise ValueError("Stage211 correction focus requires an explicitly failed admission gate.")
     alignment_binding = admission_gate.get("alignment_report")
@@ -982,9 +977,7 @@ def build_stage211_correction_layer_focus(
     mandatory_layer_ids = list(STAGE211_HARD_LAYER_IDS) if phase == "logits" else []
     dynamic_limit = int(_STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS[phase])
     selected_failure_layer_ids = [
-        int(row["layer_id"])
-        for row in ranking
-        if int(row["layer_id"]) not in mandatory_layer_ids
+        int(row["layer_id"]) for row in ranking if int(row["layer_id"]) not in mandatory_layer_ids
     ][:dynamic_limit]
     boundary_layer_ids = sorted({*mandatory_layer_ids, *selected_failure_layer_ids})
     contract = stage211_post_coverage_train_config_contract(
@@ -2102,6 +2095,8 @@ def _stage211_step_eval_cadence_source(
     source_kind: str,
     source_name: str,
     record: dict[str, Any],
+    interval: int = STAGE211_STEP_EVAL_INTERVAL,
+    require_receipt: bool = True,
 ) -> dict[str, Any]:
     if record.get("phase") != phase:
         raise ValueError(f"Stage211 {source_name} step-eval phase mismatch.")
@@ -2113,13 +2108,18 @@ def _stage211_step_eval_cadence_source(
     epochs = int(record.get("epochs", -1))
     if terminal_step <= 0 or steps_per_epoch <= 0 or terminal_step != epochs * steps_per_epoch:
         raise ValueError(f"Stage211 {source_name} step-eval coverage is invalid.")
-    expected_steps = _stage211_expected_step_eval_steps(terminal_step)
+    interval = int(interval)
+    expected_steps = _stage211_expected_step_eval_steps(terminal_step, interval=interval)
 
-    receipt_path = _validate_bound_file(
-        record,
-        path_key="receipt_path",
-        sha256_key="receipt_sha256",
-        label=f"Stage211 {phase}/{source_name} step-eval receipt",
+    receipt_path = (
+        _validate_bound_file(
+            record,
+            path_key="receipt_path",
+            sha256_key="receipt_sha256",
+            label=f"Stage211 {phase}/{source_name} step-eval receipt",
+        )
+        if require_receipt
+        else None
     )
     train_config_path = _validate_bound_file(
         record,
@@ -2138,7 +2138,7 @@ def _stage211_step_eval_cadence_source(
         raise ValueError(f"Stage211 {source_name} step-eval train config is invalid.")
     expected_config = {
         "max_steps": terminal_step,
-        "step_eval_every": STAGE211_STEP_EVAL_INTERVAL,
+        "step_eval_every": interval,
         "step_eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
         "step_eval_split": "eval",
         "step_eval_shuffle": False,
@@ -2146,7 +2146,7 @@ def _stage211_step_eval_cadence_source(
     if any(train_config.get(key) != value for key, value in expected_config.items()):
         raise ValueError(
             f"Stage211 {phase}/{source_name} train config does not declare the fixed "
-            f"{STAGE211_STEP_EVAL_INTERVAL}-step evaluation cadence."
+            f"{interval}-step evaluation cadence."
         )
     raw_config_feature_seed = train_config.get("step_eval_feature_seed")
     legacy_config_missing_feature_seed = (
@@ -2250,15 +2250,12 @@ def _stage211_step_eval_cadence_source(
             label=f"{phase}/{source_name} step {step} cadence",
         )
         assert isinstance(provenance, dict)
-        if (
-            Path(str(provenance.get("bucket_manifest_path") or "")).expanduser().resolve()
-            != manifest_path
-            or provenance.get("bucket_manifest_sha256")
-            != record.get("bucket_manifest_sha256")
-        ):
-            raise ValueError(
-                f"Stage211 {phase}/{source_name} step {step} eval manifest mismatch."
-            )
+        if Path(
+            str(provenance.get("bucket_manifest_path") or "")
+        ).expanduser().resolve() != manifest_path or provenance.get(
+            "bucket_manifest_sha256"
+        ) != record.get("bucket_manifest_sha256"):
+            raise ValueError(f"Stage211 {phase}/{source_name} step {step} eval manifest mismatch.")
         raw_feature_seed = provenance.get("feature_seed")
         legacy_missing_feature_seed = (
             raw_feature_seed is None
@@ -2290,13 +2287,11 @@ def _stage211_step_eval_cadence_source(
             }
         )
     assert part_fingerprint is not None
-    return {
+    result = {
         "order": order,
         "source_kind": source_kind,
         "source_name": source_name,
         "run_dir": str(run_dir),
-        "receipt_path": str(receipt_path),
-        "receipt_sha256": str(record["receipt_sha256"]),
         "train_config_path": str(train_config_path),
         "train_config_sha256": str(record["train_config_sha256"]),
         "metrics_path": str(metrics_path),
@@ -2306,7 +2301,7 @@ def _stage211_step_eval_cadence_source(
         "epochs": epochs,
         "steps_per_epoch": steps_per_epoch,
         "terminal_step": terminal_step,
-        "interval_steps": STAGE211_STEP_EVAL_INTERVAL,
+        "interval_steps": interval,
         "config_feature_seed": 0,
         "legacy_config_missing_feature_seed": legacy_config_missing_feature_seed,
         "expected_steps": list(expected_steps),
@@ -2318,6 +2313,14 @@ def _stage211_step_eval_cadence_source(
         ],
         "reports": reports,
     }
+    if receipt_path is not None:
+        result.update(
+            {
+                "receipt_path": str(receipt_path),
+                "receipt_sha256": str(record["receipt_sha256"]),
+            }
+        )
+    return result
 
 
 def build_stage211_step_eval_cadence(
@@ -2367,6 +2370,58 @@ def build_stage211_step_eval_cadence(
         "total_reports": sum(int(source["actual_report_count"]) for source in audited),
         "sources": audited,
     }
+
+
+def build_stage211_sft_step_eval_cadence(
+    completion: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        completion.get("phase") != "sft"
+        or completion.get("artifact") != "labeled_sft_completion"
+        or completion.get("complete") is not True
+        or int(completion.get("epochs", -1)) != 1
+    ):
+        raise ValueError("Stage211 SFT step-eval completion source is invalid.")
+    terminal_step = int(completion.get("estimated_train_steps", -1))
+    source_record = {
+        **completion,
+        "steps": terminal_step,
+        "steps_per_epoch": terminal_step,
+    }
+    source = _stage211_step_eval_cadence_source(
+        phase="sft",
+        order=0,
+        source_kind="labeled_sft",
+        source_name="labeled_sft",
+        record=source_record,
+        interval=STAGE211_SFT_STEP_EVAL_INTERVAL,
+        require_receipt=False,
+    )
+    return {
+        "schema_version": STAGE211_STEP_EVAL_CADENCE_SCHEMA_VERSION,
+        "pipeline": "stage211",
+        "artifact": "step_eval_cadence",
+        "phase": "sft",
+        "complete": True,
+        "interval_steps": STAGE211_SFT_STEP_EVAL_INTERVAL,
+        "eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        "source_order": ["labeled_sft"],
+        "source_count": 1,
+        "total_reports": int(source["actual_report_count"]),
+        "sources": [source],
+    }
+
+
+def validate_stage211_sft_step_eval_cadence(
+    completion: dict[str, Any],
+) -> dict[str, Any]:
+    replayed = build_stage211_sft_step_eval_cadence(completion)
+    _validate_stage211_replayed_value(
+        completion.get("step_eval_cadence"),
+        replayed,
+        label="sft periodic fixed-eval cadence",
+    )
+    return replayed
 
 
 def _stage211_logits_metric_checks(
@@ -3333,11 +3388,11 @@ def _stage211_trajectory_retention_entry(
         label=f"{phase}/{source_name} trajectory",
     )
     assert isinstance(provenance, dict)
-    if (
-        Path(str(provenance.get("bucket_manifest_path") or "")).expanduser().resolve()
-        != manifest_path
-        or provenance.get("bucket_manifest_sha256") != record.get("bucket_manifest_sha256")
-    ):
+    if Path(
+        str(provenance.get("bucket_manifest_path") or "")
+    ).expanduser().resolve() != manifest_path or provenance.get(
+        "bucket_manifest_sha256"
+    ) != record.get("bucket_manifest_sha256"):
         raise ValueError(
             f"Stage211 {phase}/{source_name} trajectory eval manifest binding mismatch."
         )
@@ -3350,9 +3405,7 @@ def _stage211_trajectory_retention_entry(
         and source_name == "easy"
     )
     if raw_feature_seed != 0 and not legacy_missing_feature_seed:
-        raise ValueError(
-            f"Stage211 {phase}/{source_name} trajectory fixed feature seed mismatch."
-        )
+        raise ValueError(f"Stage211 {phase}/{source_name} trajectory fixed feature seed mismatch.")
 
     try:
         components = _STAGE211_ALIGNMENT_PHASE_COMPONENTS[phase]
@@ -3431,12 +3484,8 @@ def build_stage211_trajectory_retention_gate(
     if supplemental_segment.get("difficulty") != STAGE211_SUPPLEMENTAL_DIFFICULTY:
         raise ValueError("Stage211 trajectory retention lacks supplemental_natural coverage.")
     corrections = list(post_coverage_corrections or [])
-    sources = [
-        ("curriculum", str(segment["difficulty"]), segment) for segment in segments
-    ]
-    sources.append(
-        ("curriculum", STAGE211_SUPPLEMENTAL_DIFFICULTY, supplemental_segment)
-    )
+    sources = [("curriculum", str(segment["difficulty"]), segment) for segment in segments]
+    sources.append(("curriculum", STAGE211_SUPPLEMENTAL_DIFFICULTY, supplemental_segment))
     sources.extend(
         ("correction", f"correction_round_{index}", correction)
         for index, correction in enumerate(corrections, start=1)
@@ -3463,10 +3512,9 @@ def build_stage211_trajectory_retention_gate(
         raise ValueError("Stage211 trajectory retention requires prior and candidate entries.")
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     candidate = entries[-1]
-    if (
-        Path(str(candidate["checkpoint_path"])).resolve() != checkpoint_path
-        or candidate["checkpoint_sha256"] != sha256_file(checkpoint_path)
-    ):
+    if Path(str(candidate["checkpoint_path"])).resolve() != checkpoint_path or candidate[
+        "checkpoint_sha256"
+    ] != sha256_file(checkpoint_path):
         raise ValueError("Stage211 trajectory candidate is not the phase checkpoint.")
     best_prior_index = min(
         range(len(entries) - 1),
@@ -3980,15 +4028,10 @@ def _validate_stage211_post_coverage_corrections(
             "artifact": "retention_correction_run",
             "phase": phase,
             "round": round_index,
-            "layer_focus_path": str(
-                Path(str(correction.get("layer_focus_path") or "")).resolve()
-            ),
+            "layer_focus_path": str(Path(str(correction.get("layer_focus_path") or "")).resolve()),
             "layer_focus_sha256": str(correction.get("layer_focus_sha256") or ""),
         }
-        if any(
-            provenance.get(key) != value
-            for key, value in expected_provenance_focus.items()
-        ):
+        if any(provenance.get(key) != value for key, value in expected_provenance_focus.items()):
             raise ValueError(
                 f"Stage211 {phase} correction round {round_index} provenance "
                 "layer-focus binding mismatch."
@@ -4031,10 +4074,7 @@ def _validate_stage211_post_coverage_corrections(
                 correction,
                 path_key="correction_extension_decision_path",
                 sha256_key="correction_extension_decision_sha256",
-                label=(
-                    f"Stage211 {phase} correction round {round_index} "
-                    "extension decision"
-                ),
+                label=(f"Stage211 {phase} correction round {round_index} extension decision"),
             )
             validate_stage211_correction_extension_decision(
                 extension_decision_path,
@@ -4135,9 +4175,7 @@ def _validate_stage211_segment_batch_profile(
             "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
             "steps_per_epoch": int(expected["steps_per_epoch"]),
             "steps": int(expected["steps"]),
-            "tail_padding_samples_per_epoch": int(
-                expected["tail_padding_samples_per_epoch"]
-            ),
+            "tail_padding_samples_per_epoch": int(expected["tail_padding_samples_per_epoch"]),
         }
         if any(segment.get(key) != value for key, value in legacy_fields.items()):
             raise ValueError(f"Stage211 {phase}/{difficulty} legacy profile changed.")
@@ -4148,14 +4186,11 @@ def _validate_stage211_segment_batch_profile(
             "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
             "steps_per_epoch": int(expected["steps_per_epoch"]),
             "steps": int(expected["steps"]),
-            "tail_padding_samples_per_epoch": int(
-                expected["tail_padding_samples_per_epoch"]
-            ),
+            "tail_padding_samples_per_epoch": int(expected["tail_padding_samples_per_epoch"]),
         }
     if schema_version != 2:
         raise ValueError(
-            f"Stage211 {phase}/{difficulty} coverage schema is unsupported: "
-            f"{schema_version!r}"
+            f"Stage211 {phase}/{difficulty} coverage schema is unsupported: {schema_version!r}"
         )
     from rwkvasr.eval.stage211_batch_profile import (
         validate_stage211_batch_profile_admission,
@@ -4182,9 +4217,7 @@ def _validate_stage211_segment_batch_profile(
         "frame_budget": int(profile["frame_budget"]),
         "steps_per_epoch": int(admitted_coverage["steps_per_epoch"]),
         "steps": int(admitted_coverage["full_coverage_steps"]),
-        "tail_padding_samples_per_epoch": int(
-            admitted_coverage["tail_padding_samples_per_epoch"]
-        ),
+        "tail_padding_samples_per_epoch": int(admitted_coverage["tail_padding_samples_per_epoch"]),
     }
     if any(segment.get(key) != value for key, value in admitted_fields.items()):
         raise ValueError(f"Stage211 {phase}/{difficulty} admitted profile changed.")
@@ -4323,10 +4356,7 @@ def _validate_stage211_supplemental_coverage_segment(
             "batch_token_budget": int(runtime_profile["frame_budget"]),
             "length_bucket_frame_budget": int(runtime_profile["frame_budget"]),
         }
-        if any(
-            train_config.get(key) != value
-            for key, value in expected_config_fields.items()
-        ):
+        if any(train_config.get(key) != value for key, value in expected_config_fields.items()):
             raise ValueError("Stage211 supplemental train config step contract mismatch.")
     if (
         Path(str(train_config.get("webdataset_bucket_manifest_path") or "")).resolve()
@@ -4432,15 +4462,11 @@ def validate_stage211_full_data_coverage(
             int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS
         ):
             raise ValueError(f"Stage211 {phase}/{difficulty} row exposures mismatch.")
-        if int(segment.get("steps_per_epoch", -1)) != int(
-            runtime_profile["steps_per_epoch"]
-        ):
+        if int(segment.get("steps_per_epoch", -1)) != int(runtime_profile["steps_per_epoch"]):
             raise ValueError(f"Stage211 {phase}/{difficulty} per-epoch steps mismatch.")
         if int(segment.get("steps", -1)) != int(runtime_profile["steps"]):
             raise ValueError(f"Stage211 {phase}/{difficulty} step count mismatch.")
-        tail_padding_samples_per_epoch = int(
-            runtime_profile["tail_padding_samples_per_epoch"]
-        )
+        tail_padding_samples_per_epoch = int(runtime_profile["tail_padding_samples_per_epoch"])
         if int(segment.get("tail_padding_samples_per_epoch", -1)) != tail_padding_samples_per_epoch:
             raise ValueError(f"Stage211 {phase}/{difficulty} tail-padding count mismatch.")
         if int(segment.get("tail_padding_sample_exposures", -1)) != (
@@ -4537,13 +4563,8 @@ def validate_stage211_full_data_coverage(
                 "batch_token_budget": int(runtime_profile["frame_budget"]),
                 "length_bucket_frame_budget": int(runtime_profile["frame_budget"]),
             }
-            if any(
-                train_config.get(key) != value
-                for key, value in expected_config_fields.items()
-            ):
-                raise ValueError(
-                    f"Stage211 {phase}/{difficulty} train config profile mismatch."
-                )
+            if any(train_config.get(key) != value for key, value in expected_config_fields.items()):
+                raise ValueError(f"Stage211 {phase}/{difficulty} train config profile mismatch.")
         configured_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(train_config)
         if configured_teacher_checkpoint != teacher_checkpoint:
             raise ValueError(
@@ -4591,12 +4612,10 @@ def validate_stage211_full_data_coverage(
             STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES + float(supplemental_profile["hour_exposures"])
         ),
         "total_tail_padding_sample_exposures": (
-            original_tail_exposures
-            + int(supplemental_profile["tail_padding_sample_exposures"])
+            original_tail_exposures + int(supplemental_profile["tail_padding_sample_exposures"])
         ),
         "total_executed_sample_exposures": (
-            original_executed_exposures
-            + int(supplemental_profile["executed_sample_exposures"])
+            original_executed_exposures + int(supplemental_profile["executed_sample_exposures"])
         ),
     }
     for key, expected in expected_combined_totals.items():
