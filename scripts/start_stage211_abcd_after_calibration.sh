@@ -27,6 +27,11 @@ PHASE_GATE_ROOT="${PHASE_GATE_ROOT:-${HOME}/rwkvasr_eval/stage211_phase_gates}"
 LABELED_ROOT="${LABELED_ROOT:-${HOME}/rwkvasr_data/stage211_sft_full_labeled_v2}"
 LABELED_PROFILE_RECEIPT="${LABELED_PROFILE_RECEIPT:-${LABELED_ROOT}/stage211_labeled_profile_receipt.json}"
 SFT_OUTPUT_DIR="${SFT_OUTPUT_DIR:-${FULL_OUTPUT_ROOT}/stage211d_labeled_ctc_sft_1ep}"
+SFT_CORRECTION_PROFILE_ROOT="${SFT_CORRECTION_PROFILE_ROOT:-${HOME}/rwkvasr_data/stage211_sft_source_balanced_correction_v1}"
+SFT_CORRECTION_RUN_ROOT="${SFT_CORRECTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211d_sft_correction}"
+SFT_CORRECTION_EVAL_ROOT="${SFT_CORRECTION_EVAL_ROOT:-${PHASE_GATE_ROOT}/sft_correction}"
+SFT_CORRECTED_FINAL_ROOT="${SFT_CORRECTED_FINAL_ROOT:-${PHASE_GATE_ROOT}/sft_corrected}"
+PUBLIC_OVERLAP_RECEIPT="${PUBLIC_OVERLAP_RECEIPT:-${METADATA_ROOT}/public_train_overlap_v1/receipt.json}"
 REUSE_COMPLETED_CALIBRATION_EVAL="${REUSE_COMPLETED_CALIBRATION_EVAL:-0}"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${CALIBRATION_EVAL_DIR}/public/reuse_receipt.json}"
 START_STAGE="${START_STAGE:-full}"
@@ -355,7 +360,7 @@ run_labeled_sft_phase() {
     --master-port "$((MASTER_PORT + 3))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211D labeled epoch finished; starting complete public CTC gate"
-  uv run python "${REPO_ROOT}/scripts/finalize_stage211_labeled_sft.py" \
+  if uv run python "${REPO_ROOT}/scripts/finalize_stage211_labeled_sft.py" \
     --run-dir "${SFT_OUTPUT_DIR}" \
     --output-dir "${PHASE_GATE_ROOT}/sft" \
     --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
@@ -367,8 +372,39 @@ run_labeled_sft_phase() {
     --mixer-gate-selection "${MIXER_SELECTION}" \
     --block-gate-selection "${BLOCK_SELECTION}" \
     --logits-gate-selection "${LOGITS_SELECTION}" \
+    --devices 0,1,2,3; then
+    log "Stage211 A/B/C/D strict alignment pipeline completed without SFT correction"
+    return
+  fi
+
+  local full_sft_completion="${SFT_OUTPUT_DIR}/sft_complete.json"
+  local full_sft_failed_report="${PHASE_GATE_ROOT}/sft/stage211_complete.json"
+  if [[ ! -s "${full_sft_completion}" || ! -s "${full_sft_failed_report}" ]]; then
+    log "Stage211D finalizer failed without complete full-SFT evidence; refusing correction"
+    return 1
+  fi
+  log "Stage211D full SFT gate failed; starting strict balanced-label correction loop"
+  uv run python "${REPO_ROOT}/scripts/run_stage211_sft_correction_loop.py" \
+    --full-sft-completion "${full_sft_completion}" \
+    --full-sft-failed-report "${full_sft_failed_report}" \
+    --correction-profile-root "${SFT_CORRECTION_PROFILE_ROOT}" \
+    --run-root "${SFT_CORRECTION_RUN_ROOT}" \
+    --eval-root "${SFT_CORRECTION_EVAL_ROOT}" \
+    --final-output-dir "${SFT_CORRECTED_FINAL_ROOT}" \
+    --config-dir "${FULL_CONFIG_ROOT}" \
+    --nano-checkpoint "${NANO_CHECKPOINT}" \
+    --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
+    --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
+    --public-overlap-receipt "${PUBLIC_OVERLAP_RECEIPT}" \
+    --phase-gate-root "${PHASE_GATE_ROOT}" \
+    --mixer-gate-selection "${MIXER_SELECTION}" \
+    --block-gate-selection "${BLOCK_SELECTION}" \
+    --logits-gate-selection "${LOGITS_SELECTION}" \
+    --initialization-receipt "${INITIALIZATION_RECEIPT}" \
+    --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
+    --master-port "$((MASTER_PORT + 20))" \
     --devices 0,1,2,3
-  log "Stage211 A/B/C/D strict alignment pipeline completed"
+  log "Stage211 A/B/C/D strict alignment pipeline completed after SFT correction"
 }
 
 main() {

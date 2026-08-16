@@ -26,6 +26,8 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_WORLD_SIZE,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
+    stage211_phase_train_config_contract,
+    stage211_post_coverage_correction_lr,
     stage211_sft_ctc_suppressed_token_ids,
     validate_stage211_phase_train_config,
     validate_stage211_phase_gate_report,
@@ -1144,6 +1146,7 @@ def _config(
     labeled_length_index: Path | None = None,
     audio_data_audit: dict[str, Any] | None = None,
     full_data_profile: bool = False,
+    post_coverage_correction: bool = False,
 ) -> dict[str, Any]:
     config = _stage210n_config(
         segment=segment,
@@ -1285,7 +1288,24 @@ def _config(
         labeled_webdataset_root=labeled_webdataset_root,
         labeled_length_index=labeled_length_index,
     )
-    validate_stage211_phase_train_config(config, phase=phase.name)
+    if post_coverage_correction:
+        expected_lr = stage211_post_coverage_correction_lr(phase.name)
+        if float(phase.lr) != expected_lr:
+            raise ValueError(
+                f"Stage211 {phase.name} correction LR mismatch: "
+                f"actual={phase.lr} expected={expected_lr}"
+            )
+        correction_contract = stage211_phase_train_config_contract(phase.name)
+        correction_contract["lr"] = expected_lr
+        for key, expected in correction_contract.items():
+            actual = config.get(key)
+            if type(actual) is not type(expected) or actual != expected:
+                raise ValueError(
+                    f"Stage211 {phase.name} correction train config {key} mismatch: "
+                    f"actual={actual!r} expected={expected!r}"
+                )
+    else:
+        validate_stage211_phase_train_config(config, phase=phase.name)
     return config
 
 

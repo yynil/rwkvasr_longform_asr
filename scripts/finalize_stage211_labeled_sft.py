@@ -267,6 +267,61 @@ def _validate_final_report(
     ):
         if report.get(key) != completion.get(key):
             raise ValueError(f"Stage211 final report {key} differs from SFT completion.")
+    completion_checkpoint_value = completion.get("completion_checkpoint_path")
+    full_sft_checkpoint = (
+        Path(str(completion_checkpoint_value)).resolve()
+        if completion_checkpoint_value is not None
+        else checkpoint.resolve()
+    )
+    if checkpoint.resolve() != full_sft_checkpoint:
+        try:
+            from scripts.evaluate_stage211_sft_correction import (
+                validate_correction_evaluation_report,
+            )
+        except ModuleNotFoundError as error:
+            if error.name != "scripts":
+                raise
+            from evaluate_stage211_sft_correction import (
+                validate_correction_evaluation_report,
+            )
+
+        correction_evaluation_path = Path(
+            str(report.get("sft_correction_evaluation_path") or "")
+        ).resolve()
+        correction_profile_path = Path(
+            str(report.get("sft_correction_profile_path") or "")
+        ).resolve()
+        for artifact, expected_sha256, label in (
+            (
+                correction_evaluation_path,
+                report.get("sft_correction_evaluation_sha256"),
+                "correction evaluation",
+            ),
+            (
+                correction_profile_path,
+                report.get("sft_correction_profile_sha256"),
+                "correction profile",
+            ),
+        ):
+            if not artifact.is_file() or expected_sha256 != sha256_file(artifact):
+                raise ValueError(
+                    f"Stage211 final report {label} is unavailable or changed: {artifact}"
+                )
+        correction_evaluation = validate_correction_evaluation_report(
+            correction_evaluation_path,
+            expected_full_completion_path=Path(str(report["sft_completion_path"])),
+            expected_correction_profile_path=correction_profile_path,
+            require_passed=True,
+        )
+        if (
+            Path(str(correction_evaluation.get("checkpoint_path") or "")).resolve()
+            != checkpoint.resolve()
+            or report.get("sft_correction_completion_receipts")
+            != correction_evaluation.get("correction_completion_receipts")
+            or report.get("sft_correction_public_progress")
+            != correction_evaluation.get("public_progress")
+        ):
+            raise ValueError("Stage211 final report correction evidence chain mismatch.")
     promotion_receipt = _load_json(
         Path(str(report["logits_promotion_receipt_path"])).resolve(),
         label="Stage211 logits promotion receipt",

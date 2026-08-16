@@ -374,6 +374,7 @@ def _run_correction_smoke(
         nano_checkpoint=nano_checkpoint,
         audio_data_audit=audio_data_audit,
         full_data_profile=True,
+        post_coverage_correction=True,
     )
     config.update(
         _correction_config_metadata(
@@ -518,6 +519,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         nano_checkpoint=nano_checkpoint,
         audio_data_audit=audio_data_audit,
         full_data_profile=True,
+        post_coverage_correction=True,
     )
     config.update(
         _correction_config_metadata(

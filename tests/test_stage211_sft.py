@@ -1626,6 +1626,22 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         reports["sft"],
         checkpoint=checkpoints["sft"],
     )
+    completion_path = reports["sft"].parent / "sft-completion.json"
+    completion_text = completion_path.read_text(encoding="utf-8")
+    completion = json.loads(completion_text)
+    completion["completion_checkpoint_path"] = str(checkpoints["logits"].resolve())
+    completion_path.write_text(json.dumps(completion) + "\n", encoding="utf-8")
+    sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
+    sft["sft_completion_sha256"] = sha256_file(completion_path)
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="correction evaluation"):
+        sft_finalizer._validate_final_report(
+            reports["sft"],
+            checkpoint=checkpoints["sft"],
+        )
+    completion_path.write_text(completion_text, encoding="utf-8")
+    sft["sft_completion_sha256"] = sha256_file(completion_path)
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
     assert report["nano_public_baseline_provenance_passed"] is True
     assert (
         report["nano_public_baseline_checkpoint_sha256"] == report["nano_teacher_checkpoint_sha256"]

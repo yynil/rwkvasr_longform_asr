@@ -574,6 +574,87 @@ def build_stage211_sft_public_progress(
     }
 
 
+def build_stage211_sft_correction_public_progress(
+    *,
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    benchmarks: dict[str, dict[str, str | int]],
+    tolerance: float = 1.0e-12,
+) -> dict[str, Any]:
+    baseline_results = {str(result["dataset"]): result for result in baseline["results"]}
+    candidate_results = {str(result["dataset"]): result for result in candidate["results"]}
+    if set(baseline_results) != set(benchmarks) or set(candidate_results) != set(benchmarks):
+        raise ValueError("Stage211D correction baseline/candidate public datasets differ.")
+    rows: list[dict[str, Any]] = []
+    for dataset, expected in benchmarks.items():
+        baseline_result = baseline_results[dataset]
+        candidate_result = candidate_results[dataset]
+        for hash_key in ("manifest_sha256", "nano_prediction_sha256"):
+            if baseline_result.get(hash_key) != candidate_result.get(hash_key):
+                raise ValueError(
+                    f"Stage211D correction {dataset} baseline/candidate {hash_key} differs."
+                )
+        metric = str(expected["metric"])
+        language = "en" if metric == "wer" else "zh"
+        baseline_error = float(baseline_result["student_error_rate"])
+        candidate_error = float(candidate_result["student_error_rate"])
+        if not math.isfinite(baseline_error) or not math.isfinite(candidate_error):
+            raise ValueError(f"Stage211D correction {dataset} error rate must be finite.")
+        rows.append(
+            {
+                "dataset": dataset,
+                "language": language,
+                "metric": metric,
+                "baseline_error_rate": baseline_error,
+                "candidate_error_rate": candidate_error,
+                "absolute_change": candidate_error - baseline_error,
+                "no_regression": candidate_error <= baseline_error + tolerance,
+                "improved": candidate_error < baseline_error - tolerance,
+            }
+        )
+    language_summaries: dict[str, dict[str, Any]] = {}
+    for language, metric in (("en", "wer"), ("zh", "cer")):
+        language_rows = [row for row in rows if row["language"] == language]
+        if not language_rows:
+            raise ValueError(f"Stage211D correction has no {language} public datasets.")
+        baseline_macro = sum(float(row["baseline_error_rate"]) for row in language_rows) / len(
+            language_rows
+        )
+        candidate_macro = sum(
+            float(row["candidate_error_rate"]) for row in language_rows
+        ) / len(language_rows)
+        improved_datasets = sum(bool(row["improved"]) for row in language_rows)
+        macro_improved = candidate_macro < baseline_macro - tolerance
+        language_summaries[language] = {
+            "metric": metric,
+            "datasets": [str(row["dataset"]) for row in language_rows],
+            "dataset_count": len(language_rows),
+            "macro_baseline_error_rate": baseline_macro,
+            "macro_candidate_error_rate": candidate_macro,
+            "macro_improved": macro_improved,
+            "improved_datasets": improved_datasets,
+            "gate_passed": macro_improved and improved_datasets > 0,
+        }
+    macro_baseline = sum(float(row["baseline_error_rate"]) for row in rows) / len(rows)
+    macro_candidate = sum(float(row["candidate_error_rate"]) for row in rows) / len(rows)
+    no_regressions = all(bool(row["no_regression"]) for row in rows)
+    gate_passed = no_regressions and all(
+        bool(summary["gate_passed"]) for summary in language_summaries.values()
+    )
+    return {
+        "gate_passed": gate_passed,
+        "tolerance": tolerance,
+        "no_dataset_regression": no_regressions,
+        "bilingual_macro_improved": all(
+            bool(summary["macro_improved"]) for summary in language_summaries.values()
+        ),
+        "macro_baseline_error_rate": macro_baseline,
+        "macro_candidate_error_rate": macro_candidate,
+        "language_summaries": language_summaries,
+        "results": rows,
+    }
+
+
 def _load_bound_comparison(
     report: dict[str, Any],
     *,
