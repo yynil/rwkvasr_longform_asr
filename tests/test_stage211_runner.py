@@ -2146,6 +2146,44 @@ def test_stage211_full_phase_smoke_audit_rejects_teacher_misses(
         )
 
 
+def test_stage211_logits_smoke_requires_complete_full_logit_match(
+    tmp_path: Path,
+) -> None:
+    phase = "logits"
+    init_checkpoint = tmp_path / "init.pt"
+    init_checkpoint.write_bytes(b"init")
+    easy_manifest = tmp_path / "easy.json"
+    easy_manifest.write_text("{}\n", encoding="utf-8")
+    smoke_run_dir = tmp_path / "smoke"
+    log_dir = smoke_run_dir / "logs"
+    log_dir.mkdir(parents=True)
+    torch.save({"step": 2}, smoke_run_dir / "step-2.pt")
+    log_path = log_dir / "logits_smoke_2steps.log"
+
+    def audit(match_field: str) -> dict[str, object]:
+        log_path.write_text(
+            "[rwkvasr] Distributed init complete. world_size=4\n"
+            "[deepspeed-train] step=2 loss=0.2000 peak_reserved=20.50GiB "
+            f"{match_field} online_full_missing=0\n",
+            encoding="utf-8",
+        )
+        return stage211_full_phase._audit_smoke(
+            phase=phase,
+            smoke_run_dir=smoke_run_dir,
+            init_checkpoint=init_checkpoint,
+            easy_manifest=easy_manifest,
+            max_peak_reserved_gib=22.0,
+        )
+
+    assert audit("online_full_match=8/8")["complete"] is True
+    with pytest.raises(ValueError, match="lacks step-2 online full-logit matching"):
+        audit("")
+    with pytest.raises(ValueError, match="incomplete step-2 online full-logit matching: 7/8"):
+        audit("online_full_match=7/8")
+    with pytest.raises(ValueError, match="incomplete step-2 online full-logit matching: 0/0"):
+        audit("online_full_match=0/0")
+
+
 def test_stage211_formal_rejects_volatile_output_but_smoke_allows_it(
     tmp_path: Path,
 ) -> None:
@@ -4518,10 +4556,11 @@ def _write_valid_phase_gate(
     smoke_checkpoint = smoke_dir / "step-2.pt"
     smoke_log = smoke_log_dir / f"{phase}_smoke_2steps.log"
     torch.save({"step": 2}, smoke_checkpoint)
+    logits_full_match = " online_full_match=8/8 online_full_missing=0" if phase == "logits" else ""
     smoke_log.write_text(
         "[rwkvasr] Distributed init complete.\n"
         "[deepspeed-train] step=1 loss=0.8 peak_reserved=5.50GiB\n"
-        "[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB\n",
+        f"[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB{logits_full_match}\n",
         encoding="utf-8",
     )
     easy_manifest = Path(str(segments[0]["bucket_manifest_path"])).resolve()

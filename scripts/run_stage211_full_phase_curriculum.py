@@ -99,6 +99,7 @@ BAD_SMOKE_PATTERNS = (
     re.compile(r"\bdropped_tail(?:_samples)?=[1-9][0-9]*\b"),
     re.compile(r"\bskipped_samples=[1-9][0-9]*\b"),
 )
+ONLINE_FULL_MATCH_PATTERN = re.compile(r"\bonline_full_match=([0-9]+)/([0-9]+)\b")
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -613,6 +614,23 @@ def _audit_smoke(
         if match is not None:
             raise ValueError(
                 f"Stage211 {phase} smoke contains a rejected condition: {match.group(0)}"
+            )
+    if phase == "logits":
+        step_two_lines = [
+            line
+            for line in log_text.splitlines()
+            if re.search(r"\[deepspeed-train\] step=2\b", line) is not None
+        ]
+        full_match = (
+            ONLINE_FULL_MATCH_PATTERN.search(step_two_lines[-1]) if step_two_lines else None
+        )
+        if full_match is None:
+            raise ValueError("Stage211 logits smoke lacks step-2 online full-logit matching.")
+        matched, total = (int(value) for value in full_match.groups())
+        if total <= 0 or matched != total:
+            raise ValueError(
+                "Stage211 logits smoke has incomplete step-2 online full-logit matching: "
+                f"{matched}/{total}"
             )
     peak_values = [
         float(value) for value in re.findall(r"peak_reserved=([0-9]+(?:\.[0-9]+)?)GiB", log_text)

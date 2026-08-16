@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from rwkvasr.eval.stage211_gate import stage211_phase_train_config_contract
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -174,22 +176,9 @@ def test_parse_train_telemetry_collects_alignment_safety_fields() -> None:
 
 
 def test_required_online_match_fields_follow_enabled_phase_objectives() -> None:
-    mixer = {"ctc_teacher_online_layer_mixer_loss_weight": 1.0}
-    block = {
-        "ctc_teacher_online_encoder_loss_weight": 0.5,
-        "ctc_teacher_online_decoder_hidden_loss_weight": 0.5,
-        "ctc_teacher_online_layer_mixer_loss_weight": 0.25,
-        "ctc_teacher_online_layer_ffn_loss_weight": 0.25,
-        "ctc_teacher_online_layer_block_loss_weight": 1.0,
-    }
-    logits = {
-        **block,
-        "ctc_teacher_online_blank_loss_weight": 0.25,
-        "ctc_teacher_online_conditional_nonblank_loss_weight": 1.0,
-        "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.125,
-        "ctc_teacher_online_sequence_loss_weight": 0.2,
-        "ctc_teacher_online_nonblank_window_loss_weight": 0.25,
-    }
+    mixer = stage211_phase_train_config_contract("mixer")
+    block = stage211_phase_train_config_contract("block")
+    logits = stage211_phase_train_config_contract("logits")
 
     assert probe.required_online_match_fields(mixer) == ("online_layer_match",)
     assert probe.required_online_match_fields(block) == (
@@ -199,12 +188,11 @@ def test_required_online_match_fields_follow_enabled_phase_objectives() -> None:
     )
     assert probe.required_online_match_fields(logits) == (
         "online_blank_match",
+        "online_full_match",
         "online_conditional_nonblank_match",
         "online_conditional_nonblank_hard_match",
         "online_encoder_match",
         "online_decoder_hidden_match",
-        "online_sequence_match",
-        "online_nonblank_window_match",
         "online_layer_match",
     )
 
