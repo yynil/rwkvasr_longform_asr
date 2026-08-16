@@ -11,13 +11,16 @@ sys.path.insert(0, str(REPO_ROOT))
 probe = importlib.import_module("scripts.benchmark_stage211_batch_profiles")
 
 
-def test_default_profiles_cover_baseline_and_four_larger_candidates() -> None:
+def test_default_profiles_cover_baseline_and_seven_larger_candidates() -> None:
     assert probe.DEFAULT_PROFILES == (
         probe.BatchProfile("baseline", 36, 24_000),
         probe.BatchProfile("batch48_frames42k", 48, 42_000),
         probe.BatchProfile("batch64_frames56k", 64, 56_000),
         probe.BatchProfile("batch80_frames70k", 80, 70_000),
         probe.BatchProfile("batch96_frames84k", 96, 84_000),
+        probe.BatchProfile("batch128_frames112k", 128, 112_000),
+        probe.BatchProfile("batch160_frames140k", 160, 140_000),
+        probe.BatchProfile("batch192_frames168k", 192, 168_000),
     )
 
 
