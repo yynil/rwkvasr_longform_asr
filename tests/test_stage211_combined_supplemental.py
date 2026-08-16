@@ -94,13 +94,13 @@ def test_postmaterialization_pipeline_waits_for_materialized_inventory(
     assert "social materialized inventory unavailable" in result.stdout
 
 
-def test_postmaterialization_base_audit_uses_idle_io_priority() -> None:
+def test_postmaterialization_base_audit_uses_low_io_priority() -> None:
     source = (
         REPO_ROOT / "scripts/build_stage211_social_combined_postmaterialization.sh"
     ).read_text(encoding="utf-8")
 
     assert (
-        "nice -n 10 ionice -c 3 env CUDA_VISIBLE_DEVICES='' uv run python \\\n"
+        "nice -n 10 ionice -c 2 -n 7 env CUDA_VISIBLE_DEVICES='' uv run python \\\n"
         "  scripts/audit_stage211_base_public_pcm_overlap.py"
     ) in source
 
