@@ -27,7 +27,10 @@ from rwkvasr.data import (
 from rwkvasr.eval.stage211_batch_profile import (
     STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
     STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
+    STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
+    validate_stage211_batch_profile_fixed_eval,
 )
+from rwkvasr.eval.stage211_gate import STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -215,8 +218,12 @@ def build_probe_config(
             "save_every": int(max_steps),
             "save_deepspeed_sharded_checkpoints": False,
             "step_eval_at_start": False,
-            "step_eval_every": None,
-            "step_eval_samples": None,
+            "step_eval_every": int(max_steps),
+            "step_eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+            "step_eval_split": "eval",
+            "step_eval_shuffle": False,
+            "step_eval_cache_batches": True,
+            "step_eval_feature_seed": 0,
             "max_eval_samples": 0,
             "top_k_step_checkpoints": 1,
             "periodic_checkpoint_keep_last": 1,
@@ -256,6 +263,39 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         target.flush()
         os.fsync(target.fileno())
     temporary.replace(path)
+
+
+def _capture_probe_fixed_eval(
+    *,
+    run_dir: Path,
+    profile_root: Path,
+    max_steps: int,
+) -> dict[str, Any]:
+    source_name = f"step_eval_layers_step-{int(max_steps)}.yaml"
+    source = run_dir.resolve() / source_name
+    destination = profile_root.resolve() / "fixed_eval.yaml"
+    capture: dict[str, Any] = {
+        "schema_version": STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
+        "artifact": "probe_fixed_eval_capture",
+        "source_name": source_name,
+        "report_path": str(destination),
+        "captured": False,
+        "report_sha256": None,
+    }
+    if not source.is_file() or source.stat().st_size <= 0:
+        return capture
+    if destination.exists():
+        raise FileExistsError(f"probe fixed-eval destination already exists: {destination}")
+    shutil.copyfile(source, destination)
+    with destination.open("rb") as copied:
+        os.fsync(copied.fileno())
+    capture.update(
+        {
+            "captured": True,
+            "report_sha256": sha256_file(destination),
+        }
+    )
+    return capture
 
 
 def _cleanup_probe_artifacts(*, run_dir: Path, profile_root: Path) -> dict[str, Any]:
@@ -487,7 +527,11 @@ def summarize_profile(
     full_steps: int,
     max_peak_memory_gib: float,
     required_match_fields: tuple[str, ...] = ("online_layer_match",),
+    fixed_eval_quality: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if fixed_eval_quality is None:
+        candidate_quality = result.get("fixed_eval_quality")
+        fixed_eval_quality = candidate_quality if isinstance(candidate_quality, dict) else None
     points = [TrainTelemetry(**row) for row in result.get("telemetry", [])]
     by_step = {point.step: point for point in points}
     expected_steps = set(range(1, max_steps + 1))
@@ -545,6 +589,15 @@ def summarize_profile(
     memory_monitor_ok = not result.get("gpu_memory_monitor_errors") and bool(peak_values)
     process_ok = int(result.get("return_code", -1)) == 0
     complete_steps = not missing_steps and len(ordered) == max_steps
+    fixed_eval_complete = (
+        isinstance(fixed_eval_quality, dict)
+        and fixed_eval_quality.get("complete") is True
+        and int(fixed_eval_quality.get("eval_samples", -1))
+        == STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
+        and math.isfinite(float(fixed_eval_quality.get("eval_loss", float("nan"))))
+        and math.isfinite(float(fixed_eval_quality.get("mean_cosine", float("nan"))))
+        and isinstance(fixed_eval_quality.get("provenance"), dict)
+    )
     safety_pass = all(
         (
             process_ok,
@@ -557,13 +610,14 @@ def summarize_profile(
             memory_monitor_ok,
             peak_memory <= max_peak_memory_gib,
             step_rate > 0.0,
+            fixed_eval_complete,
         )
     )
     sample_weights = [
         point_match_fields(point).get(primary_match_field, (0, 0))[1] for point in measured
     ]
     local_samples = sum(sample_weights)
-    mean_loss = (
+    training_mean_loss = (
         sum(point.loss * weight for point, weight in zip(measured, sample_weights, strict=True))
         / local_samples
         if local_samples > 0
@@ -574,7 +628,7 @@ def summarize_profile(
         for point, weight in zip(measured, sample_weights, strict=True)
         if point.cosine is not None
     )
-    mean_cosine = (
+    training_mean_cosine = (
         sum(
             float(point.cosine) * weight
             for point, weight in zip(measured, sample_weights, strict=True)
@@ -582,6 +636,16 @@ def summarize_profile(
         )
         / cosine_weight
         if cosine_weight > 0
+        else None
+    )
+    mean_loss = (
+        float(fixed_eval_quality["eval_loss"])
+        if fixed_eval_complete and fixed_eval_quality is not None
+        else None
+    )
+    mean_cosine = (
+        float(fixed_eval_quality["mean_cosine"])
+        if fixed_eval_complete and fixed_eval_quality is not None
         else None
     )
     return {
@@ -596,7 +660,29 @@ def summarize_profile(
         ),
         "mean_loss": mean_loss,
         "mean_cosine": mean_cosine,
-        "alignment_mean_aggregation": "primary_match_sample_weighted",
+        "training_mean_loss": training_mean_loss,
+        "training_mean_cosine": training_mean_cosine,
+        "training_mean_aggregation": "primary_match_sample_weighted",
+        "alignment_mean_aggregation": (
+            "fixed_eval_total_objective_and_unweighted_70_layer_primary_component"
+        ),
+        "quality_source": "terminal_fixed_eval_256",
+        "fixed_eval_complete": fixed_eval_complete,
+        "fixed_eval_samples": (
+            int(fixed_eval_quality["eval_samples"])
+            if fixed_eval_complete and fixed_eval_quality is not None
+            else None
+        ),
+        "fixed_eval_primary_component": (
+            str(fixed_eval_quality["primary_component"])
+            if fixed_eval_complete and fixed_eval_quality is not None
+            else None
+        ),
+        "fixed_eval_provenance": (
+            fixed_eval_quality["provenance"]
+            if fixed_eval_complete and fixed_eval_quality is not None
+            else None
+        ),
         "required_match_fields": list(required_match_fields),
         "primary_match_field": primary_match_field,
         "missing_required_match_fields": missing_required_match_fields,
@@ -631,6 +717,7 @@ def select_profile(
     baseline_seconds = baseline_summary.get("projected_full_coverage_seconds")
     baseline_loss = baseline_summary.get("mean_loss")
     baseline_cosine = baseline_summary.get("mean_cosine")
+    baseline_fixed_eval_provenance = baseline_summary.get("fixed_eval_provenance")
     if (
         baseline_summary.get("safety_pass") is not True
         or not isinstance(baseline_seconds, (float, int))
@@ -666,11 +753,16 @@ def select_profile(
         cosine_regression = None
         if isinstance(candidate_cosine, (float, int)):
             cosine_regression = float(baseline_cosine) - float(candidate_cosine)
+        fixed_eval_provenance_match = (
+            row["summary"].get("fixed_eval_provenance")
+            == baseline_fixed_eval_provenance
+        )
         quality_pass = (
             loss_regression_ratio is not None
             and loss_regression_ratio <= max_loss_regression_ratio
             and cosine_regression is not None
             and cosine_regression <= max_cosine_regression
+            and fixed_eval_provenance_match
         )
         admissible = (
             row["summary"].get("safety_pass") is True
@@ -687,6 +779,7 @@ def select_profile(
                 "loss_regression_ratio": loss_regression_ratio,
                 "mean_cosine": candidate_cosine,
                 "cosine_regression": cosine_regression,
+                "fixed_eval_provenance_match": fixed_eval_provenance_match,
                 "quality_pass": quality_pass,
                 "admissible": admissible,
             }
@@ -904,6 +997,23 @@ def main() -> int:
                     memory_poll_seconds=float(args.memory_poll_seconds),
                 )
                 row.update(result)
+                fixed_eval_capture = _capture_probe_fixed_eval(
+                    run_dir=run_dir,
+                    profile_root=profile_root,
+                    max_steps=max_steps,
+                )
+                row["fixed_eval_capture"] = fixed_eval_capture
+                fixed_eval_quality = None
+                if fixed_eval_capture["captured"] is True:
+                    try:
+                        fixed_eval_quality = validate_stage211_batch_profile_fixed_eval(
+                            fixed_eval_capture["report_path"],
+                            phase=str(args.phase),
+                            expected_step=max_steps,
+                            expected_manifest=manifest_path,
+                        )
+                    except (OSError, TypeError, ValueError) as error:
+                        row["fixed_eval_validation_error"] = str(error)
                 row["summary"] = summarize_profile(
                     result,
                     warmup_steps=int(args.warmup_steps),
@@ -912,13 +1022,35 @@ def main() -> int:
                     full_steps=int(coverage["full_coverage_steps"]),
                     max_peak_memory_gib=float(args.max_peak_memory_gib),
                     required_match_fields=required_match_fields,
+                    fixed_eval_quality=fixed_eval_quality,
                 )
             finally:
+                row.setdefault(
+                    "fixed_eval_capture",
+                    {
+                        "schema_version": (
+                            STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION
+                        ),
+                        "artifact": "probe_fixed_eval_capture",
+                        "source_name": f"step_eval_layers_step-{max_steps}.yaml",
+                        "report_path": str((profile_root / "fixed_eval.yaml").resolve()),
+                        "captured": False,
+                        "report_sha256": None,
+                    },
+                )
                 row["probe_artifact_cleanup"] = _cleanup_probe_artifacts(
                     run_dir=run_dir,
                     profile_root=profile_root,
                 )
         if args.dry_run:
+            row["fixed_eval_capture"] = {
+                "schema_version": STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
+                "artifact": "probe_fixed_eval_capture",
+                "source_name": f"step_eval_layers_step-{max_steps}.yaml",
+                "report_path": str((profile_root / "fixed_eval.yaml").resolve()),
+                "captured": False,
+                "report_sha256": None,
+            }
             row["probe_artifact_cleanup"] = _cleanup_probe_artifacts(
                 run_dir=run_dir,
                 profile_root=profile_root,

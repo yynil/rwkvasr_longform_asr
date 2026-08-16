@@ -9,6 +9,7 @@ from typing import Any
 
 from rwkvasr.config import load_yaml
 from rwkvasr.eval.stage211_gate import (
+    STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
     STAGE211_FULL_DATA_BATCH_SIZE,
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_FULL_DATA_FRAME_BUDGET,
@@ -18,13 +19,44 @@ from rwkvasr.eval.stage211_gate import (
 )
 
 
-STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 3
+STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 4
 STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 1
 STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION = 1
+STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION = 1
 STAGE211_BATCH_PROFILE_PHASES = ("mixer", "block", "logits")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _FLOAT_TOLERANCE = 1.0e-12
+_FIXED_EVAL_COMPONENTS = {
+    "mixer": ("mixer",),
+    "block": ("mixer", "ffn", "block"),
+    "logits": ("mixer", "ffn", "block"),
+}
+_FIXED_EVAL_PRIMARY_COMPONENT = {
+    "mixer": "mixer",
+    "block": "block",
+    "logits": "block",
+}
+_FIXED_EVAL_LOGIT_METRICS = (
+    "full_kl",
+    "conditional_nonblank_kl",
+    "conditional_nonblank_hard_ce",
+    "blank_binary_kl",
+    "selected_top1_agreement",
+    "all_top1_agreement",
+    "active_top1_agreement",
+    "blank_prob_mae",
+    "teacher_nonblank_rate",
+    "student_nonblank_rate",
+    "nonblank_rate_ratio",
+    "ctc_token_error_rate",
+    "ctc_token_deletion_rate",
+    "collapsed_length_ratio",
+    "sequence_exact_rate",
+    "mean_frame_delta",
+    "matched_utterances",
+    "missing_utterances",
+)
 
 
 def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
@@ -56,6 +88,165 @@ def _validate_bound_file(
     if sha256_file(path) != fingerprint:
         raise ValueError(f"{label} SHA-256 mismatch: {path}")
     return path
+
+
+def _fixed_eval_provenance(
+    value: Any,
+    *,
+    expected_manifest: Path,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("Stage211 batch-profile fixed eval lacks provenance.")
+    manifest = expected_manifest.expanduser().resolve()
+    expected_manifest_sha256 = sha256_file(manifest)
+    expected = {
+        "schema_version": 1,
+        "split": "eval",
+        "requested_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        "feature_seed": 0,
+        "bucket_manifest_path": str(manifest),
+        "bucket_manifest_sha256": expected_manifest_sha256,
+        "split_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+    }
+    if any(value.get(key) != expected_value for key, expected_value in expected.items()):
+        raise ValueError("Stage211 batch-profile fixed-eval provenance changed.")
+    parts = value.get("parts")
+    if not isinstance(parts, list) or not parts:
+        raise ValueError("Stage211 batch-profile fixed eval has no bound eval parts.")
+    canonical_parts: list[dict[str, Any]] = []
+    total_samples = 0
+    seen_paths: set[Path] = set()
+    for raw_part in parts:
+        if not isinstance(raw_part, dict):
+            raise ValueError("Stage211 batch-profile fixed-eval part is invalid.")
+        part = Path(str(raw_part.get("path") or "")).expanduser().resolve()
+        part_sha256 = raw_part.get("sha256")
+        num_samples = raw_part.get("num_samples")
+        if (
+            part in seen_paths
+            or not part.is_file()
+            or part.stat().st_size <= 0
+            or not isinstance(part_sha256, str)
+            or _SHA256_PATTERN.fullmatch(part_sha256) is None
+            or sha256_file(part) != part_sha256
+            or not isinstance(num_samples, int)
+            or isinstance(num_samples, bool)
+            or num_samples <= 0
+        ):
+            raise ValueError("Stage211 batch-profile fixed-eval part binding is invalid.")
+        seen_paths.add(part)
+        total_samples += num_samples
+        canonical_parts.append(
+            {
+                "path": str(part),
+                "sha256": part_sha256,
+                "num_samples": num_samples,
+            }
+        )
+    if total_samples != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES:
+        raise ValueError("Stage211 batch-profile fixed-eval parts do not cover 256 samples.")
+    return {**expected, "parts": canonical_parts}
+
+
+def validate_stage211_batch_profile_fixed_eval(
+    report_path: str | Path,
+    *,
+    phase: str,
+    expected_step: int,
+    expected_manifest: str | Path,
+) -> dict[str, Any]:
+    if phase not in STAGE211_BATCH_PROFILE_PHASES:
+        raise ValueError(f"Unsupported Stage211 batch profile phase: {phase!r}")
+    path = Path(report_path).expanduser().resolve()
+    report = load_yaml(path)
+    if not isinstance(report, dict):
+        raise ValueError(f"Stage211 batch-profile fixed eval is invalid: {path}")
+    if (
+        int(report.get("step", -1)) != int(expected_step)
+        or int(report.get("eval_samples", -1)) != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
+    ):
+        raise ValueError("Stage211 batch-profile fixed eval has wrong step or sample count.")
+    eval_loss = float(report.get("eval_loss", float("nan")))
+    if not math.isfinite(eval_loss):
+        raise ValueError("Stage211 batch-profile fixed-eval loss is non-finite.")
+    provenance = _fixed_eval_provenance(
+        report.get("eval_provenance"),
+        expected_manifest=Path(expected_manifest),
+    )
+    components = report.get("layer_components")
+    if not isinstance(components, dict):
+        raise ValueError("Stage211 batch-profile fixed eval lacks layer components.")
+    expected_layers = {str(layer_id) for layer_id in range(70)}
+    validated_components: dict[str, dict[str, dict[str, float]]] = {}
+    for component_name in _FIXED_EVAL_COMPONENTS[phase]:
+        raw_layers = components.get(component_name)
+        if not isinstance(raw_layers, dict) or set(raw_layers) != expected_layers:
+            raise ValueError(
+                "Stage211 batch-profile fixed eval lacks exact 70-layer "
+                f"{component_name} coverage."
+            )
+        validated_layers: dict[str, dict[str, float]] = {}
+        for layer_id, raw_metrics in raw_layers.items():
+            if not isinstance(raw_metrics, dict):
+                raise ValueError("Stage211 batch-profile fixed-eval layer is invalid.")
+            metrics = {
+                name: float(raw_metrics.get(name, float("nan")))
+                for name in ("loss", "cosine", "rms_ratio")
+            }
+            if not all(math.isfinite(value) for value in metrics.values()):
+                raise ValueError(
+                    "Stage211 batch-profile fixed-eval layer metrics are non-finite."
+                )
+            validated_layers[layer_id] = metrics
+        validated_components[component_name] = validated_layers
+    if phase in {"block", "logits"}:
+        decoder_hidden = report.get("decoder_hidden_metrics")
+        decoder_loss = (
+            float(decoder_hidden.get("loss", float("nan")))
+            if isinstance(decoder_hidden, dict)
+            else float("nan")
+        )
+        if not math.isfinite(decoder_loss):
+            raise ValueError(
+                "Stage211 batch-profile fixed eval lacks finite decoder-hidden loss."
+            )
+    if phase == "logits":
+        raw_logits = report.get("logit_metrics")
+        if not isinstance(raw_logits, dict):
+            raise ValueError("Stage211 batch-profile fixed eval lacks Logits metrics.")
+        logits = {
+            name: float(raw_logits.get(name, float("nan")))
+            for name in _FIXED_EVAL_LOGIT_METRICS
+        }
+        if not all(math.isfinite(value) for value in logits.values()):
+            raise ValueError("Stage211 batch-profile fixed-eval Logits metrics are non-finite.")
+        if (
+            int(round(logits["matched_utterances"]))
+            != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
+            or logits["missing_utterances"] != 0.0
+            or logits["mean_frame_delta"] != 0.0
+        ):
+            raise ValueError(
+                "Stage211 batch-profile fixed-eval Logits coverage/frame parity failed."
+            )
+    primary_component = _FIXED_EVAL_PRIMARY_COMPONENT[phase]
+    primary_layers = validated_components[primary_component]
+    mean_cosine = sum(
+        primary_layers[str(layer_id)]["cosine"] for layer_id in range(70)
+    ) / 70.0
+    if not math.isfinite(mean_cosine):
+        raise ValueError("Stage211 batch-profile fixed-eval mean cosine is non-finite.")
+    return {
+        "complete": True,
+        "report_path": str(path),
+        "report_sha256": sha256_file(path),
+        "step": int(expected_step),
+        "eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        "eval_loss": eval_loss,
+        "primary_component": primary_component,
+        "mean_cosine": mean_cosine,
+        "provenance": provenance,
+    }
 
 
 def _require_exact_float(actual: Any, expected: float, *, label: str) -> float:
@@ -135,7 +326,13 @@ def _validate_profile_config(
         "resume_from": None,
         "resume_tag": None,
         "wandb_enabled": False,
-        "step_eval_every": None,
+        "step_eval_at_start": False,
+        "step_eval_every": warmup_steps + measure_steps,
+        "step_eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        "step_eval_split": "eval",
+        "step_eval_shuffle": False,
+        "step_eval_cache_batches": True,
+        "step_eval_feature_seed": 0,
         "save_deepspeed_sharded_checkpoints": False,
         "output_dir": str((config_path.parent / "run").resolve()),
     }
@@ -144,6 +341,36 @@ def _validate_profile_config(
             raise ValueError(
                 f"Stage211 batch preflight {name} config mismatch: "
                 f"key={key} actual={config.get(key)!r} expected={expected!r}"
+            )
+    fixed_eval_capture = row.get("fixed_eval_capture")
+    expected_fixed_eval_path = (config_path.parent / "fixed_eval.yaml").resolve()
+    if not isinstance(fixed_eval_capture, dict):
+        raise ValueError(f"Stage211 batch preflight {name} fixed-eval capture is missing.")
+    expected_capture = {
+        "schema_version": STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
+        "artifact": "probe_fixed_eval_capture",
+        "source_name": f"step_eval_layers_step-{warmup_steps + measure_steps}.yaml",
+        "report_path": str(expected_fixed_eval_path),
+    }
+    if any(
+        fixed_eval_capture.get(key) != value for key, value in expected_capture.items()
+    ) or not isinstance(fixed_eval_capture.get("captured"), bool):
+        raise ValueError(f"Stage211 batch preflight {name} fixed-eval capture is invalid.")
+    if fixed_eval_capture["captured"] is True:
+        _validate_bound_file(
+            fixed_eval_capture,
+            path_key="report_path",
+            sha256_key="report_sha256",
+            label=f"Stage211 batch preflight {name} fixed eval",
+        )
+    else:
+        if fixed_eval_capture.get("report_sha256") is not None:
+            raise ValueError(
+                f"Stage211 batch preflight {name} absent fixed eval has a SHA-256."
+            )
+        if expected_fixed_eval_path.exists():
+            raise ValueError(
+                f"Stage211 batch preflight {name} fixed-eval capture state is stale."
             )
     cleanup = row.get("probe_artifact_cleanup")
     expected_cleanup = {
@@ -215,6 +442,7 @@ def _validate_safe_profile(
         "process_ok",
         "complete_steps",
         "complete_teacher_matches",
+        "fixed_eval_complete",
         "memory_monitor_ok",
         "safety_pass",
     )
@@ -230,13 +458,56 @@ def _validate_safe_profile(
         or int(summary.get("measurement_steps", -1)) != int(report["measure_steps"])
     ):
         raise ValueError(f"Stage211 batch preflight {name} alignment coverage is incomplete.")
+    fixed_eval_capture = row["fixed_eval_capture"]
+    if fixed_eval_capture.get("captured") is not True:
+        raise ValueError(f"Stage211 batch preflight {name} lacks a captured fixed eval.")
+    fixed_eval = validate_stage211_batch_profile_fixed_eval(
+        fixed_eval_capture["report_path"],
+        phase=phase,
+        expected_step=int(report["warmup_steps"]) + int(report["measure_steps"]),
+        expected_manifest=report["bucket_manifest_path"],
+    )
+    expected_fixed_summary = {
+        "fixed_eval_samples": fixed_eval["eval_samples"],
+        "fixed_eval_primary_component": fixed_eval["primary_component"],
+        "fixed_eval_provenance": fixed_eval["provenance"],
+        "quality_source": "terminal_fixed_eval_256",
+        "alignment_mean_aggregation": (
+            "fixed_eval_total_objective_and_unweighted_70_layer_primary_component"
+        ),
+    }
+    if any(summary.get(key) != value for key, value in expected_fixed_summary.items()):
+        raise ValueError(f"Stage211 batch preflight {name} fixed-eval summary changed.")
+    _require_exact_float(
+        summary.get("mean_loss"),
+        float(fixed_eval["eval_loss"]),
+        label=f"{name} fixed-eval loss",
+    )
+    _require_exact_float(
+        summary.get("mean_cosine"),
+        float(fixed_eval["mean_cosine"]),
+        label=f"{name} fixed-eval mean cosine",
+    )
     peak = float(summary.get("peak_memory_gib", float("nan")))
     memory_limit = float(report["max_peak_memory_gib"])
     rate = float(summary.get("steps_per_second", float("nan")))
     projected = float(summary.get("projected_full_coverage_seconds", float("nan")))
     loss = float(summary.get("mean_loss", float("nan")))
     cosine = float(summary.get("mean_cosine", float("nan")))
-    if not all(math.isfinite(value) for value in (peak, rate, projected, loss, cosine)):
+    training_loss = float(summary.get("training_mean_loss", float("nan")))
+    training_cosine = float(summary.get("training_mean_cosine", float("nan")))
+    if not all(
+        math.isfinite(value)
+        for value in (
+            peak,
+            rate,
+            projected,
+            loss,
+            cosine,
+            training_loss,
+            training_cosine,
+        )
+    ):
         raise ValueError(f"Stage211 batch preflight {name} has non-finite telemetry.")
     if peak > memory_limit or rate <= 0.0 or projected <= 0.0:
         raise ValueError(f"Stage211 batch preflight {name} telemetry is unsafe.")
@@ -372,6 +643,7 @@ def validate_stage211_batch_profile_preflight(
     baseline_seconds = float(baseline_summary["projected_full_coverage_seconds"])
     baseline_loss = float(baseline_summary["mean_loss"])
     baseline_cosine = float(baseline_summary["mean_cosine"])
+    baseline_fixed_eval_provenance = baseline_summary["fixed_eval_provenance"]
     comparisons = selection.get("comparisons")
     if not isinstance(comparisons, list):
         raise ValueError("Stage211 batch preflight candidate comparisons are missing.")
@@ -434,11 +706,15 @@ def validate_stage211_batch_profile_preflight(
         cosine_regression = (
             baseline_cosine - candidate_cosine if candidate_cosine is not None else None
         )
+        fixed_eval_provenance_match = (
+            summary.get("fixed_eval_provenance") == baseline_fixed_eval_provenance
+        )
         quality_pass = (
             loss_regression is not None
             and loss_regression <= float(report["max_loss_regression_ratio"])
             and cosine_regression is not None
             and cosine_regression <= float(report["max_cosine_regression"])
+            and fixed_eval_provenance_match
         )
         admissible = (
             summary.get("safety_pass") is True
@@ -478,6 +754,9 @@ def validate_stage211_batch_profile_preflight(
             label=f"{candidate_name} cosine regression",
         )
         if (
+            comparison_row.get("fixed_eval_provenance_match")
+            is not fixed_eval_provenance_match
+            or
             comparison_row.get("quality_pass") is not quality_pass
             or comparison_row.get("admissible") is not admissible
         ):

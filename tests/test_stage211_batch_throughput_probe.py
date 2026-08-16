@@ -69,6 +69,32 @@ def test_probe_artifact_cleanup_rejects_paths_outside_profile(tmp_path: Path) ->
         )
 
 
+def test_probe_fixed_eval_is_preserved_before_run_cleanup(tmp_path: Path) -> None:
+    profile_root = tmp_path / "profile"
+    run_dir = profile_root / "run"
+    source = run_dir / "step_eval_layers_step-120.yaml"
+    source.parent.mkdir(parents=True)
+    source.write_text("step: 120\neval_samples: 256\n", encoding="utf-8")
+
+    capture = probe._capture_probe_fixed_eval(
+        run_dir=run_dir,
+        profile_root=profile_root,
+        max_steps=120,
+    )
+    cleanup = probe._cleanup_probe_artifacts(
+        run_dir=run_dir,
+        profile_root=profile_root,
+    )
+
+    preserved = profile_root / "fixed_eval.yaml"
+    assert capture["captured"] is True
+    assert capture["report_path"] == str(preserved.resolve())
+    assert capture["report_sha256"] == probe.sha256_file(preserved)
+    assert preserved.read_text(encoding="utf-8") == "step: 120\neval_samples: 256\n"
+    assert cleanup["files_removed"] == 1
+    assert not run_dir.exists()
+
+
 def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> None:
     profile = probe.parse_profile("larger:48:42000")
     checkpoint = tmp_path / "init.pt"
@@ -102,7 +128,12 @@ def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> No
     assert config["resume_from"] is None
     assert config["init_checkpoint_path"] == str(checkpoint.resolve())
     assert config["max_steps"] == 120
-    assert config["step_eval_every"] is None
+    assert config["step_eval_every"] == 120
+    assert config["step_eval_samples"] == 256
+    assert config["step_eval_split"] == "eval"
+    assert config["step_eval_shuffle"] is False
+    assert config["step_eval_cache_batches"] is True
+    assert config["step_eval_feature_seed"] == 0
     assert config["wandb_enabled"] is False
     assert config["batch_size"] == 48
     assert config["batch_token_budget"] == 42_000
@@ -231,6 +262,14 @@ def _result(
         "gpu_peak_memory_gib": {"0": peak_memory, "1": peak_memory},
         "gpu_memory_monitor_errors": [],
         "telemetry": telemetry,
+        "fixed_eval_quality": {
+            "complete": True,
+            "eval_samples": 256,
+            "eval_loss": 0.10,
+            "primary_component": "mixer",
+            "mean_cosine": 0.970,
+            "provenance": {"fixed_eval": "same-256"},
+        },
     }
 
 
@@ -342,10 +381,8 @@ def test_failed_larger_candidate_does_not_mask_safe_candidate() -> None:
 def test_alignment_quality_regression_rejects_faster_candidate() -> None:
     baseline_result = _result(name="baseline", seconds_per_step=1.0, peak_memory=8.0)
     candidate_result = _result(name="candidate", seconds_per_step=1.0, peak_memory=8.0)
-    for row in candidate_result["telemetry"]:
-        if int(row["step"]) > 2:
-            row["loss"] = float(row["loss"]) * 1.20
-            row["cosine"] = float(row["cosine"]) - 0.02
+    candidate_result["fixed_eval_quality"]["eval_loss"] = 0.12
+    candidate_result["fixed_eval_quality"]["mean_cosine"] = 0.95
     rows = []
     for result, full_steps in ((baseline_result, 1000), (candidate_result, 500)):
         summary = probe.summarize_profile(
@@ -373,6 +410,38 @@ def test_alignment_quality_regression_rejects_faster_candidate() -> None:
     assert comparison["quality_pass"] is False
     assert comparison["admissible"] is False
     assert selection["decision"] == "keep_baseline"
+    assert selection["recommended_profile"] == "baseline"
+
+
+def test_training_batch_quality_cannot_override_fixed_eval_regression() -> None:
+    baseline_result = _result(name="baseline", seconds_per_step=1.0, peak_memory=8.0)
+    candidate_result = _result(name="candidate", seconds_per_step=1.0, peak_memory=8.0)
+    for row in candidate_result["telemetry"]:
+        row["loss"] = 0.001
+        row["cosine"] = 0.999
+    candidate_result["fixed_eval_quality"]["eval_loss"] = 0.11
+    candidate_result["fixed_eval_quality"]["mean_cosine"] = 0.96
+
+    rows = []
+    for result, full_steps in ((baseline_result, 1000), (candidate_result, 500)):
+        summary = probe.summarize_profile(
+            result,
+            warmup_steps=2,
+            max_steps=6,
+            world_size=4,
+            full_steps=full_steps,
+            max_peak_memory_gib=22.0,
+        )
+        rows.append({"profile": result["profile"], "summary": summary})
+
+    assert rows[1]["summary"]["training_mean_loss"] == pytest.approx(0.001)
+    assert rows[1]["summary"]["mean_loss"] == pytest.approx(0.11)
+    selection = probe.select_profile(
+        rows,
+        baseline_name="baseline",
+        min_improvement_ratio=0.10,
+    )
+    assert selection["comparisons"][0]["quality_pass"] is False
     assert selection["recommended_profile"] == "baseline"
 
 

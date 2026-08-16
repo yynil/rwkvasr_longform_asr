@@ -8,11 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from rwkvasr.config import save_yaml
+from rwkvasr.config import load_yaml, save_yaml
 from rwkvasr.eval.stage211_batch_profile import (
     STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
     STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
+    STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
     build_stage211_batch_profile_admission,
+    validate_stage211_batch_profile_fixed_eval,
     validate_stage211_batch_profile_admission,
     validate_stage211_batch_profile_preflight,
 )
@@ -50,6 +52,7 @@ def _profile_row(
     phase: str,
     init_checkpoint: Path,
     manifest: Path,
+    eval_part: Path,
 ) -> dict[str, object]:
     profile_root = root / name
     config_path = profile_root / "train_config.yaml"
@@ -68,7 +71,13 @@ def _profile_row(
         "resume_from": None,
         "resume_tag": None,
         "wandb_enabled": False,
-        "step_eval_every": None,
+        "step_eval_at_start": False,
+        "step_eval_every": 120,
+        "step_eval_samples": 256,
+        "step_eval_split": "eval",
+        "step_eval_shuffle": False,
+        "step_eval_cache_batches": True,
+        "step_eval_feature_seed": 0,
         "save_deepspeed_sharded_checkpoints": False,
         "output_dir": str((profile_root / "run").resolve()),
         "deepspeed": {
@@ -79,6 +88,81 @@ def _profile_row(
     }
     save_yaml(config_path, config)
     log_path = _write(profile_root / "train.log", "measured\n")
+    fixed_eval_path = profile_root / "fixed_eval.yaml"
+    components = {
+        component: {
+            str(layer_id): {
+                "loss": loss,
+                "cosine": cosine,
+                "rms_ratio": 1.0,
+            }
+            for layer_id in range(70)
+        }
+        for component in (
+            ("mixer",) if phase == "mixer" else ("mixer", "ffn", "block")
+        )
+    }
+    save_yaml(
+        fixed_eval_path,
+        {
+            "step": 120,
+            "eval_loss": loss,
+            "eval_samples": 256,
+            "eval_provenance": {
+                "schema_version": 1,
+                "split": "eval",
+                "requested_samples": 256,
+                "feature_seed": 0,
+                "bucket_manifest_path": str(manifest),
+                "bucket_manifest_sha256": sha256_file(manifest),
+                "split_samples": 256,
+                "parts": [
+                    {
+                        "path": str(eval_part),
+                        "sha256": sha256_file(eval_part),
+                        "num_samples": 256,
+                    }
+                ],
+            },
+            "layer_components": components,
+            "logit_metrics": (
+                {
+                    name: (
+                        256.0
+                        if name == "matched_utterances"
+                        else 0.0
+                        if name in {"missing_utterances", "mean_frame_delta"}
+                        else 0.1
+                    )
+                    for name in (
+                        "full_kl",
+                        "conditional_nonblank_kl",
+                        "conditional_nonblank_hard_ce",
+                        "blank_binary_kl",
+                        "selected_top1_agreement",
+                        "all_top1_agreement",
+                        "active_top1_agreement",
+                        "blank_prob_mae",
+                        "teacher_nonblank_rate",
+                        "student_nonblank_rate",
+                        "nonblank_rate_ratio",
+                        "ctc_token_error_rate",
+                        "ctc_token_deletion_rate",
+                        "collapsed_length_ratio",
+                        "sequence_exact_rate",
+                        "mean_frame_delta",
+                        "matched_utterances",
+                        "missing_utterances",
+                    )
+                }
+                if phase == "logits"
+                else {}
+            ),
+            "decoder_hidden_metrics": (
+                {} if phase == "mixer" else {"loss": loss}
+            ),
+        },
+    )
     full_steps = steps_per_epoch * 3
     rate = full_steps / projected_seconds
     required = ["online_layer_match"]
@@ -89,6 +173,32 @@ def _profile_row(
         "steps_per_second": rate,
         "mean_loss": loss,
         "mean_cosine": cosine,
+        "training_mean_loss": loss,
+        "training_mean_cosine": cosine,
+        "training_mean_aggregation": "primary_match_sample_weighted",
+        "alignment_mean_aggregation": (
+            "fixed_eval_total_objective_and_unweighted_70_layer_primary_component"
+        ),
+        "quality_source": "terminal_fixed_eval_256",
+        "fixed_eval_complete": True,
+        "fixed_eval_samples": 256,
+        "fixed_eval_primary_component": "mixer" if phase == "mixer" else "block",
+        "fixed_eval_provenance": {
+            "schema_version": 1,
+            "split": "eval",
+            "requested_samples": 256,
+            "feature_seed": 0,
+            "bucket_manifest_path": str(manifest),
+            "bucket_manifest_sha256": sha256_file(manifest),
+            "split_samples": 256,
+            "parts": [
+                {
+                    "path": str(eval_part),
+                    "sha256": sha256_file(eval_part),
+                    "num_samples": 256,
+                }
+            ],
+        },
         "required_match_fields": required,
         "missing_required_match_fields": {},
         "incomplete_required_match_fields": {},
@@ -119,6 +229,14 @@ def _profile_row(
             "tail_padding_samples_per_epoch": 7,
         },
         "summary": summary,
+        "fixed_eval_capture": {
+            "schema_version": STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
+            "artifact": "probe_fixed_eval_capture",
+            "source_name": "step_eval_layers_step-120.yaml",
+            "report_path": str(fixed_eval_path.resolve()),
+            "captured": True,
+            "report_sha256": sha256_file(fixed_eval_path),
+        },
         "probe_artifact_cleanup": {
             "schema_version": STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
             "artifact": "probe_artifact_cleanup",
@@ -136,6 +254,7 @@ def _profile_row(
 def _report(tmp_path: Path, *, phase: str = "mixer") -> Path:
     init_checkpoint = _write(tmp_path / "init.pt", "checkpoint")
     manifest = _write(tmp_path / "manifest.json", "{}\n")
+    eval_part = _write(tmp_path / "fixed_eval.jsonl", "{}\n" * 256)
     benchmark = _write(tmp_path / "benchmark.py", "# benchmark\n")
     base_config_path = tmp_path / "base.yaml"
     save_yaml(
@@ -157,6 +276,7 @@ def _report(tmp_path: Path, *, phase: str = "mixer") -> Path:
         phase=phase,
         init_checkpoint=init_checkpoint,
         manifest=manifest,
+        eval_part=eval_part,
     )
     candidate = _profile_row(
         tmp_path,
@@ -170,6 +290,7 @@ def _report(tmp_path: Path, *, phase: str = "mixer") -> Path:
         phase=phase,
         init_checkpoint=init_checkpoint,
         manifest=manifest,
+        eval_part=eval_part,
     )
     comparison = {
         "profile": "batch48_frames42k",
@@ -179,6 +300,7 @@ def _report(tmp_path: Path, *, phase: str = "mixer") -> Path:
         "loss_regression_ratio": 0.01999999999999988,
         "mean_cosine": 0.969,
         "cosine_regression": 0.0010000000000000009,
+        "fixed_eval_provenance_match": True,
         "quality_pass": True,
         "admissible": True,
     }
@@ -254,6 +376,58 @@ def test_measured_phase_specific_profile_can_be_admitted(tmp_path: Path) -> None
         "batch_size": 48,
         "frame_budget": 42_000,
     }
+
+
+@pytest.mark.parametrize(
+    ("phase", "primary_component"),
+    (("mixer", "mixer"), ("block", "block"), ("logits", "block")),
+)
+def test_fixed_eval_requires_phase_complete_same_distribution_metrics(
+    tmp_path: Path,
+    phase: str,
+    primary_component: str,
+) -> None:
+    root = tmp_path / phase
+    init_checkpoint = _write(root / "init.pt", "checkpoint")
+    manifest = _write(root / "manifest.json", "{}\n")
+    eval_part = _write(root / "fixed_eval.jsonl", "{}\n" * 256)
+    row = _profile_row(
+        root,
+        name="baseline",
+        batch_size=36,
+        frame_budget=24_000,
+        steps_per_epoch=10,
+        projected_seconds=30.0,
+        loss=0.1,
+        cosine=0.97,
+        phase=phase,
+        init_checkpoint=init_checkpoint,
+        manifest=manifest,
+        eval_part=eval_part,
+    )
+
+    validated = validate_stage211_batch_profile_fixed_eval(
+        row["fixed_eval_capture"]["report_path"],
+        phase=phase,
+        expected_step=120,
+        expected_manifest=manifest,
+    )
+    assert validated["primary_component"] == primary_component
+    assert validated["eval_samples"] == 256
+    assert validated["mean_cosine"] == pytest.approx(0.97)
+
+    if phase != "mixer":
+        report_path = Path(row["fixed_eval_capture"]["report_path"])
+        report = load_yaml(report_path)
+        report["layer_components"].pop("ffn")
+        save_yaml(report_path, report)
+        with pytest.raises(ValueError, match="70-layer ffn coverage"):
+            validate_stage211_batch_profile_fixed_eval(
+                report_path,
+                phase=phase,
+                expected_step=120,
+                expected_manifest=manifest,
+            )
 
 
 def test_complete_measurement_can_retain_legacy_baseline(tmp_path: Path) -> None:
@@ -340,6 +514,28 @@ def test_incomplete_objective_match_rejects_selected_profile(tmp_path: Path) -> 
     report["profiles"][1]["summary"]["complete_teacher_matches"] = False
     report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="safety gates"):
+        validate_stage211_batch_profile_preflight(report_path, phase="mixer")
+
+
+def test_candidate_on_different_fixed_eval_provenance_is_rejected(tmp_path: Path) -> None:
+    report_path = _report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    candidate = report["profiles"][1]
+    fixed_eval_path = Path(candidate["fixed_eval_capture"]["report_path"])
+    different_part = _write(tmp_path / "different_eval.jsonl", "{}\n" * 256)
+    fixed_eval = load_yaml(fixed_eval_path)
+    different_binding = {
+        "path": str(different_part),
+        "sha256": sha256_file(different_part),
+        "num_samples": 256,
+    }
+    fixed_eval["eval_provenance"]["parts"] = [different_binding]
+    save_yaml(fixed_eval_path, fixed_eval)
+    candidate["fixed_eval_capture"]["report_sha256"] = sha256_file(fixed_eval_path)
+    candidate["summary"]["fixed_eval_provenance"]["parts"] = [different_binding]
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="comparison decision"):
         validate_stage211_batch_profile_preflight(report_path, phase="mixer")
 
 
