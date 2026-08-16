@@ -725,8 +725,8 @@ def build_supplemental_retention(
     candidates_per_part: int = DEFAULT_CANDIDATES_PER_PART,
     max_eval_scan_rows_per_part: int = DEFAULT_MAX_EVAL_SCAN_ROWS_PER_PART,
     max_rows_per_part: int = DEFAULT_MAX_ROWS_PER_PART,
-    replay_dir_name: str = "retention_replay_v2",
-    stratified_dir_name: str = "stratified_hidden_eval_v2",
+    replay_dir_name: str = "retention_replay_v3",
+    stratified_dir_name: str = "stratified_hidden_eval_v3",
 ) -> dict[str, Any]:
     if (
         replay_per_language <= 0
@@ -1076,8 +1076,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, default=defaults["output_root"])
     parser.add_argument("--replay-per-language", type=int, default=DEFAULT_REPLAY_PER_LANGUAGE)
     parser.add_argument("--eval-per-cell", type=int, default=DEFAULT_EVAL_PER_CELL)
-    parser.add_argument("--replay-dir-name", default="retention_replay_v2")
-    parser.add_argument("--stratified-dir-name", default="stratified_hidden_eval_v2")
+    parser.add_argument("--replay-dir-name", default="retention_replay_v3")
+    parser.add_argument("--stratified-dir-name", default="stratified_hidden_eval_v3")
     return parser
 
 
@@ -1090,8 +1090,8 @@ def _reuse_validated_supplemental_retention(
     output_root: Path,
     replay_per_language: int,
     eval_per_cell: int,
-    replay_dir_name: str = "retention_replay_v2",
-    stratified_dir_name: str = "stratified_hidden_eval_v2",
+    replay_dir_name: str = "retention_replay_v3",
+    stratified_dir_name: str = "stratified_hidden_eval_v3",
 ) -> dict[str, Any] | None:
     replay_receipt_path = output_root / replay_dir_name / "receipt.json"
     stratified_receipt_path = output_root / stratified_dir_name / "receipt.json"

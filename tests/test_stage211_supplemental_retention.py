@@ -204,19 +204,19 @@ def test_build_and_validate_stage211_supplemental_retention_v2(
     assert receipt["cells"]["supplemental_zh"]["samples"] == 6
 
     stratified = supplemental_validator.validate_stratified_hidden_eval_v2(
-        output_root / "stratified_hidden_eval_v2" / "receipt.json"
+        output_root / "stratified_hidden_eval_v3" / "receipt.json"
     )
     assert stratified["combined_samples"] == 18
     assert stratified["validated_unique_keys"] == 18
     assert set(stratified["cells"]) == set(supplemental_builder.ALL_CELLS)
 
     validated = supplemental_validator.validate_supplemental_retention_replay(
-        output_root / "retention_replay_v2" / "receipt.json"
+        output_root / "retention_replay_v3" / "receipt.json"
     )
     assert validated["validated_unique_keys"] == 26
     assert validated["selected_keys_sha256"] == receipt["selected_keys_sha256"]
     dispatched = replay_validator.validate_retention_replay(
-        output_root / "retention_replay_v2" / "receipt.json"
+        output_root / "retention_replay_v3" / "receipt.json"
     )
     assert dispatched["validated_unique_keys"] == 26
 
@@ -231,7 +231,7 @@ def test_build_and_validate_stage211_supplemental_retention_v2(
     )
     assert reused is not None
     assert reused["receipt_sha256"] == supplemental_builder.sha256_file(
-        output_root / "retention_replay_v2" / "receipt.json"
+        output_root / "retention_replay_v3" / "receipt.json"
     )
     assert (
         supplemental_builder._reuse_validated_supplemental_retention(
@@ -253,7 +253,7 @@ def test_build_and_validate_stage211_supplemental_retention_v2(
     )
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         supplemental_validator.validate_supplemental_retention_replay(
-            output_root / "retention_replay_v2" / "receipt.json"
+            output_root / "retention_replay_v3" / "receipt.json"
         )
 
 
