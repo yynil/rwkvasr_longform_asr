@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -22,6 +23,10 @@ from rwkvasr.data import (
     estimate_bucket_manifest_steps,
     estimate_bucket_manifest_tail_padding_samples,
     load_webdataset_bucket_manifest,
+)
+from rwkvasr.eval.stage211_batch_profile import (
+    STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
+    STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
 )
 
 
@@ -251,6 +256,42 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         target.flush()
         os.fsync(target.fileno())
     temporary.replace(path)
+
+
+def _cleanup_probe_artifacts(*, run_dir: Path, profile_root: Path) -> dict[str, Any]:
+    resolved_run_dir = run_dir.resolve()
+    resolved_profile_root = profile_root.resolve()
+    if resolved_run_dir.parent != resolved_profile_root or resolved_run_dir.name != "run":
+        raise ValueError(f"refusing to clean an unexpected probe directory: {run_dir}")
+    if run_dir.is_symlink():
+        raise ValueError(f"refusing to clean a symlinked probe directory: {run_dir}")
+    existed_before = resolved_run_dir.exists()
+    if existed_before and not resolved_run_dir.is_dir():
+        raise ValueError(f"probe run path is not a directory: {resolved_run_dir}")
+    files_removed = 0
+    directories_removed = 0
+    bytes_removed = 0
+    if existed_before:
+        for path in resolved_run_dir.rglob("*"):
+            if path.is_symlink() or path.is_file():
+                files_removed += 1
+                bytes_removed += path.lstat().st_size
+            elif path.is_dir():
+                directories_removed += 1
+        shutil.rmtree(resolved_run_dir)
+    if resolved_run_dir.exists():
+        raise RuntimeError(f"probe artifact cleanup did not remove {resolved_run_dir}")
+    return {
+        "schema_version": STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
+        "artifact": "probe_artifact_cleanup",
+        "complete": True,
+        "run_dir": str(resolved_run_dir),
+        "existed_before": existed_before,
+        "files_removed": files_removed,
+        "directories_removed": directories_removed,
+        "bytes_removed": bytes_removed,
+        "exists_after": False,
+    }
 
 
 def _git_commit() -> str:
@@ -767,7 +808,7 @@ def main() -> int:
         )
     script_path = Path(__file__).resolve()
     report: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "batch_throughput_preflight",
         "phase": str(args.phase),
@@ -853,23 +894,34 @@ def main() -> int:
         if args.dry_run:
             row["status"] = "dry_run"
         else:
-            result = run_profile(
-                profile=profile,
-                config_path=config_path,
-                log_path=profile_root / "train.log",
-                world_size=int(args.world_size),
-                master_port=int(args.master_port) + profile_index,
-                memory_poll_seconds=float(args.memory_poll_seconds),
-            )
-            row.update(result)
-            row["summary"] = summarize_profile(
-                result,
-                warmup_steps=int(args.warmup_steps),
-                max_steps=max_steps,
-                world_size=int(args.world_size),
-                full_steps=int(coverage["full_coverage_steps"]),
-                max_peak_memory_gib=float(args.max_peak_memory_gib),
-                required_match_fields=required_match_fields,
+            try:
+                result = run_profile(
+                    profile=profile,
+                    config_path=config_path,
+                    log_path=profile_root / "train.log",
+                    world_size=int(args.world_size),
+                    master_port=int(args.master_port) + profile_index,
+                    memory_poll_seconds=float(args.memory_poll_seconds),
+                )
+                row.update(result)
+                row["summary"] = summarize_profile(
+                    result,
+                    warmup_steps=int(args.warmup_steps),
+                    max_steps=max_steps,
+                    world_size=int(args.world_size),
+                    full_steps=int(coverage["full_coverage_steps"]),
+                    max_peak_memory_gib=float(args.max_peak_memory_gib),
+                    required_match_fields=required_match_fields,
+                )
+            finally:
+                row["probe_artifact_cleanup"] = _cleanup_probe_artifacts(
+                    run_dir=run_dir,
+                    profile_root=profile_root,
+                )
+        if args.dry_run:
+            row["probe_artifact_cleanup"] = _cleanup_probe_artifacts(
+                run_dir=run_dir,
+                profile_root=profile_root,
             )
         report["profiles"].append(row)
         _atomic_write_json(report_path, report)

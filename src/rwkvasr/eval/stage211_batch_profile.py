@@ -18,8 +18,9 @@ from rwkvasr.eval.stage211_gate import (
 )
 
 
-STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 2
+STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 3
 STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 1
+STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION = 1
 STAGE211_BATCH_PROFILE_PHASES = ("mixer", "block", "logits")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -136,6 +137,7 @@ def _validate_profile_config(
         "wandb_enabled": False,
         "step_eval_every": None,
         "save_deepspeed_sharded_checkpoints": False,
+        "output_dir": str((config_path.parent / "run").resolve()),
     }
     for key, expected in expected_fields.items():
         if config.get(key) != expected:
@@ -143,6 +145,31 @@ def _validate_profile_config(
                 f"Stage211 batch preflight {name} config mismatch: "
                 f"key={key} actual={config.get(key)!r} expected={expected!r}"
             )
+    cleanup = row.get("probe_artifact_cleanup")
+    expected_cleanup = {
+        "schema_version": STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
+        "artifact": "probe_artifact_cleanup",
+        "complete": True,
+        "run_dir": str((config_path.parent / "run").resolve()),
+        "exists_after": False,
+    }
+    if not isinstance(cleanup, dict) or any(
+        cleanup.get(key) != value for key, value in expected_cleanup.items()
+    ):
+        raise ValueError(f"Stage211 batch preflight {name} cleanup proof is invalid.")
+    if not isinstance(cleanup.get("existed_before"), bool):
+        raise ValueError(f"Stage211 batch preflight {name} cleanup state is invalid.")
+    for key in ("files_removed", "directories_removed", "bytes_removed"):
+        value = cleanup.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"Stage211 batch preflight {name} cleanup count is invalid.")
+    if cleanup["existed_before"] is False and any(
+        int(cleanup[key]) != 0
+        for key in ("files_removed", "directories_removed", "bytes_removed")
+    ):
+        raise ValueError(f"Stage211 batch preflight {name} cleanup counts are inconsistent.")
+    if Path(str(cleanup["run_dir"])).exists():
+        raise ValueError(f"Stage211 batch preflight {name} retained probe artifacts.")
     deepspeed = config.get("deepspeed")
     if not isinstance(deepspeed, dict):
         raise ValueError(f"Stage211 batch preflight {name} lacks a DeepSpeed config.")

@@ -10,6 +10,8 @@ import pytest
 
 from rwkvasr.config import save_yaml
 from rwkvasr.eval.stage211_batch_profile import (
+    STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
+    STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
     build_stage211_batch_profile_admission,
     validate_stage211_batch_profile_admission,
     validate_stage211_batch_profile_preflight,
@@ -68,6 +70,7 @@ def _profile_row(
         "wandb_enabled": False,
         "step_eval_every": None,
         "save_deepspeed_sharded_checkpoints": False,
+        "output_dir": str((profile_root / "run").resolve()),
         "deepspeed": {
             "gradient_accumulation_steps": 1,
             "train_micro_batch_size_per_gpu": batch_size,
@@ -116,6 +119,17 @@ def _profile_row(
             "tail_padding_samples_per_epoch": 7,
         },
         "summary": summary,
+        "probe_artifact_cleanup": {
+            "schema_version": STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
+            "artifact": "probe_artifact_cleanup",
+            "complete": True,
+            "run_dir": str((profile_root / "run").resolve()),
+            "existed_before": True,
+            "files_removed": 3,
+            "directories_removed": 1,
+            "bytes_removed": 123,
+            "exists_after": False,
+        },
     }
 
 
@@ -169,7 +183,7 @@ def _report(tmp_path: Path, *, phase: str = "mixer") -> Path:
         "admissible": True,
     }
     report = {
-        "schema_version": 2,
+        "schema_version": STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "batch_throughput_preflight",
         "phase": phase,
@@ -307,6 +321,17 @@ def test_dry_run_or_wrong_phase_cannot_be_admitted(tmp_path: Path) -> None:
     report_path = _report(tmp_path / "fresh")
     with pytest.raises(ValueError, match="formal measured report"):
         validate_stage211_batch_profile_preflight(report_path, phase="block")
+
+
+def test_measured_profile_rejects_retained_probe_artifacts(tmp_path: Path) -> None:
+    report_path = _report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    retained = Path(report["profiles"][1]["probe_artifact_cleanup"]["run_dir"])
+    retained.mkdir(parents=True)
+    (retained / "step-120.pt").write_bytes(b"retained")
+
+    with pytest.raises(ValueError, match="retained probe artifacts"):
+        validate_stage211_batch_profile_preflight(report_path, phase="mixer")
 
 
 def test_incomplete_objective_match_rejects_selected_profile(tmp_path: Path) -> None:

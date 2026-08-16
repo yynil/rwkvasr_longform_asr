@@ -5,6 +5,8 @@ import math
 import sys
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -22,6 +24,49 @@ def test_default_profiles_cover_baseline_and_seven_larger_candidates() -> None:
         probe.BatchProfile("batch160_frames140k", 160, 140_000),
         probe.BatchProfile("batch192_frames168k", 192, 168_000),
     )
+
+
+def test_probe_artifact_cleanup_removes_only_generated_run_dir(tmp_path: Path) -> None:
+    profile_root = tmp_path / "profile"
+    run_dir = profile_root / "run"
+    checkpoint = run_dir / "step-120.pt"
+    nested = run_dir / "metadata" / "latest.yaml"
+    config = profile_root / "train_config.yaml"
+    log = profile_root / "train.log"
+    checkpoint.parent.mkdir(parents=True)
+    nested.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    nested.write_text("step: 120\n", encoding="utf-8")
+    config.write_text("max_steps: 120\n", encoding="utf-8")
+    log.write_text("measured\n", encoding="utf-8")
+
+    receipt = probe._cleanup_probe_artifacts(
+        run_dir=run_dir,
+        profile_root=profile_root,
+    )
+
+    assert receipt == {
+        "schema_version": probe.STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
+        "artifact": "probe_artifact_cleanup",
+        "complete": True,
+        "run_dir": str(run_dir.resolve()),
+        "existed_before": True,
+        "files_removed": 2,
+        "directories_removed": 1,
+        "bytes_removed": len(b"checkpoint") + len("step: 120\n".encode()),
+        "exists_after": False,
+    }
+    assert not run_dir.exists()
+    assert config.read_text(encoding="utf-8") == "max_steps: 120\n"
+    assert log.read_text(encoding="utf-8") == "measured\n"
+
+
+def test_probe_artifact_cleanup_rejects_paths_outside_profile(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unexpected probe directory"):
+        probe._cleanup_probe_artifacts(
+            run_dir=tmp_path / "other" / "run",
+            profile_root=tmp_path / "profile",
+        )
 
 
 def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> None:
