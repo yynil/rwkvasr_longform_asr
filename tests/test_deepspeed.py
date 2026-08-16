@@ -274,6 +274,83 @@ def test_layer_hidden_sampler_keeps_boundaries_and_covers_every_layer() -> None:
     assert {0, 49, 50, 69}.issubset(boundary_selection)
 
 
+def test_stage211_layer_sampling_schedules_have_exact_full_coverage() -> None:
+    num_layers = 70
+    weak_layer_ids = (0, 11, 12, 17, 20, 49, 50, 69)
+
+    layer_period = 35
+    layer_period_counts = {
+        layer_id: sum(
+            layer_id
+            in _select_layer_hidden_ids(
+                step=step,
+                num_layers=num_layers,
+                sample_count=8,
+                boundary_ids=(),
+            )
+            for step in range(layer_period)
+        )
+        for layer_id in range(num_layers)
+    }
+    assert set(layer_period_counts.values()) == {4}
+
+    expected_full_segment_counts = {
+        29_946: (3_422, 3_423),
+        1_003_713: (114_710, 114_711),
+        966_315: (110_436, 110_436),
+        105: (12, 12),
+    }
+    for steps, expected_range in expected_full_segment_counts.items():
+        full_periods, remainder = divmod(steps, layer_period)
+        counts = {
+            layer_id: layer_period_counts[layer_id] * full_periods
+            for layer_id in range(num_layers)
+        }
+        for step in range(remainder):
+            for layer_id in _select_layer_hidden_ids(
+                step=step,
+                num_layers=num_layers,
+                sample_count=8,
+                boundary_ids=(),
+            ):
+                counts[layer_id] += 1
+        assert (min(counts.values()), max(counts.values())) == expected_range
+        assert all(count > 0 for count in counts.values())
+        assert sum(counts.values()) == steps * 8
+
+    logits_period = 31
+    logits_selections = [
+        _select_layer_hidden_ids(
+            step=step,
+            num_layers=num_layers,
+            sample_count=12,
+            boundary_ids=weak_layer_ids,
+            include_boundaries=True,
+        )
+        for step in range(logits_period)
+    ]
+    assert all(set(weak_layer_ids).issubset(selection) for selection in logits_selections)
+    logits_counts = {
+        layer_id: sum(layer_id in selection for selection in logits_selections)
+        for layer_id in range(num_layers)
+    }
+    assert {logits_counts[layer_id] for layer_id in weak_layer_ids} == {31}
+    assert {
+        logits_counts[layer_id]
+        for layer_id in range(num_layers)
+        if layer_id not in weak_layer_ids
+    } == {2}
+
+    sft_selection = _select_layer_hidden_ids(
+        step=0,
+        num_layers=num_layers,
+        sample_count=8,
+        boundary_ids=weak_layer_ids,
+        include_boundaries=True,
+    )
+    assert sft_selection == weak_layer_ids
+
+
 def test_specific_ctc_frame_balance_mode_overrides_legacy_fallback() -> None:
     assert _resolve_ctc_frame_balance_mode(None, "teacher_top1_balanced") == (
         "teacher_top1_balanced"
