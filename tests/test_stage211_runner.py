@@ -305,6 +305,112 @@ def test_stage211_public_eval_shards_large_second_stage(
     assert receipt_path == tmp_path / "output" / "student_prediction_receipt.json"
 
 
+def test_stage211_stratified_alignment_uses_four_collocated_devices() -> None:
+    student_devices, teacher_devices = (
+        stage211_phase_finalizer._resolve_stratified_alignment_devices(
+            SimpleNamespace(devices="0,1,2,3")
+        )
+    )
+
+    assert student_devices == ("cuda:0", "cuda:1", "cuda:2", "cuda:3")
+    assert teacher_devices == student_devices
+
+    with pytest.raises(ValueError, match="Use only one"):
+        stage211_phase_finalizer._resolve_stratified_alignment_devices(
+            SimpleNamespace(
+                devices="0,1,2,3",
+                stratified_alignment_device="cuda:0",
+                stratified_alignment_devices="0,1,2,3",
+            )
+        )
+    with pytest.raises(ValueError, match="teacher-device count"):
+        stage211_phase_finalizer._resolve_stratified_alignment_devices(
+            SimpleNamespace(
+                devices="0,1,2,3",
+                stratified_alignment_teacher_devices="0,1",
+            )
+        )
+    with pytest.raises(ValueError, match="exactly one device"):
+        stage211_phase_finalizer._resolve_stratified_alignment_devices(
+            SimpleNamespace(
+                devices="0,1,2,3",
+                stratified_alignment_device="0,1",
+            )
+        )
+    with pytest.raises(ValueError, match="exactly one device"):
+        stage211_phase_finalizer._resolve_stratified_alignment_devices(
+            SimpleNamespace(
+                devices="0",
+                stratified_alignment_teacher_device="0,1",
+            )
+        )
+
+
+def test_stage211_stratified_alignment_runs_deterministic_device_width_waves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = [["cell", str(index)] for index in range(9)]
+    waves: list[tuple[list[list[str]], bool]] = []
+    monkeypatch.setattr(
+        stage211_phase_finalizer,
+        "_run_parallel_wave",
+        lambda wave, *, dry_run: waves.append((wave, dry_run)),
+    )
+
+    stage211_phase_finalizer._run_parallel_waves(
+        commands,
+        width=4,
+        dry_run=False,
+    )
+
+    assert [len(wave) for wave, _ in waves] == [4, 4, 1]
+    assert [command for wave, _ in waves for command in wave] == commands
+    assert all(dry_run is False for _, dry_run in waves)
+
+
+def test_stage211_parallel_alignment_failure_terminates_wave_peers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        def __init__(self, return_code: int | None) -> None:
+            self.return_code = return_code
+            self.terminated = False
+
+        def poll(self) -> int | None:
+            return self.return_code
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.return_code = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is None or timeout == 10
+            return int(self.return_code or 0)
+
+        def kill(self) -> None:
+            self.return_code = -9
+
+    peer = FakeProcess(None)
+    failure = FakeProcess(7)
+    pending = [peer, failure]
+
+    def fake_popen(command: list[str], *, cwd: Path) -> FakeProcess:
+        assert cwd == stage211_phase_finalizer.REPO_ROOT
+        assert command in (["peer"], ["failure"])
+        return pending.pop(0)
+
+    monkeypatch.setattr(stage211_phase_finalizer.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        stage211_phase_finalizer._run_parallel_wave(
+            [["peer"], ["failure"]],
+            dry_run=False,
+        )
+
+    assert error.value.returncode == 7
+    assert peer.terminated is True
+
+
 def test_stage211_public_eval_preflight_binds_canonical_directories(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -980,6 +1086,23 @@ def test_stage211_mixer_finalizer_runs_stratified_hidden_gate(
     assert {
         command[command.index("--eval-bucket-manifest") + 1] for command in sidecar_commands
     } == {str(Path(cell["manifest_path"]).resolve()) for cell in stratified_cells.values()}
+    assert [command[command.index("--device") + 1] for command in sidecar_commands] == [
+        "cuda:0",
+        "cuda:1",
+        "cuda:2",
+        "cuda:3",
+        "cuda:0",
+        "cuda:1",
+        "cuda:2",
+        "cuda:3",
+        "cuda:0",
+    ]
+    assert [command[command.index("--teacher-device") + 1] for command in sidecar_commands] == [
+        command[command.index("--device") + 1] for command in sidecar_commands
+    ]
+    assert {
+        Path(command[command.index("--audio-cache-dir") + 1]).name for command in sidecar_commands
+    } == set(stage211_phase_finalizer.STRATIFIED_HIDDEN_CELLS)
     summary_command = next(
         command
         for command in commands

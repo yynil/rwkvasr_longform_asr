@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,136 @@ def _run(command: list[str], *, dry_run: bool, env: dict[str, str] | None = None
         env=env,
         check=True,
     )
+
+
+def _terminate_processes(processes: list[subprocess.Popen[Any]]) -> None:
+    for process in processes:
+        if process.poll() is None:
+            process.terminate()
+    for process in processes:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def _run_parallel_wave(commands: list[list[str]], *, dry_run: bool) -> None:
+    if not commands:
+        return
+    if dry_run:
+        for command in commands:
+            _run(command, dry_run=True)
+        return
+
+    processes: list[tuple[list[str], subprocess.Popen[Any]]] = []
+    try:
+        for command in commands:
+            print(f"[stage211-finalize] command={shlex.join(command)}", flush=True)
+            processes.append(
+                (
+                    command,
+                    subprocess.Popen(command, cwd=REPO_ROOT),
+                )
+            )
+    except BaseException:
+        _terminate_processes([process for _, process in processes])
+        raise
+
+    active = list(processes)
+    try:
+        while active:
+            for command, process in tuple(active):
+                return_code = process.poll()
+                if return_code is None:
+                    continue
+                active.remove((command, process))
+                if return_code != 0:
+                    raise subprocess.CalledProcessError(return_code, command)
+            if active:
+                time.sleep(0.2)
+    except BaseException:
+        _terminate_processes([peer for _, peer in active])
+        raise
+
+
+def _run_parallel_waves(
+    commands: list[list[str]],
+    *,
+    width: int,
+    dry_run: bool,
+) -> None:
+    if width <= 0:
+        raise ValueError("Stage211 parallel evaluation width must be positive.")
+    total_waves = (len(commands) + width - 1) // width
+    for wave_index, start in enumerate(range(0, len(commands), width), start=1):
+        wave = commands[start : start + width]
+        print(
+            "[stage211-finalize] stratified wave "
+            f"index={wave_index}/{total_waves} jobs={len(wave)}",
+            flush=True,
+        )
+        _run_parallel_wave(wave, dry_run=dry_run)
+
+
+def _parse_alignment_devices(raw_devices: str) -> tuple[str, ...]:
+    devices: list[str] = []
+    for raw_device in str(raw_devices).split(","):
+        device = raw_device.strip()
+        if not device:
+            raise ValueError("Stage211 alignment device list contains an empty entry.")
+        if device.isdecimal():
+            device = f"cuda:{int(device)}"
+        devices.append(device)
+    if not devices:
+        raise ValueError("Stage211 alignment device list is empty.")
+    if len(set(devices)) != len(devices):
+        raise ValueError("Stage211 alignment device list contains duplicates.")
+    return tuple(devices)
+
+
+def _resolve_stratified_alignment_devices(
+    args: argparse.Namespace,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    singular = getattr(args, "stratified_alignment_device", None)
+    plural = getattr(args, "stratified_alignment_devices", None)
+    if singular is not None and plural is not None:
+        raise ValueError(
+            "Use only one of --stratified-alignment-device or --stratified-alignment-devices."
+        )
+    if plural is not None:
+        student_devices = _parse_alignment_devices(str(plural))
+    elif singular is not None:
+        student_devices = _parse_alignment_devices(str(singular))
+        if len(student_devices) != 1:
+            raise ValueError("--stratified-alignment-device accepts exactly one device.")
+    else:
+        student_devices = _parse_alignment_devices(str(args.devices))
+
+    teacher_singular = getattr(args, "stratified_alignment_teacher_device", None)
+    teacher_plural = getattr(args, "stratified_alignment_teacher_devices", None)
+    if teacher_singular is not None and teacher_plural is not None:
+        raise ValueError(
+            "Use only one of --stratified-alignment-teacher-device or "
+            "--stratified-alignment-teacher-devices."
+        )
+    if teacher_plural is not None:
+        teacher_devices = _parse_alignment_devices(str(teacher_plural))
+        if len(teacher_devices) != len(student_devices):
+            raise ValueError(
+                "Stage211 stratified teacher-device count must match the student-device count."
+            )
+    elif teacher_singular is not None:
+        if len(student_devices) != 1:
+            raise ValueError(
+                "A singular Stage211 stratified teacher device requires a singular student device."
+            )
+        teacher_devices = _parse_alignment_devices(str(teacher_singular))
+        if len(teacher_devices) != 1:
+            raise ValueError("--stratified-alignment-teacher-device accepts exactly one device.")
+    else:
+        teacher_devices = student_devices
+    return student_devices, teacher_devices
 
 
 def _resolve_curriculum(
@@ -458,19 +589,12 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         stratified_eval_dir = output_dir / "alignment_stratified"
         stratified_batch_size = int(getattr(args, "stratified_alignment_batch_size", 1))
         stratified_num_workers = int(getattr(args, "stratified_alignment_num_workers", 2))
-        stratified_device = str(
-            getattr(
-                args,
-                "stratified_alignment_device",
-                getattr(args, "alignment_device", "cuda:0"),
-            )
-        )
-        stratified_teacher_device = getattr(
-            args,
-            "stratified_alignment_teacher_device",
-            getattr(args, "alignment_teacher_device", None),
-        )
-        for cell_name in STRATIFIED_HIDDEN_CELLS:
+        stratified_devices, stratified_teacher_devices = _resolve_stratified_alignment_devices(args)
+        stratified_commands: list[list[str]] = []
+        for cell_index, cell_name in enumerate(STRATIFIED_HIDDEN_CELLS):
+            device_index = cell_index % len(stratified_devices)
+            stratified_device = stratified_devices[device_index]
+            stratified_teacher_device = stratified_teacher_devices[device_index]
             cell_command = [
                 str(PYTHON),
                 str(ALIGNMENT_PAIR_EVAL_SCRIPT),
@@ -500,10 +624,17 @@ def finalize_phase(args: argparse.Namespace) -> Path:
                 str(stratified_num_workers),
                 "--device",
                 stratified_device,
+                "--teacher-device",
+                stratified_teacher_device,
+                "--audio-cache-dir",
+                str(stratified_eval_dir / "teacher_audio_cache" / cell_name),
             ]
-            if stratified_teacher_device is not None:
-                cell_command.extend(("--teacher-device", str(stratified_teacher_device)))
-            _run(cell_command, dry_run=bool(args.dry_run))
+            stratified_commands.append(cell_command)
+        _run_parallel_waves(
+            stratified_commands,
+            width=len(stratified_devices),
+            dry_run=bool(args.dry_run),
+        )
         stratified_summary_path = stratified_eval_dir / "summary.json"
         summary_script = (
             STRATIFIED_LOGITS_SUMMARY_SCRIPT if phase == "logits" else STRATIFIED_SUMMARY_SCRIPT
@@ -744,10 +875,30 @@ def main() -> int:
         type=Path,
         default=DEFAULT_STRATIFIED_HIDDEN_RECEIPT,
     )
-    parser.add_argument("--stratified-alignment-device", default="cuda:0")
+    parser.add_argument(
+        "--stratified-alignment-device",
+        default=None,
+        help="Run every stratified cell serially on one explicit device.",
+    )
+    parser.add_argument(
+        "--stratified-alignment-devices",
+        default=None,
+        help=(
+            "Comma-separated stratified evaluation devices. Defaults to "
+            "--devices, with one concurrent cell per device."
+        ),
+    )
     parser.add_argument(
         "--stratified-alignment-teacher-device",
         default=None,
+    )
+    parser.add_argument(
+        "--stratified-alignment-teacher-devices",
+        default=None,
+        help=(
+            "Comma-separated Nano teacher devices matching the stratified "
+            "student-device list. Teachers follow student devices by default."
+        ),
     )
     parser.add_argument("--stratified-alignment-batch-size", type=int, default=1)
     parser.add_argument("--stratified-alignment-num-workers", type=int, default=2)
