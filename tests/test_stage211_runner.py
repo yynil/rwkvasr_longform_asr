@@ -131,7 +131,7 @@ def test_stage211_public_benchmark_contract_uses_full_real_sets() -> None:
         "aishell1_test": 7_176,
         "librispeech_test_clean": 2_620,
         "librispeech_test_other": 2_939,
-        "commonvoice_en_test": 14_922,
+        "commonvoice_en_test": 14_927,
         "wenetspeech_test_net": 24_774,
     }
 
@@ -322,7 +322,7 @@ def test_stage211_public_eval_preflight_binds_canonical_directories(
     monkeypatch.setattr(
         stage211_phase_finalizer,
         "validate_stage211_nano_public_baseline_receipt",
-        lambda path: {"results": results, "total_samples": 52_431},
+        lambda path: {"results": results, "total_samples": 52_436},
     )
 
     validated = stage211_phase_finalizer._validate_public_eval_inputs(
@@ -331,7 +331,7 @@ def test_stage211_public_eval_preflight_binds_canonical_directories(
         nano_public_baseline_receipt=receipt_path,
     )
 
-    assert validated["total_samples"] == 52_431
+    assert validated["total_samples"] == 52_436
     with pytest.raises(ValueError, match="public-eval manifest differs"):
         stage211_phase_finalizer._validate_public_eval_inputs(
             manifest_dir=tmp_path / "different-manifests",

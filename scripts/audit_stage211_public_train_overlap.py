@@ -15,7 +15,7 @@ DEFAULT_STAGE178_INDEX = Path(
 )
 DEFAULT_CV22_ROOT = Path("/media/usbhd/common_voice_22/common_voice_22_0")
 DEFAULT_OUTPUT_DIR = (
-    Path.home() / "rwkvasr_data" / "stage211_full_curriculum" / "public_train_overlap_v1"
+    Path.home() / "rwkvasr_data" / "stage211_full_curriculum" / "public_train_overlap_v2"
 )
 
 
@@ -56,7 +56,7 @@ def main() -> None:
         converter_source=args.converter_source,
         output_dir=args.output_dir,
         expected_stage178_english_rows=63_625,
-        expected_public_rows=16_396,
+        expected_public_rows=16_401,
         expected_candidate_rows=1_474,
     )
     coverage = receipt["coverage"]

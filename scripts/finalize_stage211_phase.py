@@ -59,7 +59,7 @@ DEFAULT_STRATIFIED_HIDDEN_RECEIPT = (
     Path.home()
     / "rwkvasr_data"
     / "stage211_full_curriculum"
-    / "stratified_hidden_eval_v2"
+    / "stratified_hidden_eval_v3"
     / "receipt.json"
 )
 STRATIFIED_HIDDEN_CELLS = (

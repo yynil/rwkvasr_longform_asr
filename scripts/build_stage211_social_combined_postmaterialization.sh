@@ -17,6 +17,7 @@ USB_COVERAGE_RECEIPT="${USB_COVERAGE_RECEIPT:-${HOME}/rwkvasr_data/stage211_usb_
 ARCHIVED_SOCIAL_OVERLAP_RECEIPT="${ARCHIVED_SOCIAL_OVERLAP_RECEIPT:-${HOME}/rwkvasr_data/stage211_archived_social_overlap_v1/overlap_receipt.json}"
 ARCHIVED_SOCIAL_OVERLAP_SESSION="${ARCHIVED_SOCIAL_OVERLAP_SESSION:-rwkvasr_stage211_archived_social_overlap}"
 POLL_SECONDS="${POLL_SECONDS:-3600}"
+QUOTE_REPAIR_HANDOFF_SCRIPT="${QUOTE_REPAIR_HANDOFF_SCRIPT:-scripts/build_stage211_quote_repair_handoff.sh}"
 
 cd "${REPO_ROOT}"
 
@@ -59,42 +60,11 @@ nice -n 10 ionice -c 2 -n 7 env CUDA_VISIBLE_DEVICES='' uv run python \
   --decode-workers "${BASE_PUBLIC_DECODE_WORKERS}" \
   "${BASE_PUBLIC_PREFETCH_ARGS[@]}"
 
-wait_for_artifact "social materialized inventory" "${MATERIALIZED_INVENTORY}"
-
-env CUDA_VISIBLE_DEVICES='' uv run python \
-  scripts/filter_stage211_social_pcm_overlap.py \
-  --materialized-inventory "${MATERIALIZED_INVENTORY}" \
-  --output-root "${FILTERED_ROOT}" \
-  --build-public
-
-env CUDA_VISIBLE_DEVICES='' uv run python \
-  scripts/filter_stage211_social_pcm_overlap.py \
-  --materialized-inventory "${MATERIALIZED_INVENTORY}" \
-  --output-root "${FILTERED_ROOT}" \
-  --finalize-only
-
-uv run python scripts/build_stage211_combined_supplemental_inventory.py \
-  --base-inventory "${BASE_INVENTORY}" \
-  --base-public-overlap-audit "${BASE_PUBLIC_OVERLAP_ROOT}/audit_receipt.json" \
-  --social-inventory "${FILTERED_ROOT}/filtered_inventory.json" \
-  --usb-coverage-receipt "${USB_COVERAGE_RECEIPT}" \
-  --archived-social-overlap-receipt "${ARCHIVED_SOCIAL_OVERLAP_RECEIPT}" \
-  --output-root "${COMBINED_ROOT}"
-
-uv run python scripts/create_stage211_supplemental_profile_receipt.py \
-  --inventory "${COMBINED_ROOT}/supplemental_inventory.json" \
-  --output "${COMBINED_ROOT}/supplemental_profile_receipt.json"
-
-nice -n 10 ionice -c 2 -n 7 uv run python \
-  scripts/build_stage211_supplemental_retention.py \
-  --supplemental-inventory "${COMBINED_ROOT}/supplemental_inventory.json" \
-  --supplemental-profile-receipt "${COMBINED_ROOT}/supplemental_profile_receipt.json" \
-  --output-root "${RETENTION_OUTPUT_ROOT}"
-
-nice -n 10 ionice -c 2 -n 7 uv run python \
-  scripts/validate_stage211_supplemental_retention.py \
-  --stratified-receipt "${RETENTION_OUTPUT_ROOT}/stratified_hidden_eval_v2/receipt.json"
-
-nice -n 10 ionice -c 2 -n 7 uv run python \
-  scripts/validate_stage211_supplemental_retention.py \
-  --receipt "${RETENTION_OUTPUT_ROOT}/retention_replay_v2/receipt.json"
+exec env \
+  LEGACY_SESSION=rwkvasr_stage211_no_legacy_session \
+  BASE_INVENTORY="${BASE_INVENTORY}" \
+  BASE_SOURCE_AUDIT="${BASE_PUBLIC_OVERLAP_ROOT}/audit_receipt.json" \
+  USB_COVERAGE_RECEIPT="${USB_COVERAGE_RECEIPT}" \
+  ARCHIVED_SOCIAL_OVERLAP_RECEIPT="${ARCHIVED_SOCIAL_OVERLAP_RECEIPT}" \
+  RETENTION_OUTPUT_ROOT="${RETENTION_OUTPUT_ROOT}" \
+  bash "${QUOTE_REPAIR_HANDOFF_SCRIPT}"

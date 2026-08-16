@@ -50,14 +50,14 @@ DEFAULT_REPLAY_RECEIPT = (
     Path.home()
     / "rwkvasr_data"
     / "stage211_full_curriculum"
-    / "retention_replay_v2"
+    / "retention_replay_v3"
     / "receipt.json"
 )
 DEFAULT_STRATIFIED_HIDDEN_RECEIPT = (
     Path.home()
     / "rwkvasr_data"
     / "stage211_full_curriculum"
-    / "stratified_hidden_eval_v2"
+    / "stratified_hidden_eval_v3"
     / "receipt.json"
 )
 DEFAULT_PUBLIC_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"

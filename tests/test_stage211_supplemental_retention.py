@@ -283,6 +283,8 @@ def test_supplemental_retention_main_reuses_validated_output_under_lock(
             output_root=output_root,
             replay_per_language=6,
             eval_per_cell=2,
+            replay_dir_name="retention_replay_v3",
+            stratified_dir_name="stratified_hidden_eval_v3",
         ),
     )
     monkeypatch.setattr(supplemental_builder, "build_parser", lambda: parser)
@@ -291,10 +293,16 @@ def test_supplemental_retention_main_reuses_validated_output_under_lock(
         "total_hours": 1.25,
         "manifest_path": str(tmp_path / "manifest.json"),
     }
+    reuse_calls: list[dict[str, object]] = []
+
+    def reuse_validated(**kwargs: object) -> dict[str, object]:
+        reuse_calls.append(kwargs)
+        return reused
+
     monkeypatch.setattr(
         supplemental_builder,
         "_reuse_validated_supplemental_retention",
-        lambda **kwargs: reused,
+        reuse_validated,
     )
 
     def fail_build(**kwargs: object) -> dict[str, object]:
@@ -307,5 +315,18 @@ def test_supplemental_retention_main_reuses_validated_output_under_lock(
     )
 
     assert supplemental_builder.main() == 0
+    assert reuse_calls == [
+        {
+            "base_replay_receipt_path": inputs["base_replay_receipt"],
+            "base_stratified_receipt_path": inputs["base_stratified_receipt"],
+            "supplemental_inventory_path": inputs["supplemental_inventory"],
+            "supplemental_profile_receipt_path": inputs["supplemental_profile_receipt"],
+            "output_root": output_root.resolve(),
+            "replay_per_language": 6,
+            "eval_per_cell": 2,
+            "replay_dir_name": "retention_replay_v3",
+            "stratified_dir_name": "stratified_hidden_eval_v3",
+        }
+    ]
     assert (output_root / ".stage211_supplemental_retention_v2.lock").is_file()
     assert "reused=true samples=26" in capsys.readouterr().out

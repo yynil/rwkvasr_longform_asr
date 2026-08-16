@@ -15,6 +15,8 @@ from typing import Any
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
     DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
+    STAGE211_CLEAN_COMMONVOICE_MANIFEST_SHA256,
+    STAGE211_PUBLIC_OVERLAP_RECEIPT_SHA256,
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
     validate_stage211_nano_public_baseline_receipt,
@@ -47,15 +49,12 @@ DEFAULT_TOKENIZER_SOURCE = REPO_ROOT / "src" / "rwkvasr" / "eval" / "text_metric
 DEFAULT_NANO_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
 DEFAULT_CALIBRATION_ROOT = Path.home() / "rwkvasr_eval" / "stage211_calibration_selected_full"
 DEFAULT_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
-DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_metric_unicode_v1"
+DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_metric_unicode_v2"
 DEFAULT_CORRECTION_RECEIPT = DEFAULT_OUTPUT_ROOT / "correction_receipt.json"
 DEFAULT_PRIOR_INSTALL_RECEIPT = (
-    Path.home() / "rwkvasr_eval" / "stage211_public_clean_v1" / "canonical_install_receipt.json"
+    Path.home() / "rwkvasr_eval" / "stage211_public_clean_v2" / "canonical_install_receipt.json"
 )
 DEFAULT_NANO_CHECKPOINT = Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
-EXPECTED_PRIOR_INSTALL_SHA256 = (
-    "574314795de83ada77d5c9d14ededfcdad60474f3240a915f600deff9783ca91"
-)
 LEGACY_WER_PATTERN = re.compile(r"[A-Za-z0-9]+|[\u4e00-\u9fff]")
 
 
@@ -178,19 +177,63 @@ def validate_completed_correction(
 
 def _validate_prior_install(path: Path) -> dict[str, Any]:
     path = path.expanduser().resolve()
-    if sha256_file(path) != EXPECTED_PRIOR_INSTALL_SHA256:
-        raise ValueError("Stage211 prior clean canonical-install receipt changed.")
     receipt = _load_json(path, label="Stage211 prior clean canonical-install receipt")
     if (
         receipt.get("pipeline") != "stage211"
         or receipt.get("artifact") != "stage211_clean_public_canonical_install"
         or receipt.get("complete") is not True
+        or Path(str(receipt.get("overlap_receipt_path") or "")).resolve()
+        != DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT.expanduser().resolve()
+        or receipt.get("overlap_receipt_sha256")
+        != STAGE211_PUBLIC_OVERLAP_RECEIPT_SHA256
     ):
         raise ValueError("Stage211 prior clean canonical-install receipt is invalid.")
-    for record in receipt.get("installed_files", []):
+
+    derivation_path = Path(str(receipt.get("derivation_receipt_path") or "")).resolve()
+    derivation_sha256 = str(receipt.get("derivation_receipt_sha256") or "")
+    if (
+        not derivation_path.is_file()
+        or sha256_file(derivation_path) != derivation_sha256
+        or int(
+            _load_json(
+                derivation_path,
+                label="Stage211 clean public derivation receipt",
+            ).get("total_samples", -1)
+        )
+        != sum(int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values())
+    ):
+        raise ValueError("Stage211 prior clean derivation binding is invalid.")
+
+    metrics = receipt.get("commonvoice_clean_metrics")
+    installed_files = receipt.get("installed_files")
+    if (
+        not isinstance(metrics, dict)
+        or int(metrics.get("sample_count", -1))
+        != int(STAGE211_PUBLIC_BENCHMARKS["commonvoice_en_test"]["samples"])
+        or not isinstance(installed_files, list)
+        or len(installed_files) != 12
+    ):
+        raise ValueError("Stage211 prior clean public coverage is invalid.")
+    for record in installed_files:
+        if not isinstance(record, dict):
+            raise ValueError("Stage211 prior clean canonical artifact binding is invalid.")
         artifact = Path(str(record.get("path") or "")).resolve()
         if not artifact.is_file() or record.get("sha256") != sha256_file(artifact):
             raise ValueError(f"Stage211 prior clean canonical artifact changed: {artifact}")
+    manifest_record = next(
+        (
+            record
+            for record in installed_files
+            if Path(str(record["path"])).resolve()
+            == (DEFAULT_MANIFEST_DIR / "commonvoice_en_test.jsonl").resolve()
+        ),
+        None,
+    )
+    if (
+        not isinstance(manifest_record, dict)
+        or manifest_record.get("sha256") != STAGE211_CLEAN_COMMONVOICE_MANIFEST_SHA256
+    ):
+        raise ValueError("Stage211 prior clean Common Voice manifest binding is invalid.")
     return receipt
 
 

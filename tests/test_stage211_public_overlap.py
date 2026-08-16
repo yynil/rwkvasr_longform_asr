@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from rwkvasr.eval.stage211_public_overlap import (
+    _load_test_rows,
     create_stage211_public_overlap_audit,
     validate_stage211_public_overlap_receipt,
 )
@@ -165,6 +166,26 @@ def test_overlap_audit_excludes_only_byte_identical_audio(tmp_path: Path) -> Non
         expected_public_manifest=fixture["public_manifest"],
         expected_loaded_manifest_receipt=fixture["loaded_receipt"],
     )
+
+
+def test_common_voice_tsv_quotes_are_literal_and_do_not_merge_rows(tmp_path: Path) -> None:
+    test_tsv = tmp_path / "test.tsv"
+    test_tsv.write_text(
+        "client_id\tpath\tsentence_id\tsentence\tup_votes\n"
+        'client-a\tfirst.mp3\tsentence-a\t"An unmatched leading quote.\t2\n'
+        'client-b\tsecond.mp3\tsentence-b\tA later "quoted" phrase.\t2\n',
+        encoding="utf-8",
+    )
+
+    rows, by_pair = _load_test_rows(test_tsv)
+
+    assert [row["utt_id"] for row in rows] == ["first", "second"]
+    assert rows[0]["sentence"] == '"An unmatched leading quote.'
+    assert rows[1]["sentence"] == 'A later "quoted" phrase.'
+    assert by_pair == {
+        ("client-a", "sentence-a"): ["first"],
+        ("client-b", "sentence-b"): ["second"],
+    }
 
 
 def test_overlap_audit_rejects_public_test_identity_drift(tmp_path: Path) -> None:

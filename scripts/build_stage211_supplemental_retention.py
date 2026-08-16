@@ -75,7 +75,7 @@ DEFAULT_MAX_EVAL_SCAN_ROWS_PER_PART = 8192
 
 def _default_paths() -> dict[str, Path]:
     metadata = Path.home() / "rwkvasr_data" / "stage211_full_curriculum"
-    supplemental = Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v2"
+    supplemental = Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v3"
     return {
         "base_replay_receipt": metadata / "retention_replay_v1" / "receipt.json",
         "base_stratified_receipt": metadata / "stratified_hidden_eval_v1" / "receipt.json",
@@ -725,6 +725,8 @@ def build_supplemental_retention(
     candidates_per_part: int = DEFAULT_CANDIDATES_PER_PART,
     max_eval_scan_rows_per_part: int = DEFAULT_MAX_EVAL_SCAN_ROWS_PER_PART,
     max_rows_per_part: int = DEFAULT_MAX_ROWS_PER_PART,
+    replay_dir_name: str = "retention_replay_v2",
+    stratified_dir_name: str = "stratified_hidden_eval_v2",
 ) -> dict[str, Any]:
     if (
         replay_per_language <= 0
@@ -734,9 +736,15 @@ def build_supplemental_retention(
         or max_rows_per_part <= 0
     ):
         raise ValueError("Supplemental replay and evaluation limits must be positive.")
+    for label, name in (
+        ("replay", replay_dir_name),
+        ("stratified", stratified_dir_name),
+    ):
+        if not name or Path(name).name != name or name in {".", ".."}:
+            raise ValueError(f"Supplemental {label} directory name is invalid: {name!r}")
     output_root = output_root.expanduser().resolve()
-    replay_dir = output_root / "retention_replay_v2"
-    stratified_dir = output_root / "stratified_hidden_eval_v2"
+    replay_dir = output_root / replay_dir_name
+    stratified_dir = output_root / stratified_dir_name
     base_replay_receipt_path = base_replay_receipt_path.expanduser().resolve()
     base_stratified_receipt_path = base_stratified_receipt_path.expanduser().resolve()
     base_replay = validate_retention_replay(
@@ -1068,6 +1076,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, default=defaults["output_root"])
     parser.add_argument("--replay-per-language", type=int, default=DEFAULT_REPLAY_PER_LANGUAGE)
     parser.add_argument("--eval-per-cell", type=int, default=DEFAULT_EVAL_PER_CELL)
+    parser.add_argument("--replay-dir-name", default="retention_replay_v2")
+    parser.add_argument("--stratified-dir-name", default="stratified_hidden_eval_v2")
     return parser
 
 
@@ -1080,9 +1090,11 @@ def _reuse_validated_supplemental_retention(
     output_root: Path,
     replay_per_language: int,
     eval_per_cell: int,
+    replay_dir_name: str = "retention_replay_v2",
+    stratified_dir_name: str = "stratified_hidden_eval_v2",
 ) -> dict[str, Any] | None:
-    replay_receipt_path = output_root / "retention_replay_v2" / "receipt.json"
-    stratified_receipt_path = output_root / "stratified_hidden_eval_v2" / "receipt.json"
+    replay_receipt_path = output_root / replay_dir_name / "receipt.json"
+    stratified_receipt_path = output_root / stratified_dir_name / "receipt.json"
     if not replay_receipt_path.is_file() or not stratified_receipt_path.is_file():
         return None
     try:
@@ -1178,6 +1190,8 @@ def main() -> int:
             output_root=output_root,
             replay_per_language=args.replay_per_language,
             eval_per_cell=args.eval_per_cell,
+            replay_dir_name=args.replay_dir_name,
+            stratified_dir_name=args.stratified_dir_name,
         )
         reused = receipt is not None
         if receipt is None:
@@ -1189,6 +1203,8 @@ def main() -> int:
                 output_root=output_root,
                 replay_per_language=args.replay_per_language,
                 eval_per_cell=args.eval_per_cell,
+                replay_dir_name=args.replay_dir_name,
+                stratified_dir_name=args.stratified_dir_name,
             )
     print(
         "stage211_supplemental_retention_complete "

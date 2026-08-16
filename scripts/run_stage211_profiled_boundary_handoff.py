@@ -64,7 +64,7 @@ DEFAULT_NANO_CHECKPOINT = (
     Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
 )
 DEFAULT_SUPPLEMENTAL_ROOT = (
-    Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v2"
+    Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v3"
 )
 DEFAULT_SUPPLEMENTAL_INVENTORY = DEFAULT_SUPPLEMENTAL_ROOT / "supplemental_inventory.json"
 DEFAULT_SUPPLEMENTAL_PROFILE_RECEIPT = (
@@ -475,12 +475,12 @@ def main() -> int:
     stratified_hidden_receipt = (
         args.stratified_hidden_receipt.expanduser().resolve()
         if args.stratified_hidden_receipt is not None
-        else metadata_root / "stratified_hidden_eval_v2" / "receipt.json"
+        else metadata_root / "stratified_hidden_eval_v3" / "receipt.json"
     )
     retention_replay_receipt = (
         args.retention_replay_receipt.expanduser().resolve()
         if args.retention_replay_receipt is not None
-        else metadata_root / "retention_replay_v2" / "receipt.json"
+        else metadata_root / "retention_replay_v3" / "receipt.json"
     )
     nano_checkpoint = args.nano_checkpoint.expanduser().resolve()
     handoff_log = args.handoff_log.expanduser().resolve()

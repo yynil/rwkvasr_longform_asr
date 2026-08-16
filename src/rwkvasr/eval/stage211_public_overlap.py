@@ -91,7 +91,9 @@ def _load_test_rows(path: Path) -> tuple[list[dict[str, str]], dict[tuple[str, s
     rows: list[dict[str, str]] = []
     by_pair: dict[tuple[str, str], list[str]] = defaultdict(list)
     with path.open("r", encoding="utf-8", newline="") as source:
-        reader = csv.DictReader(source, delimiter="\t")
+        # Common Voice transcript quotes are literal TSV content. Treating them
+        # as CSV quoting can merge several utterances into one logical row.
+        reader = csv.DictReader(source, delimiter="\t", quoting=csv.QUOTE_NONE)
         required = {"client_id", "path", "sentence_id", "sentence"}
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
             raise ValueError(f"Common Voice test TSV lacks required columns: {path}")

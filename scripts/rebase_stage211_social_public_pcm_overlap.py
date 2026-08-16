@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+try:
+    from scripts.filter_stage211_social_pcm_overlap import (
+        EXPECTED_PUBLIC_ROWS,
+        _immutable_json,
+        _sha256,
+        _source_fingerprint_paths,
+        build_public_fingerprints,
+        finalize_filtered_inventory,
+        rebase_social_source_fingerprints,
+        validate_filtered_inventory,
+        validate_materialized_inventory,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+    from filter_stage211_social_pcm_overlap import (
+        EXPECTED_PUBLIC_ROWS,
+        _immutable_json,
+        _sha256,
+        _source_fingerprint_paths,
+        build_public_fingerprints,
+        finalize_filtered_inventory,
+        rebase_social_source_fingerprints,
+        validate_filtered_inventory,
+        validate_materialized_inventory,
+    )
+
+
+DEFAULT_SOURCE_INVENTORY = (
+    Path.home() / "rwkvasr_data/stage211_social_vad_filtered_v1/filtered_inventory.json"
+)
+DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_data/stage211_social_vad_filtered_v2"
+DEFAULT_CLEAN_MANIFEST_ROOT = Path.home() / "rwkvasr_eval/stage211_public_clean_v2/manifests"
+DEFAULT_PUBLIC_MANIFESTS = {
+    dataset: DEFAULT_CLEAN_MANIFEST_ROOT / f"{dataset}.jsonl"
+    for dataset in EXPECTED_PUBLIC_ROWS
+}
+REBASE_ARTIFACT = "stage211_social_public_pcm_fingerprint_rebase"
+
+
+def _load_json(path: Path, *, label: str) -> dict[str, Any]:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"{label} is missing or empty: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be a JSON object: {path}")
+    return payload
+
+
+def _receipt_set_sha256(root: Path, source_count: int) -> str:
+    digest = hashlib.sha256()
+    for source_index in range(source_count):
+        _, receipt_path = _source_fingerprint_paths(root, source_index)
+        digest.update(bytes.fromhex(_sha256(receipt_path)))
+    return digest.hexdigest()
+
+
+def validate_rebase_receipt(path: str | Path) -> dict[str, Any]:
+    receipt_path = Path(path).expanduser().resolve()
+    receipt = _load_json(receipt_path, label="Stage211 social PCM rebase receipt")
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": REBASE_ARTIFACT,
+        "complete": True,
+        "audio_redecoded": False,
+        "reuse_mode": "same_filesystem_hardlink_plus_rebound_receipts",
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 social PCM rebase receipt contract changed.")
+    source_inventory_path = Path(
+        str(receipt.get("source_filtered_inventory_path") or "")
+    ).resolve()
+    destination_inventory_path = Path(
+        str(receipt.get("destination_filtered_inventory_path") or "")
+    ).resolve()
+    if (
+        _sha256(source_inventory_path) != receipt.get("source_filtered_inventory_sha256")
+        or _sha256(destination_inventory_path)
+        != receipt.get("destination_filtered_inventory_sha256")
+    ):
+        raise ValueError("Stage211 social PCM rebase inventory binding changed.")
+    source = validate_filtered_inventory(source_inventory_path, verify_part_sha256=True)
+    destination = validate_filtered_inventory(
+        destination_inventory_path,
+        verify_part_sha256=True,
+    )
+    if source["inventory"].get("materialized_inventory_sha256") != destination[
+        "inventory"
+    ].get("materialized_inventory_sha256"):
+        raise ValueError("Stage211 social PCM rebase changed materialized coverage.")
+
+    source_root = source_inventory_path.parent
+    destination_root = destination_inventory_path.parent
+    source_count = int(receipt.get("source_count", -1))
+    source_records = source["inventory"].get("source_fingerprint_receipts") or []
+    if source_count != len(source_records):
+        raise ValueError("Stage211 social PCM rebase source count changed.")
+    for source_index in range(source_count):
+        source_part, _ = _source_fingerprint_paths(source_root, source_index)
+        destination_part, _ = _source_fingerprint_paths(destination_root, source_index)
+        if not source_part.samefile(destination_part):
+            raise ValueError(
+                "Stage211 social PCM rebased fingerprint is not the source hardlink: "
+                f"{source_index}"
+            )
+    if (
+        _receipt_set_sha256(source_root, source_count)
+        != receipt.get("source_receipt_set_sha256")
+        or _receipt_set_sha256(destination_root, source_count)
+        != receipt.get("destination_receipt_set_sha256")
+    ):
+        raise ValueError("Stage211 social PCM rebased receipt set changed.")
+    public_manifest_rows = receipt.get("public_manifest_rows")
+    if (
+        not isinstance(public_manifest_rows, dict)
+        or int(destination["inventory"].get("public_overlap", {}).get("public_rows", -1))
+        != sum(int(value) for value in public_manifest_rows.values())
+    ):
+        raise ValueError("Stage211 social PCM corrected public coverage changed.")
+    return receipt
+
+
+def rebase_and_finalize(
+    *,
+    source_filtered_inventory: Path,
+    output_root: Path,
+    public_manifests: dict[str, Path],
+    expected_public_rows: dict[str, int],
+) -> dict[str, Any]:
+    source_filtered_inventory = source_filtered_inventory.expanduser().resolve()
+    output_root = output_root.expanduser().resolve()
+    receipt_path = output_root / "rebase_receipt.json"
+    if receipt_path.is_file():
+        return validate_rebase_receipt(receipt_path)
+    source = validate_filtered_inventory(
+        source_filtered_inventory,
+        verify_part_sha256=True,
+    )
+    materialized = validate_materialized_inventory(
+        Path(str(source["inventory"]["materialized_inventory_path"]))
+    )
+    rebase = rebase_social_source_fingerprints(
+        materialized=materialized,
+        source_root=source_filtered_inventory.parent,
+        output_root=output_root,
+    )
+    build_public_fingerprints(
+        public_manifests=public_manifests,
+        output_root=output_root,
+        expected_rows=expected_public_rows,
+    )
+    destination = finalize_filtered_inventory(
+        materialized=materialized,
+        public_manifests=public_manifests,
+        output_root=output_root,
+        expected_public_rows=expected_public_rows,
+    )
+    destination_inventory = output_root / "filtered_inventory.json"
+    receipt = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": REBASE_ARTIFACT,
+        "complete": True,
+        "audio_redecoded": False,
+        "reuse_mode": "same_filesystem_hardlink_plus_rebound_receipts",
+        **rebase,
+        "source_filtered_inventory_path": str(source_filtered_inventory),
+        "source_filtered_inventory_sha256": _sha256(source_filtered_inventory),
+        "destination_filtered_inventory_path": str(destination_inventory.resolve()),
+        "destination_filtered_inventory_sha256": _sha256(destination_inventory),
+        "destination_selected_rows": int(destination["selected_rows"]),
+        "destination_selected_hours": float(destination["selected_hours"]),
+        "public_manifest_rows": dict(sorted(expected_public_rows.items())),
+    }
+    _immutable_json(receipt_path, receipt)
+    return validate_rebase_receipt(receipt_path)
+
+
+def _parse_public_manifests(values: list[str]) -> dict[str, Path]:
+    if not values:
+        return dict(DEFAULT_PUBLIC_MANIFESTS)
+    parsed: dict[str, Path] = {}
+    for value in values:
+        dataset, separator, raw_path = value.partition("=")
+        if not separator or not dataset or not raw_path:
+            raise ValueError("--public-manifest must use DATASET=/absolute/path.jsonl")
+        parsed[dataset] = Path(raw_path).expanduser().resolve()
+    if set(parsed) != set(EXPECTED_PUBLIC_ROWS):
+        raise ValueError("Stage211 corrected public manifest dataset set changed.")
+    return parsed
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Rebind completed Stage211 social PCM fingerprints to the corrected public "
+            "suite without decoding social audio again."
+        )
+    )
+    parser.add_argument(
+        "--source-filtered-inventory",
+        type=Path,
+        default=DEFAULT_SOURCE_INVENTORY,
+    )
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--public-manifest", action="append", default=[])
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    receipt = rebase_and_finalize(
+        source_filtered_inventory=args.source_filtered_inventory,
+        output_root=args.output_root,
+        public_manifests=_parse_public_manifests(args.public_manifest),
+        expected_public_rows=EXPECTED_PUBLIC_ROWS,
+    )
+    print(
+        "[stage211-social-public-pcm-rebase] "
+        f"sources={receipt['source_count']} audio_redecoded={receipt['audio_redecoded']} "
+        f"receipt={args.output_root.expanduser().resolve() / 'rebase_receipt.json'}",
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

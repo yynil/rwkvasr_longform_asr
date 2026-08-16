@@ -28,10 +28,10 @@ DEFAULT_BASE_INVENTORY = (
     Path.home() / "rwkvasr_data/stage211_supplemental_natural_v1/supplemental_inventory.json"
 )
 DEFAULT_SOCIAL_INVENTORY = (
-    Path.home() / "rwkvasr_data/stage211_social_vad_filtered_v1/filtered_inventory.json"
+    Path.home() / "rwkvasr_data/stage211_social_vad_filtered_v2/filtered_inventory.json"
 )
 DEFAULT_BASE_PUBLIC_OVERLAP_AUDIT = (
-    Path.home() / "rwkvasr_data/stage211_base_public_pcm_overlap_v1/audit_receipt.json"
+    Path.home() / "rwkvasr_data/stage211_base_public_pcm_overlap_v2/audit_receipt.json"
 )
 DEFAULT_USB_COVERAGE_RECEIPT = (
     Path.home()
@@ -41,7 +41,7 @@ DEFAULT_ARCHIVED_SOCIAL_OVERLAP_RECEIPT = (
     Path.home()
     / "rwkvasr_data/stage211_archived_social_overlap_v1/overlap_receipt.json"
 )
-DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_data/stage211_supplemental_combined_v2"
+DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_data/stage211_supplemental_combined_v3"
 COMBINED_ARTIFACT = "stage211_supplemental_combined_inventory"
 SCHEMA_VERSION = 2
 EXPECTED_USB_PENDING_NATURAL_ADMISSION = {

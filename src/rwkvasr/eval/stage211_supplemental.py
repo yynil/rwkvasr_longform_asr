@@ -16,7 +16,7 @@ from rwkvasr.data import (
 
 STAGE211_SUPPLEMENTAL_DIFFICULTY = "supplemental_natural"
 DEFAULT_STAGE211_SUPPLEMENTAL_ROOT = (
-    Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v2"
+    Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v3"
 )
 DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY = (
     DEFAULT_STAGE211_SUPPLEMENTAL_ROOT / "supplemental_inventory.json"

@@ -21,14 +21,14 @@ DEFAULT_OVERLAP_RECEIPT = (
     Path.home()
     / "rwkvasr_data"
     / "stage211_full_curriculum"
-    / "public_train_overlap_v1"
+    / "public_train_overlap_v2"
     / "receipt.json"
 )
 DEFAULT_NANO_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
 DEFAULT_CALIBRATION_PUBLIC = (
     Path.home() / "rwkvasr_eval" / "stage211_calibration_selected_full" / "public"
 )
-DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_clean_v1"
+DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_clean_v2"
 DEFAULT_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
 
 

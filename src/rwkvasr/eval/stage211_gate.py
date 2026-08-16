@@ -175,17 +175,17 @@ DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT = (
     Path.home()
     / "rwkvasr_data"
     / "stage211_full_curriculum"
-    / "public_train_overlap_v1"
+    / "public_train_overlap_v2"
     / "receipt.json"
 )
 STAGE211_LOADED_MANIFEST_RECEIPT_SHA256 = (
     "af7c38a72fd714148390de5dea7d4d32a062a78ed1e25143928e0c3db88561c1"
 )
 STAGE211_PUBLIC_OVERLAP_RECEIPT_SHA256 = (
-    "af6a0034efe6d231649966337d29aadf43b33d658c0e479e48f0ce1fae8da6b4"
+    "0d06feee47e7e0e1f2ba56db4a2d1104dba40c1691eafdb91494e6264b622b82"
 )
 STAGE211_CLEAN_COMMONVOICE_MANIFEST_SHA256 = (
-    "4cf4f3e171f888660b140e187d4848c9f0d26d77b9ed166d7f3e0e25c699e21b"
+    "4c9c8d9bff332000f56d18aa7482014bb345d2f98b1b2569a2bc16243ae22281"
 )
 STAGE211_GLOBAL_DEDUP_MANIFEST_SHA256 = (
     "9228d24a8befe24d0e35debd63070f24a6a6313bf318308452e95656dd6708ba"
@@ -231,7 +231,7 @@ STAGE211_PUBLIC_BENCHMARKS: dict[str, dict[str, str | int]] = {
     "aishell1_test": {"language": "zh", "metric": "cer", "samples": 7_176},
     "librispeech_test_clean": {"language": "en", "metric": "wer", "samples": 2_620},
     "librispeech_test_other": {"language": "en", "metric": "wer", "samples": 2_939},
-    "commonvoice_en_test": {"language": "en", "metric": "wer", "samples": 14_922},
+    "commonvoice_en_test": {"language": "en", "metric": "wer", "samples": 14_927},
     "wenetspeech_test_net": {"language": "zh", "metric": "cer", "samples": 24_774},
 }
 DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT = (
@@ -1627,7 +1627,7 @@ def validate_stage211_public_overlap_binding(
     exact_rows = int(coverage.get("exact_byte_identical_training_rows", -1))
     candidate_rows = int(coverage.get("candidate_training_rows", -1))
     if (
-        clean_rows != 14_922
+        clean_rows != 14_927
         or excluded_rows < 0
         or public_rows != clean_rows + excluded_rows
         or exact_rows != candidate_rows
@@ -1637,10 +1637,10 @@ def validate_stage211_public_overlap_binding(
     if production_receipt:
         expected_coverage = {
             "candidate_training_rows": 1_474,
-            "clean_public_rows": 14_922,
+            "clean_public_rows": 14_927,
             "exact_byte_identical_training_rows": 1_474,
             "excluded_public_rows": 1_474,
-            "public_rows": 16_396,
+            "public_rows": 16_401,
             "stage178_english_rows": 63_625,
         }
         if any(int(coverage.get(key, -1)) != value for key, value in expected_coverage.items()):
@@ -1649,7 +1649,7 @@ def validate_stage211_public_overlap_binding(
     exclusions = outputs.get("exclusions")
     if not isinstance(clean_manifest, dict) or not isinstance(exclusions, dict):
         raise ValueError("Stage211 public/train overlap receipt lacks clean/exclusion outputs.")
-    if int(clean_manifest.get("rows", -1)) != 14_922:
+    if int(clean_manifest.get("rows", -1)) != 14_927:
         raise ValueError("Stage211 clean Common Voice manifest contract changed.")
     if production_receipt and (
         clean_manifest.get("sha256") != STAGE211_CLEAN_COMMONVOICE_MANIFEST_SHA256
@@ -1672,7 +1672,7 @@ def validate_stage211_public_overlap_binding(
         if not isinstance(commonvoice, dict):
             raise ValueError("Stage211 public benchmark lacks Common Voice.")
         if (
-            int(commonvoice.get("sample_count", -1)) != 14_922
+            int(commonvoice.get("sample_count", -1)) != 14_927
             or commonvoice.get("manifest_sha256") != clean_manifest["sha256"]
         ):
             raise ValueError(

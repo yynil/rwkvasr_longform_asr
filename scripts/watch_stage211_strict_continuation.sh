@@ -33,7 +33,7 @@ CORRECTED_FINAL_STEPWISE_REPORT="${PHASE_GATE_ROOT}/sft_corrected/stage211_stepw
 CORRECTED_FINAL_STEPWISE_MARKDOWN="${PHASE_GATE_ROOT}/sft_corrected/stage211_stepwise_results.md"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${HOME}/rwkvasr_eval/stage211_calibration_selected_full/public/reuse_receipt.json}"
 INITIALIZATION_RECEIPT="${INITIALIZATION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_initialization/nano_initialization_receipt.json}"
-PUBLIC_METRIC_CORRECTION_RECEIPT="${PUBLIC_METRIC_CORRECTION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_public_metric_unicode_v1/correction_receipt.json}"
+PUBLIC_METRIC_CORRECTION_RECEIPT="${PUBLIC_METRIC_CORRECTION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_public_metric_unicode_v2/correction_receipt.json}"
 
 stage211_log() {
   mkdir -p "$(dirname "${WATCH_LOG}")"

@@ -43,7 +43,7 @@ DEFAULT_PUBLIC_MANIFESTS = {
 }
 EXPECTED_PUBLIC_ROWS = {
     "aishell1_test": 7_176,
-    "commonvoice_en_test": 14_922,
+    "commonvoice_en_test": 14_927,
     "librispeech_test_clean": 2_620,
     "librispeech_test_other": 2_939,
     "wenetspeech_test_net": 24_774,
@@ -107,6 +107,28 @@ def _immutable_json(path: Path, payload: dict[str, Any]) -> str:
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
     return _immutable_bytes(path, rendered)
+
+
+def _immutable_hardlink(source: Path, destination: Path) -> str:
+    source = source.expanduser().resolve()
+    destination = destination.expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"Stage211 hardlink source is unavailable: {source}")
+    if destination.exists():
+        if not destination.is_file() or not os.path.samefile(source, destination):
+            raise ValueError(f"Stage211 hardlink destination differs: {destination}")
+        return "reused"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f"{destination.name}.tmp.{os.getpid()}")
+    try:
+        os.link(source, temporary)
+        temporary.replace(destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    if not os.path.samefile(source, destination):
+        raise ValueError(f"Stage211 hardlink installation failed: {destination}")
+    return "created"
 
 
 def _read_region(path: Path, *, offset: int, size: int) -> bytes:
@@ -394,6 +416,52 @@ def run_social_fingerprint_worker(
                 flush=True,
             )
     return {"assigned": len(assigned), **dict(sorted(counts.items()))}
+
+
+def rebase_social_source_fingerprints(
+    *,
+    materialized: dict[str, Any],
+    source_root: Path,
+    output_root: Path,
+) -> dict[str, Any]:
+    source_root = source_root.expanduser().resolve()
+    output_root = output_root.expanduser().resolve()
+    if source_root == output_root:
+        raise ValueError("Stage211 social PCM rebase source and destination must differ.")
+    source_records = materialized["inventory"]["source_receipts"]
+    statuses: Counter[str] = Counter()
+    source_receipt_digest = hashlib.sha256()
+    destination_receipt_digest = hashlib.sha256()
+    for source_index, source_record in enumerate(source_records):
+        source_part, source_receipt_path = _source_fingerprint_paths(source_root, source_index)
+        source_receipt = _validate_source_fingerprint_receipt(
+            source_receipt_path,
+            source_record=source_record,
+            source_index=source_index,
+        )
+        destination_part, destination_receipt_path = _source_fingerprint_paths(
+            output_root,
+            source_index,
+        )
+        statuses[_immutable_hardlink(source_part, destination_part)] += 1
+        destination_receipt = {
+            **source_receipt,
+            "part_path": str(destination_part.resolve()),
+        }
+        _immutable_json(destination_receipt_path, destination_receipt)
+        _validate_source_fingerprint_receipt(
+            destination_receipt_path,
+            source_record=source_record,
+            source_index=source_index,
+        )
+        source_receipt_digest.update(bytes.fromhex(_sha256(source_receipt_path)))
+        destination_receipt_digest.update(bytes.fromhex(_sha256(destination_receipt_path)))
+    return {
+        "source_count": len(source_records),
+        "source_hardlink_status": dict(sorted(statuses.items())),
+        "source_receipt_set_sha256": source_receipt_digest.hexdigest(),
+        "destination_receipt_set_sha256": destination_receipt_digest.hexdigest(),
+    }
 
 
 def _public_fingerprint_paths(output_root: Path, dataset: str) -> tuple[Path, Path]:
@@ -1066,7 +1134,9 @@ def main() -> int:
     output_root = args.output_root.expanduser().resolve()
     public_manifests = _parse_public_manifests(args.public_manifest)
     expected_public_rows = (
-        EXPECTED_PUBLIC_ROWS if public_manifests == DEFAULT_PUBLIC_MANIFESTS else None
+        EXPECTED_PUBLIC_ROWS
+        if set(public_manifests) == set(EXPECTED_PUBLIC_ROWS)
+        else None
     )
     if args.finalize_only:
         result = finalize_filtered_inventory(

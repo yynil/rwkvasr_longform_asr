@@ -108,7 +108,9 @@ def _common_voice_records(root: Path, locale: str, split: str, audio_output_dir:
         _extract_tar_once(tar_path, audio_output_dir)
     audio_by_name = {path.name: path for path in audio_output_dir.rglob("*.mp3")}
     with transcript_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
+        # Common Voice TSV stores transcript quote marks literally and does not
+        # escape them as CSV fields. CSV quote parsing can merge physical rows.
+        reader = csv.DictReader(handle, delimiter="\t", quoting=csv.QUOTE_NONE)
         for row in reader:
             path_name = str(row["path"])
             audio_path = audio_by_name.get(path_name)

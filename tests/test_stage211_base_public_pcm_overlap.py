@@ -17,6 +17,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 audit = importlib.import_module("scripts.audit_stage211_base_public_pcm_overlap")
+rebase = importlib.import_module("scripts.rebase_stage211_base_public_pcm_overlap")
 
 
 def _sha256(path: Path) -> str:
@@ -432,6 +433,96 @@ def test_base_public_pcm_parallel_decode_matches_serial_bytes(tmp_path: Path) ->
 
     assert fingerprints["parallel"] == fingerprints["serial"]
     assert fingerprints["parallel_prefetch"] == fingerprints["serial"]
+
+
+def test_base_public_pcm_rebase_reuses_fingerprints_without_audio_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory_path, _ = _fixture(tmp_path)
+    base = audit.validate_base_inventory(inventory_path)
+    source_root = tmp_path / "source_audit"
+    source_audio = tmp_path / "source_public.flac"
+    source_audio.write_bytes(_flac(np.linspace(-0.4, 0.4, 8_000, dtype=np.float32)))
+    source_manifest = tmp_path / "source_public.jsonl"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "utt_id": "source-public",
+                "audio_filepath": str(source_audio),
+                "text": "source",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    source_public = {"public_test": source_manifest}
+    audit.build_public_fingerprints(
+        public_manifests=source_public,
+        output_root=source_root,
+        expected_rows={"public_test": 1},
+    )
+    audit.build_location_index(base=base, output_root=source_root)
+    source_index = audit.validate_location_index(source_root, base=base)
+    audit.run_archive_worker(
+        location_index=source_index,
+        output_root=source_root,
+        worker_index=0,
+        num_workers=1,
+        max_archives=None,
+        archive_cache_dir=None,
+    )
+    audit.finalize_audit(
+        base=base,
+        public_manifests=source_public,
+        output_root=source_root,
+        expected_public_rows={"public_test": 1},
+        location_index=source_index,
+    )
+
+    corrected_audio = tmp_path / "corrected_public.flac"
+    corrected_audio.write_bytes(_flac(np.linspace(0.3, -0.3, 8_000, dtype=np.float32)))
+    corrected_manifest = tmp_path / "corrected_public.jsonl"
+    corrected_manifest.write_text(
+        json.dumps(
+            {
+                "utt_id": "corrected-public",
+                "audio_filepath": str(corrected_audio),
+                "text": "corrected",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        audit,
+        "_canonical_pcm_fingerprint_bytes",
+        lambda payload: pytest.fail("base audio must not be decoded during fingerprint rebase"),
+    )
+    destination_root = tmp_path / "destination_audit"
+    receipt = rebase.rebase_and_finalize(
+        base_inventory=inventory_path,
+        source_audit_receipt=source_root / "audit_receipt.json",
+        output_root=destination_root,
+        public_manifests={"public_test": corrected_manifest},
+        expected_public_rows={"public_test": 1},
+    )
+
+    assert receipt["audio_redecoded"] is False
+    assert receipt["archive_count"] == 5
+    assert receipt["archive_hardlink_status"] == {"created": 5}
+    source_database, _ = audit._index_paths(source_root)
+    destination_database, _ = audit._index_paths(destination_root)
+    assert source_database.samefile(destination_database)
+    for archive_index in range(5):
+        source_fingerprint, source_receipt = audit._archive_paths(source_root, archive_index)
+        destination_fingerprint, destination_receipt = audit._archive_paths(
+            destination_root,
+            archive_index,
+        )
+        assert source_fingerprint.samefile(destination_fingerprint)
+        assert source_receipt.read_bytes() != destination_receipt.read_bytes()
+    assert rebase.validate_rebase_receipt(destination_root / "rebase_receipt.json") == receipt
 
 
 def test_base_public_pcm_prefetch_overlaps_next_copy_with_current_decode(

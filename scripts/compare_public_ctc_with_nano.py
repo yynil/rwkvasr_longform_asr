@@ -42,7 +42,7 @@ DATASETS: dict[str, dict[str, str | int]] = {
         "language": "en",
         "label": "Common Voice 22 en test",
         "metric": "wer",
-        "samples": 14_922,
+        "samples": 14_927,
     },
     "wenetspeech_test_net": {
         "language": "zh",

@@ -20,10 +20,10 @@ from rwkvasr.eval.stage211_public_overlap import validate_stage211_public_overla
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CLEAN_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_clean_v1"
+DEFAULT_CLEAN_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_clean_v2"
 DEFAULT_NANO_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
 DEFAULT_CALIBRATION_ROOT = Path.home() / "rwkvasr_eval" / "stage211_calibration_selected_full"
-DEFAULT_ARCHIVE_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_contaminated_archive_v1"
+DEFAULT_ARCHIVE_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_pre_quote_repair_archive_v2"
 DEFAULT_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
 
 

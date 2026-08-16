@@ -36,23 +36,26 @@ def _write_executable(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
-def test_postmaterialization_pipeline_waits_for_materialized_inventory(
+def test_postmaterialization_pipeline_hands_off_after_base_audit(
     tmp_path: Path,
 ) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     call_log = tmp_path / "calls.log"
-    materialized_inventory = tmp_path / "materialized.json"
     _write_executable(fake_bin / "tmux", "#!/usr/bin/env bash\nexit 1\n")
     _write_executable(
-        fake_bin / "sleep",
-        "#!/usr/bin/env bash\n"
-        "printf 'sleep\\n' >>\"${CALL_LOG}\"\n"
-        "printf '{}\\n' >\"${MATERIALIZED_INVENTORY}\"\n",
-    )
-    _write_executable(
         fake_bin / "uv",
-        '#!/usr/bin/env bash\nprintf \'uv %s\\n\' "$*" >>"${CALL_LOG}"\n',
+        "#!/usr/bin/env bash\n"
+        "printf 'uv %s\\n' \"$*\" >>\"${CALL_LOG}\"\n"
+        "mkdir -p \"${BASE_PUBLIC_OVERLAP_ROOT}\"\n"
+        "printf '{}\\n' >\"${BASE_PUBLIC_OVERLAP_ROOT}/audit_receipt.json\"\n",
+    )
+    handoff = tmp_path / "quote-repair-handoff.sh"
+    _write_executable(
+        handoff,
+        "#!/usr/bin/env bash\n"
+        "printf 'handoff legacy=%s base=%s\\n' \"${LEGACY_SESSION}\" \"${BASE_SOURCE_AUDIT}\" "
+        ">>\"${CALL_LOG}\"\n",
     )
     base_inventory = tmp_path / "base.json"
     usb_receipt = tmp_path / "usb.json"
@@ -64,7 +67,6 @@ def test_postmaterialization_pipeline_waits_for_materialized_inventory(
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "CALL_LOG": str(call_log),
         "POLL_SECONDS": "1",
-        "MATERIALIZED_INVENTORY": str(materialized_inventory),
         "BASE_INVENTORY": str(base_inventory),
         "USB_COVERAGE_RECEIPT": str(usb_receipt),
         "ARCHIVED_SOCIAL_OVERLAP_RECEIPT": str(archived_receipt),
@@ -72,6 +74,7 @@ def test_postmaterialization_pipeline_waits_for_materialized_inventory(
         "BASE_PUBLIC_PREFETCH_NEXT_ARCHIVE": "1",
         "FILTERED_ROOT": str(tmp_path / "filtered"),
         "COMBINED_ROOT": str(tmp_path / "combined"),
+        "QUOTE_REPAIR_HANDOFF_SCRIPT": str(handoff),
     }
 
     result = subprocess.run(
@@ -85,15 +88,13 @@ def test_postmaterialization_pipeline_waits_for_materialized_inventory(
     )
 
     calls = call_log.read_text(encoding="utf-8").splitlines()
-    wait_index = calls.index("sleep")
-    filter_index = next(
-        index for index, call in enumerate(calls) if "filter_stage211_social_pcm_overlap.py" in call
-    )
-    assert wait_index > 0
-    assert filter_index > wait_index
+    handoff_index = next(index for index, call in enumerate(calls) if call.startswith("handoff "))
     assert calls[0].startswith("uv run python scripts/audit_stage211_base_public_pcm_overlap.py")
     assert "--prefetch-next-archive" in calls[0]
-    assert "social materialized inventory unavailable" in result.stdout
+    assert handoff_index == 1
+    assert "legacy=rwkvasr_stage211_no_legacy_session" in calls[handoff_index]
+    assert f"base={tmp_path / 'base-overlap' / 'audit_receipt.json'}" in calls[handoff_index]
+    assert result.stdout == ""
 
 
 def test_postmaterialization_base_audit_uses_low_io_priority() -> None:

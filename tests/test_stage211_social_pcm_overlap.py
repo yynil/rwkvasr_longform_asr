@@ -19,6 +19,7 @@ from rwkvasr.data.webdataset_lengths import load_webdataset_length_entries
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 pcm_filter = importlib.import_module("scripts.filter_stage211_social_pcm_overlap")
+pcm_rebase = importlib.import_module("scripts.rebase_stage211_social_public_pcm_overlap")
 
 
 def _sha256(path: Path) -> str:
@@ -348,3 +349,79 @@ def test_filtered_inventory_rejects_changed_fingerprint_evidence(tmp_path: Path)
 
     with pytest.raises(ValueError, match="receipt changed"):
         pcm_filter.validate_filtered_inventory(output_root / "filtered_inventory.json")
+
+
+def test_social_pcm_rebase_reuses_source_fingerprints_without_audio_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    materialized = pcm_filter.validate_materialized_inventory(fixture["materialized"])
+    source_root = tmp_path / "source_filtered"
+    source_manifests = {"public_test": Path(fixture["public_manifest"])}
+    pcm_filter.run_social_fingerprint_worker(
+        materialized=materialized,
+        output_root=source_root,
+        worker_index=0,
+        num_workers=1,
+        max_sources=None,
+    )
+    pcm_filter.build_public_fingerprints(
+        public_manifests=source_manifests,
+        output_root=source_root,
+        expected_rows={"public_test": 1},
+    )
+    pcm_filter.finalize_filtered_inventory(
+        materialized=materialized,
+        public_manifests=source_manifests,
+        output_root=source_root,
+        expected_public_rows={"public_test": 1},
+    )
+
+    corrected_audio = tmp_path / "corrected_public.flac"
+    corrected_audio.write_bytes(
+        _flac(np.sin(np.linspace(0, 70, 8_000, dtype=np.float32)) * 0.1)
+    )
+    corrected_manifest = tmp_path / "corrected_public.jsonl"
+    _write_jsonl(
+        corrected_manifest,
+        [
+            {
+                "utt_id": "corrected-public",
+                "audio_filepath": str(corrected_audio),
+                "dataset": "public_test",
+                "text": "corrected",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        pcm_filter,
+        "_read_region",
+        lambda *args, **kwargs: pytest.fail(
+            "social source audio must not be decoded during fingerprint rebase"
+        ),
+    )
+    destination_root = tmp_path / "destination_filtered"
+    receipt = pcm_rebase.rebase_and_finalize(
+        source_filtered_inventory=source_root / "filtered_inventory.json",
+        output_root=destination_root,
+        public_manifests={"public_test": corrected_manifest},
+        expected_public_rows={"public_test": 1},
+    )
+
+    assert receipt["audio_redecoded"] is False
+    assert receipt["source_count"] == 2
+    assert receipt["source_hardlink_status"] == {"created": 2}
+    assert receipt["destination_selected_rows"] == 3
+    for source_index in range(2):
+        source_part, source_receipt = pcm_filter._source_fingerprint_paths(
+            source_root,
+            source_index,
+        )
+        destination_part, destination_receipt = pcm_filter._source_fingerprint_paths(
+            destination_root,
+            source_index,
+        )
+        assert source_part.samefile(destination_part)
+        assert source_receipt.read_bytes() != destination_receipt.read_bytes()
+    assert pcm_rebase.validate_rebase_receipt(destination_root / "rebase_receipt.json") == receipt

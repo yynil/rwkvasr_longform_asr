@@ -243,6 +243,28 @@ def _immutable_json(path: Path, payload: dict[str, Any]) -> str:
     return _immutable_bytes(path, rendered)
 
 
+def _immutable_hardlink(source: Path, destination: Path) -> str:
+    source = source.expanduser().resolve()
+    destination = destination.expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"Stage211 hardlink source is unavailable: {source}")
+    if destination.exists():
+        if not destination.is_file() or not os.path.samefile(source, destination):
+            raise ValueError(f"Stage211 hardlink destination differs: {destination}")
+        return "reused"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f"{destination.name}.tmp.{os.getpid()}")
+    try:
+        os.link(source, temporary)
+        temporary.replace(destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    if not os.path.samefile(source, destination):
+        raise ValueError(f"Stage211 hardlink installation failed: {destination}")
+    return "created"
+
+
 def _resolve_part_path(manifest_path: Path, raw_path: str) -> Path:
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
@@ -1210,6 +1232,90 @@ def _archive_receipts(
     return records
 
 
+def rebase_archive_fingerprints(
+    *,
+    base: dict[str, Any],
+    source_audit_receipt: Path,
+    output_root: Path,
+) -> dict[str, Any]:
+    source_audit_receipt = source_audit_receipt.expanduser().resolve()
+    output_root = output_root.expanduser().resolve()
+    if source_audit_receipt.parent == output_root:
+        raise ValueError("Stage211 PCM rebase source and destination must differ.")
+    source_audit = validate_audit_receipt(
+        source_audit_receipt,
+        verify_overlap_replay=True,
+    )
+    if (
+        source_audit.get("base_inventory_path") != base["inventory_path"]
+        or source_audit.get("base_inventory_sha256") != base["inventory_sha256"]
+    ):
+        raise ValueError("Stage211 PCM rebase source binds another base inventory.")
+
+    source_root = source_audit_receipt.parent
+    source_index = validate_location_index(source_root, base=base)
+    source_database, _ = _index_paths(source_root)
+    destination_database, destination_index_receipt = _index_paths(output_root)
+    index_status = _immutable_hardlink(source_database, destination_database)
+    summary = _index_database_summary(destination_database, base=base)
+    _immutable_json(
+        destination_index_receipt,
+        _index_receipt_payload(
+            database_path=destination_database,
+            base=base,
+            summary=summary,
+        ),
+    )
+    destination_index = validate_location_index(output_root, base=base)
+    if destination_index["archives"] != source_index["archives"]:
+        raise ValueError("Stage211 PCM rebased location index changed archive coverage.")
+
+    status_counts: Counter[str] = Counter()
+    source_receipt_digest = hashlib.sha256()
+    destination_receipt_digest = hashlib.sha256()
+    for archive in source_index["archives"]:
+        archive_index = int(archive["archive_index"])
+        source_fingerprint, source_receipt_path = _archive_paths(source_root, archive_index)
+        source_receipt = _validate_archive_receipt(
+            source_receipt_path,
+            location_index=source_index,
+            archive=archive,
+        )
+        destination_fingerprint, destination_receipt_path = _archive_paths(
+            output_root,
+            archive_index,
+        )
+        status_counts[_immutable_hardlink(source_fingerprint, destination_fingerprint)] += 1
+        destination_receipt = {
+            **source_receipt,
+            "location_index_receipt_path": destination_index["receipt_path"],
+            "location_index_receipt_sha256": destination_index["receipt_sha256"],
+            "fingerprint_path": str(destination_fingerprint.resolve()),
+        }
+        _immutable_json(destination_receipt_path, destination_receipt)
+        _validate_archive_receipt(
+            destination_receipt_path,
+            location_index=destination_index,
+            archive=archive,
+        )
+        source_receipt_digest.update(bytes.fromhex(_sha256(source_receipt_path)))
+        destination_receipt_digest.update(bytes.fromhex(_sha256(destination_receipt_path)))
+
+    return {
+        "archive_count": len(source_index["archives"]),
+        "archive_hardlink_status": dict(sorted(status_counts.items())),
+        "destination_archive_receipt_set_sha256": destination_receipt_digest.hexdigest(),
+        "destination_location_index_receipt_path": destination_index["receipt_path"],
+        "destination_location_index_receipt_sha256": destination_index["receipt_sha256"],
+        "index_hardlink_status": index_status,
+        "source_archive_receipt_set_sha256": source_receipt_digest.hexdigest(),
+        "source_audit_receipt_path": str(source_audit_receipt),
+        "source_audit_receipt_sha256": _sha256(source_audit_receipt),
+        "source_location_index_receipt_path": source_index["receipt_path"],
+        "source_location_index_receipt_sha256": source_index["receipt_sha256"],
+    }
+
+
 def _part_receipts(base: dict[str, Any], output_root: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for part in base["parts"]:
@@ -1502,7 +1608,11 @@ def main() -> int:
     args = _parse_args()
     output_root = args.output_root.expanduser().resolve()
     public_manifests = _parse_public_manifest(args.public_manifest)
-    expected_rows = EXPECTED_PUBLIC_ROWS if public_manifests == DEFAULT_PUBLIC_MANIFESTS else None
+    expected_rows = (
+        EXPECTED_PUBLIC_ROWS
+        if set(public_manifests) == set(EXPECTED_PUBLIC_ROWS)
+        else None
+    )
     base = validate_base_inventory(args.base_inventory)
     location_index: dict[str, Any] | None = None
     if args.command in {"public", "all"}:
