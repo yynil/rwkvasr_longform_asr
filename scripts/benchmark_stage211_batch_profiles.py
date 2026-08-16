@@ -513,10 +513,31 @@ def summarize_profile(
             step_rate > 0.0,
         )
     )
-    local_samples = sum(
+    sample_weights = [
         point_match_fields(point).get(primary_match_field, (0, 0))[1] for point in measured
+    ]
+    local_samples = sum(sample_weights)
+    mean_loss = (
+        sum(point.loss * weight for point, weight in zip(measured, sample_weights, strict=True))
+        / local_samples
+        if local_samples > 0
+        else None
     )
-    cosines = [point.cosine for point in measured if point.cosine is not None]
+    cosine_weight = sum(
+        weight
+        for point, weight in zip(measured, sample_weights, strict=True)
+        if point.cosine is not None
+    )
+    mean_cosine = (
+        sum(
+            float(point.cosine) * weight
+            for point, weight in zip(measured, sample_weights, strict=True)
+            if point.cosine is not None
+        )
+        / cosine_weight
+        if cosine_weight > 0
+        else None
+    )
     return {
         "process_ok": process_ok,
         "complete_steps": complete_steps,
@@ -527,10 +548,9 @@ def summarize_profile(
         "estimated_global_samples_per_second": (
             local_samples * world_size / elapsed if elapsed > 0.0 else 0.0
         ),
-        "mean_loss": (
-            sum(point.loss for point in measured) / len(measured) if measured else None
-        ),
-        "mean_cosine": sum(cosines) / len(cosines) if cosines else None,
+        "mean_loss": mean_loss,
+        "mean_cosine": mean_cosine,
+        "alignment_mean_aggregation": "primary_match_sample_weighted",
         "required_match_fields": list(required_match_fields),
         "primary_match_field": primary_match_field,
         "missing_required_match_fields": missing_required_match_fields,
@@ -554,6 +574,8 @@ def select_profile(
     *,
     baseline_name: str,
     min_improvement_ratio: float,
+    max_loss_regression_ratio: float = 0.05,
+    max_cosine_regression: float = 0.005,
 ) -> dict[str, Any]:
     by_name = {str(row["profile"]["name"]): row for row in rows}
     if baseline_name not in by_name:
@@ -561,14 +583,21 @@ def select_profile(
     baseline = by_name[baseline_name]
     baseline_summary = baseline["summary"]
     baseline_seconds = baseline_summary.get("projected_full_coverage_seconds")
-    if baseline_summary.get("safety_pass") is not True or not isinstance(
-        baseline_seconds, (float, int)
+    baseline_loss = baseline_summary.get("mean_loss")
+    baseline_cosine = baseline_summary.get("mean_cosine")
+    if (
+        baseline_summary.get("safety_pass") is not True
+        or not isinstance(baseline_seconds, (float, int))
+        or not isinstance(baseline_loss, (float, int))
+        or not isinstance(baseline_cosine, (float, int))
     ):
         return {
             "decision": "baseline_failed",
             "baseline_profile": baseline_name,
             "recommended_profile": None,
             "min_improvement_ratio": min_improvement_ratio,
+            "max_loss_regression_ratio": max_loss_regression_ratio,
+            "max_cosine_regression": max_cosine_regression,
         }
     candidates: list[tuple[float, str, float]] = []
     comparisons: list[dict[str, Any]] = []
@@ -576,21 +605,43 @@ def select_profile(
         if name == baseline_name:
             continue
         candidate_seconds = row["summary"].get("projected_full_coverage_seconds")
+        candidate_loss = row["summary"].get("mean_loss")
+        candidate_cosine = row["summary"].get("mean_cosine")
         improvement = None
         if isinstance(candidate_seconds, (float, int)) and baseline_seconds > 0:
             improvement = (float(baseline_seconds) - float(candidate_seconds)) / float(
                 baseline_seconds
             )
+        loss_regression_ratio = None
+        if isinstance(candidate_loss, (float, int)):
+            loss_regression_ratio = (float(candidate_loss) - float(baseline_loss)) / max(
+                abs(float(baseline_loss)), 1.0e-12
+            )
+        cosine_regression = None
+        if isinstance(candidate_cosine, (float, int)):
+            cosine_regression = float(baseline_cosine) - float(candidate_cosine)
+        quality_pass = (
+            loss_regression_ratio is not None
+            and loss_regression_ratio <= max_loss_regression_ratio
+            and cosine_regression is not None
+            and cosine_regression <= max_cosine_regression
+        )
         admissible = (
             row["summary"].get("safety_pass") is True
             and improvement is not None
             and improvement >= min_improvement_ratio
+            and quality_pass
         )
         comparisons.append(
             {
                 "profile": name,
                 "projected_full_coverage_seconds": candidate_seconds,
                 "improvement_ratio": improvement,
+                "mean_loss": candidate_loss,
+                "loss_regression_ratio": loss_regression_ratio,
+                "mean_cosine": candidate_cosine,
+                "cosine_regression": cosine_regression,
+                "quality_pass": quality_pass,
                 "admissible": admissible,
             }
         )
@@ -603,6 +654,10 @@ def select_profile(
         "recommended_profile": candidates[0][1] if candidates else baseline_name,
         "recommended_improvement_ratio": candidates[0][2] if candidates else 0.0,
         "min_improvement_ratio": min_improvement_ratio,
+        "baseline_mean_loss": float(baseline_loss),
+        "baseline_mean_cosine": float(baseline_cosine),
+        "max_loss_regression_ratio": max_loss_regression_ratio,
+        "max_cosine_regression": max_cosine_regression,
         "comparisons": comparisons,
         "formal_admission": False,
     }
@@ -658,6 +713,8 @@ def main() -> int:
     parser.add_argument("--master-port", type=int, default=29731)
     parser.add_argument("--max-peak-memory-gib", type=float, default=22.0)
     parser.add_argument("--min-improvement-ratio", type=float, default=0.10)
+    parser.add_argument("--max-loss-regression-ratio", type=float, default=0.05)
+    parser.add_argument("--max-cosine-regression", type=float, default=0.005)
     parser.add_argument("--memory-poll-seconds", type=float, default=0.25)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -673,6 +730,8 @@ def main() -> int:
         parser.error("formal epochs and world size must be positive")
     if args.max_peak_memory_gib <= 0.0 or not 0.0 <= args.min_improvement_ratio < 1.0:
         parser.error("memory limit must be positive and improvement ratio must be in [0, 1)")
+    if args.max_loss_regression_ratio < 0.0 or args.max_cosine_regression < 0.0:
+        parser.error("quality regression limits must be non-negative")
     if args.memory_poll_seconds <= 0.0:
         parser.error("memory poll interval must be positive")
 
@@ -726,6 +785,8 @@ def main() -> int:
         "world_size": int(args.world_size),
         "max_peak_memory_gib": float(args.max_peak_memory_gib),
         "min_improvement_ratio": float(args.min_improvement_ratio),
+        "max_loss_regression_ratio": float(args.max_loss_regression_ratio),
+        "max_cosine_regression": float(args.max_cosine_regression),
         "profiles": [],
     }
     report_path = output_root / "batch_throughput_preflight.json"
@@ -816,6 +877,8 @@ def main() -> int:
             report["profiles"],
             baseline_name=str(args.baseline_profile),
             min_improvement_ratio=float(args.min_improvement_ratio),
+            max_loss_regression_ratio=float(args.max_loss_regression_ratio),
+            max_cosine_regression=float(args.max_cosine_regression),
         )
         report["complete"] = True
     report["finished_at"] = datetime.now(UTC).isoformat()

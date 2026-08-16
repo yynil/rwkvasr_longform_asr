@@ -252,6 +252,43 @@ def test_missing_teacher_alignment_rejects_fast_candidate() -> None:
     assert selection["recommended_profile"] == "baseline"
 
 
+def test_alignment_quality_regression_rejects_faster_candidate() -> None:
+    baseline_result = _result(name="baseline", seconds_per_step=1.0, peak_memory=8.0)
+    candidate_result = _result(name="candidate", seconds_per_step=1.0, peak_memory=8.0)
+    for row in candidate_result["telemetry"]:
+        if int(row["step"]) > 2:
+            row["loss"] = float(row["loss"]) * 1.20
+            row["cosine"] = float(row["cosine"]) - 0.02
+    rows = []
+    for result, full_steps in ((baseline_result, 1000), (candidate_result, 500)):
+        summary = probe.summarize_profile(
+            result,
+            warmup_steps=2,
+            max_steps=6,
+            world_size=4,
+            full_steps=full_steps,
+            max_peak_memory_gib=22.0,
+        )
+        rows.append({"profile": result["profile"], "summary": summary})
+
+    selection = probe.select_profile(
+        rows,
+        baseline_name="baseline",
+        min_improvement_ratio=0.10,
+        max_loss_regression_ratio=0.05,
+        max_cosine_regression=0.005,
+    )
+
+    comparison = selection["comparisons"][0]
+    assert comparison["improvement_ratio"] == 0.5
+    assert comparison["loss_regression_ratio"] > 0.05
+    assert comparison["cosine_regression"] > 0.005
+    assert comparison["quality_pass"] is False
+    assert comparison["admissible"] is False
+    assert selection["decision"] == "keep_baseline"
+    assert selection["recommended_profile"] == "baseline"
+
+
 def test_git_worktree_changes_preserve_porcelain_evidence(
     monkeypatch: object,
 ) -> None:
