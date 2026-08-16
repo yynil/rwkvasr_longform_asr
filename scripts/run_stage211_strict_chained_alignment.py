@@ -99,8 +99,9 @@ STAGE211_FULL_LABELED_INPUT_SOURCE_COUNTS = {
     "librispeech": 222_040,
 }
 STAGE211_FULL_LABELED_INPUT_LANGUAGE_COUNTS = {
-    "en": 1_334_785,
-    "zh": 96_016,
+    # Two commonvoice_en metadata rows are marked zh; both are rejected later.
+    "en": 1_334_783,
+    "zh": 96_018,
 }
 STAGE211_FULL_LABELED_REJECTED_SOURCE_SPLITS = (
     "dev",

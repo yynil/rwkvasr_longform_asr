@@ -337,6 +337,20 @@ def test_stage211_full_label_preparation_binds_filter_and_pronunciation_support(
     )
 
 
+def test_stage211_full_input_languages_bind_observed_metadata_counts() -> None:
+    assert strict_runner.STAGE211_FULL_LABELED_INPUT_LANGUAGE_COUNTS == {
+        "en": 1_334_783,
+        "zh": 96_018,
+    }
+    source_derived_english = sum(
+        strict_runner.STAGE211_FULL_LABELED_INPUT_SOURCE_COUNTS[source]
+        for source in ("commonvoice_en", "librispeech")
+    )
+    assert source_derived_english == (
+        strict_runner.STAGE211_FULL_LABELED_INPUT_LANGUAGE_COUNTS["en"] + 2
+    )
+
+
 def test_interleave_source_lanes_are_parsed_and_assigned_deterministically() -> None:
     assert builder._parse_interleave_source_lanes(
         ["commonvoice_en:35,librispeech:7", "aishell3:2", "commonvoice_cn:1"]
