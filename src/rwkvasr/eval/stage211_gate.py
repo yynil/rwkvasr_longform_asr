@@ -2314,6 +2314,12 @@ def build_stage211_full_data_coverage(
     supplemental_executed_exposures = (
         int(supplemental_segment.get("executed_sample_exposures", 0)) if supplemental_segment else 0
     )
+    original_tail_exposures = sum(
+        int(segment.get("tail_padding_sample_exposures", 0)) for segment in segments
+    )
+    original_executed_exposures = sum(
+        int(segment.get("executed_sample_exposures", 0)) for segment in segments
+    )
     coverage: dict[str, Any] = {
         "phase": phase,
         "complete": True,
@@ -2321,21 +2327,17 @@ def build_stage211_full_data_coverage(
         "original_total_hours": STAGE211_AUDIO_TOTAL_HOURS,
         "original_total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
         "original_total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
-        "original_total_tail_padding_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
-        ),
-        "original_total_executed_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
-        ),
+        "original_total_tail_padding_sample_exposures": original_tail_exposures,
+        "original_total_executed_sample_exposures": original_executed_exposures,
         "total_unique_rows": STAGE211_AUDIO_TOTAL_ROWS + supplemental_rows,
         "total_hours": STAGE211_AUDIO_TOTAL_HOURS + supplemental_hours,
         "total_row_exposures": (STAGE211_AUDIO_TOTAL_ROW_EXPOSURES + supplemental_row_exposures),
         "total_hour_exposures": (STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES + supplemental_hour_exposures),
         "total_tail_padding_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES + supplemental_tail_exposures
+            original_tail_exposures + supplemental_tail_exposures
         ),
         "total_executed_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES + supplemental_executed_exposures
+            original_executed_exposures + supplemental_executed_exposures
         ),
         "segments": segments,
         "final_checkpoint_path": str(checkpoint_path),
@@ -2797,6 +2799,94 @@ def _validate_stage211_post_coverage_corrections(
     return validated, previous_checkpoint_sha256
 
 
+def _validate_stage211_segment_batch_profile(
+    segment: dict[str, Any],
+    *,
+    phase: str,
+    difficulty: str,
+) -> dict[str, Any]:
+    schema_version = segment.get("schema_version")
+    if schema_version == 1:
+        expected = (
+            stage211_supplemental_profile(
+                _validate_bound_file(
+                    segment,
+                    path_key="supplemental_inventory_path",
+                    sha256_key="supplemental_inventory_sha256",
+                    label=f"Stage211 {phase} supplemental inventory",
+                ),
+                epochs=STAGE211_FULL_DATA_EPOCHS,
+                batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+                world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+                frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+                require_training_ready=True,
+                verify_part_sha256=False,
+            )
+            if difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY
+            else STAGE211_AUDIO_CURRICULUM[difficulty]
+        )
+        legacy_fields = {
+            "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+            "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+            "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "steps_per_epoch": int(expected["steps_per_epoch"]),
+            "steps": int(expected["steps"]),
+            "tail_padding_samples_per_epoch": int(
+                expected["tail_padding_samples_per_epoch"]
+            ),
+        }
+        if any(segment.get(key) != value for key, value in legacy_fields.items()):
+            raise ValueError(f"Stage211 {phase}/{difficulty} legacy profile changed.")
+        return {
+            "schema_version": 1,
+            "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+            "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+            "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "steps_per_epoch": int(expected["steps_per_epoch"]),
+            "steps": int(expected["steps"]),
+            "tail_padding_samples_per_epoch": int(
+                expected["tail_padding_samples_per_epoch"]
+            ),
+        }
+    if schema_version != 2:
+        raise ValueError(
+            f"Stage211 {phase}/{difficulty} coverage schema is unsupported: "
+            f"{schema_version!r}"
+        )
+    from rwkvasr.eval.stage211_batch_profile import (
+        validate_stage211_batch_profile_admission,
+    )
+
+    admission_path = _validate_bound_file(
+        segment,
+        path_key="batch_profile_admission_path",
+        sha256_key="batch_profile_admission_sha256",
+        label=f"Stage211 {phase}/{difficulty} batch-profile admission",
+    )
+    admission = validate_stage211_batch_profile_admission(
+        admission_path,
+        phase=phase,
+        expected_init_checkpoint=segment.get("init_checkpoint_path"),
+        expected_bucket_manifest=segment.get("bucket_manifest_path"),
+    )
+    profile = admission["selected_profile"]
+    admitted_coverage = admission["selected_coverage"]
+    admitted_fields = {
+        "batch_profile_name": profile["name"],
+        "batch_size": int(profile["batch_size"]),
+        "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+        "frame_budget": int(profile["frame_budget"]),
+        "steps_per_epoch": int(admitted_coverage["steps_per_epoch"]),
+        "steps": int(admitted_coverage["full_coverage_steps"]),
+        "tail_padding_samples_per_epoch": int(
+            admitted_coverage["tail_padding_samples_per_epoch"]
+        ),
+    }
+    if any(segment.get(key) != value for key, value in admitted_fields.items()):
+        raise ValueError(f"Stage211 {phase}/{difficulty} admitted profile changed.")
+    return {"schema_version": 2, **admitted_fields}
+
+
 def _validate_stage211_supplemental_coverage_segment(
     segment: Any,
     *,
@@ -2807,7 +2897,6 @@ def _validate_stage211_supplemental_coverage_segment(
     if not isinstance(segment, dict):
         raise ValueError("Stage211 full-data coverage lacks supplemental_natural.")
     expected_fields = {
-        "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "curriculum_coverage",
         "phase": phase,
@@ -2815,15 +2904,17 @@ def _validate_stage211_supplemental_coverage_segment(
         "complete": True,
         "full_data_profile": True,
         "epochs": STAGE211_FULL_DATA_EPOCHS,
-        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
-        "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
-        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
     }
     if any(segment.get(key) != value for key, value in expected_fields.items()):
         raise ValueError(f"Stage211 {phase}/supplemental_natural coverage is incomplete.")
+    runtime_profile = _validate_stage211_segment_batch_profile(
+        segment,
+        phase=phase,
+        difficulty=STAGE211_SUPPLEMENTAL_DIFFICULTY,
+    )
     inventory_path = _validate_bound_file(
         segment,
         path_key="supplemental_inventory_path",
@@ -2833,9 +2924,9 @@ def _validate_stage211_supplemental_coverage_segment(
     profile = stage211_supplemental_profile(
         inventory_path,
         epochs=STAGE211_FULL_DATA_EPOCHS,
-        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+        batch_size=int(runtime_profile["batch_size"]),
         world_size=STAGE211_FULL_DATA_WORLD_SIZE,
-        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+        frame_budget=int(runtime_profile["frame_budget"]),
         require_training_ready=True,
         verify_part_sha256=False,
     )
@@ -2921,8 +3012,18 @@ def _validate_stage211_supplemental_coverage_segment(
     train_config_path = Path(str(segment["train_config_path"])).resolve()
     train_config = load_yaml(train_config_path)
     validate_stage211_phase_train_config(train_config, phase=phase)
-    if int(train_config.get("max_steps", -1)) != int(profile["steps"]):
-        raise ValueError("Stage211 supplemental train config step contract mismatch.")
+    if runtime_profile["schema_version"] == 2:
+        expected_config_fields = {
+            "max_steps": int(profile["steps"]),
+            "batch_size": int(runtime_profile["batch_size"]),
+            "batch_token_budget": int(runtime_profile["frame_budget"]),
+            "length_bucket_frame_budget": int(runtime_profile["frame_budget"]),
+        }
+        if any(
+            train_config.get(key) != value
+            for key, value in expected_config_fields.items()
+        ):
+            raise ValueError("Stage211 supplemental train config step contract mismatch.")
     if (
         Path(str(train_config.get("webdataset_bucket_manifest_path") or "")).resolve()
         != Path(str(profile["bucket_manifest_path"])).resolve()
@@ -2954,12 +3055,6 @@ def validate_stage211_full_data_coverage(
         "original_total_hours": STAGE211_AUDIO_TOTAL_HOURS,
         "original_total_row_exposures": STAGE211_AUDIO_TOTAL_ROW_EXPOSURES,
         "original_total_hour_exposures": STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES,
-        "original_total_tail_padding_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
-        ),
-        "original_total_executed_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
-        ),
     }
     for key, expected in expected_original_totals.items():
         actual = coverage.get(key)
@@ -2993,10 +3088,11 @@ def validate_stage211_full_data_coverage(
 
     previous_checkpoint_sha256: str | None = None
     nano_teacher_checkpoint_sha256: str | None = None
+    original_tail_exposures = 0
+    original_executed_exposures = 0
     for difficulty, expected in STAGE211_AUDIO_CURRICULUM.items():
         segment = by_difficulty[difficulty]
         expected_fields = {
-            "schema_version": 1,
             "pipeline": "stage211",
             "artifact": "curriculum_coverage",
             "phase": phase,
@@ -3004,15 +3100,17 @@ def validate_stage211_full_data_coverage(
             "complete": True,
             "full_data_profile": True,
             "epochs": STAGE211_FULL_DATA_EPOCHS,
-            "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
-            "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
-            "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
             "length_bucket_drop_last": False,
             "skip_oversized_samples": False,
             "webdataset_skip_decode_errors": False,
         }
         if any(segment.get(key) != value for key, value in expected_fields.items()):
             raise ValueError(f"Stage211 {phase}/{difficulty} coverage is incomplete.")
+        runtime_profile = _validate_stage211_segment_batch_profile(
+            segment,
+            phase=phase,
+            difficulty=difficulty,
+        )
         _validate_parameter_delta_audit(
             segment,
             phase=phase,
@@ -3021,7 +3119,7 @@ def validate_stage211_full_data_coverage(
         validate_stage211_runtime_epoch_coverage(
             segment.get("runtime_epoch_coverage"),
             epochs=STAGE211_FULL_DATA_EPOCHS,
-            steps_per_epoch=int(expected["steps_per_epoch"]),
+            steps_per_epoch=int(runtime_profile["steps_per_epoch"]),
             label=f"{phase}/{difficulty}",
         )
         if int(segment.get("rows", -1)) != int(expected["rows"]):
@@ -3030,11 +3128,15 @@ def validate_stage211_full_data_coverage(
             int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS
         ):
             raise ValueError(f"Stage211 {phase}/{difficulty} row exposures mismatch.")
-        if int(segment.get("steps_per_epoch", -1)) != int(expected["steps_per_epoch"]):
+        if int(segment.get("steps_per_epoch", -1)) != int(
+            runtime_profile["steps_per_epoch"]
+        ):
             raise ValueError(f"Stage211 {phase}/{difficulty} per-epoch steps mismatch.")
-        if int(segment.get("steps", -1)) != int(expected["steps"]):
+        if int(segment.get("steps", -1)) != int(runtime_profile["steps"]):
             raise ValueError(f"Stage211 {phase}/{difficulty} step count mismatch.")
-        tail_padding_samples_per_epoch = int(expected["tail_padding_samples_per_epoch"])
+        tail_padding_samples_per_epoch = int(
+            runtime_profile["tail_padding_samples_per_epoch"]
+        )
         if int(segment.get("tail_padding_samples_per_epoch", -1)) != tail_padding_samples_per_epoch:
             raise ValueError(f"Stage211 {phase}/{difficulty} tail-padding count mismatch.")
         if int(segment.get("tail_padding_sample_exposures", -1)) != (
@@ -3046,6 +3148,8 @@ def validate_stage211_full_data_coverage(
             + tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
         ):
             raise ValueError(f"Stage211 {phase}/{difficulty} executed-sample exposure mismatch.")
+        original_tail_exposures += int(segment["tail_padding_sample_exposures"])
+        original_executed_exposures += int(segment["executed_sample_exposures"])
         hours = float(segment.get("hours", float("nan")))
         if not math.isfinite(hours) or abs(hours - float(expected["hours"])) > 0.002:
             raise ValueError(f"Stage211 {phase}/{difficulty} hour count mismatch.")
@@ -3122,6 +3226,20 @@ def validate_stage211_full_data_coverage(
                 )
         train_config = load_yaml(train_config_path)
         validate_stage211_phase_train_config(train_config, phase=phase)
+        if runtime_profile["schema_version"] == 2:
+            expected_config_fields = {
+                "max_steps": int(runtime_profile["steps"]),
+                "batch_size": int(runtime_profile["batch_size"]),
+                "batch_token_budget": int(runtime_profile["frame_budget"]),
+                "length_bucket_frame_budget": int(runtime_profile["frame_budget"]),
+            }
+            if any(
+                train_config.get(key) != value
+                for key, value in expected_config_fields.items()
+            ):
+                raise ValueError(
+                    f"Stage211 {phase}/{difficulty} train config profile mismatch."
+                )
         configured_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(train_config)
         if configured_teacher_checkpoint != teacher_checkpoint:
             raise ValueError(
@@ -3145,6 +3263,13 @@ def validate_stage211_full_data_coverage(
             )
         previous_checkpoint_sha256 = str(segment["completion_checkpoint_sha256"])
 
+    dynamic_original_totals = {
+        "original_total_tail_padding_sample_exposures": original_tail_exposures,
+        "original_total_executed_sample_exposures": original_executed_exposures,
+    }
+    if any(coverage.get(key) != value for key, value in dynamic_original_totals.items()):
+        raise ValueError("Stage211 dynamic original exposure totals mismatch.")
+
     supplemental_segment, supplemental_profile = _validate_stage211_supplemental_coverage_segment(
         coverage.get("supplemental_natural"),
         phase=phase,
@@ -3162,11 +3287,11 @@ def validate_stage211_full_data_coverage(
             STAGE211_AUDIO_TOTAL_HOUR_EXPOSURES + float(supplemental_profile["hour_exposures"])
         ),
         "total_tail_padding_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_TAIL_PADDING_SAMPLE_EXPOSURES
+            original_tail_exposures
             + int(supplemental_profile["tail_padding_sample_exposures"])
         ),
         "total_executed_sample_exposures": (
-            STAGE211_AUDIO_TOTAL_EXECUTED_SAMPLE_EXPOSURES
+            original_executed_exposures
             + int(supplemental_profile["executed_sample_exposures"])
         ),
     }

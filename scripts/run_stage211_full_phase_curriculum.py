@@ -11,6 +11,9 @@ from typing import Any
 
 import torch
 
+from rwkvasr.eval.stage211_batch_profile import (
+    validate_stage211_batch_profile_admission,
+)
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
     STAGE211_AUDIO_CURRICULUM,
@@ -175,6 +178,25 @@ def _parse_manifest_overrides(
     return {difficulty: path.expanduser().resolve() for difficulty, path in manifests.items()}
 
 
+def _parse_batch_profile_admissions(values: list[str]) -> dict[str, Path]:
+    allowed = (*tuple(STAGE211_AUDIO_CURRICULUM), STAGE211_SUPPLEMENTAL_DIFFICULTY)
+    admissions: dict[str, Path] = {}
+    for value in values:
+        difficulty, separator, raw_path = value.partition("=")
+        if separator != "=" or difficulty not in allowed or not raw_path:
+            raise ValueError(
+                "--batch-profile-admission must use "
+                "difficulty=/absolute/path for easy, medium, hard, long, or "
+                f"{STAGE211_SUPPLEMENTAL_DIFFICULTY}."
+            )
+        if difficulty in admissions:
+            raise ValueError(
+                f"Stage211 batch-profile admission was supplied twice: {difficulty}"
+            )
+        admissions[difficulty] = Path(raw_path).expanduser().resolve()
+    return admissions
+
+
 def _require_loaded_manifest_bindings(
     *,
     manifests: dict[str, Path],
@@ -246,6 +268,7 @@ def _runner_command(
     smoke: bool,
     dry_run: bool,
     supplemental_inventory: Path | None = None,
+    batch_profile_admission: Path | None = None,
 ) -> list[str]:
     command = [
         str(PYTHON),
@@ -274,6 +297,8 @@ def _runner_command(
         command.extend(("--promotion-receipt", str(promotion_receipt)))
     if supplemental_inventory is not None:
         command.extend(("--supplemental-inventory", str(supplemental_inventory)))
+    if batch_profile_admission is not None:
+        command.extend(("--batch-profile-admission", str(batch_profile_admission)))
     if smoke:
         command.append("--smoke")
     if dry_run:
@@ -291,6 +316,7 @@ def _receipt_command(
     completion_checkpoint: Path,
     output: Path,
     supplemental_inventory: Path | None = None,
+    batch_profile_admission: Path | None = None,
 ) -> list[str]:
     command = [
         str(PYTHON),
@@ -312,6 +338,8 @@ def _receipt_command(
     ]
     if supplemental_inventory is not None:
         command.extend(("--supplemental-inventory", str(supplemental_inventory)))
+    if batch_profile_admission is not None:
+        command.extend(("--batch-profile-admission", str(batch_profile_admission)))
     return command
 
 
@@ -635,11 +663,35 @@ def _load_reusable_receipt(
     init_checkpoint: Path,
     completion_checkpoint: Path,
     expected_profile: dict[str, Any] | None = None,
+    batch_profile_admission_path: Path | None = None,
 ) -> dict[str, Any]:
     receipt = _load_json(receipt_path, label="Stage211 reusable curriculum receipt")
     expected = expected_profile or STAGE211_AUDIO_CURRICULUM[difficulty]
+    batch_size = STAGE211_FULL_DATA_BATCH_SIZE
+    frame_budget = STAGE211_FULL_DATA_FRAME_BUDGET
+    steps_per_epoch = int(expected["steps_per_epoch"])
+    tail_padding_samples_per_epoch = int(expected["tail_padding_samples_per_epoch"])
+    schema_version = 1
+    batch_profile_admission: dict[str, Any] | None = None
+    if batch_profile_admission_path is not None:
+        batch_profile_admission = validate_stage211_batch_profile_admission(
+            batch_profile_admission_path,
+            phase=phase,
+            expected_init_checkpoint=init_checkpoint,
+            expected_bucket_manifest=manifest_path,
+        )
+        profile = batch_profile_admission["selected_profile"]
+        coverage = batch_profile_admission["selected_coverage"]
+        batch_size = int(profile["batch_size"])
+        frame_budget = int(profile["frame_budget"])
+        steps_per_epoch = int(coverage["steps_per_epoch"])
+        tail_padding_samples_per_epoch = int(
+            coverage["tail_padding_samples_per_epoch"]
+        )
+        schema_version = 2
+    total_steps = steps_per_epoch * STAGE211_FULL_DATA_EPOCHS
     expected_fields = {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "pipeline": "stage211",
         "artifact": "curriculum_coverage",
         "phase": phase,
@@ -647,27 +699,25 @@ def _load_reusable_receipt(
         "complete": True,
         "full_data_profile": True,
         "epochs": STAGE211_FULL_DATA_EPOCHS,
-        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "batch_size": batch_size,
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
-        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "frame_budget": frame_budget,
         "rows": int(expected["rows"]),
         "row_exposures": int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS,
         "tail_padding_sample_exposures": int(
-            expected["tail_padding_samples_per_epoch"]
+            tail_padding_samples_per_epoch
         )
         * STAGE211_FULL_DATA_EPOCHS,
         "executed_sample_exposures": (
             int(expected["rows"])
-            + int(expected["tail_padding_samples_per_epoch"])
+            + tail_padding_samples_per_epoch
         )
         * STAGE211_FULL_DATA_EPOCHS,
         "hours": float(expected["hours"]),
         "hour_exposures": float(expected["hours"]) * STAGE211_FULL_DATA_EPOCHS,
-        "steps_per_epoch": int(expected["steps_per_epoch"]),
-        "steps": int(expected["steps"]),
-        "tail_padding_samples_per_epoch": int(
-            expected["tail_padding_samples_per_epoch"]
-        ),
+        "steps_per_epoch": steps_per_epoch,
+        "steps": total_steps,
+        "tail_padding_samples_per_epoch": tail_padding_samples_per_epoch,
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
@@ -699,6 +749,27 @@ def _load_reusable_receipt(
             sha_key,
             label=f"Stage211 {phase}/{difficulty} reusable receipt",
         )
+    if batch_profile_admission is not None:
+        admission_fields = {
+            "batch_profile_admission_path": batch_profile_admission["receipt_path"],
+            "batch_profile_admission_sha256": batch_profile_admission["receipt_sha256"],
+            "batch_profile_name": batch_profile_admission["selected_profile"]["name"],
+        }
+        if any(receipt.get(key) != value for key, value in admission_fields.items()):
+            raise ValueError(
+                f"Stage211 {phase}/{difficulty} reusable batch-profile binding changed."
+            )
+    elif any(
+        receipt.get(key) is not None
+        for key in (
+            "batch_profile_admission_path",
+            "batch_profile_admission_sha256",
+            "batch_profile_name",
+        )
+    ):
+        raise ValueError(
+            f"Stage211 {phase}/{difficulty} legacy receipt unexpectedly binds a batch profile."
+        )
     audit = receipt.get("parameter_delta_audit")
     if (
         not isinstance(audit, dict)
@@ -714,7 +785,7 @@ def _load_reusable_receipt(
     _validate_reusable_runtime_coverage(
         receipt.get("runtime_epoch_coverage"),
         difficulty=difficulty,
-        steps_per_epoch=int(expected["steps_per_epoch"]),
+        steps_per_epoch=steps_per_epoch,
     )
     if expected_profile is not None:
         for key in ("supplemental_inventory_path", "supplemental_inventory_sha256"):
@@ -740,6 +811,9 @@ def run_phase(args: argparse.Namespace) -> Path | None:
         list(args.manifest),
         metadata_root=args.metadata_root.expanduser().resolve(),
         easy_manifest=args.easy_manifest.expanduser().resolve(),
+    )
+    batch_profile_admissions = _parse_batch_profile_admissions(
+        list(getattr(args, "batch_profile_admission", ()))
     )
     for difficulty, manifest in manifests.items():
         if not manifest.is_file() or manifest.stat().st_size <= 0:
@@ -823,7 +897,22 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             )
         run_dir = phase_root / difficulty
         receipt_path = phase_root / "receipts" / f"{difficulty}.json"
-        target_step = int(STAGE211_AUDIO_CURRICULUM[difficulty]["steps"])
+        batch_profile_admission_path = batch_profile_admissions.get(difficulty)
+        batch_profile_admission = (
+            validate_stage211_batch_profile_admission(
+                batch_profile_admission_path,
+                phase=phase,
+                expected_init_checkpoint=current_init,
+                expected_bucket_manifest=manifests[difficulty],
+            )
+            if batch_profile_admission_path is not None
+            else None
+        )
+        target_step = int(
+            batch_profile_admission["selected_coverage"]["full_coverage_steps"]
+            if batch_profile_admission is not None
+            else STAGE211_AUDIO_CURRICULUM[difficulty]["steps"]
+        )
         latest_step = _latest_step(run_dir)
         runner = _runner_command(
             phase=phase,
@@ -843,6 +932,7 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             smoke=False,
             dry_run=bool(args.dry_run),
             supplemental_inventory=None,
+            batch_profile_admission=batch_profile_admission_path,
         )
         _run_command(runner, dry_run=bool(args.dry_run))
         completion_checkpoint = run_dir / f"step-{target_step}.pt"
@@ -872,6 +962,7 @@ def run_phase(args: argparse.Namespace) -> Path | None:
                 manifest_path=manifests[difficulty],
                 init_checkpoint=current_init,
                 completion_checkpoint=completion_checkpoint,
+                batch_profile_admission_path=batch_profile_admission_path,
             )
             print(
                 f"[stage211-full-phase] reused immutable receipt "
@@ -888,6 +979,7 @@ def run_phase(args: argparse.Namespace) -> Path | None:
                 completion_checkpoint=completion_checkpoint,
                 output=receipt_path,
                 supplemental_inventory=None,
+                batch_profile_admission=batch_profile_admission_path,
             )
             _run_command(receipt_command, dry_run=False)
             receipt = _load_enriched_receipt(receipt_path)
@@ -920,6 +1012,32 @@ def run_phase(args: argparse.Namespace) -> Path | None:
     supplemental_receipt_path = (
         phase_root / "receipts" / f"{STAGE211_SUPPLEMENTAL_DIFFICULTY}.json"
     )
+    supplemental_batch_profile_path = batch_profile_admissions.get(
+        STAGE211_SUPPLEMENTAL_DIFFICULTY
+    )
+    supplemental_batch_profile = (
+        validate_stage211_batch_profile_admission(
+            supplemental_batch_profile_path,
+            phase=phase,
+            expected_init_checkpoint=current_init,
+            expected_bucket_manifest=supplemental_manifest,
+        )
+        if supplemental_batch_profile_path is not None
+        else None
+    )
+    if supplemental_batch_profile is not None:
+        selected_profile = supplemental_batch_profile["selected_profile"]
+        supplemental_profile = stage211_supplemental_profile(
+            supplemental_inventory,
+            epochs=STAGE211_FULL_DATA_EPOCHS,
+            batch_size=int(selected_profile["batch_size"]),
+            world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+            frame_budget=int(selected_profile["frame_budget"]),
+            require_training_ready=not args.dry_run,
+            verify_part_sha256=False,
+        )
+        if not args.dry_run:
+            validate_stage211_formal_supplemental_profile(supplemental_profile)
     supplemental_target_step = int(supplemental_profile["steps"])
     supplemental_latest_step = _latest_step(supplemental_run_dir)
     if loaded_manifest_receipt is not None:
@@ -941,6 +1059,7 @@ def run_phase(args: argparse.Namespace) -> Path | None:
         smoke=False,
         dry_run=bool(args.dry_run),
         supplemental_inventory=supplemental_inventory,
+        batch_profile_admission=supplemental_batch_profile_path,
     )
     _run_command(supplemental_runner, dry_run=bool(args.dry_run))
     supplemental_completion = supplemental_run_dir / f"step-{supplemental_target_step}.pt"
@@ -969,6 +1088,7 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             init_checkpoint=current_init,
             completion_checkpoint=supplemental_completion,
             expected_profile=supplemental_profile,
+            batch_profile_admission_path=supplemental_batch_profile_path,
         )
     else:
         supplemental_receipt_command = _receipt_command(
@@ -980,6 +1100,7 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             completion_checkpoint=supplemental_completion,
             output=supplemental_receipt_path,
             supplemental_inventory=supplemental_inventory,
+            batch_profile_admission=supplemental_batch_profile_path,
         )
         _run_command(supplemental_receipt_command, dry_run=False)
         supplemental_receipt = _load_enriched_receipt(supplemental_receipt_path)
@@ -1080,6 +1201,15 @@ def main() -> int:
         action="append",
         default=[],
         help="Override one manifest as difficulty=/absolute/path.",
+    )
+    parser.add_argument(
+        "--batch-profile-admission",
+        action="append",
+        default=[],
+        help=(
+            "Bind one fresh segment to a measured profile as "
+            "difficulty=/absolute/path; repeat only for admitted segments."
+        ),
     )
     parser.add_argument("--nano-checkpoint", type=Path, default=DEFAULT_NANO_CHECKPOINT)
     parser.add_argument(

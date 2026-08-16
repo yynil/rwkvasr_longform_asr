@@ -704,6 +704,7 @@ def main() -> int:
     parser.add_argument("--base-config", type=Path, required=True)
     parser.add_argument("--init-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--phase", choices=("mixer", "block", "logits"), required=True)
     parser.add_argument("--profile", type=parse_profile, action="append", default=[])
     parser.add_argument("--baseline-profile", default="baseline")
     parser.add_argument("--warmup-steps", type=int, default=20)
@@ -761,9 +762,10 @@ def main() -> int:
         )
     script_path = Path(__file__).resolve()
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "pipeline": "stage211",
         "artifact": "batch_throughput_preflight",
+        "phase": str(args.phase),
         "complete": False,
         "formal_admission": False,
         "dry_run": bool(args.dry_run),
@@ -818,6 +820,7 @@ def main() -> int:
             max_steps=max_steps,
             world_size=int(args.world_size),
         )
+        config["stage211_batch_profile_probe_phase"] = str(args.phase)
         required_match_fields = required_online_match_fields(config)
         if not required_match_fields:
             raise ValueError(

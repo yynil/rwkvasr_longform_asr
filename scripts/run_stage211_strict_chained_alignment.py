@@ -33,6 +33,9 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_phase_gate_report,
     validate_stage211_runtime_epoch_coverage,
 )
+from rwkvasr.eval.stage211_batch_profile import (
+    validate_stage211_batch_profile_admission,
+)
 from rwkvasr.eval.stage211_supplemental import (
     DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
     STAGE211_SUPPLEMENTAL_DIFFICULTY,
@@ -303,6 +306,10 @@ def _segments(
                     "Stage211 supplemental natural audio requires its dynamic full-data steps."
                 )
             target_step = int(formal_steps)
+        elif full_data_profile and formal_steps is not None:
+            if int(formal_steps) <= 0:
+                raise ValueError("Stage211 admitted full-data steps must be positive.")
+            target_step = int(formal_steps)
         else:
             target_step = int(
                 STAGE211_AUDIO_CURRICULUM[difficulty]["steps"]
@@ -508,14 +515,29 @@ def _validate_curriculum_receipt(
         expected_difficulty = CURRICULUM_SEQUENCE[target_index - 1]
     if target_difficulty == "easy":
         raise ValueError("Stage211 easy curriculum does not accept a predecessor receipt.")
+    schema_version = receipt.get("schema_version")
+    if schema_version not in (1, 2):
+        raise ValueError(
+            f"Stage211 curriculum receipt schema mismatch: actual={schema_version!r}"
+        )
     expected_fields = {
-        "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "curriculum_coverage",
         "phase": phase,
         "difficulty": expected_difficulty,
         "complete": True,
     }
+    if schema_version == 2:
+        expected_fields.update(
+            {
+                "full_data_profile": True,
+                "epochs": STAGE211_FULL_DATA_EPOCHS,
+                "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+                "length_bucket_drop_last": False,
+                "skip_oversized_samples": False,
+                "webdataset_skip_decode_errors": False,
+            }
+        )
     for key, expected in expected_fields.items():
         if receipt.get(key) != expected:
             raise ValueError(
@@ -531,10 +553,40 @@ def _validate_curriculum_receipt(
         )
     if receipt.get("completion_checkpoint_sha256") != _sha256_file(checkpoint_path):
         raise ValueError("Stage211 curriculum receipt checkpoint SHA-256 mismatch.")
+    if schema_version == 1:
+        steps_per_epoch = int(
+            STAGE211_AUDIO_CURRICULUM[expected_difficulty]["steps_per_epoch"]
+        )
+    else:
+        admission_path = Path(
+            str(receipt.get("batch_profile_admission_path") or "")
+        ).resolve()
+        admission = validate_stage211_batch_profile_admission(
+            admission_path,
+            phase=phase,
+            expected_init_checkpoint=receipt.get("init_checkpoint_path"),
+            expected_bucket_manifest=receipt.get("bucket_manifest_path"),
+        )
+        profile = admission["selected_profile"]
+        coverage = admission["selected_coverage"]
+        schema2_fields = {
+            "batch_profile_admission_sha256": admission["receipt_sha256"],
+            "batch_profile_name": profile["name"],
+            "batch_size": int(profile["batch_size"]),
+            "frame_budget": int(profile["frame_budget"]),
+            "steps_per_epoch": int(coverage["steps_per_epoch"]),
+            "steps": int(coverage["full_coverage_steps"]),
+            "tail_padding_samples_per_epoch": int(
+                coverage["tail_padding_samples_per_epoch"]
+            ),
+        }
+        if any(receipt.get(key) != value for key, value in schema2_fields.items()):
+            raise ValueError("Stage211 admitted curriculum receipt profile changed.")
+        steps_per_epoch = int(coverage["steps_per_epoch"])
     validate_stage211_runtime_epoch_coverage(
         receipt.get("runtime_epoch_coverage"),
         epochs=STAGE211_FULL_DATA_EPOCHS,
-        steps_per_epoch=int(STAGE211_AUDIO_CURRICULUM[expected_difficulty]["steps_per_epoch"]),
+        steps_per_epoch=steps_per_epoch,
         label=f"{phase}/{expected_difficulty}",
     )
     recorded_teacher_sha256 = str(receipt.get("nano_teacher_checkpoint_sha256") or "")
@@ -1146,6 +1198,7 @@ def _config(
     labeled_length_index: Path | None = None,
     audio_data_audit: dict[str, Any] | None = None,
     full_data_profile: bool = False,
+    batch_profile_admission: dict[str, Any] | None = None,
     post_coverage_correction: bool = False,
 ) -> dict[str, Any]:
     config = _stage210n_config(
@@ -1225,12 +1278,22 @@ def _config(
         }
     )
     if full_data_profile:
+        selected_profile = (
+            batch_profile_admission["selected_profile"]
+            if batch_profile_admission is not None
+            else {
+                "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+                "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            }
+        )
+        runtime_batch_size = int(selected_profile["batch_size"])
+        runtime_frame_budget = int(selected_profile["frame_budget"])
         config.update(
             {
-                "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
-                "batch_token_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+                "batch_size": runtime_batch_size,
+                "batch_token_budget": runtime_frame_budget,
                 "length_bucket_drop_last": False,
-                "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+                "length_bucket_frame_budget": runtime_frame_budget,
                 "skip_oversized_samples": False,
                 "webdataset_skip_decode_errors": False,
             }
@@ -1239,13 +1302,27 @@ def _config(
         gradient_accumulation = int(deepspeed_config.get("gradient_accumulation_steps", 1))
         deepspeed_config.update(
             {
-                "train_micro_batch_size_per_gpu": STAGE211_FULL_DATA_BATCH_SIZE,
+                "train_micro_batch_size_per_gpu": runtime_batch_size,
                 "train_batch_size": (
-                    STAGE211_FULL_DATA_BATCH_SIZE * TRAIN_WORLD_SIZE * gradient_accumulation
+                    runtime_batch_size * TRAIN_WORLD_SIZE * gradient_accumulation
                 ),
             }
         )
         config["deepspeed"] = deepspeed_config
+        if batch_profile_admission is not None:
+            config.update(
+                {
+                    "stage211_batch_profile_admission_path": batch_profile_admission[
+                        "receipt_path"
+                    ],
+                    "stage211_batch_profile_admission_sha256": batch_profile_admission[
+                        "receipt_sha256"
+                    ],
+                    "stage211_batch_profile_name": batch_profile_admission[
+                        "selected_profile"
+                    ]["name"],
+                }
+            )
     if phase.requires_labels:
         if labeled_webdataset_root is None or labeled_length_index is None:
             raise ValueError(
@@ -1416,6 +1493,7 @@ def _record_or_validate_provenance(
     curriculum_difficulty: str | None,
     curriculum_receipt: dict[str, Any] | None,
     full_data_profile: bool,
+    batch_profile_admission: dict[str, Any] | None,
     labeled_data_audit: dict[str, Any] | None,
     audio_data_audit: dict[str, Any] | None,
 ) -> Path:
@@ -1450,6 +1528,18 @@ def _record_or_validate_provenance(
         payload["length_bucket_drop_last"] = False
         payload["skip_oversized_samples"] = False
         payload["webdataset_skip_decode_errors"] = False
+        if batch_profile_admission is not None:
+            payload["batch_profile_admission_path"] = batch_profile_admission["receipt_path"]
+            payload["batch_profile_admission_sha256"] = batch_profile_admission[
+                "receipt_sha256"
+            ]
+            payload["batch_profile_name"] = batch_profile_admission["selected_profile"]["name"]
+            payload["batch_size"] = int(
+                batch_profile_admission["selected_profile"]["batch_size"]
+            )
+            payload["frame_budget"] = int(
+                batch_profile_admission["selected_profile"]["frame_budget"]
+            )
     if phase.requires_labels:
         payload["length_bucket_drop_last"] = False
         payload["skip_oversized_samples"] = False
@@ -1477,6 +1567,7 @@ def _validate_resume_provenance(
     audio_data_audit: dict[str, Any] | None,
     curriculum_difficulty: str | None,
     full_data_profile: bool,
+    batch_profile_admission: dict[str, Any] | None,
 ) -> dict[str, Any]:
     path = output_dir / "stage211_provenance.json"
     if not path.is_file():
@@ -1497,6 +1588,22 @@ def _validate_resume_provenance(
         expected["length_bucket_drop_last"] = False
         expected["skip_oversized_samples"] = False
         expected["webdataset_skip_decode_errors"] = False
+        if batch_profile_admission is not None:
+            expected["batch_profile_admission_path"] = batch_profile_admission[
+                "receipt_path"
+            ]
+            expected["batch_profile_admission_sha256"] = batch_profile_admission[
+                "receipt_sha256"
+            ]
+            expected["batch_profile_name"] = batch_profile_admission["selected_profile"][
+                "name"
+            ]
+            expected["batch_size"] = int(
+                batch_profile_admission["selected_profile"]["batch_size"]
+            )
+            expected["frame_budget"] = int(
+                batch_profile_admission["selected_profile"]["frame_budget"]
+            )
     if phase.requires_labels:
         expected["length_bucket_drop_last"] = False
         expected["skip_oversized_samples"] = False
@@ -1507,6 +1614,19 @@ def _validate_resume_provenance(
                 f"Stage211 resume provenance {key} mismatch: "
                 f"expected={value!r} actual={payload.get(key)!r}"
             )
+    admission_keys = (
+        "batch_profile_admission_path",
+        "batch_profile_admission_sha256",
+        "batch_profile_name",
+        "batch_size",
+        "frame_budget",
+    )
+    if batch_profile_admission is None and any(
+        payload.get(key) is not None for key in admission_keys
+    ):
+        raise ValueError(
+            "Stage211 resume provenance requires its recorded batch-profile admission."
+        )
     curriculum_receipt_path_value = payload.get("curriculum_receipt_path")
     curriculum_receipt_sha256 = payload.get("curriculum_receipt_sha256")
     is_curriculum_continuation = (
@@ -1561,6 +1681,7 @@ def main() -> int:
         ),
     )
     parser.add_argument("--full-data-profile", action="store_true")
+    parser.add_argument("--batch-profile-admission", type=Path, default=None)
     parser.add_argument("--labeled-webdataset-root", type=Path, default=None)
     parser.add_argument("--labeled-length-index", type=Path, default=None)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
@@ -1582,6 +1703,7 @@ def main() -> int:
             args.difficulty is not None
             or args.curriculum_receipt is not None
             or args.full_data_profile
+            or args.batch_profile_admission is not None
         ):
             parser.error("Stage211 SFT does not accept audio curriculum arguments")
         difficulty = "easy"
@@ -1589,6 +1711,12 @@ def main() -> int:
         difficulty = str(args.difficulty or "easy")
         if args.full_data_profile and args.difficulty is None:
             parser.error("--full-data-profile requires an explicit --difficulty")
+    if args.batch_profile_admission is not None and (
+        not args.full_data_profile or args.smoke
+    ):
+        parser.error(
+            "--batch-profile-admission requires a non-smoke --full-data-profile run"
+        )
     is_supplemental = difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY
     if is_supplemental and args.supplemental_inventory is None:
         parser.error(
@@ -1607,9 +1735,28 @@ def main() -> int:
     if not bucket_manifest.is_file():
         raise FileNotFoundError(str(bucket_manifest))
 
+    batch_profile_admission: dict[str, Any] | None = None
+    runtime_batch_size = STAGE211_FULL_DATA_BATCH_SIZE
+    runtime_frame_budget = STAGE211_FULL_DATA_FRAME_BUDGET
+    if args.batch_profile_admission is not None:
+        batch_profile_admission = validate_stage211_batch_profile_admission(
+            args.batch_profile_admission,
+            phase=phase.name,
+            expected_init_checkpoint=args.init_checkpoint,
+            expected_bucket_manifest=bucket_manifest,
+        )
+        runtime_batch_size = int(batch_profile_admission["selected_profile"]["batch_size"])
+        runtime_frame_budget = int(
+            batch_profile_admission["selected_profile"]["frame_budget"]
+        )
+
     labeled_data_audit: dict[str, Any] | None = None
     audio_data_audit: dict[str, Any] | None = None
-    formal_steps: int | None = None
+    formal_steps: int | None = (
+        int(batch_profile_admission["selected_coverage"]["full_coverage_steps"])
+        if batch_profile_admission is not None
+        else None
+    )
     if phase.requires_labels:
         if args.labeled_webdataset_root is None or args.labeled_length_index is None:
             parser.error(
@@ -1627,9 +1774,9 @@ def main() -> int:
         supplemental_profile = stage211_supplemental_profile(
             args.supplemental_inventory or DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY,
             epochs=STAGE211_FULL_DATA_EPOCHS,
-            batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+            batch_size=runtime_batch_size,
             world_size=TRAIN_WORLD_SIZE,
-            frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+            frame_budget=runtime_frame_budget,
             require_training_ready=not args.dry_run,
             verify_part_sha256=False,
         )
@@ -1671,10 +1818,10 @@ def main() -> int:
         expected_coverage = STAGE211_AUDIO_CURRICULUM[difficulty]
         actual_rows = int(audio_data_audit["split_samples"].get("train", 0))
         audit_batch_size = (
-            STAGE211_FULL_DATA_BATCH_SIZE if args.full_data_profile else TRAIN_BATCH_SIZE
+            runtime_batch_size if args.full_data_profile else TRAIN_BATCH_SIZE
         )
         audit_frame_budget = (
-            STAGE211_FULL_DATA_FRAME_BUDGET if args.full_data_profile else TRAIN_FRAME_BUDGET
+            runtime_frame_budget if args.full_data_profile else TRAIN_FRAME_BUDGET
         )
         actual_steps_per_epoch = estimate_bucket_manifest_steps(
             manifest,
@@ -1685,7 +1832,9 @@ def main() -> int:
             drop_last=not args.full_data_profile,
         )
         expected_steps_per_epoch = int(
-            expected_coverage["steps_per_epoch"]
+            batch_profile_admission["selected_coverage"]["steps_per_epoch"]
+            if batch_profile_admission is not None
+            else expected_coverage["steps_per_epoch"]
             if args.full_data_profile
             else LEGACY_CURRICULUM_STEPS[difficulty]
         )
@@ -1706,12 +1855,20 @@ def main() -> int:
                 world_size=TRAIN_WORLD_SIZE,
                 frame_budget=audit_frame_budget,
             )
-            expected_tail_padding = int(expected_coverage["tail_padding_samples_per_epoch"])
+            expected_tail_padding = int(
+                batch_profile_admission["selected_coverage"][
+                    "tail_padding_samples_per_epoch"
+                ]
+                if batch_profile_admission is not None
+                else expected_coverage["tail_padding_samples_per_epoch"]
+            )
             if actual_tail_padding != expected_tail_padding:
                 raise ValueError(
                     f"Stage211 {difficulty} manifest tail-padding mismatch: "
                     f"actual={actual_tail_padding} expected={expected_tail_padding}"
                 )
+            if batch_profile_admission is not None:
+                formal_steps = expected_steps_per_epoch * STAGE211_FULL_DATA_EPOCHS
         if difficulty != "easy" or args.full_data_profile:
             eval_rows = int(audio_data_audit["split_samples"].get("eval", 0))
             if eval_rows != FIXED_HIDDEN_EVAL_SAMPLES:
@@ -1814,6 +1971,7 @@ def main() -> int:
                 curriculum_difficulty=args.difficulty,
                 curriculum_receipt=curriculum_receipt,
                 full_data_profile=bool(args.full_data_profile),
+                batch_profile_admission=batch_profile_admission,
                 labeled_data_audit=labeled_data_audit,
                 audio_data_audit=audio_data_audit,
             )
@@ -1836,6 +1994,7 @@ def main() -> int:
             audio_data_audit=audio_data_audit,
             curriculum_difficulty=args.difficulty,
             full_data_profile=bool(args.full_data_profile),
+            batch_profile_admission=batch_profile_admission,
         )
     if init_checkpoint is None:
         init_checkpoint = output_dir / "resume-placeholder.pt"
@@ -1846,6 +2005,14 @@ def main() -> int:
     if not phase.requires_labels:
         print(f"difficulty={difficulty}", flush=True)
         print(f"full_data_profile={str(bool(args.full_data_profile)).lower()}", flush=True)
+        if batch_profile_admission is not None:
+            print(
+                "batch_profile_admission="
+                f"{batch_profile_admission['receipt_path']} "
+                f"profile={batch_profile_admission['selected_profile']['name']} "
+                f"batch={runtime_batch_size} frame_budget={runtime_frame_budget}",
+                flush=True,
+            )
     if labeled_data_audit is not None:
         print(
             "labeled_data_audit="
@@ -1904,6 +2071,7 @@ def main() -> int:
             labeled_length_index=args.labeled_length_index,
             audio_data_audit=audio_data_audit,
             full_data_profile=bool(args.full_data_profile),
+            batch_profile_admission=batch_profile_admission,
         )
         config_path = _write_config(
             phase=phase,
