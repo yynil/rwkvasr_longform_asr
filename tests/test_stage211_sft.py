@@ -25,6 +25,10 @@ from rwkvasr.eval.stage211_public_metrics import (
     replay_stage211_public_comparison,
     replay_stage211_sft_public_evidence,
 )
+from stage211_public_helpers import (
+    stage211_test_student_ctc_context,
+    stage211_test_student_ctc_row,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -929,8 +933,21 @@ def test_stage211_sft_public_evidence_replays_baseline_candidate_and_progress(
         "".join(json.dumps(row) + "\n" for row in baseline_rows),
         encoding="utf-8",
     )
+    provenance, tokenizer = stage211_test_student_ctc_context(candidate_checkpoint)
     candidate.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows),
+        "".join(
+            json.dumps(
+                stage211_test_student_ctc_row(
+                    utt_id=str(row["utt_id"]),
+                    ref_text=str(row["ref_text"]),
+                    pred_text=str(row["pred_text"]),
+                    provenance=provenance,
+                    tokenizer=tokenizer,
+                )
+            )
+            + "\n"
+            for row in rows
+        ),
         encoding="utf-8",
     )
 

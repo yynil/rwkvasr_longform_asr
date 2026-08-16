@@ -52,6 +52,10 @@ from rwkvasr.eval.stage211_public_metrics import (
     replay_stage211_public_comparison,
     validate_stage211_student_public_prediction_receipt,
 )
+from stage211_public_helpers import (
+    stage211_test_student_ctc_context,
+    stage211_test_student_ctc_row,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -497,9 +501,25 @@ def test_stage211_public_prediction_receipt_binds_checkpoint_and_predictions(
         '{"utt_id":"one","text":"hello world"}\n{"utt_id":"two","text":"speech test"}\n',
         encoding="utf-8",
     )
+    provenance, tokenizer = stage211_test_student_ctc_context(checkpoint)
+    prediction_rows = [
+        stage211_test_student_ctc_row(
+            utt_id="one",
+            ref_text="hello world",
+            pred_text="hello world",
+            provenance=provenance,
+            tokenizer=tokenizer,
+        ),
+        stage211_test_student_ctc_row(
+            utt_id="two",
+            ref_text="speech test",
+            pred_text="speech",
+            provenance=provenance,
+            tokenizer=tokenizer,
+        ),
+    ]
     prediction.write_text(
-        '{"utt_id":"one","ref_text":"hello world","pred_text":"hello world"}\n'
-        '{"utt_id":"two","ref_text":"speech test","pred_text":"speech"}\n',
+        "".join(json.dumps(row) + "\n" for row in prediction_rows),
         encoding="utf-8",
     )
     receipt = build_stage211_student_public_prediction_receipt(
@@ -518,6 +538,7 @@ def test_stage211_public_prediction_receipt_binds_checkpoint_and_predictions(
         expected_prediction_paths={dataset: prediction},
         benchmarks=benchmarks,
     )
+    assert validated["schema_version"] == 2
     assert validated["total_samples"] == 2
     monkeypatch.setattr(
         public_compare,
@@ -551,8 +572,15 @@ def test_stage211_public_prediction_receipt_binds_checkpoint_and_predictions(
             benchmarks=benchmarks,
         )
 
+    prediction_rows[1] = stage211_test_student_ctc_row(
+        utt_id="two",
+        ref_text="speech test",
+        pred_text="speech test",
+        provenance=provenance,
+        tokenizer=tokenizer,
+    )
     prediction.write_text(
-        prediction.read_text(encoding="utf-8").replace('"speech"}', '"speech test"}'),
+        "".join(json.dumps(row) + "\n" for row in prediction_rows),
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="does not match current files"):
@@ -562,6 +590,64 @@ def test_stage211_public_prediction_receipt_binds_checkpoint_and_predictions(
             expected_manifest_paths={dataset: manifest},
             expected_prediction_paths={dataset: prediction},
             benchmarks=benchmarks,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing_provenance", "lacks CTC execution provenance"),
+        ("nano_row", "lacks CTC execution provenance"),
+        ("wrong_checkpoint", "does not match current checkpoint/config files"),
+        ("wrong_blank", "does not match current checkpoint/config files"),
+        ("decoder_rescore", "not CTC-only greedy output"),
+    ),
+)
+def test_stage211_public_prediction_receipt_rejects_unbound_or_non_ctc_rows(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    dataset = "librispeech_test_clean"
+    checkpoint = tmp_path / "student.pt"
+    checkpoint.write_bytes(b"student")
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"utt_id":"one","text":"hello world"}\n', encoding="utf-8")
+    provenance, tokenizer = stage211_test_student_ctc_context(checkpoint)
+    row = stage211_test_student_ctc_row(
+        utt_id="one",
+        ref_text="hello world",
+        pred_text="hello world",
+        provenance=provenance,
+        tokenizer=tokenizer,
+    )
+    if mutation == "missing_provenance":
+        row.pop("inference_provenance")
+    elif mutation == "nano_row":
+        row = {"utt_id": "one", "ref_text": "hello world", "pred_text": "hello world"}
+    elif mutation == "wrong_checkpoint":
+        other_checkpoint = tmp_path / "other.pt"
+        other_checkpoint.write_bytes(b"other")
+        row["inference_provenance"], _ = stage211_test_student_ctc_context(
+            other_checkpoint
+        )
+    elif mutation == "wrong_blank":
+        row["inference_provenance"] = {
+            **provenance,
+            "blank_id": 60_514,
+        }
+    elif mutation == "decoder_rescore":
+        row["decoder_score"] = 0.0
+    else:
+        raise AssertionError(mutation)
+    prediction = tmp_path / "prediction.jsonl"
+    prediction.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        build_stage211_student_public_prediction_receipt(
+            checkpoint_path=checkpoint,
+            manifest_paths={dataset: manifest},
+            prediction_paths={dataset: prediction},
+            benchmarks={dataset: {"language": "en", "metric": "wer", "samples": 1}},
         )
 
 
@@ -4102,6 +4188,7 @@ def _write_public_comparison_evidence_fixture(
     baseline_checkpoint: Path,
     clean_commonvoice_manifest: Path,
 ) -> tuple[Path, dict[str, object], Path, dict[str, object]]:
+    candidate_provenance, candidate_tokenizer = stage211_test_student_ctc_context(checkpoint)
     candidate_results: list[dict[str, object]] = []
     baseline_results: list[dict[str, object]] = []
     manifest_paths: dict[str, Path] = {}
@@ -4135,6 +4222,7 @@ def _write_public_comparison_evidence_fixture(
 
         manifest_rows: list[str] = []
         nano_rows: list[str] = []
+        candidate_rows: list[str] = []
         baseline_rows: list[str] = []
         for row_index, utt_id in enumerate(utt_ids):
             if dataset != "commonvoice_en_test":
@@ -4148,6 +4236,19 @@ def _write_public_comparison_evidence_fixture(
                         "ref_text": reference,
                         "pred_text": baseline_prediction if row_index == 0 else reference,
                     },
+                    ensure_ascii=True,
+                )
+                + "\n"
+            )
+            candidate_rows.append(
+                json.dumps(
+                    stage211_test_student_ctc_row(
+                        utt_id=utt_id,
+                        ref_text=reference,
+                        pred_text=(baseline_prediction if row_index == 0 else reference),
+                        provenance=candidate_provenance,
+                        tokenizer=candidate_tokenizer,
+                    ),
                     ensure_ascii=True,
                 )
                 + "\n"
@@ -4166,7 +4267,7 @@ def _write_public_comparison_evidence_fixture(
         if manifest_rows:
             manifest_path.write_text("".join(manifest_rows), encoding="utf-8")
         nano_path.write_text("".join(nano_rows), encoding="utf-8")
-        os.link(nano_path, candidate_path)
+        candidate_path.write_text("".join(candidate_rows), encoding="utf-8")
         baseline_path.write_text("".join(baseline_rows), encoding="utf-8")
         manifest_paths[dataset] = manifest_path.resolve()
         candidate_prediction_paths[dataset] = candidate_path.resolve()
@@ -5533,16 +5634,40 @@ def _write_corrected_phase_gate(
     prior_receipt = json.loads(prior_receipt_path.read_text(encoding="utf-8"))
     receipt_results = {str(result["dataset"]): result for result in prior_receipt["results"]}
     public_results = {str(result["dataset"]): result for result in public_source["results"]}
+    corrected_provenance, corrected_tokenizer = stage211_test_student_ctc_context(checkpoint)
+    corrected_prediction_paths: dict[str, Path] = {}
+    for dataset in STAGE211_PUBLIC_BENCHMARKS:
+        prior_prediction_path = Path(str(public_results[dataset]["student_prediction_path"]))
+        corrected_prediction_path = tmp_path / f"{dataset}.corrected.jsonl"
+        corrected_rows = []
+        for line in prior_prediction_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            corrected_rows.append(
+                stage211_test_student_ctc_row(
+                    utt_id=str(row["utt_id"]),
+                    ref_text=str(row["ref_text"]),
+                    pred_text=str(row["pred_text"]),
+                    provenance=corrected_provenance,
+                    tokenizer=corrected_tokenizer,
+                )
+            )
+        corrected_prediction_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in corrected_rows),
+            encoding="utf-8",
+        )
+        corrected_prediction_paths[dataset] = corrected_prediction_path.resolve()
+        public_results[dataset]["student_prediction_path"] = str(
+            corrected_prediction_path.resolve()
+        )
     corrected_receipt = build_stage211_student_public_prediction_receipt(
         checkpoint_path=checkpoint,
         manifest_paths={
             dataset: Path(str(receipt_results[dataset]["manifest_path"]))
             for dataset in STAGE211_PUBLIC_BENCHMARKS
         },
-        prediction_paths={
-            dataset: Path(str(public_results[dataset]["student_prediction_path"]))
-            for dataset in STAGE211_PUBLIC_BENCHMARKS
-        },
+        prediction_paths=corrected_prediction_paths,
         benchmarks=STAGE211_PUBLIC_BENCHMARKS,
     )
     corrected_receipt_path = tmp_path / "corrected-public-prediction-receipt.json"
@@ -5552,6 +5677,15 @@ def _write_corrected_phase_gate(
     )
     public_source["student_prediction_receipt_path"] = str(corrected_receipt_path.resolve())
     public_source["student_prediction_receipt_sha256"] = sha256_file(corrected_receipt_path)
+    report["public_benchmark"] = replay_stage211_public_comparison(
+        public_source,
+        manifest_paths={
+            dataset: Path(str(receipt_results[dataset]["manifest_path"]))
+            for dataset in STAGE211_PUBLIC_BENCHMARKS
+        },
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        expected_checkpoint=checkpoint,
+    )
     corrected_public_source_path = tmp_path / "corrected-public-comparison.json"
     corrected_public_source_path.write_text(
         json.dumps(public_source) + "\n",
@@ -5559,14 +5693,6 @@ def _write_corrected_phase_gate(
     )
     report["public_comparison_report_path"] = str(corrected_public_source_path.resolve())
     report["public_comparison_report_sha256"] = sha256_file(corrected_public_source_path)
-    report["public_benchmark"]["student_checkpoint_path"] = str(checkpoint.resolve())
-    report["public_benchmark"]["student_checkpoint_sha256"] = sha256_file(checkpoint)
-    report["public_benchmark"]["student_prediction_receipt_path"] = str(
-        corrected_receipt_path.resolve()
-    )
-    report["public_benchmark"]["student_prediction_receipt_sha256"] = sha256_file(
-        corrected_receipt_path
-    )
     corrected_gate = tmp_path / "corrected_phase_gate.json"
     corrected_gate.write_text(json.dumps(report) + "\n", encoding="utf-8")
     return corrected_gate

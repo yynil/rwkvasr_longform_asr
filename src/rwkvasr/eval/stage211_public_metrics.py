@@ -6,6 +6,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from rwkvasr.config import load_yaml
+from rwkvasr.data.manifest import build_text_tokenizer
 from rwkvasr.eval.text_metrics import (
     _normalize_text_for_error_tokens,
     edit_counts,
@@ -19,6 +21,9 @@ from rwkvasr.eval.text_metrics import (
 STAGE211_PUBLIC_MAX_RELATIVE_RATIO = 1.20
 STAGE211_PUBLIC_MAX_ABSOLUTE_GAP_POINTS = 3.0
 STAGE211_PUBLIC_MAX_PROGRESS_REGRESSION = 0.03
+STAGE211_STUDENT_BLANK_ID = 60_515
+STAGE211_STUDENT_TOKENIZER_VOCAB_SIZE = 60_515
+STAGE211_STUDENT_CTC_VOCAB_SIZE = 60_516
 
 _PUBLIC_LABELS = {
     "aishell1_test": "AISHELL-1 test",
@@ -37,11 +42,159 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_json_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _bound_file(path_value: Any, *, label: str) -> Path:
     path = Path(str(path_value or "")).expanduser().resolve()
     if not path.is_file() or path.stat().st_size <= 0:
         raise ValueError(f"Stage211 {label} is missing or empty: {path}")
     return path
+
+
+def build_stage211_student_ctc_execution_provenance(
+    *,
+    checkpoint_path: Path,
+    model_config_path: Path,
+    tokenizer_config_path: Path,
+    mode: str,
+    beam_size: int,
+    token_prune_topk: int | None,
+    decoder_rescore_topk: int,
+    blank_logit_bias: float,
+    hotwords_path: str | Path | None,
+    text_normalization: str,
+    save_debug_lengths: bool,
+) -> dict[str, Any]:
+    checkpoint_path = _bound_file(checkpoint_path, label="student CTC execution checkpoint")
+    model_config_path = _bound_file(
+        model_config_path,
+        label="student CTC execution model config",
+    )
+    tokenizer_config_path = _bound_file(
+        tokenizer_config_path,
+        label="student CTC execution tokenizer config",
+    )
+    if model_config_path != (checkpoint_path.parent / "model_config.yaml").resolve():
+        raise ValueError("Stage211 student CTC execution must use the checkpoint-local model config.")
+    if tokenizer_config_path != (checkpoint_path.parent / "tokenizer_config.yaml").resolve():
+        raise ValueError(
+            "Stage211 student CTC execution must use the checkpoint-local tokenizer config."
+        )
+
+    model_config = load_yaml(model_config_path)
+    tokenizer_config = load_yaml(tokenizer_config_path)
+    if not isinstance(model_config, dict) or not isinstance(tokenizer_config, dict):
+        raise ValueError("Stage211 student CTC execution configs must be mappings.")
+    blank_id = int(model_config.get("blank_id", -1))
+    tokenizer_vocab_size = int(tokenizer_config.get("vocab_size", -1))
+    model_vocab_size = int(model_config.get("vocab_size", -1))
+    ctc_vocab_size = max(model_vocab_size, blank_id + 1)
+    tokenizer_model_path = _bound_file(
+        tokenizer_config.get("tokenizer_model_path"),
+        label="student CTC tokenizer model",
+    )
+    ctc_decoder_type = str(model_config.get("ctc_decoder_type") or "").lower()
+    suppressed_token_ids = tuple(
+        sorted({int(token_id) for token_id in model_config.get("ctc_suppressed_token_ids", ())})
+    )
+    contract_valid = (
+        blank_id == STAGE211_STUDENT_BLANK_ID
+        and model_vocab_size == STAGE211_STUDENT_TOKENIZER_VOCAB_SIZE
+        and tokenizer_vocab_size == STAGE211_STUDENT_TOKENIZER_VOCAB_SIZE
+        and ctc_vocab_size == STAGE211_STUDENT_CTC_VOCAB_SIZE
+        and tokenizer_config.get("tokenizer_type") == "sensevoice_tiktoken"
+        and ctc_decoder_type in {"funasr_nano_transformer", "nano_transformer"}
+        and int(model_config.get("ctc_decoder_num_layers", -1)) == 5
+        and model_config.get("decoder_enabled") is False
+        and str(mode) == "bi"
+        and int(beam_size) == 1
+        and int(token_prune_topk or 0) == 16
+        and int(decoder_rescore_topk) == 0
+        and math.isclose(float(blank_logit_bias), 0.0, rel_tol=0.0, abs_tol=0.0)
+        and hotwords_path is None
+        and str(text_normalization) == "ctc"
+        and bool(save_debug_lengths)
+    )
+    if not contract_valid:
+        raise ValueError(
+            "Stage211 student CTC execution does not satisfy the strict checkpoint/tokenizer/"
+            "greedy-decode contract."
+        )
+    if any(
+        token_id < 0
+        or token_id >= STAGE211_STUDENT_CTC_VOCAB_SIZE
+        or token_id == STAGE211_STUDENT_BLANK_ID
+        for token_id in suppressed_token_ids
+    ):
+        raise ValueError("Stage211 student CTC suppression IDs are invalid.")
+
+    return {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "student_ctc_prediction_execution",
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": _sha256_file(checkpoint_path),
+        "model_config_path": str(model_config_path),
+        "model_config_sha256": _sha256_file(model_config_path),
+        "tokenizer_config_path": str(tokenizer_config_path),
+        "tokenizer_config_sha256": _sha256_file(tokenizer_config_path),
+        "tokenizer_type": "sensevoice_tiktoken",
+        "tokenizer_model_path": str(tokenizer_model_path),
+        "tokenizer_model_sha256": _sha256_file(tokenizer_model_path),
+        "tokenizer_vocab_size": tokenizer_vocab_size,
+        "blank_id": blank_id,
+        "ctc_vocab_size": ctc_vocab_size,
+        "ctc_decoder_type": ctc_decoder_type,
+        "ctc_decoder_num_layers": 5,
+        "ctc_suppressed_token_ids_count": len(suppressed_token_ids),
+        "ctc_suppressed_token_ids_sha256": _canonical_json_sha256(suppressed_token_ids),
+        "mode": "bi",
+        "decode_strategy": "ctc_greedy",
+        "beam_size": 1,
+        "token_prune_topk": 16,
+        "decoder_rescore_topk": 0,
+        "blank_logit_bias": 0.0,
+        "hotwords_enabled": False,
+        "text_normalization": "ctc",
+        "save_debug_lengths": True,
+        "llm_decoder_enabled": False,
+        "ctc_only": True,
+    }
+
+
+def validate_stage211_student_ctc_execution_provenance(
+    payload: Any,
+    *,
+    expected_checkpoint: Path,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Stage211 student prediction lacks CTC execution provenance.")
+    rebuilt = build_stage211_student_ctc_execution_provenance(
+        checkpoint_path=expected_checkpoint,
+        model_config_path=Path(str(payload.get("model_config_path") or "")),
+        tokenizer_config_path=Path(str(payload.get("tokenizer_config_path") or "")),
+        mode=str(payload.get("mode") or ""),
+        beam_size=int(payload.get("beam_size", -1)),
+        token_prune_topk=int(payload.get("token_prune_topk", -1)),
+        decoder_rescore_topk=int(payload.get("decoder_rescore_topk", -1)),
+        blank_logit_bias=float(payload.get("blank_logit_bias", float("nan"))),
+        hotwords_path=("enabled" if payload.get("hotwords_enabled") else None),
+        text_normalization=str(payload.get("text_normalization") or ""),
+        save_debug_lengths=bool(payload.get("save_debug_lengths")),
+    )
+    if payload != rebuilt:
+        raise ValueError(
+            "Stage211 student CTC execution provenance does not match current checkpoint/config files."
+        )
+    return rebuilt
 
 
 def _jsonl_references(
@@ -129,6 +282,151 @@ def _jsonl_predictions(
     return records
 
 
+def _jsonl_student_ctc_predictions(
+    path: Path,
+    *,
+    language: str,
+    expected_checkpoint: Path,
+    expected_execution_provenance: dict[str, Any] | None = None,
+) -> tuple[dict[str, tuple[str, str]], dict[str, Any]]:
+    records: dict[str, tuple[str, str]] = {}
+    execution_provenance = expected_execution_provenance
+    tokenizer: Any | None = None
+    suppressed_token_ids: set[int] = set()
+    decoded_token_ids: dict[tuple[int, ...], str] = {}
+    with path.open("r", encoding="utf-8") as source:
+        for line_number, line in enumerate(source, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"Stage211 public row is invalid at {path}:{line_number}")
+            utt_id = str(row.get("utt_id") or "")
+            if not utt_id:
+                raise ValueError(f"Stage211 public row lacks an ID at {path}:{line_number}")
+            if utt_id in records:
+                raise ValueError(
+                    f"Stage211 public row duplicates {utt_id!r} at {path}:{line_number}"
+                )
+            if row.get("ref_text") is None or row.get("pred_text") is None:
+                raise ValueError(
+                    f"Stage211 public prediction row is incomplete at {path}:{line_number}"
+                )
+            if execution_provenance is None:
+                execution_provenance = validate_stage211_student_ctc_execution_provenance(
+                    row.get("inference_provenance"),
+                    expected_checkpoint=expected_checkpoint,
+                )
+            elif row.get("inference_provenance") != execution_provenance:
+                raise ValueError(
+                    f"Stage211 student CTC execution provenance changed at {path}:{line_number}"
+                )
+            if tokenizer is None:
+                tokenizer_config = load_yaml(Path(execution_provenance["tokenizer_config_path"]))
+                model_config = load_yaml(Path(execution_provenance["model_config_path"]))
+                tokenizer = build_text_tokenizer(
+                    str(tokenizer_config["tokenizer_type"]),
+                    model_path=str(tokenizer_config["tokenizer_model_path"]),
+                    language=tokenizer_config.get("tokenizer_language"),
+                    task=tokenizer_config.get("tokenizer_task"),
+                )
+                suppressed_token_ids = {
+                    int(token_id)
+                    for token_id in model_config.get("ctc_suppressed_token_ids", ())
+                }
+
+            if (
+                row.get("mode") != "bi"
+                or row.get("decode_strategy") != "ctc_greedy"
+                or row.get("ctc_score") is not None
+                or row.get("decoder_score") is not None
+                or row.get("combined_score") is not None
+            ):
+                raise ValueError(
+                    f"Stage211 student row is not CTC-only greedy output at {path}:{line_number}"
+                )
+            pred_token_ids = row.get("pred_token_ids")
+            ref_token_ids = row.get("ref_token_ids")
+            if (
+                not isinstance(pred_token_ids, list)
+                or not isinstance(ref_token_ids, list)
+                or any(isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in pred_token_ids)
+                or any(isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in ref_token_ids)
+            ):
+                raise ValueError(
+                    f"Stage211 student row has invalid token IDs at {path}:{line_number}"
+                )
+            if any(
+                token_id < 0
+                or token_id >= STAGE211_STUDENT_TOKENIZER_VOCAB_SIZE
+                or token_id in suppressed_token_ids
+                for token_id in (*pred_token_ids, *ref_token_ids)
+            ):
+                raise ValueError(
+                    f"Stage211 student row contains blank, suppressed, or out-of-range token IDs "
+                    f"at {path}:{line_number}"
+                )
+            if tokenizer is None:
+                raise AssertionError("Stage211 student tokenizer was not initialized.")
+            pred_token_key = tuple(pred_token_ids)
+            pred_decoded = decoded_token_ids.get(pred_token_key)
+            if pred_decoded is None:
+                pred_decoded = str(tokenizer.decode(pred_token_ids))
+                decoded_token_ids[pred_token_key] = pred_decoded
+            if pred_decoded != str(row["pred_text"]):
+                raise ValueError(
+                    f"Stage211 student prediction text/token mismatch at {path}:{line_number}"
+                )
+            ref_token_key = tuple(ref_token_ids)
+            ref_decoded = decoded_token_ids.get(ref_token_key)
+            if ref_decoded is None:
+                ref_decoded = str(tokenizer.decode(ref_token_ids))
+                decoded_token_ids[ref_token_key] = ref_decoded
+            if ref_decoded != str(row["ref_text"]):
+                raise ValueError(
+                    f"Stage211 student reference text/token mismatch at {path}:{line_number}"
+                )
+            debug = row.get("debug")
+            if (
+                not isinstance(debug, dict)
+                or int(debug.get("pred_token_count", -1)) != len(pred_token_ids)
+                or int(debug.get("ref_token_count", -1)) != len(ref_token_ids)
+                or int(debug.get("feature_length", -1)) <= 0
+                or int(debug.get("logit_length", -1)) <= 0
+                or not math.isfinite(float(debug.get("blank_top1_ratio", float("nan"))))
+                or not math.isfinite(float(debug.get("avg_blank_prob", float("nan"))))
+            ):
+                raise ValueError(
+                    f"Stage211 student row has invalid CTC debug evidence at {path}:{line_number}"
+                )
+            alignments = row.get("alignments")
+            if (
+                not isinstance(alignments, list)
+                or len(alignments) != len(pred_token_ids)
+                or not all(isinstance(alignment, dict) for alignment in alignments)
+                or [int(alignment.get("token_id", -1)) for alignment in alignments]
+                != pred_token_ids
+            ):
+                raise ValueError(
+                    f"Stage211 student row has invalid CTC alignments at {path}:{line_number}"
+                )
+
+            reference = normalize_asr_text_for_metrics(
+                str(row["ref_text"]),
+                language=language,
+                normalization="ctc",
+            )
+            prediction = normalize_asr_text_for_metrics(
+                str(row["pred_text"]),
+                language=language,
+                normalization="ctc",
+            )
+            records[utt_id] = (reference, prediction)
+    if not records or execution_provenance is None:
+        raise ValueError(f"Stage211 public prediction JSONL is empty: {path}")
+    return records, execution_provenance
+
+
 def build_stage211_student_public_prediction_receipt(
     *,
     checkpoint_path: Path,
@@ -143,6 +441,7 @@ def build_stage211_student_public_prediction_receipt(
         raise ValueError("Stage211 student public receipt prediction map is incomplete.")
 
     results: list[dict[str, Any]] = []
+    shared_execution_provenance: dict[str, Any] | None = None
     for dataset, expected in benchmarks.items():
         language = str(expected["language"])
         metric = str(expected["metric"])
@@ -160,7 +459,18 @@ def build_stage211_student_public_prediction_receipt(
             language=language,
             reference_keys=("text", "transcript", "ref_text", "reference"),
         )
-        predictions = _jsonl_predictions(prediction_path, language=language)
+        predictions, execution_provenance = _jsonl_student_ctc_predictions(
+            prediction_path,
+            language=language,
+            expected_checkpoint=checkpoint_path,
+            expected_execution_provenance=shared_execution_provenance,
+        )
+        if shared_execution_provenance is None:
+            shared_execution_provenance = execution_provenance
+        elif execution_provenance != shared_execution_provenance:
+            raise ValueError(
+                f"Stage211 {dataset} student CTC execution provenance differs across datasets."
+            )
         if (
             len(manifest_references) != expected_samples
             or len(predictions) != expected_samples
@@ -186,10 +496,17 @@ def build_stage211_student_public_prediction_receipt(
                 "manifest_sha256": _sha256_file(manifest_path),
                 "student_prediction_path": str(prediction_path),
                 "student_prediction_sha256": _sha256_file(prediction_path),
+                "student_ctc_execution_provenance_sha256": _canonical_json_sha256(
+                    execution_provenance
+                ),
+                "all_rows_ctc_only_greedy": True,
+                "all_token_ids_within_student_tokenizer": True,
             }
         )
+    if shared_execution_provenance is None:
+        raise ValueError("Stage211 student public receipt lacks CTC execution provenance.")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "pipeline": "stage211",
         "artifact": "student_public_prediction_receipt",
         "complete": True,
@@ -198,6 +515,13 @@ def build_stage211_student_public_prediction_receipt(
         "normalization": "ctc",
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": _sha256_file(checkpoint_path),
+        "student_ctc_execution_provenance": shared_execution_provenance,
+        "student_ctc_execution_provenance_sha256": _canonical_json_sha256(
+            shared_execution_provenance
+        ),
+        "all_rows_ctc_only_greedy": True,
+        "all_rows_checkpoint_bound": True,
+        "all_token_ids_within_student_tokenizer": True,
         "dataset_count": len(results),
         "total_samples": sum(int(result["sample_count"]) for result in results),
         "results": results,
@@ -218,13 +542,16 @@ def validate_stage211_student_public_prediction_receipt(
         raise ValueError("Stage211 student public prediction receipt must be a JSON object.")
     expected_checkpoint = expected_checkpoint.expanduser().resolve()
     if (
-        payload.get("schema_version") != 1
+        payload.get("schema_version") != 2
         or payload.get("pipeline") != "stage211"
         or payload.get("artifact") != "student_public_prediction_receipt"
         or payload.get("complete") is not True
         or payload.get("decode") != "greedy_ctc"
         or payload.get("mode") != "bi"
         or payload.get("normalization") != "ctc"
+        or payload.get("all_rows_ctc_only_greedy") is not True
+        or payload.get("all_rows_checkpoint_bound") is not True
+        or payload.get("all_token_ids_within_student_tokenizer") is not True
     ):
         raise ValueError("Stage211 student public prediction receipt contract mismatch.")
     if Path(str(payload.get("checkpoint_path") or "")).expanduser().resolve() != (

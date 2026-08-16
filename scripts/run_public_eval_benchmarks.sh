@@ -199,6 +199,7 @@ run_ctc_dataset() {
     --token-prune-topk "${CTC_TOKEN_PRUNE_TOPK}" \
     --text-normalization "${CTC_TEXT_NORMALIZATION}" \
     --progress-interval "${CTC_PROGRESS_INTERVAL}" \
+    --embed-stage211-ctc-provenance \
     "${limit_args[@]}" \
     --save-debug-lengths \
     >"${log_path}" 2>&1
@@ -258,6 +259,7 @@ run_ctc_dataset_sharded() {
       --token-prune-topk "${CTC_TOKEN_PRUNE_TOPK}" \
       --text-normalization "${CTC_TEXT_NORMALIZATION}" \
       --progress-interval "${CTC_PROGRESS_INTERVAL}" \
+      --embed-stage211-ctc-provenance \
       --save-debug-lengths \
       >"${log_path}" 2>&1 &
     pids+=("$!")
