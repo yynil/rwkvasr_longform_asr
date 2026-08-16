@@ -28,6 +28,9 @@ LOGITS_SELECTION="${PHASE_GATE_ROOT}/logits_selected.json"
 FINAL_REPORT="${PHASE_GATE_ROOT}/sft/stage211_complete.json"
 FINAL_STEPWISE_REPORT="${PHASE_GATE_ROOT}/sft/stage211_stepwise_results.json"
 FINAL_STEPWISE_MARKDOWN="${PHASE_GATE_ROOT}/sft/stage211_stepwise_results.md"
+CORRECTED_FINAL_REPORT="${PHASE_GATE_ROOT}/sft_corrected/stage211_complete.json"
+CORRECTED_FINAL_STEPWISE_REPORT="${PHASE_GATE_ROOT}/sft_corrected/stage211_stepwise_results.json"
+CORRECTED_FINAL_STEPWISE_MARKDOWN="${PHASE_GATE_ROOT}/sft_corrected/stage211_stepwise_results.md"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${HOME}/rwkvasr_eval/stage211_calibration_selected_full/public/reuse_receipt.json}"
 INITIALIZATION_RECEIPT="${INITIALIZATION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_initialization/nano_initialization_receipt.json}"
 PUBLIC_METRIC_CORRECTION_RECEIPT="${PUBLIC_METRIC_CORRECTION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_public_metric_unicode_v1/correction_receipt.json}"
@@ -92,34 +95,50 @@ stage211_choose_start_stage() {
   fi
 }
 
-stage211_final_proof_valid() {
+stage211_final_candidate_valid() {
+  local final_report="$1"
+  local final_stepwise_report="$2"
+  local final_stepwise_markdown="$3"
   if ! stage211_json_matches \
-    "${FINAL_REPORT}" \
+    "${final_report}" \
     '.pipeline == "stage211" and .artifact == "final_completion" and .complete == true and .gate_passed == true'; then
     return 1
   fi
 
-  stage211_log "deep-validating final Stage211 stepwise proof"
+  stage211_log "deep-validating final Stage211 stepwise proof source=${final_report}"
   if ! (
     cd "${REPO_ROOT}"
     uv run python "${REPO_ROOT}/scripts/create_stage211_stepwise_report.py" \
       --initialization-receipt "${INITIALIZATION_RECEIPT}" \
       --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
       --public-metric-correction-receipt "${PUBLIC_METRIC_CORRECTION_RECEIPT}" \
-      --sft-final-report "${FINAL_REPORT}" \
-      --output-json "${FINAL_STEPWISE_REPORT}" \
-      --output-markdown "${FINAL_STEPWISE_MARKDOWN}"
+      --sft-final-report "${final_report}" \
+      --output-json "${final_stepwise_report}" \
+      --output-markdown "${final_stepwise_markdown}"
   ) >>"${WATCH_LOG}" 2>&1; then
-    stage211_log "final Stage211 stepwise proof is missing or invalid"
+    stage211_log "final Stage211 stepwise proof is missing or invalid source=${final_report}"
     return 1
   fi
 
   if ! stage211_json_matches \
-    "${FINAL_STEPWISE_REPORT}" \
+    "${final_stepwise_report}" \
     '.pipeline == "stage211" and .artifact == "stepwise_final_results" and .complete == true and .gate_passed == true and .strict_stage_order == ["calibration", "mixer", "block", "logits", "sft"] and .requested_alignment_stage_order == ["rwkv_layer", "block", "logits", "sft"] and .checkpoint_chain_passed == true and .nano_initialization_chain_passed == true and .nano_initialization_source_chain_passed == true and .ctc_label_normalization_chain_passed == true and .ctc_label_proof.full_length_index_audit_passed == true and .ctc_label_proof.ctc_suppress_non_pronunciation_tokens == true and .ctc_label_proof.ctc_suppressed_token_ids_count == 2114 and .ctc_label_proof.ctc_suppressed_token_ids_sha256 == "76a68d03bb2dc486c214fd44891f3e3e2c36286d79fea1e69c8e74d7767d5a09" and .ctc_label_proof.teacher_projection_support_matches_student == true and .ctc_label_proof.ctc_unk_tokens == 0 and .public_metric_definition_chain_passed == true and .public_metric_tokenizer_contract == "unicode_alnum_words_basic_cjk_chars_v1" and (.public_metric_correction_receipt_sha256 | length) == 64 and (.public_metric_tokenizer_source_sha256 | length) == 64 and .nano_teacher_chain_passed == true and .nano_public_baseline_provenance_passed == true and .supplemental_inventory_chain_passed == true and .supplemental_dedupe_proof.inventory_schema_version == 2 and .supplemental_dedupe_proof.inventory_artifact == "stage211_supplemental_combined_inventory" and .supplemental_dedupe_proof.mode == "source_identity_plus_known_corpus_exclusion" and .supplemental_dedupe_proof.source_sets_disjoint == true and .supplemental_dedupe_proof.content_fingerprint_complete == false and .supplemental_dedupe_proof.base_public_overlap_normalized_pcm_exact_complete == true and .supplemental_dedupe_proof.base_public_overlap_scan_order == "manifest_location_index_archive_order_v1" and .supplemental_dedupe_proof.base_public_overlap_rows == 0 and .supplemental_dedupe_proof.base_public_overlap_scanned_rows > 0 and (.supplemental_dedupe_proof.base_public_overlap_receipt_sha256 | length) == 64 and .supplemental_dedupe_proof.social_normalized_pcm_exact_complete == true and .supplemental_dedupe_proof.social_public_overlap_mode == "normalized_pcm_exact" and .supplemental_dedupe_proof.archived_social_exact_duplicate_exclusion_complete == true and .supplemental_dedupe_proof.archived_social_unique_members == 0 and (.supplemental_dedupe_proof.archived_social_overlap_receipt_sha256 | length) == 64 and .supplemental_dedupe_proof.usb_top_level_classification_complete == true and .supplemental_dedupe_proof.usb_natural_audio_resolution_complete == true and .supplemental_dedupe_proof.usb_unresolved_natural_entries == [] and (.supplemental_dedupe_proof.usb_top_level_coverage_receipt_sha256 | length) == 64 and .supplemental_dedupe_proof.near_duplicate_complete == false and .supplemental_dedupe_proof.known_overlap_exclusions == ["llaso_gigaspeech", "llaso_librispeech"] and (.supplemental_dedupe_proof.component_inventories | keys | sort) == ["base_natural", "social_vad"] and (.coverage_results | length) == 4 and ([.coverage_results[] | select(.stage == "mixer" or .stage == "block" or .stage == "logits")] | length) == 3 and ([.coverage_results[] | select(.stage == "mixer" or .stage == "block" or .stage == "logits") | (.training_segments | length == 5 and all(.[]; .epochs == 3))] | all) and .public_metric_stage_order == ["calibration", "mixer", "block", "logits", "sft"] and .all_stage_public_metrics_complete == true and (.english_wer_datasets | length) == 3 and (.chinese_cer_datasets | length) == 2 and (.language_metric_summaries | length) == 2 and ([.language_metric_summaries[] | select(.name == "english_wer" and .language == "en" and .metric == "wer" and .aggregation == "unweighted_dataset_macro" and .dataset_count == 3 and (.datasets | length) == 3 and .sample_count > 0 and (.stages | length) == 5 and ([.stages[] | type == "number"] | all))] | length) == 1 and ([.language_metric_summaries[] | select(.name == "chinese_cer" and .language == "zh" and .metric == "cer" and .aggregation == "unweighted_dataset_macro" and .dataset_count == 2 and (.datasets | length) == 2 and .sample_count > 0 and (.stages | length) == 5 and ([.stages[] | type == "number"] | all))] | length) == 1 and (.dataset_results | length) == 5 and ([.dataset_results[] | select(.language == "en" and .metric == "wer")] | length) == 3 and ([.dataset_results[] | select(.language == "zh" and .metric == "cer")] | length) == 2 and ([.dataset_results[] | (.stages | length == 5 and has("calibration") and has("mixer") and has("block") and has("logits") and has("sft"))] | all)'; then
-    stage211_log "final Stage211 stepwise proof failed validation"
+    stage211_log "final Stage211 stepwise proof failed validation source=${final_report}"
     return 1
   fi
+}
+
+stage211_final_proof_valid() {
+  if stage211_final_candidate_valid \
+    "${FINAL_REPORT}" \
+    "${FINAL_STEPWISE_REPORT}" \
+    "${FINAL_STEPWISE_MARKDOWN}"; then
+    return 0
+  fi
+  stage211_final_candidate_valid \
+    "${CORRECTED_FINAL_REPORT}" \
+    "${CORRECTED_FINAL_STEPWISE_REPORT}" \
+    "${CORRECTED_FINAL_STEPWISE_MARKDOWN}"
 }
 
 stage211_start_supervisor() {

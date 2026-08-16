@@ -968,6 +968,9 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert '--output "${NANO_BASELINE_RECEIPT}"' in script
     assert 'START_STAGE="${START_STAGE:-full}"' in script
     assert "run_stage211_mixer_retention_loop.py" in script
+    assert "create_stage211_stepwise_report.py" in script
+    assert 'run_stepwise_report "${PHASE_GATE_ROOT}/sft/stage211_complete.json"' in script
+    assert 'run_stepwise_report "${SFT_CORRECTED_FINAL_ROOT}/stage211_complete.json"' in script
     assert "MIXER_SELECTION" in script
     assert "BLOCK_SELECTION" in script
     assert "LOGITS_SELECTION" in script
@@ -1040,7 +1043,22 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
     call_log = tmp_path / "calls.log"
     uv = fake_bin / "uv"
     uv.write_text(
-        '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >>"${CALL_LOG}"\n',
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >>"${CALL_LOG}"\n'
+        'if [[ "$*" == *create_stage211_stepwise_report.py* ]]; then\n'
+        "  output_json=\n"
+        "  output_markdown=\n"
+        "  while (($#)); do\n"
+        '    case "$1" in\n'
+        '      --output-json) output_json="$2"; shift 2 ;;\n'
+        '      --output-markdown) output_markdown="$2"; shift 2 ;;\n'
+        "      *) shift ;;\n"
+        "    esac\n"
+        "  done\n"
+        '  mkdir -p "$(dirname "${output_json}")"\n'
+        '  printf \'{}\\n\' >"${output_json}"\n'
+        '  printf \'# stepwise\\n\' >"${output_markdown}"\n'
+        "fi\n",
         encoding="utf-8",
     )
     uv.chmod(0o755)
@@ -1065,6 +1083,10 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
     profile.write_text("{}\n", encoding="utf-8")
     stratified.write_text("{}\n", encoding="utf-8")
     replay.write_text("{}\n", encoding="utf-8")
+    phase_gate_root = tmp_path / "phase-gates"
+    final_report = phase_gate_root / "sft" / "stage211_complete.json"
+    final_report.parent.mkdir(parents=True)
+    final_report.write_text("{}\n", encoding="utf-8")
 
     subprocess.run(
         ["bash", str(REPO_ROOT / "scripts" / "start_stage211_abcd_after_calibration.sh")],
@@ -1079,6 +1101,7 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
             "SUPPLEMENTAL_PROFILE_RECEIPT": str(profile),
             "STRATIFIED_HIDDEN_RECEIPT": str(stratified),
             "RETENTION_REPLAY_RECEIPT": str(replay),
+            "PHASE_GATE_ROOT": str(phase_gate_root),
             "MIXER_SELECTION": str(tmp_path / "mixer_selected.json"),
             "BLOCK_SELECTION": str(tmp_path / "block_selected.json"),
             "LOGITS_SELECTION": str(tmp_path / "logits_selected.json"),
@@ -1105,6 +1128,117 @@ def test_stage211_supervisor_narrow_restart_skips_completed_full_phase_controlle
     assert len(correction_calls) == 3
     assert "--phase block" in correction_calls[1]
     assert "--phase logits" in correction_calls[2]
+    assert any("create_stage211_stepwise_report.py" in call for call in calls)
+
+
+def test_stage211_supervisor_corrected_sft_builds_stepwise_report(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    call_log = tmp_path / "calls.log"
+    uv = fake_bin / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >>"${CALL_LOG}"\n'
+        'if [[ "$*" == *finalize_stage211_labeled_sft.py* ]]; then\n'
+        '  mkdir -p "${PHASE_GATE_ROOT}/sft" "${SFT_OUTPUT_DIR}"\n'
+        "  printf '%s\\n' "
+        "'{\"pipeline\":\"stage211\",\"artifact\":\"final_completion\","
+        "\"complete\":true,\"gate_passed\":false}' "
+        '>"${PHASE_GATE_ROOT}/sft/stage211_complete.json"\n'
+        '  printf \'{}\\n\' >"${SFT_OUTPUT_DIR}/sft_complete.json"\n'
+        "  exit 1\n"
+        "fi\n"
+        'if [[ "$*" == *run_stage211_sft_correction_loop.py* ]]; then\n'
+        '  mkdir -p "${SFT_CORRECTED_FINAL_ROOT}"\n'
+        "  printf '%s\\n' "
+        "'{\"pipeline\":\"stage211\",\"artifact\":\"final_completion\","
+        "\"complete\":true,\"gate_passed\":true}' "
+        '>"${SFT_CORRECTED_FINAL_ROOT}/stage211_complete.json"\n'
+        "fi\n"
+        'if [[ "$*" == *create_stage211_stepwise_report.py* ]]; then\n'
+        "  output_json=\n"
+        "  output_markdown=\n"
+        "  while (($#)); do\n"
+        '    case "$1" in\n'
+        '      --output-json) output_json="$2"; shift 2 ;;\n'
+        '      --output-markdown) output_markdown="$2"; shift 2 ;;\n'
+        "      *) shift ;;\n"
+        "    esac\n"
+        "  done\n"
+        '  mkdir -p "$(dirname "${output_json}")"\n'
+        '  printf \'{}\\n\' >"${output_json}"\n'
+        '  printf \'# stepwise\\n\' >"${output_markdown}"\n'
+        "fi\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    jq = fake_bin / "jq"
+    jq.write_text(
+        "#!/usr/bin/env bash\n"
+        'name="$(basename "$3" _selected.json)"\n'
+        'case "$2" in\n'
+        "  .checkpoint_path) printf '/tmp/%s-checkpoint.pt\\n' \"$name\" ;;\n"
+        "  .promotion_receipt_path) printf '/tmp/%s-promotion.json\\n' \"$name\" ;;\n"
+        "  .gate_dir) printf '/tmp/%s-gate\\n' \"$name\" ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    jq.chmod(0o755)
+
+    inventory = tmp_path / "supplemental_inventory.json"
+    profile = tmp_path / "supplemental_profile_receipt.json"
+    stratified = tmp_path / "stratified_hidden_eval_v2.json"
+    replay = tmp_path / "retention_replay_v2.json"
+    for path in (inventory, profile, stratified, replay):
+        path.write_text("{}\n", encoding="utf-8")
+    phase_gate_root = tmp_path / "phase-gates"
+    sft_output_dir = tmp_path / "sft-run"
+    corrected_root = phase_gate_root / "sft_corrected"
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "start_stage211_abcd_after_calibration.sh")],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CALL_LOG": str(call_log),
+            "START_STAGE": "sft",
+            "STAGE211_REPO_ROOT": str(REPO_ROOT),
+            "SUPPLEMENTAL_INVENTORY": str(inventory),
+            "SUPPLEMENTAL_PROFILE_RECEIPT": str(profile),
+            "STRATIFIED_HIDDEN_RECEIPT": str(stratified),
+            "RETENTION_REPLAY_RECEIPT": str(replay),
+            "PHASE_GATE_ROOT": str(phase_gate_root),
+            "SFT_OUTPUT_DIR": str(sft_output_dir),
+            "SFT_CORRECTED_FINAL_ROOT": str(corrected_root),
+            "MIXER_SELECTION": str(tmp_path / "mixer_selected.json"),
+            "BLOCK_SELECTION": str(tmp_path / "block_selected.json"),
+            "LOGITS_SELECTION": str(tmp_path / "logits_selected.json"),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (corrected_root / "stage211_stepwise_results.json").is_file()
+    assert (corrected_root / "stage211_stepwise_results.md").is_file()
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    finalizer_index = next(
+        index for index, call in enumerate(calls) if "finalize_stage211_labeled_sft.py" in call
+    )
+    correction_index = next(
+        index for index, call in enumerate(calls) if "run_stage211_sft_correction_loop.py" in call
+    )
+    stepwise_index = next(
+        index for index, call in enumerate(calls) if "create_stage211_stepwise_report.py" in call
+    )
+    assert finalizer_index < correction_index < stepwise_index
+    assert str(corrected_root / "stage211_complete.json") in calls[stepwise_index]
 
 
 @pytest.mark.parametrize(
@@ -5931,6 +6065,7 @@ def _run_stage211_continuation_watcher_fixture(
     tmux_mode: str = "stateless",
     watch_once: str | None = "1",
     initial_final_report: bool = True,
+    corrected_final_report: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], str, Path]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -6002,7 +6137,8 @@ def _run_stage211_continuation_watcher_fixture(
     uv.chmod(0o755)
 
     phase_gate_root = tmp_path / "gates"
-    final_report = phase_gate_root / "sft" / "stage211_complete.json"
+    final_report_dir = "sft_corrected" if corrected_final_report else "sft"
+    final_report = phase_gate_root / final_report_dir / "stage211_complete.json"
     final_report.parent.mkdir(parents=True)
     if initial_final_report:
         final_report.write_text(
@@ -6057,6 +6193,23 @@ def test_stage211_continuation_watcher_accepts_only_deep_stepwise_proof(
     assert "SFT and stepwise proofs pass" in result.stdout
     assert "new-session" not in tmux_calls
     assert (phase_gate_root / "sft" / "stage211_stepwise_results.json").is_file()
+
+
+def test_stage211_continuation_watcher_accepts_corrected_sft_proof(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, phase_gate_root = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="success",
+        corrected_final_report=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "SFT and stepwise proofs pass" in result.stdout
+    assert "new-session" not in tmux_calls
+    assert (
+        phase_gate_root / "sft_corrected" / "stage211_stepwise_results.json"
+    ).is_file()
 
 
 def test_stage211_continuation_watcher_restarts_after_stepwise_failure(

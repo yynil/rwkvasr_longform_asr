@@ -32,6 +32,7 @@ SFT_CORRECTION_RUN_ROOT="${SFT_CORRECTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211
 SFT_CORRECTION_EVAL_ROOT="${SFT_CORRECTION_EVAL_ROOT:-${PHASE_GATE_ROOT}/sft_correction}"
 SFT_CORRECTED_FINAL_ROOT="${SFT_CORRECTED_FINAL_ROOT:-${PHASE_GATE_ROOT}/sft_corrected}"
 PUBLIC_OVERLAP_RECEIPT="${PUBLIC_OVERLAP_RECEIPT:-${METADATA_ROOT}/public_train_overlap_v1/receipt.json}"
+PUBLIC_METRIC_CORRECTION_RECEIPT="${PUBLIC_METRIC_CORRECTION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_public_metric_unicode_v1/correction_receipt.json}"
 REUSE_COMPLETED_CALIBRATION_EVAL="${REUSE_COMPLETED_CALIBRATION_EVAL:-0}"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${CALIBRATION_EVAL_DIR}/public/reuse_receipt.json}"
 START_STAGE="${START_STAGE:-full}"
@@ -338,6 +339,31 @@ run_logits_correction_loop() {
     --devices 0,1,2,3
 }
 
+run_stepwise_report() {
+  local final_report="$1"
+  local report_dir
+  report_dir="$(dirname "${final_report}")"
+  local output_json="${report_dir}/stage211_stepwise_results.json"
+  local output_markdown="${report_dir}/stage211_stepwise_results.md"
+  if [[ ! -s "${final_report}" ]]; then
+    log "successful SFT path produced no final report: ${final_report}"
+    return 1
+  fi
+  log "building strict Layer/Block/Logits/SFT stepwise report from ${final_report}"
+  uv run python "${REPO_ROOT}/scripts/create_stage211_stepwise_report.py" \
+    --initialization-receipt "${INITIALIZATION_RECEIPT}" \
+    --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
+    --public-metric-correction-receipt "${PUBLIC_METRIC_CORRECTION_RECEIPT}" \
+    --sft-final-report "${final_report}" \
+    --output-json "${output_json}" \
+    --output-markdown "${output_markdown}"
+  if [[ ! -s "${output_json}" || ! -s "${output_markdown}" ]]; then
+    log "stepwise report builder returned without complete outputs: ${report_dir}"
+    return 1
+  fi
+  log "strict stepwise report completed at ${output_json}"
+}
+
 run_labeled_sft_phase() {
   local init_checkpoint
   init_checkpoint="$(jq -er '.checkpoint_path' "${LOGITS_SELECTION}")"
@@ -373,6 +399,7 @@ run_labeled_sft_phase() {
     --block-gate-selection "${BLOCK_SELECTION}" \
     --logits-gate-selection "${LOGITS_SELECTION}" \
     --devices 0,1,2,3; then
+    run_stepwise_report "${PHASE_GATE_ROOT}/sft/stage211_complete.json"
     log "Stage211 A/B/C/D strict alignment pipeline completed without SFT correction"
     return
   fi
@@ -404,6 +431,7 @@ run_labeled_sft_phase() {
     --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
     --master-port "$((MASTER_PORT + 20))" \
     --devices 0,1,2,3
+  run_stepwise_report "${SFT_CORRECTED_FINAL_ROOT}/stage211_complete.json"
   log "Stage211 A/B/C/D strict alignment pipeline completed after SFT correction"
 }
 
