@@ -19,12 +19,14 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
     STAGE211_RETENTION_CORRECTION_EPOCHS,
+    STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
     STAGE211_RETENTION_CORRECTION_LR,
     STAGE211_RETENTION_CORRECTION_MAX_ROUNDS,
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
     stage211_post_coverage_correction_lr,
     stage211_phase_train_config_contract,
+    validate_stage211_correction_extension_decision,
     validate_stage211_phase_gate_report,
 )
 from rwkvasr.eval.stage211_runtime import audit_stage211_runtime_epoch_coverage
@@ -281,6 +283,17 @@ def build_receipt(
             "Stage211 correction round does not immediately follow its admission gate."
         )
 
+    extension_decision_path: Path | None = None
+    if round_index > STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+        extension_decision_path = admission_gate_path.parent / "correction_extension_decision.json"
+        validate_stage211_correction_extension_decision(
+            extension_decision_path,
+            phase=phase,
+            next_round=round_index,
+            admission_gate_path=admission_gate_path,
+            admission_gate=admission_gate,
+        )
+
     provenance_path = run_dir / "stage211_correction_provenance.json"
     provenance = _load_json(
         provenance_path,
@@ -313,6 +326,14 @@ def build_receipt(
         "early_stopping": False,
         "smoke_marker_path": str(smoke_marker_path),
         "smoke_marker_sha256": sha256_file(smoke_marker_path),
+        "correction_extension_decision_path": (
+            str(extension_decision_path) if extension_decision_path is not None else None
+        ),
+        "correction_extension_decision_sha256": (
+            sha256_file(extension_decision_path)
+            if extension_decision_path is not None
+            else None
+        ),
     }
     if any(provenance.get(key) != value for key, value in expected_provenance.items()):
         raise ValueError("Stage211 correction provenance contract mismatch.")
@@ -398,6 +419,14 @@ def build_receipt(
         "bucket_manifest_sha256": sha256_file(replay_manifest),
         "admission_gate_path": str(admission_gate_path),
         "admission_gate_sha256": sha256_file(admission_gate_path),
+        "correction_extension_decision_path": (
+            str(extension_decision_path) if extension_decision_path is not None else None
+        ),
+        "correction_extension_decision_sha256": (
+            sha256_file(extension_decision_path)
+            if extension_decision_path is not None
+            else None
+        ),
         "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint),
         "nano_teacher_checkpoint_sha256": nano_teacher_sha256,
         "init_checkpoint_path": str(init_checkpoint_path),

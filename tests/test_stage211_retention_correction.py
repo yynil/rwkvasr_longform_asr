@@ -303,6 +303,8 @@ def test_create_stage211_retention_correction_receipt(
         "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
         "smoke_marker_path": str(smoke_marker.resolve()),
         "smoke_marker_sha256": correction.sha256_file(smoke_marker),
+        "correction_extension_decision_path": None,
+        "correction_extension_decision_sha256": None,
     }
     (run_dir / "stage211_correction_provenance.json").write_text(
         json.dumps(provenance) + "\n",
@@ -359,6 +361,8 @@ def test_create_stage211_retention_correction_receipt(
     assert receipt["learning_rate"] == correction_lr
     assert receipt["nano_teacher_checkpoint_sha256"] == nano_sha256
     assert receipt["smoke_marker_sha256"] == correction.sha256_file(smoke_marker)
+    assert receipt["correction_extension_decision_path"] is None
+    assert receipt["correction_extension_decision_sha256"] is None
 
     config["init_checkpoint_path"] = None
     config["resume_from"] = "latest"

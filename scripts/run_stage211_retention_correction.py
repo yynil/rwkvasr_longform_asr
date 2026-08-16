@@ -19,8 +19,10 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_BATCH_SIZE,
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
+    STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
     sha256_file,
     stage211_post_coverage_correction_lr,
+    validate_stage211_correction_extension_decision,
     validate_stage211_phase_gate_report,
 )
 
@@ -226,6 +228,7 @@ def _provenance_payload(
     init_checkpoint: Path,
     nano_checkpoint: Path,
     smoke_marker: Path,
+    extension_decision: Path | None,
     steps_per_epoch: int,
     phase: str = "mixer",
 ) -> dict[str, Any]:
@@ -248,6 +251,12 @@ def _provenance_payload(
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
         "smoke_marker_path": str(smoke_marker),
         "smoke_marker_sha256": sha256_file(smoke_marker),
+        "correction_extension_decision_path": (
+            str(extension_decision) if extension_decision is not None else None
+        ),
+        "correction_extension_decision_sha256": (
+            sha256_file(extension_decision) if extension_decision is not None else None
+        ),
         "epochs": 1,
         "steps_per_epoch": steps_per_epoch,
         "learning_rate": stage211_post_coverage_correction_lr(phase),
@@ -454,12 +463,22 @@ def run_correction(args: argparse.Namespace) -> Path | None:
 
     replay = validate_retention_replay(replay_receipt)
     replay_manifest, audio_data_audit = _audit_replay_storage(replay)
-    _, teacher_sha256 = _admit_failed_gate(
+    admitted_gate, teacher_sha256 = _admit_failed_gate(
         admission_gate_path=admission_gate,
         init_checkpoint=init_checkpoint,
         round_index=round_index,
         phase=phase_name,
     )
+    extension_decision: Path | None = None
+    if round_index > STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+        extension_decision = admission_gate.parent / "correction_extension_decision.json"
+        validate_stage211_correction_extension_decision(
+            extension_decision,
+            phase=phase_name,
+            next_round=round_index,
+            admission_gate_path=admission_gate,
+            admission_gate=admitted_gate,
+        )
     _validate_target_nano_teacher_checkpoint(
         recorded_sha256=teacher_sha256,
         nano_checkpoint_path=nano_checkpoint,
@@ -570,6 +589,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             init_checkpoint=init_checkpoint,
             nano_checkpoint=nano_checkpoint,
             smoke_marker=smoke_marker_path,
+            extension_decision=extension_decision,
             steps_per_epoch=steps_per_epoch,
             phase=phase_name,
         )

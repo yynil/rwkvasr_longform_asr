@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.eval.stage211_gate import (
+    STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
     STAGE211_RETENTION_CORRECTION_MAX_ROUNDS,
+    build_stage211_correction_extension_decision as _correction_extension_decision,
     sha256_file,
     validate_stage211_phase_gate_report,
 )
@@ -420,6 +422,35 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
             raise ValueError(
                 f"Stage211 failed {phase_label} gate must not have a promotion receipt."
             )
+        if (
+            round_index >= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
+            and round_index < int(args.max_rounds)
+        ):
+            prior_gate = _validate_gate_for_phase(prior_gate_path, phase=phase)
+            decision = _correction_extension_decision(
+                phase=phase,
+                completed_round=round_index,
+                prior_gate_path=prior_gate_path,
+                prior_gate=prior_gate,
+                current_gate_path=gate_path,
+                current_gate=gate,
+                max_rounds=int(args.max_rounds),
+            )
+            decision_path = gate_dir / "correction_extension_decision.json"
+            _write_immutable_json(decision_path, decision)
+            print(
+                "[stage211-correction-loop] extension decision "
+                f"phase={phase} completed_round={round_index} "
+                f"continue={str(decision['continue_training']).lower()} "
+                f"improved={','.join(decision['improved_metrics']) or '-'} "
+                f"receipt={decision_path}",
+                flush=True,
+            )
+            if decision["continue_training"] is not True:
+                raise ValueError(
+                    f"Stage211 {phase} correction stalled after round {round_index}; "
+                    f"extension evidence is preserved at {decision_path}."
+                )
         prior_gate_path = gate_path
 
     raise ValueError(

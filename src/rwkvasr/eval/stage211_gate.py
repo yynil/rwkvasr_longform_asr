@@ -32,7 +32,8 @@ STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
 STAGE211_FULL_DATA_FRAME_BUDGET = 24_000
-STAGE211_RETENTION_CORRECTION_MAX_ROUNDS = 3
+STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS = 3
+STAGE211_RETENTION_CORRECTION_MAX_ROUNDS = 8
 STAGE211_RETENTION_CORRECTION_EPOCHS = 1
 STAGE211_RETENTION_CORRECTION_LR = 1.0e-6
 STAGE211_POST_COVERAGE_CORRECTION_LRS = {
@@ -466,6 +467,172 @@ def _validate_bound_file(
     if len(expected_sha256) != 64 or sha256_file(path) != expected_sha256:
         raise ValueError(f"{label} SHA-256 mismatch: {path}")
     return path
+
+
+def _stage211_finite_number(value: Any, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be numeric.")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{label} must be finite.")
+    return result
+
+
+def _stage211_collect_candidate_losses(value: Any) -> list[float]:
+    losses: list[float] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "candidate_loss":
+                losses.append(
+                    _stage211_finite_number(
+                        child,
+                        label="Stage211 alignment candidate loss",
+                    )
+                )
+            else:
+                losses.extend(_stage211_collect_candidate_losses(child))
+    elif isinstance(value, list):
+        for child in value:
+            losses.extend(_stage211_collect_candidate_losses(child))
+    return losses
+
+
+def stage211_correction_progress_metrics(
+    gate: dict[str, Any],
+    *,
+    phase: str,
+) -> dict[str, float]:
+    trajectory = gate.get("trajectory_retention")
+    if not isinstance(trajectory, dict):
+        raise ValueError(f"Stage211 {phase} gate lacks trajectory progress evidence.")
+    benchmark = gate.get("public_benchmark")
+    results = benchmark.get("results") if isinstance(benchmark, dict) else None
+    if not isinstance(results, list) or len(results) != 5:
+        raise ValueError(f"Stage211 {phase} gate lacks five-dataset public progress evidence.")
+    public_errors = [
+        _stage211_finite_number(
+            result.get("student_error_rate") if isinstance(result, dict) else None,
+            label=f"Stage211 {phase} public student error",
+        )
+        for result in results
+    ]
+    alignment_record = gate.get("alignment_report")
+    if not isinstance(alignment_record, dict):
+        raise ValueError(f"Stage211 {phase} gate lacks alignment progress evidence.")
+    alignment_path = _validate_bound_file(
+        alignment_record,
+        path_key="path",
+        sha256_key="sha256",
+        label=f"Stage211 {phase} alignment progress source",
+    )
+    alignment = _load_json_object(
+        alignment_path,
+        label=f"Stage211 {phase} alignment progress source",
+    )
+    alignment_losses = _stage211_collect_candidate_losses(alignment)
+    if not alignment_losses:
+        raise ValueError(f"Stage211 {phase} alignment source lacks candidate losses.")
+    return {
+        "trajectory_candidate_loss": _stage211_finite_number(
+            trajectory.get("candidate_loss"),
+            label=f"Stage211 {phase} trajectory candidate loss",
+        ),
+        "public_macro_student_error": sum(public_errors) / len(public_errors),
+        "alignment_mean_candidate_loss": sum(alignment_losses) / len(alignment_losses),
+    }
+
+
+def build_stage211_correction_extension_decision(
+    *,
+    phase: str,
+    completed_round: int,
+    prior_gate_path: Path,
+    prior_gate: dict[str, Any],
+    current_gate_path: Path,
+    current_gate: dict[str, Any],
+    max_rounds: int,
+) -> dict[str, Any]:
+    if completed_round < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+        raise ValueError("Stage211 correction extension is only evaluated after round three.")
+    if not completed_round < max_rounds <= STAGE211_RETENTION_CORRECTION_MAX_ROUNDS:
+        raise ValueError("Stage211 correction extension exceeds its configured hard cap.")
+    if prior_gate.get("gate_passed") is not False or current_gate.get("gate_passed") is not False:
+        raise ValueError("Stage211 correction extension requires two failed phase gates.")
+    prior_metrics = stage211_correction_progress_metrics(prior_gate, phase=phase)
+    current_metrics = stage211_correction_progress_metrics(current_gate, phase=phase)
+    if prior_metrics.keys() != current_metrics.keys():
+        raise ValueError("Stage211 correction progress metric sets differ.")
+    improved_metrics = sorted(
+        name for name in prior_metrics if current_metrics[name] < prior_metrics[name]
+    )
+    continue_training = bool(improved_metrics)
+    return {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "post_coverage_correction_extension_decision",
+        "phase": phase,
+        "completed_round": completed_round,
+        "guaranteed_rounds": STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
+        "max_rounds": max_rounds,
+        "prior_gate_path": str(prior_gate_path.resolve()),
+        "prior_gate_sha256": sha256_file(prior_gate_path),
+        "current_gate_path": str(current_gate_path.resolve()),
+        "current_gate_sha256": sha256_file(current_gate_path),
+        "prior_metrics": prior_metrics,
+        "current_metrics": current_metrics,
+        "improved_metrics": improved_metrics,
+        "continue_training": continue_training,
+        "next_round": completed_round + 1 if continue_training else None,
+    }
+
+
+def validate_stage211_correction_extension_decision(
+    path: str | Path,
+    *,
+    phase: str,
+    next_round: int,
+    admission_gate_path: Path,
+    admission_gate: dict[str, Any],
+) -> dict[str, Any]:
+    decision_path = Path(path).expanduser().resolve()
+    decision = _load_json_object(
+        decision_path,
+        label=f"Stage211 {phase} correction extension decision",
+    )
+    completed_round = next_round - 1
+    max_rounds = int(decision.get("max_rounds", -1))
+    current_gate_path = Path(str(decision.get("current_gate_path") or "")).resolve()
+    if current_gate_path != admission_gate_path.resolve():
+        raise ValueError("Stage211 correction extension admission gate differs.")
+    prior_gate_path = _validate_bound_file(
+        decision,
+        path_key="prior_gate_path",
+        sha256_key="prior_gate_sha256",
+        label=f"Stage211 {phase} prior correction gate",
+    )
+    raw_prior_gate = _load_json_object(
+        prior_gate_path,
+        label=f"Stage211 {phase} prior correction gate",
+    )
+    prior_checkpoint = Path(str(raw_prior_gate.get("checkpoint_path") or "")).resolve()
+    prior_gate = validate_stage211_phase_gate_report(
+        prior_gate_path,
+        expected_phase=phase,
+        checkpoint_path=prior_checkpoint,
+        require_passed=False,
+    )
+    rebuilt = build_stage211_correction_extension_decision(
+        phase=phase,
+        completed_round=completed_round,
+        prior_gate_path=prior_gate_path,
+        prior_gate=prior_gate,
+        current_gate_path=admission_gate_path,
+        current_gate=admission_gate,
+        max_rounds=max_rounds,
+    )
+    if decision != rebuilt or decision.get("continue_training") is not True:
+        raise ValueError("Stage211 correction extension decision is stale or did not pass.")
+    return decision
 
 
 def validate_stage211_full_profile_smoke_binding(
@@ -2995,6 +3162,30 @@ def _validate_stage211_post_coverage_corrections(
         if admission_gate.get("gate_passed") is not False:
             raise ValueError(
                 f"Stage211 {phase} correction round {round_index} admission gate passed."
+            )
+        if round_index > STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+            extension_decision_path = _validate_bound_file(
+                correction,
+                path_key="correction_extension_decision_path",
+                sha256_key="correction_extension_decision_sha256",
+                label=(
+                    f"Stage211 {phase} correction round {round_index} "
+                    "extension decision"
+                ),
+            )
+            validate_stage211_correction_extension_decision(
+                extension_decision_path,
+                phase=phase,
+                next_round=round_index,
+                admission_gate_path=admission_gate_path,
+                admission_gate=admission_gate,
+            )
+        elif (
+            correction.get("correction_extension_decision_path") is not None
+            or correction.get("correction_extension_decision_sha256") is not None
+        ):
+            raise ValueError(
+                f"Stage211 {phase} correction round {round_index} has an early extension decision."
             )
         admission_coverage = admission_gate.get("full_data_coverage")
         if not isinstance(admission_coverage, dict):
