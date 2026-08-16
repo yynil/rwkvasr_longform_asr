@@ -71,6 +71,19 @@ def _require_exact_float(actual: Any, expected: float, *, label: str) -> float:
     return value
 
 
+def _require_optional_exact_float(
+    actual: Any,
+    expected: float | None,
+    *,
+    label: str,
+) -> None:
+    if expected is None:
+        if actual is not None:
+            raise ValueError(f"{label} mismatch: actual={actual!r} expected=None")
+        return
+    _require_exact_float(actual, expected, label=label)
+
+
 def _validate_profile_config(
     row: dict[str, Any],
     *,
@@ -226,6 +239,7 @@ def validate_stage211_batch_profile_preflight(
     report_path: str | Path,
     *,
     phase: str,
+    require_candidate: bool = True,
 ) -> dict[str, Any]:
     if phase not in STAGE211_BATCH_PROFILE_PHASES:
         raise ValueError(f"Unsupported Stage211 batch profile phase: {phase!r}")
@@ -305,16 +319,20 @@ def validate_stage211_batch_profile_preflight(
         raise ValueError("Stage211 batch preflight selection is missing.")
     baseline_name = selection.get("baseline_profile")
     selected_name = selection.get("recommended_profile")
+    decision = selection.get("decision")
     if (
-        selection.get("decision") != "candidate_recommended"
+        decision not in ("candidate_recommended", "keep_baseline")
         or selection.get("formal_admission") is not False
         or not isinstance(baseline_name, str)
         or not isinstance(selected_name, str)
-        or selected_name == baseline_name
         or baseline_name not in by_name
         or selected_name not in by_name
     ):
-        raise ValueError("Stage211 batch preflight has no admissible larger profile.")
+        raise ValueError("Stage211 batch preflight selection is not replayable.")
+    if decision == "candidate_recommended" and selected_name == baseline_name:
+        raise ValueError("Stage211 batch preflight candidate selection retained the baseline.")
+    if decision == "keep_baseline" and selected_name != baseline_name:
+        raise ValueError("Stage211 batch preflight baseline selection names a candidate.")
     baseline_profile = by_name[baseline_name]["profile"]
     if baseline_profile != {
         "name": baseline_name,
@@ -323,10 +341,168 @@ def validate_stage211_batch_profile_preflight(
     }:
         raise ValueError("Stage211 batch preflight baseline differs from the legacy profile.")
     baseline = _validate_safe_profile(by_name[baseline_name], report=report, phase=phase)
-    selected = _validate_safe_profile(by_name[selected_name], report=report, phase=phase)
+    baseline_summary = baseline["summary"]
+    baseline_seconds = float(baseline_summary["projected_full_coverage_seconds"])
+    baseline_loss = float(baseline_summary["mean_loss"])
+    baseline_cosine = float(baseline_summary["mean_cosine"])
     comparisons = selection.get("comparisons")
     if not isinstance(comparisons, list):
         raise ValueError("Stage211 batch preflight candidate comparisons are missing.")
+    comparison_by_name = {
+        str(row.get("profile") or ""): row
+        for row in comparisons
+        if isinstance(row, dict)
+    }
+    candidate_names = set(by_name).difference((baseline_name,))
+    if set(comparison_by_name) != candidate_names or len(comparisons) != len(candidate_names):
+        raise ValueError("Stage211 batch preflight candidate comparison coverage is invalid.")
+    replayed_admissible: list[tuple[float, str, float]] = []
+    for candidate_name in sorted(candidate_names):
+        candidate_row = by_name[candidate_name]
+        _validate_profile_config(candidate_row, report=report, phase=phase)
+        _validate_bound_file(
+            candidate_row,
+            path_key="log_path",
+            sha256_key="log_sha256",
+            label=f"Stage211 batch preflight {candidate_name} log",
+        )
+        summary = candidate_row.get("summary")
+        if not isinstance(summary, dict):
+            raise ValueError(
+                f"Stage211 batch preflight {candidate_name} summary is missing."
+            )
+        if summary.get("safety_pass") is True:
+            _validate_safe_profile(candidate_row, report=report, phase=phase)
+        candidate_seconds_value = summary.get("projected_full_coverage_seconds")
+        candidate_loss_value = summary.get("mean_loss")
+        candidate_cosine_value = summary.get("mean_cosine")
+        candidate_seconds = (
+            float(candidate_seconds_value)
+            if isinstance(candidate_seconds_value, (float, int))
+            and not isinstance(candidate_seconds_value, bool)
+            else None
+        )
+        candidate_loss = (
+            float(candidate_loss_value)
+            if isinstance(candidate_loss_value, (float, int))
+            and not isinstance(candidate_loss_value, bool)
+            else None
+        )
+        candidate_cosine = (
+            float(candidate_cosine_value)
+            if isinstance(candidate_cosine_value, (float, int))
+            and not isinstance(candidate_cosine_value, bool)
+            else None
+        )
+        improvement = (
+            (baseline_seconds - candidate_seconds) / baseline_seconds
+            if candidate_seconds is not None and baseline_seconds > 0.0
+            else None
+        )
+        loss_regression = (
+            (candidate_loss - baseline_loss) / max(abs(baseline_loss), 1.0e-12)
+            if candidate_loss is not None
+            else None
+        )
+        cosine_regression = (
+            baseline_cosine - candidate_cosine if candidate_cosine is not None else None
+        )
+        quality_pass = (
+            loss_regression is not None
+            and loss_regression <= float(report["max_loss_regression_ratio"])
+            and cosine_regression is not None
+            and cosine_regression <= float(report["max_cosine_regression"])
+        )
+        admissible = (
+            summary.get("safety_pass") is True
+            and improvement is not None
+            and improvement >= float(report["min_improvement_ratio"])
+            and quality_pass
+        )
+        comparison_row = comparison_by_name[candidate_name]
+        _require_optional_exact_float(
+            comparison_row.get("projected_full_coverage_seconds"),
+            candidate_seconds,
+            label=f"{candidate_name} projected coverage",
+        )
+        _require_optional_exact_float(
+            comparison_row.get("improvement_ratio"),
+            improvement,
+            label=f"{candidate_name} improvement",
+        )
+        _require_optional_exact_float(
+            comparison_row.get("mean_loss"),
+            candidate_loss,
+            label=f"{candidate_name} mean loss",
+        )
+        _require_optional_exact_float(
+            comparison_row.get("loss_regression_ratio"),
+            loss_regression,
+            label=f"{candidate_name} loss regression",
+        )
+        _require_optional_exact_float(
+            comparison_row.get("mean_cosine"),
+            candidate_cosine,
+            label=f"{candidate_name} mean cosine",
+        )
+        _require_optional_exact_float(
+            comparison_row.get("cosine_regression"),
+            cosine_regression,
+            label=f"{candidate_name} cosine regression",
+        )
+        if (
+            comparison_row.get("quality_pass") is not quality_pass
+            or comparison_row.get("admissible") is not admissible
+        ):
+            raise ValueError(
+                f"Stage211 batch preflight {candidate_name} comparison decision changed."
+            )
+        if admissible:
+            assert candidate_seconds is not None
+            assert improvement is not None
+            replayed_admissible.append((candidate_seconds, candidate_name, improvement))
+    replayed_admissible.sort()
+    for key in (
+        "min_improvement_ratio",
+        "max_loss_regression_ratio",
+        "max_cosine_regression",
+    ):
+        _require_exact_float(selection.get(key), float(report[key]), label=f"selection {key}")
+    _require_exact_float(
+        selection.get("baseline_mean_loss"),
+        float(baseline_summary["mean_loss"]),
+        label="selection baseline mean loss",
+    )
+    _require_exact_float(
+        selection.get("baseline_mean_cosine"),
+        float(baseline_summary["mean_cosine"]),
+        label="selection baseline mean cosine",
+    )
+    if decision == "keep_baseline":
+        _require_exact_float(
+            selection.get("recommended_improvement_ratio"),
+            0.0,
+            label="retained baseline improvement",
+        )
+        if replayed_admissible:
+            raise ValueError(
+                "Stage211 batch preflight retained the baseline despite an admissible candidate."
+            )
+        if require_candidate:
+            raise ValueError("Stage211 batch preflight has no admissible larger profile.")
+        return {
+            **report,
+            "report_path": str(path),
+            "report_sha256": sha256_file(path),
+            "selection_decision": decision,
+            "selected_profile_name": baseline_name,
+            "selected_profile_row": baseline,
+            "selected_comparison": None,
+        }
+
+    selected = _validate_safe_profile(by_name[selected_name], report=report, phase=phase)
+    if not replayed_admissible or replayed_admissible[0][1] != selected_name:
+        raise ValueError("Stage211 batch preflight did not select the fastest admissible profile.")
     comparison = next(
         (
             row
@@ -341,15 +517,11 @@ def validate_stage211_batch_profile_preflight(
         or comparison.get("admissible") is not True
     ):
         raise ValueError("Stage211 selected batch profile failed its quality comparison.")
-    baseline_summary = baseline["summary"]
     selected_summary = selected["summary"]
-    baseline_seconds = float(baseline_summary["projected_full_coverage_seconds"])
     selected_seconds = float(selected_summary["projected_full_coverage_seconds"])
     improvement = (baseline_seconds - selected_seconds) / baseline_seconds
-    baseline_loss = float(baseline_summary["mean_loss"])
     selected_loss = float(selected_summary["mean_loss"])
     loss_regression = (selected_loss - baseline_loss) / max(abs(baseline_loss), 1.0e-12)
-    baseline_cosine = float(baseline_summary["mean_cosine"])
     selected_cosine = float(selected_summary["mean_cosine"])
     cosine_regression = baseline_cosine - selected_cosine
     _require_exact_float(
@@ -370,12 +542,6 @@ def validate_stage211_batch_profile_preflight(
         improvement,
         label="recommended improvement",
     )
-    for key in (
-        "min_improvement_ratio",
-        "max_loss_regression_ratio",
-        "max_cosine_regression",
-    ):
-        _require_exact_float(selection.get(key), float(report[key]), label=f"selection {key}")
     if (
         improvement < float(report["min_improvement_ratio"])
         or loss_regression > float(report["max_loss_regression_ratio"])
@@ -386,6 +552,7 @@ def validate_stage211_batch_profile_preflight(
         **report,
         "report_path": str(path),
         "report_sha256": sha256_file(path),
+        "selection_decision": decision,
         "selected_profile_name": selected_name,
         "selected_profile_row": selected,
         "selected_comparison": comparison,

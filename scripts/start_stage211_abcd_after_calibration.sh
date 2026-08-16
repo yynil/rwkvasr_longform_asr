@@ -268,6 +268,8 @@ run_full_block_phase() {
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --supplemental-inventory "${SUPPLEMENTAL_INVENTORY}" \
     --supplemental-profile-receipt "${SUPPLEMENTAL_PROFILE_RECEIPT}" \
+    --auto-batch-profile \
+    --batch-profile-master-port "$((MASTER_PORT + 110))" \
     --master-port "$((MASTER_PORT + 1))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211B full curriculum finished; starting strict correction/evaluation loop"
@@ -314,6 +316,8 @@ run_full_logits_phase() {
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --supplemental-inventory "${SUPPLEMENTAL_INVENTORY}" \
     --supplemental-profile-receipt "${SUPPLEMENTAL_PROFILE_RECEIPT}" \
+    --auto-batch-profile \
+    --batch-profile-master-port "$((MASTER_PORT + 120))" \
     --master-port "$((MASTER_PORT + 2))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"
   log "Stage211C full curriculum finished; starting strict correction/evaluation loop"

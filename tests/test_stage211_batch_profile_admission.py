@@ -242,6 +242,60 @@ def test_measured_phase_specific_profile_can_be_admitted(tmp_path: Path) -> None
     }
 
 
+def test_complete_measurement_can_retain_legacy_baseline(tmp_path: Path) -> None:
+    report_path = _report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    candidate = report["profiles"][1]
+    full_steps = int(candidate["coverage"]["full_coverage_steps"])
+    candidate["summary"]["projected_full_coverage_seconds"] = 2_850.0
+    candidate["summary"]["steps_per_second"] = full_steps / 2_850.0
+    comparison = report["selection"]["comparisons"][0]
+    comparison["projected_full_coverage_seconds"] = 2_850.0
+    comparison["improvement_ratio"] = 0.05
+    comparison["admissible"] = False
+    report["selection"].update(
+        {
+            "decision": "keep_baseline",
+            "recommended_profile": "baseline",
+            "recommended_improvement_ratio": 0.0,
+        }
+    )
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    measured = validate_stage211_batch_profile_preflight(
+        report_path,
+        phase="mixer",
+        require_candidate=False,
+    )
+    assert measured["selection_decision"] == "keep_baseline"
+    assert measured["selected_profile_name"] == "baseline"
+    with pytest.raises(ValueError, match="no admissible larger profile"):
+        validate_stage211_batch_profile_preflight(report_path, phase="mixer")
+
+
+def test_keep_baseline_measurement_rejects_hidden_admissible_candidate(
+    tmp_path: Path,
+) -> None:
+    report_path = _report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["selection"].update(
+        {
+            "decision": "keep_baseline",
+            "recommended_profile": "baseline",
+            "recommended_improvement_ratio": 0.0,
+        }
+    )
+    report["selection"]["comparisons"][0]["admissible"] = False
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="comparison decision"):
+        validate_stage211_batch_profile_preflight(
+            report_path,
+            phase="mixer",
+            require_candidate=False,
+        )
+
+
 def test_dry_run_or_wrong_phase_cannot_be_admitted(tmp_path: Path) -> None:
     report_path = _report(tmp_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -320,6 +374,50 @@ def test_controller_threads_an_explicit_segment_admission(tmp_path: Path) -> Non
         stage211_full_phase._parse_batch_profile_admissions(
             [f"long={admission}", f"long={admission}"]
         )
+
+
+def test_controller_recovers_auto_admission_from_segment_provenance(
+    tmp_path: Path,
+) -> None:
+    admission = _write(tmp_path / "admission.json", "{}\n")
+    run_dir = tmp_path / "run"
+    provenance = {
+        "batch_profile_admission_path": str(admission),
+        "batch_profile_admission_sha256": sha256_file(admission),
+    }
+    _write(run_dir / "stage211_provenance.json", json.dumps(provenance) + "\n")
+
+    assert (
+        stage211_full_phase._resolve_segment_batch_profile_admission(
+            run_dir=run_dir,
+            requested=None,
+        )
+        == admission
+    )
+    with pytest.raises(ValueError, match="differs from provenance"):
+        stage211_full_phase._resolve_segment_batch_profile_admission(
+            run_dir=run_dir,
+            requested=tmp_path / "other.json",
+        )
+
+
+def test_controller_builds_phase_specific_automatic_preflight_command(
+    tmp_path: Path,
+) -> None:
+    command = stage211_full_phase._profile_preflight_command(
+        phase="block",
+        base_config=tmp_path / "base.yaml",
+        init_checkpoint=tmp_path / "init.pt",
+        output_root=tmp_path / "probe",
+        master_port=29741,
+    )
+
+    assert command[command.index("--phase") + 1] == "block"
+    assert "--profile" not in command
+    assert command[command.index("--max-peak-memory-gib") + 1] == "22.0"
+    assert command[command.index("--min-improvement-ratio") + 1] == "0.10"
+    assert command[command.index("--max-loss-regression-ratio") + 1] == "0.05"
+    assert command[command.index("--max-cosine-regression") + 1] == "0.005"
 
 
 def test_schema2_profile_and_mixed_coverage_keep_dynamic_exposures(

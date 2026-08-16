@@ -3269,10 +3269,9 @@ def test_stage211_full_phase_revalidates_manifests_before_every_segment_runner()
     revalidation_lines = sorted(call_lines["_require_loaded_manifest_bindings"])
     runner_lines = sorted(call_lines["_runner_command"])
     assert len(revalidation_lines) == 2
-    assert len(runner_lines) == 2
-    assert all(
-        revalidation < runner for revalidation, runner in zip(revalidation_lines, runner_lines)
-    )
+    assert len(runner_lines) == 4
+    assert revalidation_lines[0] < runner_lines[0] < runner_lines[1]
+    assert runner_lines[1] < revalidation_lines[1] < runner_lines[2] < runner_lines[3]
 
 
 def test_stage211_loaded_manifest_receipt_rejects_runtime_manifest_rewrite(

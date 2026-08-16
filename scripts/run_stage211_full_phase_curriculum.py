@@ -11,8 +11,10 @@ from typing import Any
 
 import torch
 
+from rwkvasr.config import load_yaml
 from rwkvasr.eval.stage211_batch_profile import (
     validate_stage211_batch_profile_admission,
+    validate_stage211_batch_profile_preflight,
 )
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
@@ -49,6 +51,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = Path(sys.executable)
 SINGLE_SEGMENT_RUNNER = REPO_ROOT / "scripts" / "run_stage211_strict_chained_alignment.py"
 RECEIPT_CREATOR = REPO_ROOT / "scripts" / "create_stage211_curriculum_receipt.py"
+PROFILE_BENCHMARK = REPO_ROOT / "scripts" / "benchmark_stage211_batch_profiles.py"
+PROFILE_ADMISSION_CREATOR = REPO_ROOT / "scripts" / "create_stage211_batch_profile_admission.py"
 DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_runs" / "stage211_full_alignment"
 DEFAULT_CONFIG_ROOT = Path.home() / "rwkvasr_configs" / "stage211_full_alignment"
 DEFAULT_METADATA_ROOT = Path.home() / "rwkvasr_data" / "stage211_full_curriculum"
@@ -304,6 +308,220 @@ def _runner_command(
     if dry_run:
         command.extend(("--dry-run", "--skip-nano-weight-audit"))
     return command
+
+
+def _recorded_batch_profile_admission(run_dir: Path) -> Path | None:
+    provenance_path = run_dir / "stage211_provenance.json"
+    if not provenance_path.is_file():
+        return None
+    provenance = _load_json(provenance_path, label="Stage211 segment provenance")
+    raw_path = provenance.get("batch_profile_admission_path")
+    raw_sha256 = provenance.get("batch_profile_admission_sha256")
+    if raw_path is None and raw_sha256 is None:
+        return None
+    if not isinstance(raw_path, str) or not raw_path or not isinstance(raw_sha256, str):
+        raise ValueError("Stage211 segment provenance has an incomplete batch-profile binding.")
+    admission_path = Path(raw_path).expanduser().resolve()
+    if not admission_path.is_file() or sha256_file(admission_path) != raw_sha256:
+        raise ValueError("Stage211 segment provenance batch-profile admission changed.")
+    return admission_path
+
+
+def _resolve_segment_batch_profile_admission(
+    *,
+    run_dir: Path,
+    requested: Path | None,
+) -> Path | None:
+    recorded = _recorded_batch_profile_admission(run_dir)
+    if requested is not None:
+        requested = requested.expanduser().resolve()
+    if recorded is not None and requested is not None and recorded != requested:
+        raise ValueError(
+            "Requested Stage211 segment batch-profile admission differs from provenance."
+        )
+    return requested or recorded
+
+
+def _find_generated_base_config(
+    *,
+    config_root: Path,
+    phase: str,
+    difficulty: str,
+    expected_steps: int,
+    init_checkpoint: Path,
+    manifest_path: Path,
+) -> Path:
+    target_root = config_root / phase / f"full_{difficulty}"
+    matches: list[Path] = []
+    for path in sorted(target_root.glob("*.yaml")):
+        config = load_yaml(path)
+        if (
+            int(config.get("max_steps", -1)) == int(expected_steps)
+            and Path(str(config.get("init_checkpoint_path") or "")).resolve()
+            == init_checkpoint.resolve()
+            and Path(str(config.get("webdataset_bucket_manifest_path") or "")).resolve()
+            == manifest_path.resolve()
+        ):
+            matches.append(path.resolve())
+    if len(matches) != 1:
+        raise ValueError(
+            "Stage211 automatic batch preflight baseline config is ambiguous: "
+            f"phase={phase} difficulty={difficulty} expected_steps={expected_steps} "
+            f"matches={matches}"
+        )
+    return matches[0]
+
+
+def _profile_preflight_command(
+    *,
+    phase: str,
+    base_config: Path,
+    init_checkpoint: Path,
+    output_root: Path,
+    master_port: int,
+) -> list[str]:
+    return [
+        str(PYTHON),
+        str(PROFILE_BENCHMARK),
+        "--phase",
+        phase,
+        "--base-config",
+        str(base_config),
+        "--init-checkpoint",
+        str(init_checkpoint),
+        "--output-root",
+        str(output_root),
+        "--master-port",
+        str(master_port),
+        "--max-peak-memory-gib",
+        "22.0",
+        "--min-improvement-ratio",
+        "0.10",
+        "--max-loss-regression-ratio",
+        "0.05",
+        "--max-cosine-regression",
+        "0.005",
+    ]
+
+
+def _profile_admission_command(
+    *,
+    phase: str,
+    report_path: Path,
+    admission_path: Path,
+) -> list[str]:
+    return [
+        str(PYTHON),
+        str(PROFILE_ADMISSION_CREATOR),
+        "--preflight-report",
+        str(report_path),
+        "--phase",
+        phase,
+        "--admitted-by",
+        "stage211-auto-segment-boundary",
+        "--reason",
+        (
+            "phase/checkpoint/manifest-specific four-GPU profile passed memory, "
+            "objective-match, quality-equivalence, and wall-time gates"
+        ),
+        "--admit-recommended-profile",
+        "--output",
+        str(admission_path),
+    ]
+
+
+def _ensure_automatic_batch_profile(
+    *,
+    phase: str,
+    difficulty: str,
+    phase_root: Path,
+    config_root: Path,
+    manifest_path: Path,
+    init_checkpoint: Path,
+    expected_legacy_steps: int,
+    template_command: list[str],
+    master_port: int,
+) -> Path | None:
+    _run_command(template_command, dry_run=False)
+    base_config = _find_generated_base_config(
+        config_root=config_root,
+        phase=phase,
+        difficulty=difficulty,
+        expected_steps=expected_legacy_steps,
+        init_checkpoint=init_checkpoint,
+        manifest_path=manifest_path,
+    )
+    init_sha256 = sha256_file(init_checkpoint)
+    preflight_root = (
+        phase_root
+        / "batch_profile_preflight"
+        / f"{difficulty}-{init_sha256[:16]}"
+    )
+    report_path = preflight_root / "batch_throughput_preflight.json"
+    if report_path.is_file():
+        measured = validate_stage211_batch_profile_preflight(
+            report_path,
+            phase=phase,
+            require_candidate=False,
+        )
+    else:
+        if preflight_root.exists() and any(preflight_root.iterdir()):
+            raise ValueError(
+                f"Incomplete Stage211 automatic batch preflight exists: {preflight_root}"
+            )
+        _run_command(
+            _profile_preflight_command(
+                phase=phase,
+                base_config=base_config,
+                init_checkpoint=init_checkpoint,
+                output_root=preflight_root,
+                master_port=master_port,
+            ),
+            dry_run=False,
+        )
+        measured = validate_stage211_batch_profile_preflight(
+            report_path,
+            phase=phase,
+            require_candidate=False,
+        )
+    if (
+        Path(str(measured["init_checkpoint_path"])).resolve() != init_checkpoint.resolve()
+        or Path(str(measured["bucket_manifest_path"])).resolve() != manifest_path.resolve()
+    ):
+        raise ValueError("Stage211 automatic batch preflight binds different segment inputs.")
+    if measured["selection_decision"] == "keep_baseline":
+        print(
+            "[stage211-full-phase] automatic batch preflight retained legacy profile "
+            f"phase={phase} difficulty={difficulty} report={report_path}",
+            flush=True,
+        )
+        return None
+    admission_path = (
+        phase_root
+        / "batch_profile_preflight"
+        / f"{difficulty}-{init_sha256[:16]}-admission.json"
+    )
+    _run_command(
+        _profile_admission_command(
+            phase=phase,
+            report_path=report_path,
+            admission_path=admission_path,
+        ),
+        dry_run=False,
+    )
+    admission = validate_stage211_batch_profile_admission(
+        admission_path,
+        phase=phase,
+        expected_init_checkpoint=init_checkpoint,
+        expected_bucket_manifest=manifest_path,
+    )
+    print(
+        "[stage211-full-phase] automatic batch profile admitted "
+        f"phase={phase} difficulty={difficulty} "
+        f"profile={admission['selected_profile']['name']} admission={admission_path}",
+        flush=True,
+    )
+    return admission_path
 
 
 def _receipt_command(
@@ -897,7 +1115,50 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             )
         run_dir = phase_root / difficulty
         receipt_path = phase_root / "receipts" / f"{difficulty}.json"
-        batch_profile_admission_path = batch_profile_admissions.get(difficulty)
+        latest_step = _latest_step(run_dir)
+        batch_profile_admission_path = _resolve_segment_batch_profile_admission(
+            run_dir=run_dir,
+            requested=batch_profile_admissions.get(difficulty),
+        )
+        if (
+            batch_profile_admission_path is None
+            and bool(getattr(args, "auto_batch_profile", False))
+            and not args.dry_run
+            and latest_step <= 0
+            and not receipt_path.is_file()
+            and not (run_dir / "stage211_provenance.json").exists()
+        ):
+            template = _runner_command(
+                phase=phase,
+                difficulty=difficulty,
+                output_dir=run_dir,
+                config_dir=config_root,
+                manifest_path=manifests[difficulty],
+                nano_checkpoint=nano_checkpoint,
+                master_port=int(args.master_port),
+                init_checkpoint=current_init,
+                curriculum_receipt=(
+                    preceding_receipt if difficulty != "easy" else None
+                ),
+                promotion_receipt=(
+                    promotion_receipt if difficulty == "easy" else None
+                ),
+                smoke=False,
+                dry_run=True,
+                supplemental_inventory=None,
+                batch_profile_admission=None,
+            )
+            batch_profile_admission_path = _ensure_automatic_batch_profile(
+                phase=phase,
+                difficulty=difficulty,
+                phase_root=phase_root,
+                config_root=config_root,
+                manifest_path=manifests[difficulty],
+                init_checkpoint=current_init,
+                expected_legacy_steps=int(STAGE211_AUDIO_CURRICULUM[difficulty]["steps"]),
+                template_command=template,
+                master_port=int(args.batch_profile_master_port),
+            )
         batch_profile_admission = (
             validate_stage211_batch_profile_admission(
                 batch_profile_admission_path,
@@ -913,7 +1174,6 @@ def run_phase(args: argparse.Namespace) -> Path | None:
             if batch_profile_admission is not None
             else STAGE211_AUDIO_CURRICULUM[difficulty]["steps"]
         )
-        latest_step = _latest_step(run_dir)
         runner = _runner_command(
             phase=phase,
             difficulty=difficulty,
@@ -1012,9 +1272,54 @@ def run_phase(args: argparse.Namespace) -> Path | None:
     supplemental_receipt_path = (
         phase_root / "receipts" / f"{STAGE211_SUPPLEMENTAL_DIFFICULTY}.json"
     )
+    if loaded_manifest_receipt is not None:
+        _require_loaded_manifest_bindings(
+            manifests=manifests,
+            receipt=loaded_manifest_receipt,
+        )
     supplemental_batch_profile_path = batch_profile_admissions.get(
         STAGE211_SUPPLEMENTAL_DIFFICULTY
     )
+    supplemental_latest_step = _latest_step(supplemental_run_dir)
+    supplemental_batch_profile_path = _resolve_segment_batch_profile_admission(
+        run_dir=supplemental_run_dir,
+        requested=supplemental_batch_profile_path,
+    )
+    if (
+        supplemental_batch_profile_path is None
+        and bool(getattr(args, "auto_batch_profile", False))
+        and not args.dry_run
+        and supplemental_latest_step <= 0
+        and not supplemental_receipt_path.is_file()
+        and not (supplemental_run_dir / "stage211_provenance.json").exists()
+    ):
+        template = _runner_command(
+            phase=phase,
+            difficulty=STAGE211_SUPPLEMENTAL_DIFFICULTY,
+            output_dir=supplemental_run_dir,
+            config_dir=config_root,
+            manifest_path=supplemental_manifest,
+            nano_checkpoint=nano_checkpoint,
+            master_port=int(args.master_port),
+            init_checkpoint=current_init,
+            curriculum_receipt=preceding_receipt,
+            promotion_receipt=None,
+            smoke=False,
+            dry_run=True,
+            supplemental_inventory=supplemental_inventory,
+            batch_profile_admission=None,
+        )
+        supplemental_batch_profile_path = _ensure_automatic_batch_profile(
+            phase=phase,
+            difficulty=STAGE211_SUPPLEMENTAL_DIFFICULTY,
+            phase_root=phase_root,
+            config_root=config_root,
+            manifest_path=supplemental_manifest,
+            init_checkpoint=current_init,
+            expected_legacy_steps=int(supplemental_profile["steps"]),
+            template_command=template,
+            master_port=int(args.batch_profile_master_port),
+        )
     supplemental_batch_profile = (
         validate_stage211_batch_profile_admission(
             supplemental_batch_profile_path,
@@ -1039,12 +1344,6 @@ def run_phase(args: argparse.Namespace) -> Path | None:
         if not args.dry_run:
             validate_stage211_formal_supplemental_profile(supplemental_profile)
     supplemental_target_step = int(supplemental_profile["steps"])
-    supplemental_latest_step = _latest_step(supplemental_run_dir)
-    if loaded_manifest_receipt is not None:
-        _require_loaded_manifest_bindings(
-            manifests=manifests,
-            receipt=loaded_manifest_receipt,
-        )
     supplemental_runner = _runner_command(
         phase=phase,
         difficulty=STAGE211_SUPPLEMENTAL_DIFFICULTY,
@@ -1211,6 +1510,15 @@ def main() -> int:
             "difficulty=/absolute/path; repeat only for admitted segments."
         ),
     )
+    parser.add_argument(
+        "--auto-batch-profile",
+        action="store_true",
+        help=(
+            "Measure and admit a phase-specific profile at each fresh segment boundary; "
+            "currently restricted to future Block and Logits phases."
+        ),
+    )
+    parser.add_argument("--batch-profile-master-port", type=int, default=29741)
     parser.add_argument("--nano-checkpoint", type=Path, default=DEFAULT_NANO_CHECKPOINT)
     parser.add_argument(
         "--supplemental-inventory",
@@ -1233,6 +1541,10 @@ def main() -> int:
 
     if args.max_peak_reserved_gib <= 0.0:
         parser.error("--max-peak-reserved-gib must be positive")
+    if args.batch_profile_master_port <= 0:
+        parser.error("--batch-profile-master-port must be positive")
+    if args.auto_batch_profile and args.phase not in ("block", "logits"):
+        parser.error("--auto-batch-profile is restricted to Block and Logits")
     run_phase(args)
     return 0
 
