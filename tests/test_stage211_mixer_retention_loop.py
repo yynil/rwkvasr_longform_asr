@@ -399,6 +399,40 @@ def test_correction_extension_validator_replays_bound_progress_decision(
         )
 
 
+def test_progress_can_extend_beyond_the_superseded_round_eight_cap(
+    tmp_path: Path,
+) -> None:
+    prior_path, prior = _write_progress_gate(
+        tmp_path,
+        name="round-seven",
+        trajectory_loss=0.18,
+        public_error=0.45,
+        alignment_loss=0.20,
+    )
+    current_path, current = _write_progress_gate(
+        tmp_path,
+        name="round-eight",
+        trajectory_loss=0.17,
+        public_error=0.44,
+        alignment_loss=0.19,
+    )
+
+    decision = stage211_gate.build_stage211_correction_extension_decision(
+        phase="mixer",
+        completed_round=8,
+        prior_gate_path=prior_path,
+        prior_gate=prior,
+        current_gate_path=current_path,
+        current_gate=current,
+        max_rounds=32,
+    )
+
+    assert decision["continue_training"] is True
+    assert decision["completed_round"] == 8
+    assert decision["next_round"] == 9
+    assert decision["max_rounds"] == 32
+
+
 def test_retention_loop_stops_after_guaranteed_rounds_without_progress(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -534,8 +568,8 @@ def test_retention_loop_default_allows_progress_qualified_extensions() -> None:
     parser = loop.build_parser()
 
     assert loop.STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS == 3
-    assert loop.STAGE211_RETENTION_CORRECTION_MAX_ROUNDS == 8
-    assert parser.get_default("max_rounds") == 8
+    assert loop.STAGE211_RETENTION_CORRECTION_MAX_ROUNDS == 32
+    assert parser.get_default("max_rounds") == 32
 
 
 def test_retention_loop_rejects_failed_gate_with_promotion(
