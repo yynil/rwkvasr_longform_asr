@@ -15,6 +15,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
     build_stage211_full_data_coverage,
+    build_stage211_step_eval_cadence,
     build_stage211_trajectory_retention_gate,
     load_stage211_post_coverage_correction_receipts,
     sha256_file,
@@ -416,6 +417,12 @@ def build_phase_gate(
         checkpoint_path=checkpoint_path,
     )
     trajectory_retention_gate_passed = bool(trajectory_retention["gate_passed"])
+    step_eval_cadence = build_stage211_step_eval_cadence(
+        phase=phase,
+        segments=coverage,
+        supplemental_segment=supplemental_coverage,
+        post_coverage_corrections=correction_receipts,
+    )
     gate_passed = stage211_phase_gate_decision(
         phase=phase,
         alignment_gate_passed=alignment_gate_passed,
@@ -436,6 +443,7 @@ def build_phase_gate(
         "public_progress_gate_passed": public_progress_gate_passed,
         "trajectory_retention_gate_passed": trajectory_retention_gate_passed,
         "trajectory_retention": trajectory_retention,
+        "step_eval_cadence": step_eval_cadence,
         "preflight_smoke": preflight_smoke,
         "global_dedup_manifest_path": str(global_dedup_manifest_path),
         "global_dedup_manifest_sha256": sha256_file(global_dedup_manifest_path),

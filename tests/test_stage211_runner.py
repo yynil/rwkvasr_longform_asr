@@ -31,6 +31,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_RETENTION_CORRECTION_LR,
     build_stage211_correction_layer_focus,
     build_stage211_full_data_coverage,
+    build_stage211_step_eval_cadence,
     build_stage211_trajectory_retention_gate,
     sha256_file,
     stage211_post_coverage_correction_exposure,
@@ -82,6 +83,8 @@ def _compact_public_replay_for_phase_gate_tests(
             "test_stage211_nano_baseline_receipt_",
             "test_stage211_promotion_receipt_binds_",
             "test_stage211_curriculum_receipt_requires_",
+            "test_stage211_stepwise_",
+            "test_stage211_trajectory_",
         )
     )
     if not phase_gate_test:
@@ -96,6 +99,24 @@ def _compact_public_replay_for_phase_gate_tests(
     monkeypatch.setattr(sys.modules[__name__], "STAGE211_PUBLIC_BENCHMARKS", compact)
     monkeypatch.setattr(stage211_gate_module, "STAGE211_PUBLIC_BENCHMARKS", compact)
     monkeypatch.setattr(stage211_phase_gate, "STAGE211_PUBLIC_BENCHMARKS", compact)
+    compact_steps_per_epoch = {
+        "easy": 3_334,
+        "medium": 6_667,
+        "hard": 10_001,
+        "long": 35,
+    }
+    compact_curriculum = {
+        difficulty: {
+            **expected,
+            "steps_per_epoch": compact_steps_per_epoch[difficulty],
+            "steps": compact_steps_per_epoch[difficulty] * STAGE211_FULL_DATA_EPOCHS,
+        }
+        for difficulty, expected in STAGE211_AUDIO_CURRICULUM.items()
+    }
+    monkeypatch.setattr(sys.modules[__name__], "STAGE211_AUDIO_CURRICULUM", compact_curriculum)
+    monkeypatch.setattr(stage211_gate_module, "STAGE211_AUDIO_CURRICULUM", compact_curriculum)
+    monkeypatch.setattr(stage211_phase_gate, "STAGE211_AUDIO_CURRICULUM", compact_curriculum)
+    monkeypatch.setattr(stage211, "STAGE211_AUDIO_CURRICULUM", compact_curriculum)
 
 
 def test_stage211_public_benchmark_contract_uses_full_real_sets() -> None:
@@ -2893,6 +2914,11 @@ def _write_supplemental_coverage_fixture(
             "ctc_teacher_online_model_path": str(nano_teacher_dir.resolve()),
             "max_steps": int(profile["steps"]),
             "webdataset_bucket_manifest_path": profile["bucket_manifest_path"],
+            "step_eval_every": 10_000,
+            "step_eval_samples": 256,
+            "step_eval_split": "eval",
+            "step_eval_shuffle": False,
+            "step_eval_feature_seed": 0,
         }
     )
     save_yaml(train_config, train_config_payload)
@@ -4343,6 +4369,71 @@ def _write_trajectory_eval_fixture(
     return output
 
 
+def _write_step_eval_cadence_source_fixture(record: dict[str, object]) -> None:
+    run_dir = Path(str(record["run_dir"]))
+    terminal_step = int(record["steps"])
+    steps_per_epoch = int(record["steps_per_epoch"])
+    epochs = int(record["epochs"])
+    expected_steps = list(range(10_000, terminal_step + 1, 10_000))
+    if not expected_steps or expected_steps[-1] != terminal_step:
+        expected_steps.append(terminal_step)
+    terminal_report_path = run_dir / f"step_eval_layers_step-{terminal_step}.yaml"
+    terminal_report = load_yaml(terminal_report_path)
+    records = []
+    for step in expected_steps:
+        report_path = run_dir / f"step_eval_layers_step-{step}.yaml"
+        if report_path.is_file():
+            report = load_yaml(report_path)
+        else:
+            report = {
+                "step": step,
+                "eval_loss": float(terminal_report["eval_loss"]) + 1.0 / (step + 1),
+                "eval_samples": 256,
+                "eval_provenance": terminal_report["eval_provenance"],
+            }
+            save_yaml(report_path, report)
+        records.append(
+            {
+                "step": step,
+                "epoch": min(epochs, ((step - 1) // steps_per_epoch) + 1),
+                "eval_loss": float(report["eval_loss"]),
+                "eval_samples": 256,
+                "checkpoint_path": str((run_dir / f"step-{step}.pt").resolve()),
+                "deepspeed_checkpoint_dir": str(
+                    (run_dir / "ds_checkpoints" / f"step-{step}").resolve()
+                ),
+                "resume_tag": f"step-{step}",
+                "layer_metrics_path": str(report_path.resolve()),
+            }
+        )
+    save_yaml(
+        run_dir / "step_checkpoint_metrics.yaml",
+        {
+            "step_checkpoints": records,
+            "best": records[: min(8, len(records))],
+            "keep_top_k": min(8, len(records)),
+        },
+    )
+
+
+def _write_step_eval_cadence_fixture(
+    *,
+    phase: str,
+    segments: list[dict[str, object]],
+    supplemental_segment: dict[str, object],
+    corrections: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    records = [*segments, supplemental_segment, *(corrections or [])]
+    for record in records:
+        _write_step_eval_cadence_source_fixture(record)
+    return build_stage211_step_eval_cadence(
+        phase=phase,
+        segments=segments,
+        supplemental_segment=supplemental_segment,
+        post_coverage_corrections=corrections or [],
+    )
+
+
 def _write_valid_phase_gate(
     tmp_path: Path,
     *,
@@ -4366,7 +4457,17 @@ def _write_valid_phase_gate(
         provenance.write_text("{}\n", encoding="utf-8")
         train_config = run_dir / "train_config.yaml"
         train_config_payload = stage211_phase_train_config_contract(phase)
-        train_config_payload["ctc_teacher_online_model_path"] = str(nano_teacher_dir.resolve())
+        train_config_payload.update(
+            {
+                "ctc_teacher_online_model_path": str(nano_teacher_dir.resolve()),
+                "max_steps": int(expected["steps"]),
+                "step_eval_every": 10_000,
+                "step_eval_samples": 256,
+                "step_eval_split": "eval",
+                "step_eval_shuffle": False,
+                "step_eval_feature_seed": 0,
+            }
+        )
         save_yaml(train_config, train_config_payload)
         completion = run_dir / f"step-{int(expected['steps'])}.pt"
         completion.write_bytes(f"checkpoint-{index}".encode())
@@ -4464,6 +4565,11 @@ def _write_valid_phase_gate(
                 "eval_provenance"
             ]["parts"]
         ),
+    )
+    step_eval_cadence = _write_step_eval_cadence_fixture(
+        phase=phase,
+        segments=segments,
+        supplemental_segment=supplemental_segment,
     )
     full_data_coverage = build_stage211_full_data_coverage(
         phase=phase,
@@ -4620,6 +4726,7 @@ def _write_valid_phase_gate(
                 "public_progress_gate_passed": True,
                 "trajectory_retention_gate_passed": True,
                 "trajectory_retention": trajectory_retention,
+                "step_eval_cadence": step_eval_cadence,
                 "public_comparison_report_path": str(public_comparison_report.resolve()),
                 "public_comparison_report_sha256": sha256_file(public_comparison_report),
                 "baseline_public_comparison_report": (
@@ -4734,6 +4841,10 @@ def test_stage211_phase_gate_fails_trajectory_regression_from_best_prior(
     candidate_report = load_yaml(candidate_report_path)
     candidate_report["eval_loss"] = 0.8
     save_yaml(candidate_report_path, candidate_report)
+    candidate_metrics_path = candidate_report_path.parent / "step_checkpoint_metrics.yaml"
+    candidate_metrics = load_yaml(candidate_metrics_path)
+    candidate_metrics["step_checkpoints"][-1]["eval_loss"] = 0.8
+    save_yaml(candidate_metrics_path, candidate_metrics)
     trajectory = build_stage211_trajectory_retention_gate(
         phase="mixer",
         segments=coverage["segments"],
@@ -4750,6 +4861,12 @@ def test_stage211_phase_gate_fails_trajectory_regression_from_best_prior(
     gate["trajectory_retention"] = trajectory
     gate["trajectory_retention_gate_passed"] = False
     gate["gate_passed"] = False
+    gate["step_eval_cadence"] = build_stage211_step_eval_cadence(
+        phase="mixer",
+        segments=coverage["segments"],
+        supplemental_segment=coverage["supplemental_natural"],
+        post_coverage_corrections=[],
+    )
     gate_path.write_text(json.dumps(gate) + "\n", encoding="utf-8")
     validated = validate_stage211_phase_gate_report(
         gate_path,
@@ -4805,7 +4922,70 @@ def test_stage211_phase_gate_builder_emits_trajectory_retention(
         "long",
         STAGE211_SUPPLEMENTAL_DIFFICULTY,
     ]
+    assert report["step_eval_cadence"]["complete"] is True
+    assert report["step_eval_cadence"]["interval_steps"] == 10_000
     assert report["gate_passed"] is True
+
+
+def test_stage211_phase_gate_rejects_incomplete_or_inconsistent_step_eval_cadence(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_path = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    hard = next(
+        source
+        for source in gate["step_eval_cadence"]["sources"]
+        if source["source_name"] == "hard"
+    )
+    metrics_path = Path(hard["metrics_path"])
+    original_metrics = metrics_path.read_text(encoding="utf-8")
+    metrics = load_yaml(metrics_path)
+    metrics["step_checkpoints"].pop(0)
+    save_yaml(metrics_path, metrics)
+    with pytest.raises(ValueError, match="step-eval cadence mismatch"):
+        validate_stage211_phase_gate_report(
+            gate_path,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+    metrics_path.write_text(original_metrics, encoding="utf-8")
+
+    report_path = Path(hard["reports"][0]["report_path"])
+    hidden_path = report_path.with_suffix(".hidden")
+    report_path.rename(hidden_path)
+    with pytest.raises(ValueError, match="report files do not exactly cover"):
+        validate_stage211_phase_gate_report(
+            gate_path,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+    hidden_path.rename(report_path)
+
+    stale_path = report_path.parent / "step_eval_layers_step-123.yaml"
+    stale_path.write_text(report_path.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(ValueError, match="report files do not exactly cover"):
+        validate_stage211_phase_gate_report(
+            gate_path,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+    stale_path.unlink()
+
+    report = load_yaml(report_path)
+    report["eval_loss"] = float(report["eval_loss"]) + 0.25
+    save_yaml(report_path, report)
+    with pytest.raises(ValueError, match="report metadata mismatch"):
+        validate_stage211_phase_gate_report(
+            gate_path,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
 
 
 def test_stage211_phase_gate_rejects_mutated_trajectory_terminal_report(
@@ -5111,6 +5291,11 @@ def _write_retention_correction(
             "stage211_post_coverage_original_coverage_unchanged": True,
             "stage211_post_coverage_smoke_marker_path": str(smoke_marker.resolve()),
             "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
+            "step_eval_every": 10_000,
+            "step_eval_samples": 256,
+            "step_eval_split": "eval",
+            "step_eval_shuffle": False,
+            "step_eval_feature_seed": 0,
         }
     )
     save_yaml(train_config, config)
@@ -5228,6 +5413,7 @@ def _write_retention_correction(
         record=bound_correction,
         eval_loss=0.45,
     )
+    _write_step_eval_cadence_source_fixture(bound_correction)
     return bound_correction, replay_part
 
 
@@ -5315,6 +5501,12 @@ def _write_corrected_phase_gate(
     )
     report["trajectory_retention_gate_passed"] = bool(
         report["trajectory_retention"]["gate_passed"]
+    )
+    report["step_eval_cadence"] = build_stage211_step_eval_cadence(
+        phase="mixer",
+        segments=original_segments,
+        supplemental_segment=supplemental_segment,
+        post_coverage_corrections=[correction],
     )
     public_source_path = Path(report["public_comparison_report_path"])
     public_source = json.loads(public_source_path.read_text(encoding="utf-8"))

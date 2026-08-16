@@ -25,9 +25,11 @@ from rwkvasr.eval.stage211_supplemental import (
 )
 
 
-STAGE211_PHASE_GATE_SCHEMA_VERSION = 2
+STAGE211_PHASE_GATE_SCHEMA_VERSION = 3
 STAGE211_NANO_PUBLIC_BASELINE_SCHEMA_VERSION = 1
 STAGE211_TRAJECTORY_RETENTION_SCHEMA_VERSION = 1
+STAGE211_STEP_EVAL_CADENCE_SCHEMA_VERSION = 1
+STAGE211_STEP_EVAL_INTERVAL = 10_000
 STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
@@ -88,6 +90,9 @@ _STAGE211_LOGITS_MAX_CELL_TOKEN_ERROR_REGRESSION = 0.03
 _STAGE211_LOGITS_MAX_HIDDEN_LOSS_REGRESSION = 0.10
 _STAGE211_LOGITS_MAX_HIDDEN_COSINE_REGRESSION = 0.01
 _STAGE211_ALIGNMENT_TOLERANCE = 1.0e-12
+_STAGE211_STEP_EVAL_REPORT_PATTERN = re.compile(
+    r"^step_eval_layers_step-([1-9][0-9]*)\.yaml$"
+)
 _STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS = {
     "mixer": 5,
     "block": 5,
@@ -2073,6 +2078,295 @@ def _validate_stage211_logits_metrics(
     ):
         raise ValueError(f"Stage211 {label} CTC logit coverage is incomplete.")
     return metrics
+
+
+def _stage211_expected_step_eval_steps(
+    terminal_step: int,
+    *,
+    interval: int = STAGE211_STEP_EVAL_INTERVAL,
+) -> tuple[int, ...]:
+    terminal_step = int(terminal_step)
+    interval = int(interval)
+    if terminal_step <= 0 or interval <= 0:
+        raise ValueError("Stage211 step-eval cadence requires positive steps and interval.")
+    steps = list(range(interval, terminal_step + 1, interval))
+    if not steps or steps[-1] != terminal_step:
+        steps.append(terminal_step)
+    return tuple(steps)
+
+
+def _stage211_step_eval_cadence_source(
+    *,
+    phase: str,
+    order: int,
+    source_kind: str,
+    source_name: str,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    if record.get("phase") != phase:
+        raise ValueError(f"Stage211 {source_name} step-eval phase mismatch.")
+    run_dir = Path(str(record.get("run_dir") or "")).expanduser().resolve()
+    if not run_dir.is_dir():
+        raise ValueError(f"Stage211 {source_name} step-eval run directory is unavailable.")
+    terminal_step = int(record.get("steps", -1))
+    steps_per_epoch = int(record.get("steps_per_epoch", -1))
+    epochs = int(record.get("epochs", -1))
+    if terminal_step <= 0 or steps_per_epoch <= 0 or terminal_step != epochs * steps_per_epoch:
+        raise ValueError(f"Stage211 {source_name} step-eval coverage is invalid.")
+    expected_steps = _stage211_expected_step_eval_steps(terminal_step)
+
+    receipt_path = _validate_bound_file(
+        record,
+        path_key="receipt_path",
+        sha256_key="receipt_sha256",
+        label=f"Stage211 {phase}/{source_name} step-eval receipt",
+    )
+    train_config_path = _validate_bound_file(
+        record,
+        path_key="train_config_path",
+        sha256_key="train_config_sha256",
+        label=f"Stage211 {phase}/{source_name} step-eval train config",
+    )
+    manifest_path = _validate_bound_file(
+        record,
+        path_key="bucket_manifest_path",
+        sha256_key="bucket_manifest_sha256",
+        label=f"Stage211 {phase}/{source_name} step-eval manifest",
+    )
+    train_config = load_yaml(train_config_path)
+    if not isinstance(train_config, dict):
+        raise ValueError(f"Stage211 {source_name} step-eval train config is invalid.")
+    expected_config = {
+        "max_steps": terminal_step,
+        "step_eval_every": STAGE211_STEP_EVAL_INTERVAL,
+        "step_eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        "step_eval_split": "eval",
+        "step_eval_shuffle": False,
+    }
+    if any(train_config.get(key) != value for key, value in expected_config.items()):
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} train config does not declare the fixed "
+            f"{STAGE211_STEP_EVAL_INTERVAL}-step evaluation cadence."
+        )
+    raw_config_feature_seed = train_config.get("step_eval_feature_seed")
+    legacy_config_missing_feature_seed = (
+        raw_config_feature_seed is None
+        and "step_eval_feature_seed" not in train_config
+        and phase == "mixer"
+        and source_kind == "curriculum"
+        and source_name == "easy"
+    )
+    if raw_config_feature_seed != 0 and not legacy_config_missing_feature_seed:
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} train config fixed feature seed mismatch."
+        )
+
+    metrics_path = run_dir / "step_checkpoint_metrics.yaml"
+    if not metrics_path.is_file() or metrics_path.stat().st_size <= 0:
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} cumulative step-eval metrics are unavailable: "
+            f"{metrics_path}"
+        )
+    metrics = load_yaml(metrics_path)
+    if not isinstance(metrics, dict):
+        raise ValueError(f"Stage211 {phase}/{source_name} step-eval metrics are invalid.")
+    raw_records = metrics.get("step_checkpoints")
+    if not isinstance(raw_records, list):
+        raise ValueError(f"Stage211 {phase}/{source_name} step-eval records are missing.")
+    actual_steps = tuple(
+        int(raw_record.get("step", -1)) if isinstance(raw_record, dict) else -1
+        for raw_record in raw_records
+    )
+    if actual_steps != expected_steps or len(set(actual_steps)) != len(actual_steps):
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} step-eval cadence mismatch: "
+            f"actual={list(actual_steps)} expected={list(expected_steps)}"
+        )
+
+    report_paths: dict[int, Path] = {}
+    for path in run_dir.glob("step_eval_layers_step-*.yaml"):
+        match = _STAGE211_STEP_EVAL_REPORT_PATTERN.fullmatch(path.name)
+        if match is None:
+            continue
+        step = int(match.group(1))
+        if step in report_paths:
+            raise ValueError(f"Stage211 {phase}/{source_name} has duplicate step-eval reports.")
+        report_paths[step] = path.resolve()
+    if tuple(sorted(report_paths)) != expected_steps:
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} step-eval report files do not exactly cover "
+            "the configured cadence."
+        )
+
+    reports: list[dict[str, Any]] = []
+    part_fingerprint: tuple[tuple[str, int], ...] | None = None
+    for raw_record, step in zip(raw_records, expected_steps, strict=True):
+        assert isinstance(raw_record, dict)
+        expected_epoch = min(epochs, ((step - 1) // steps_per_epoch) + 1)
+        if int(raw_record.get("epoch", -1)) != expected_epoch:
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} step {step} has the wrong epoch index."
+            )
+        eval_loss = _stage211_alignment_float(
+            raw_record.get("eval_loss"),
+            label=f"{phase}/{source_name} step {step} eval loss",
+        )
+        if eval_loss < 0.0:
+            raise ValueError(f"Stage211 {phase}/{source_name} step-eval loss is negative.")
+        if int(raw_record.get("eval_samples", -1)) != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES:
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} step {step} fixed-eval coverage mismatch."
+            )
+        report_path = report_paths[step]
+        if Path(str(raw_record.get("layer_metrics_path") or "")).resolve() != report_path:
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} step {step} metrics-report binding mismatch."
+            )
+        report = load_yaml(report_path)
+        if not isinstance(report, dict):
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} step {step} fixed-eval report is invalid."
+            )
+        report_loss = _stage211_alignment_float(
+            report.get("eval_loss"),
+            label=f"{phase}/{source_name} step {step} report loss",
+        )
+        if (
+            int(report.get("step", -1)) != step
+            or int(report.get("eval_samples", -1)) != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
+            or not math.isclose(
+                report_loss,
+                eval_loss,
+                rel_tol=0.0,
+                abs_tol=_STAGE211_ALIGNMENT_TOLERANCE,
+            )
+        ):
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} step {step} report metadata mismatch."
+            )
+        provenance = report.get("eval_provenance")
+        fingerprint = _validate_stage211_alignment_eval_provenance(
+            provenance,
+            label=f"{phase}/{source_name} step {step} cadence",
+        )
+        assert isinstance(provenance, dict)
+        if (
+            Path(str(provenance.get("bucket_manifest_path") or "")).expanduser().resolve()
+            != manifest_path
+            or provenance.get("bucket_manifest_sha256")
+            != record.get("bucket_manifest_sha256")
+        ):
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} step {step} eval manifest mismatch."
+            )
+        raw_feature_seed = provenance.get("feature_seed")
+        legacy_missing_feature_seed = (
+            raw_feature_seed is None
+            and "feature_seed" not in provenance
+            and phase == "mixer"
+            and source_kind == "curriculum"
+            and source_name == "easy"
+        )
+        if raw_feature_seed != 0 and not legacy_missing_feature_seed:
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} step {step} fixed feature seed mismatch."
+            )
+        if part_fingerprint is None:
+            part_fingerprint = fingerprint
+        elif fingerprint != part_fingerprint:
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} fixed-eval rows changed within the run."
+            )
+        reports.append(
+            {
+                "step": step,
+                "epoch": expected_epoch,
+                "eval_loss": eval_loss,
+                "eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+                "feature_seed": 0,
+                "legacy_missing_feature_seed": legacy_missing_feature_seed,
+                "report_path": str(report_path),
+                "report_sha256": sha256_file(report_path),
+            }
+        )
+    assert part_fingerprint is not None
+    return {
+        "order": order,
+        "source_kind": source_kind,
+        "source_name": source_name,
+        "run_dir": str(run_dir),
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": str(record["receipt_sha256"]),
+        "train_config_path": str(train_config_path),
+        "train_config_sha256": str(record["train_config_sha256"]),
+        "metrics_path": str(metrics_path),
+        "metrics_sha256": sha256_file(metrics_path),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": str(record["bucket_manifest_sha256"]),
+        "epochs": epochs,
+        "steps_per_epoch": steps_per_epoch,
+        "terminal_step": terminal_step,
+        "interval_steps": STAGE211_STEP_EVAL_INTERVAL,
+        "config_feature_seed": 0,
+        "legacy_config_missing_feature_seed": legacy_config_missing_feature_seed,
+        "expected_steps": list(expected_steps),
+        "expected_report_count": len(expected_steps),
+        "actual_report_count": len(reports),
+        "eval_part_fingerprint": [
+            {"sha256": sha256, "num_samples": num_samples}
+            for sha256, num_samples in part_fingerprint
+        ],
+        "reports": reports,
+    }
+
+
+def build_stage211_step_eval_cadence(
+    *,
+    phase: str,
+    segments: list[dict[str, Any]],
+    supplemental_segment: dict[str, Any],
+    post_coverage_corrections: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if phase not in _STAGE211_ALIGNMENT_PHASE_COMPONENTS:
+        raise ValueError(f"Unsupported Stage211 step-eval phase: {phase!r}")
+    expected_difficulties = tuple(STAGE211_AUDIO_CURRICULUM)
+    actual_difficulties = tuple(str(segment.get("difficulty") or "") for segment in segments)
+    if actual_difficulties != expected_difficulties:
+        raise ValueError("Stage211 step-eval curriculum source order is invalid.")
+    if str(supplemental_segment.get("difficulty") or "") != STAGE211_SUPPLEMENTAL_DIFFICULTY:
+        raise ValueError("Stage211 step-eval Supplemental source is invalid.")
+    sources: list[tuple[str, str, dict[str, Any]]] = [
+        ("curriculum", str(segment["difficulty"]), segment) for segment in segments
+    ]
+    sources.append(("curriculum", STAGE211_SUPPLEMENTAL_DIFFICULTY, supplemental_segment))
+    corrections = list(post_coverage_corrections or [])
+    for index, correction in enumerate(corrections, start=1):
+        if int(correction.get("round", -1)) != index:
+            raise ValueError("Stage211 step-eval correction rounds are not contiguous.")
+        sources.append(("correction", f"correction_round_{index:02d}", correction))
+    audited = [
+        _stage211_step_eval_cadence_source(
+            phase=phase,
+            order=order,
+            source_kind=source_kind,
+            source_name=source_name,
+            record=record,
+        )
+        for order, (source_kind, source_name, record) in enumerate(sources)
+    ]
+    return {
+        "schema_version": STAGE211_STEP_EVAL_CADENCE_SCHEMA_VERSION,
+        "pipeline": "stage211",
+        "artifact": "step_eval_cadence",
+        "phase": phase,
+        "complete": True,
+        "interval_steps": STAGE211_STEP_EVAL_INTERVAL,
+        "eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        "source_order": [source["source_name"] for source in audited],
+        "source_count": len(audited),
+        "total_reports": sum(int(source["actual_report_count"]) for source in audited),
+        "sources": audited,
+    }
 
 
 def _stage211_logits_metric_checks(
@@ -4517,6 +4811,17 @@ def validate_stage211_phase_gate_report(
         report.get("trajectory_retention"),
         replayed_trajectory_retention,
         label=f"{expected_phase} intra-phase trajectory retention gate",
+    )
+    replayed_step_eval_cadence = build_stage211_step_eval_cadence(
+        phase=expected_phase,
+        segments=phase_segments,
+        supplemental_segment=coverage.get("supplemental_natural"),
+        post_coverage_corrections=coverage.get("post_coverage_corrections", []),
+    )
+    _validate_stage211_replayed_value(
+        report.get("step_eval_cadence"),
+        replayed_step_eval_cadence,
+        label=f"{expected_phase} periodic fixed-eval cadence",
     )
     trajectory_retention_gate_passed = report.get("trajectory_retention_gate_passed")
     if not isinstance(trajectory_retention_gate_passed, bool):

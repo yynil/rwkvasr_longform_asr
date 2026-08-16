@@ -866,6 +866,69 @@ def _trajectory_retention_result(
     }
 
 
+def _step_eval_cadence_result(
+    *,
+    phase: str,
+    phase_report: dict[str, Any],
+) -> dict[str, Any]:
+    cadence = phase_report.get("step_eval_cadence")
+    if (
+        not isinstance(cadence, dict)
+        or cadence.get("pipeline") != "stage211"
+        or cadence.get("artifact") != "step_eval_cadence"
+        or cadence.get("phase") != phase
+        or cadence.get("complete") is not True
+        or int(cadence.get("interval_steps", -1)) != 10_000
+        or int(cadence.get("eval_samples", -1)) != 256
+    ):
+        raise ValueError(f"Stage211 {phase} periodic fixed-eval cadence is incomplete.")
+    source_order = cadence.get("source_order")
+    sources = cadence.get("sources")
+    required_prefix = ["easy", "medium", "hard", "long", "supplemental_natural"]
+    if (
+        not isinstance(source_order, list)
+        or source_order[: len(required_prefix)] != required_prefix
+        or not isinstance(sources, list)
+        or len(sources) != len(source_order)
+        or int(cadence.get("source_count", -1)) != len(sources)
+    ):
+        raise ValueError(f"Stage211 {phase} periodic fixed-eval source order is invalid.")
+    source_results = []
+    total_reports = 0
+    for order, (source_name, source) in enumerate(zip(source_order, sources, strict=True)):
+        if (
+            not isinstance(source, dict)
+            or int(source.get("order", -1)) != order
+            or source.get("source_name") != source_name
+            or int(source.get("interval_steps", -1)) != 10_000
+            or int(source.get("expected_report_count", -1))
+            != int(source.get("actual_report_count", -2))
+        ):
+            raise ValueError(f"Stage211 {phase}/{source_name} fixed-eval cadence is invalid.")
+        report_count = int(source["actual_report_count"])
+        total_reports += report_count
+        source_results.append(
+            {
+                "source": str(source_name),
+                "source_kind": str(source.get("source_kind") or ""),
+                "terminal_step": int(source.get("terminal_step", -1)),
+                "report_count": report_count,
+                "eval_samples_per_report": 256,
+            }
+        )
+    if total_reports != int(cadence.get("total_reports", -1)):
+        raise ValueError(f"Stage211 {phase} fixed-eval report total is invalid.")
+    return {
+        "complete": True,
+        "interval_steps": 10_000,
+        "eval_samples_per_report": 256,
+        "source_order": [str(value) for value in source_order],
+        "source_count": len(sources),
+        "total_reports": total_reports,
+        "sources": source_results,
+    }
+
+
 def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, Any]:
     record = phase_report.get("alignment_report")
     if not isinstance(record, dict):
@@ -910,6 +973,10 @@ def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, 
             if isinstance(cell, dict)
         ),
         "trajectory_retention": _trajectory_retention_result(
+            phase=phase,
+            phase_report=phase_report,
+        ),
+        "step_eval_cadence": _step_eval_cadence_result(
             phase=phase,
             phase_report=phase_report,
         ),
@@ -1990,6 +2057,25 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{float(trajectory['relative_regression_pct']):+.3f}% | "
             f"{float(trajectory['max_relative_regression_pct']):.3f}% | pass |"
         )
+    lines.extend(
+        (
+            "",
+            "## Periodic Fixed Evaluation",
+            "",
+            "| Stage | Source | Terminal step | Interval | Reports | Samples/report | Gate |",
+            "|---|---|---:|---:|---:|---:|---:|",
+        )
+    )
+    for alignment in report["alignment_results"]:
+        cadence = alignment["step_eval_cadence"]
+        for source in cadence["sources"]:
+            lines.append(
+                f"| {alignment['label']} | `{source['source']}` | "
+                f"{int(source['terminal_step']):,} | "
+                f"{int(cadence['interval_steps']):,} | "
+                f"{int(source['report_count']):,} | "
+                f"{int(source['eval_samples_per_report'])} | pass |"
+            )
     lines.extend(
         (
             "",

@@ -1278,6 +1278,18 @@ def _write_stepwise_inputs(
             {"source_name": source_name, "eval_loss": 0.5}
             for source_name in trajectory_source_order
         ]
+        step_eval_sources = [
+            {
+                "order": order,
+                "source_kind": "curriculum",
+                "source_name": source_name,
+                "terminal_step": 3,
+                "interval_steps": 10_000,
+                "expected_report_count": 1,
+                "actual_report_count": 1,
+            }
+            for order, source_name in enumerate(trajectory_source_order)
+        ]
         gate = tmp_path / f"{stage}-gate.json"
         gate.write_text(
             json.dumps(
@@ -1306,6 +1318,19 @@ def _write_stepwise_inputs(
                         "best_prior_loss": 0.5,
                         "candidate_loss": 0.5,
                         "relative_regression_pct": 0.0,
+                    },
+                    "step_eval_cadence": {
+                        "schema_version": 1,
+                        "pipeline": "stage211",
+                        "artifact": "step_eval_cadence",
+                        "phase": stage,
+                        "complete": True,
+                        "interval_steps": 10_000,
+                        "eval_samples": 256,
+                        "source_order": trajectory_source_order,
+                        "source_count": len(step_eval_sources),
+                        "total_reports": len(step_eval_sources),
+                        "sources": step_eval_sources,
                     },
                     "alignment_report": {
                         "path": str(alignment_path.resolve()),
@@ -2052,6 +2077,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert "Nine-Cell Logits Alignment" in output_markdown.read_text(encoding="utf-8")
     assert "Decoder Hidden Alignment" in output_markdown.read_text(encoding="utf-8")
     assert "Alignment Evidence" in output_markdown.read_text(encoding="utf-8")
+    assert "Periodic Fixed Evaluation" in output_markdown.read_text(encoding="utf-8")
     assert "Training Coverage" in output_markdown.read_text(encoding="utf-8")
     assert "Full Data Segment Proof" in output_markdown.read_text(encoding="utf-8")
     assert "CTC label normalization" in output_markdown.read_text(encoding="utf-8")
