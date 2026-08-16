@@ -431,6 +431,15 @@ def _profile_admission_command(
     ]
 
 
+def _automatic_profile_requires_admission(measured: dict[str, Any]) -> bool:
+    selected_profile = measured["selected_profile_row"]["profile"]
+    selected_is_legacy = (
+        int(selected_profile["batch_size"]) == STAGE211_FULL_DATA_BATCH_SIZE
+        and int(selected_profile["frame_budget"]) == STAGE211_FULL_DATA_FRAME_BUDGET
+    )
+    return measured["selection_decision"] != "keep_baseline" or not selected_is_legacy
+
+
 def _ensure_automatic_batch_profile(
     *,
     phase: str,
@@ -490,7 +499,7 @@ def _ensure_automatic_batch_profile(
         or Path(str(measured["bucket_manifest_path"])).resolve() != manifest_path.resolve()
     ):
         raise ValueError("Stage211 automatic batch preflight binds different segment inputs.")
-    if measured["selection_decision"] == "keep_baseline":
+    if not _automatic_profile_requires_admission(measured):
         print(
             "[stage211-full-phase] automatic batch preflight retained legacy profile "
             f"phase={phase} difficulty={difficulty} report={report_path}",
@@ -519,7 +528,8 @@ def _ensure_automatic_batch_profile(
     print(
         "[stage211-full-phase] automatic batch profile admitted "
         f"phase={phase} difficulty={difficulty} "
-        f"profile={admission['selected_profile']['name']} admission={admission_path}",
+        f"profile={admission['selected_profile']['name']} "
+        f"selection={measured['selection_decision']} admission={admission_path}",
         flush=True,
     )
     return admission_path

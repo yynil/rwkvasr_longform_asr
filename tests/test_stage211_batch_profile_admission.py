@@ -408,6 +408,77 @@ def test_logits_preflight_accepts_safe_and_legacy_baselines(tmp_path: Path) -> N
     assert legacy_baseline["frame_budget"] == 24_000
 
 
+def test_logits_retained_safe_baseline_can_be_formally_admitted(tmp_path: Path) -> None:
+    report_path = _report(
+        tmp_path,
+        phase="logits",
+        baseline_batch_size=12,
+        baseline_frame_budget=8_000,
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    candidate = report["profiles"][1]
+    full_steps = int(candidate["coverage"]["full_coverage_steps"])
+    candidate["summary"]["projected_full_coverage_seconds"] = 3_150.0
+    candidate["summary"]["steps_per_second"] = full_steps / 3_150.0
+    comparison = report["selection"]["comparisons"][0]
+    comparison["projected_full_coverage_seconds"] = 3_150.0
+    comparison["improvement_ratio"] = -0.05
+    comparison["admissible"] = False
+    report["selection"].update(
+        {
+            "decision": "keep_baseline",
+            "recommended_profile": "baseline",
+            "recommended_improvement_ratio": 0.0,
+        }
+    )
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    receipt = build_stage211_batch_profile_admission(
+        report_path,
+        phase="logits",
+        admitted_by="test",
+        reason="memory-safe measured baseline",
+    )
+    assert receipt["selected_profile"] == {
+        "name": "baseline",
+        "batch_size": 12,
+        "frame_budget": 8_000,
+    }
+    assert receipt["selected_comparison"] is None
+    receipt_path = tmp_path / "admission.json"
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+
+    validated = validate_stage211_batch_profile_admission(
+        receipt_path,
+        phase="logits",
+        expected_init_checkpoint=tmp_path / "init.pt",
+        expected_bucket_manifest=tmp_path / "manifest.json",
+    )
+    assert validated["selected_profile"] == receipt["selected_profile"]
+    assert validated["selected_comparison"] is None
+
+
+def test_automatic_profile_routes_nonlegacy_retained_baseline_to_admission() -> None:
+    retained_safe_logits = {
+        "selection_decision": "keep_baseline",
+        "selected_profile_row": {
+            "profile": {"name": "baseline", "batch_size": 12, "frame_budget": 8_000}
+        },
+    }
+    retained_legacy = copy.deepcopy(retained_safe_logits)
+    retained_legacy["selected_profile_row"]["profile"].update(
+        {"batch_size": 36, "frame_budget": 24_000}
+    )
+    admitted_candidate = copy.deepcopy(retained_legacy)
+    admitted_candidate["selection_decision"] = "admit_candidate"
+
+    assert stage211_full_phase._automatic_profile_requires_admission(
+        retained_safe_logits
+    )
+    assert not stage211_full_phase._automatic_profile_requires_admission(retained_legacy)
+    assert stage211_full_phase._automatic_profile_requires_admission(admitted_candidate)
+
+
 def test_mixer_preflight_rejects_logits_safe_baseline(tmp_path: Path) -> None:
     report_path = _report(
         tmp_path,

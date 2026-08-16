@@ -887,9 +887,14 @@ def build_stage211_batch_profile_admission(
     rationale = reason.strip()
     if not actor or not rationale:
         raise ValueError("Stage211 batch profile admission requires an actor and reason.")
-    report = validate_stage211_batch_profile_preflight(report_path, phase=phase)
+    report = validate_stage211_batch_profile_preflight(
+        report_path,
+        phase=phase,
+        require_candidate=False,
+    )
     selected = report["selected_profile_row"]
     profile = selected["profile"]
+    selected_comparison = report["selected_comparison"]
     return {
         "schema_version": STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION,
         "pipeline": "stage211",
@@ -917,7 +922,11 @@ def build_stage211_batch_profile_admission(
         "selected_profile": dict(profile),
         "selected_coverage": dict(selected["coverage"]),
         "selected_summary": dict(selected["summary"]),
-        "selected_comparison": dict(report["selected_comparison"]),
+        "selected_comparison": (
+            dict(selected_comparison)
+            if isinstance(selected_comparison, dict)
+            else None
+        ),
         "thresholds": {
             "max_peak_memory_gib": report["max_peak_memory_gib"],
             "min_improvement_ratio": report["min_improvement_ratio"],
@@ -959,7 +968,11 @@ def validate_stage211_batch_profile_admission(
         sha256_key="preflight_report_sha256",
         label="Stage211 admitted batch preflight report",
     )
-    report = validate_stage211_batch_profile_preflight(report_path, phase=phase)
+    report = validate_stage211_batch_profile_preflight(
+        report_path,
+        phase=phase,
+        require_candidate=False,
+    )
     selected = report["selected_profile_row"]
     exact_fields = {
         "preflight_git_commit": report["git_commit"],
@@ -993,7 +1006,7 @@ def validate_stage211_batch_profile_admission(
     ).resolve() != Path(expected_bucket_manifest).expanduser().resolve():
         raise ValueError("Stage211 batch profile admission uses another bucket manifest.")
     profile = receipt["selected_profile"]
-    if (
+    if phase != "logits" and (
         int(profile["batch_size"]) <= STAGE211_FULL_DATA_BATCH_SIZE
         and int(profile["frame_budget"]) <= STAGE211_FULL_DATA_FRAME_BUDGET
     ):
