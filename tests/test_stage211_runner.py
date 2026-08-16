@@ -4991,6 +4991,42 @@ def test_stage211_stepwise_alignment_disclosure_accepts_deep_phase_evidence(
         assert set(disclosure["fixed"]["components"]) == expected_components
 
 
+def test_stage211_stepwise_coverage_discloses_correction_promotion_gate(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_path = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = validate_stage211_phase_gate_report(
+        gate_path,
+        expected_phase="mixer",
+        checkpoint_path=checkpoint,
+    )
+
+    coverage = stage211_stepwise_report._coverage_record(
+        stage="mixer",
+        coverage=gate["full_data_coverage"],
+        correction_round_promotion=gate["correction_round_promotion"],
+    )
+
+    assert coverage["correction_rounds"] == 0
+    assert coverage["correction_round_promotion"] == (
+        build_stage211_correction_round_promotion_gate(0)
+    )
+    tampered = dict(gate["correction_round_promotion"])
+    tampered["completed_rounds"] = 3
+    with pytest.raises(ValueError, match="final correction-round promotion evidence"):
+        stage211_stepwise_report._coverage_record(
+            stage="mixer",
+            coverage=gate["full_data_coverage"],
+            correction_round_promotion=tampered,
+        )
+
+
 def test_stage211_phase_gate_fails_trajectory_regression_from_best_prior(
     tmp_path: Path,
 ) -> None:

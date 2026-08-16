@@ -14,6 +14,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
     STAGE211_SFT_STEP_EVAL_INTERVAL,
     STAGE211_STEP_EVAL_INTERVAL,
+    build_stage211_correction_round_promotion_gate,
     sha256_file,
     validate_stage211_nano_public_baseline_receipt,
     validate_stage211_phase_gate_report,
@@ -281,14 +282,11 @@ def _validate_sft_correction_coverage(
         require_passed=True,
     )
     if (
-        Path(str(evaluation.get("checkpoint_path") or "")).resolve()
-        != final_checkpoint
+        Path(str(evaluation.get("checkpoint_path") or "")).resolve() != final_checkpoint
         or report.get("sft_correction_completion_receipts")
         != evaluation.get("correction_completion_receipts")
-        or report.get("sft_correction_coverage")
-        != evaluation.get("correction_coverage")
-        or report.get("sft_correction_public_progress")
-        != evaluation.get("public_progress")
+        or report.get("sft_correction_coverage") != evaluation.get("correction_coverage")
+        or report.get("sft_correction_public_progress") != evaluation.get("public_progress")
     ):
         raise ValueError("Stage211 SFT correction evidence chain mismatch.")
     coverage = evaluation.get("correction_coverage")
@@ -297,8 +295,7 @@ def _validate_sft_correction_coverage(
         or coverage.get("schema_version") != 1
         or coverage.get("applied") is not True
         or not 1 <= int(coverage.get("rounds", 0)) <= 3
-        or int(coverage.get("rounds", 0))
-        != len(coverage.get("round_receipts") or [])
+        or int(coverage.get("rounds", 0)) != len(coverage.get("round_receipts") or [])
     ):
         raise ValueError("Stage211 SFT correction coverage is incomplete.")
     return dict(coverage)
@@ -498,12 +495,8 @@ def _requested_alignment_views(
     chinese = summaries_by_name.get("chinese_cer")
     if english is None or chinese is None:
         raise ValueError("Stage211 requested-stage view lacks English WER or Chinese CER.")
-    nano_english_wer = _finite_float(
-        english["nano_error_rate"], label="Nano English WER"
-    )
-    nano_chinese_cer = _finite_float(
-        chinese["nano_error_rate"], label="Nano Chinese CER"
-    )
+    nano_english_wer = _finite_float(english["nano_error_rate"], label="Nano English WER")
+    nano_chinese_cer = _finite_float(chinese["nano_error_rate"], label="Nano Chinese CER")
 
     calibration_record = stage_records_by_name["calibration"]
     calibration_english_wer = _finite_float(
@@ -1246,6 +1239,7 @@ def _coverage_record(
     *,
     stage: str,
     coverage: dict[str, Any],
+    correction_round_promotion: dict[str, Any] | None = None,
     sft_correction_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if stage in {"mixer", "block", "logits"}:
@@ -1262,6 +1256,17 @@ def _coverage_record(
                 "steps": 0,
                 "executed_sample_exposures": 0,
             }
+        correction_rounds = int(correction.get("rounds", 0))
+        expected_correction_round_promotion = build_stage211_correction_round_promotion_gate(
+            correction_rounds
+        )
+        if (
+            correction_round_promotion != expected_correction_round_promotion
+            or expected_correction_round_promotion["gate_passed"] is not True
+        ):
+            raise ValueError(
+                f"Stage211 {stage} final correction-round promotion evidence is invalid."
+            )
         original_segments = coverage.get("segments")
         supplemental_segment = coverage.get("supplemental_natural")
         if not isinstance(original_segments, list) or not isinstance(supplemental_segment, dict):
@@ -1327,7 +1332,8 @@ def _coverage_record(
             "row_exposures": row_exposures,
             "hour_exposures": float(coverage["total_hour_exposures"]),
             "executed_sample_exposures": int(coverage["total_executed_sample_exposures"]),
-            "correction_rounds": int(correction.get("rounds", 0)),
+            "correction_rounds": correction_rounds,
+            "correction_round_promotion": expected_correction_round_promotion,
             "correction_row_exposures": int(correction.get("row_exposures", 0)),
             "correction_hour_exposures": correction_hour_exposures,
             "effective_hour_exposures": (
@@ -1595,9 +1601,7 @@ def build_stepwise_report(
             checkpoint_path=checkpoint,
         )
         phase_checkpoints[phase] = checkpoint
-    sft, sft_checkpoint, sft_correction_coverage = _validate_sft_report(
-        sft_final_report_path
-    )
+    sft, sft_checkpoint, sft_correction_coverage = _validate_sft_report(sft_final_report_path)
     if Path(str(sft.get("mixer_phase_gate_path") or "")).resolve() != mixer_gate_path or sft.get(
         "mixer_phase_gate_sha256"
     ) != sha256_file(mixer_gate_path):
@@ -1868,9 +1872,12 @@ def build_stepwise_report(
                 if stage in {"mixer", "block", "logits"}
                 else sft["labeled_data_coverage"]
             ),
-            sft_correction_coverage=(
-                sft_correction_coverage if stage == "sft" else None
+            correction_round_promotion=(
+                phase_reports[stage]["correction_round_promotion"]
+                if stage in {"mixer", "block", "logits"}
+                else None
             ),
+            sft_correction_coverage=(sft_correction_coverage if stage == "sft" else None),
         )
         for stage in ("mixer", "block", "logits", "sft")
     ]
@@ -2261,8 +2268,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             "## Training Coverage",
             "",
             "| Stage | Objective | Train rows | Eval rows | Hours/epoch | "
-            "Epochs | Executed exposures | Post-coverage correction |",
-            "|---|---|---:|---:|---:|---:|---:|---:|",
+            "Epochs | Executed exposures | Post-coverage correction | Promotion eligibility |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---|",
         )
     )
     for coverage in report["coverage_results"]:
@@ -2278,6 +2285,18 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "executed"
             )
         )
+        correction_policy = coverage.get("correction_round_promotion")
+        if isinstance(correction_policy, dict):
+            promotion_eligibility = (
+                "not entered; eligible"
+                if correction_policy["correction_started"] is not True
+                else (
+                    f"{int(correction_policy['completed_rounds'])}/"
+                    f"{int(correction_policy['guaranteed_rounds'])} rounds; eligible"
+                )
+            )
+        else:
+            promotion_eligibility = "n/a"
         lines.append(
             f"| {coverage['label']} | `{coverage['objective']}` | "
             f"{int(coverage['unique_or_train_rows']):,} | "
@@ -2285,6 +2304,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{float(coverage['hours_per_epoch']):,.3f} | "
             f"{int(coverage['epochs'])} | "
             f"{int(coverage['executed_sample_exposures']):,} | {correction} |"
+            f" {promotion_eligibility} |"
         )
     correction_evidence = report["sft_correction_evidence"]
     lines.extend(("", "## SFT Correction Proof", ""))

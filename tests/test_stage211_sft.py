@@ -15,6 +15,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
     STAGE211_SFT_STEP_EVAL_INTERVAL,
+    build_stage211_correction_round_promotion_gate,
     build_stage211_sft_step_eval_cadence,
     sha256_file,
     stage211_phase_train_config_contract,
@@ -37,9 +38,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sft_runner = importlib.import_module("scripts.run_stage211_labeled_sft")
 sft_finalizer = importlib.import_module("scripts.finalize_stage211_labeled_sft")
 sft_correction_loop = importlib.import_module("scripts.run_stage211_sft_correction_loop")
-sft_correction_evaluator = importlib.import_module(
-    "scripts.evaluate_stage211_sft_correction"
-)
+sft_correction_evaluator = importlib.import_module("scripts.evaluate_stage211_sft_correction")
 stepwise_report = importlib.import_module("scripts.create_stage211_stepwise_report")
 public_compare = importlib.import_module("scripts.compare_public_ctc_with_nano")
 LABELED_EXPECTED = sft_runner.LABELED_EXPECTED
@@ -848,12 +847,15 @@ def test_stage211_stepwise_sft_correction_evidence_is_not_hidden(
         lambda *args, **kwargs: evaluation,
     )
 
-    assert stepwise_report._validate_sft_correction_coverage(
-        report,
-        full_completion_path=full_completion,
-        full_checkpoint=full_checkpoint,
-        final_checkpoint=corrected_checkpoint,
-    ) == correction_coverage
+    assert (
+        stepwise_report._validate_sft_correction_coverage(
+            report,
+            full_completion_path=full_completion,
+            full_checkpoint=full_checkpoint,
+            final_checkpoint=corrected_checkpoint,
+        )
+        == correction_coverage
+    )
 
     forged = dict(report)
     forged["sft_correction_coverage"] = {
@@ -1591,6 +1593,9 @@ def _write_stepwise_inputs(
                 {
                     "phase": stage,
                     "gate_passed": True,
+                    "correction_round_promotion": (
+                        build_stage211_correction_round_promotion_gate(0)
+                    ),
                     "checkpoint_path": str(checkpoints[stage].resolve()),
                     "checkpoint_sha256": sha256_file(checkpoints[stage]),
                     "alignment_gate_passed": True,
@@ -2343,13 +2348,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         requested_language_summaries["chinese_cer"]["stages"]["rwkv_layer"]
     )
     assert report["initial_calibration_result"]["nano_english_wer"] == pytest.approx(0.1)
-    assert report["initial_calibration_result"]["english_wer_gap_to_nano"] == pytest.approx(
-        0.4
-    )
+    assert report["initial_calibration_result"]["english_wer_gap_to_nano"] == pytest.approx(0.4)
     assert report["initial_calibration_result"]["nano_chinese_cer"] == pytest.approx(0.1)
-    assert report["initial_calibration_result"]["chinese_cer_gap_to_nano"] == pytest.approx(
-        0.4
-    )
+    assert report["initial_calibration_result"]["chinese_cer_gap_to_nano"] == pytest.approx(0.4)
     expected_nano_gaps = {
         "rwkv_layer": 0.3,
         "block": 0.2,
@@ -2358,13 +2359,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     }
     for stage, expected_gap in expected_nano_gaps.items():
         assert requested_results[stage]["nano_english_wer"] == pytest.approx(0.1)
-        assert requested_results[stage]["english_wer_gap_to_nano"] == pytest.approx(
-            expected_gap
-        )
+        assert requested_results[stage]["english_wer_gap_to_nano"] == pytest.approx(expected_gap)
         assert requested_results[stage]["nano_chinese_cer"] == pytest.approx(0.1)
-        assert requested_results[stage]["chinese_cer_gap_to_nano"] == pytest.approx(
-            expected_gap
-        )
+        assert requested_results[stage]["chinese_cer_gap_to_nano"] == pytest.approx(expected_gap)
     assert len(report["requested_alignment_dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert all(
         list(row["stages"]) == report["requested_alignment_stage_order"]
@@ -2392,10 +2389,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert (
         report["coverage_results"][-1]["unique_or_train_rows"] == LABELED_EXPECTED["train_samples"]
     )
-    assert (
-        report["coverage_results"][-1]["steps"]
-        == LABELED_EXPECTED["estimated_train_steps"]
-    )
+    assert report["coverage_results"][-1]["steps"] == LABELED_EXPECTED["estimated_train_steps"]
     assert (
         report["coverage_results"][-1]["tail_padding_sample_exposures"]
         == LABELED_EXPECTED["tail_padding_sample_exposures"]
@@ -2414,11 +2408,10 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "source_row_exposures": {},
         "round_receipts": [],
     }
-    assert report["coverage_results"][-1]["correction"] == report[
-        "sft_correction_evidence"
-    ]
-    assert report["coverage_results"][-1]["effective_row_exposures"] == (
-        LABELED_EXPECTED["train_samples"]
+    assert report["coverage_results"][-1]["correction"] == report["sft_correction_evidence"]
+    assert (
+        report["coverage_results"][-1]["effective_row_exposures"]
+        == (LABELED_EXPECTED["train_samples"])
     )
     assert report["coverage_results"][-1]["step_eval_cadence"] == {
         "complete": True,
