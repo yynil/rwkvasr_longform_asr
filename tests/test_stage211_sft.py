@@ -2135,6 +2135,29 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert requested_results["rwkv_layer"]["chinese_cer"] == pytest.approx(
         requested_language_summaries["chinese_cer"]["stages"]["rwkv_layer"]
     )
+    assert report["initial_calibration_result"]["nano_english_wer"] == pytest.approx(0.1)
+    assert report["initial_calibration_result"]["english_wer_gap_to_nano"] == pytest.approx(
+        0.4
+    )
+    assert report["initial_calibration_result"]["nano_chinese_cer"] == pytest.approx(0.1)
+    assert report["initial_calibration_result"]["chinese_cer_gap_to_nano"] == pytest.approx(
+        0.4
+    )
+    expected_nano_gaps = {
+        "rwkv_layer": 0.3,
+        "block": 0.2,
+        "logits": 0.1,
+        "sft": 0.0,
+    }
+    for stage, expected_gap in expected_nano_gaps.items():
+        assert requested_results[stage]["nano_english_wer"] == pytest.approx(0.1)
+        assert requested_results[stage]["english_wer_gap_to_nano"] == pytest.approx(
+            expected_gap
+        )
+        assert requested_results[stage]["nano_chinese_cer"] == pytest.approx(0.1)
+        assert requested_results[stage]["chinese_cer_gap_to_nano"] == pytest.approx(
+            expected_gap
+        )
     assert len(report["requested_alignment_dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert all(
         list(row["stages"]) == report["requested_alignment_stage_order"]
@@ -2208,6 +2231,8 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         output_markdown.read_text(encoding="utf-8")
     )
     assert "## Requested Alignment Results" in output_markdown.read_text(encoding="utf-8")
+    assert "WER gap" in output_markdown.read_text(encoding="utf-8")
+    assert "+30.000 pt" in output_markdown.read_text(encoding="utf-8")
     assert "Language Macro Metrics" in output_markdown.read_text(encoding="utf-8")
     assert "unweighted_dataset_macro" in output_markdown.read_text(encoding="utf-8")
     assert "Per-Dataset Metrics" in output_markdown.read_text(encoding="utf-8")

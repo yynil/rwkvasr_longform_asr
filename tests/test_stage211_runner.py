@@ -6668,6 +6668,9 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert ".interval_steps == 10000" in script
     assert ".interval_steps == 2000" in script
     assert '.source_order == ["labeled_sft"]' in script
+    assert "stage211_requested_nano_gaps_valid" in script
+    assert "english_wer_gap_to_nano" in script
+    assert "chinese_cer_gap_to_nano" in script
     assert "post_mixer" in script
     assert "tmux kill-session" not in script
     assert '[[ "${BASH_SOURCE[0]}" == "$0" ]]' in script
@@ -7004,7 +7007,7 @@ def _run_stage211_continuation_watcher_fixture(
         'trajectory=\'{"gate_passed":true,"fixed_eval_samples":256,"source_order":["easy","medium","hard","long","supplemental_natural"],"terminal_entries":5,"best_prior_loss":0.1,"candidate_loss":0.105,"relative_regression_pct":5.0,"max_relative_regression_pct":10.0}\'\n'
         'phase_cadence=\'{"complete":true,"interval_steps":10000,"eval_samples_per_report":256,"source_order":["easy","medium","hard","long","supplemental_natural"],"source_count":5,"total_reports":5,"sources":[{"source":"easy","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"medium","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"hard","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"long","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"supplemental_natural","terminal_step":3,"report_count":1,"eval_samples_per_report":256}]}\'\n'
         'sft_cadence=\'{"complete":true,"interval_steps":2000,"eval_samples_per_report":256,"source_order":["labeled_sft"],"source_count":1,"total_reports":7,"sources":[{"source":"labeled_sft","terminal_step":12045,"report_count":7,"eval_samples_per_report":256}]}\'\n'
-        'jq -c --argjson trajectory "${trajectory}" --argjson phase_cadence "${phase_cadence}" --argjson sft_cadence "${sft_cadence}" \'.alignment_results |= map(. + {trajectory_retention: $trajectory, step_eval_cadence: $phase_cadence}) | (.coverage_results[] | select(.stage == "sft")).step_eval_cadence = $sft_cadence\' "${output_json}" >"${output_json}.tmp"\n'
+        'jq -c --argjson trajectory "${trajectory}" --argjson phase_cadence "${phase_cadence}" --argjson sft_cadence "${sft_cadence}" \'.alignment_results |= map(. + {trajectory_retention: $trajectory, step_eval_cadence: $phase_cadence}) | (.coverage_results[] | select(.stage == "sft")).step_eval_cadence = $sft_cadence | .requested_alignment_language_metric_summaries |= map(. + {nano_error_rate: 0.1}) | .initial_calibration_result += {nano_english_wer: 0.1, nano_chinese_cer: 0.1} | .initial_calibration_result.english_wer_gap_to_nano = (.initial_calibration_result.english_wer - .initial_calibration_result.nano_english_wer) | .initial_calibration_result.chinese_cer_gap_to_nano = (.initial_calibration_result.chinese_cer - .initial_calibration_result.nano_chinese_cer) | .requested_alignment_results |= map(. + {nano_english_wer: 0.1, nano_chinese_cer: 0.1} | .english_wer_gap_to_nano = (.english_wer - .nano_english_wer) | .chinese_cer_gap_to_nano = (.chinese_cer - .nano_chinese_cer))\' "${output_json}" >"${output_json}.tmp"\n'
         'mv "${output_json}.tmp" "${output_json}"\n'
         'if [[ "${UV_MODE}" == missing_alignment ]]; then\n'
         '  sed -i \'s/"all_stage_alignment_results_complete":true/"all_stage_alignment_results_complete":false/\' "${output_json}"\n'
@@ -7013,6 +7016,9 @@ def _run_stage211_continuation_watcher_fixture(
         '  mv "${output_json}.tmp" "${output_json}"\n'
         'elif [[ "${UV_MODE}" == missing_periodic_cadence ]]; then\n'
         '  jq \'del(.coverage_results[] | select(.stage == "sft") | .step_eval_cadence)\' "${output_json}" >"${output_json}.tmp"\n'
+        '  mv "${output_json}.tmp" "${output_json}"\n'
+        'elif [[ "${UV_MODE}" == missing_requested_nano_gap ]]; then\n'
+        '  jq \'del(.requested_alignment_results[2].english_wer_gap_to_nano)\' "${output_json}" >"${output_json}.tmp"\n'
         '  mv "${output_json}.tmp" "${output_json}"\n'
         'elif [[ "${UV_MODE}" == missing_requested_alignment ]]; then\n'
         '  sed -i \'s/"all_requested_alignment_metrics_complete":true/"all_requested_alignment_metrics_complete":false/\' "${output_json}"\n'
@@ -7180,6 +7186,20 @@ def test_stage211_continuation_watcher_requires_periodic_fixed_eval(
 
     assert result.returncode == 0, result.stderr
     assert "periodic fixed-eval proof failed validation" in result.stdout
+    assert "START_STAGE=full" in result.stdout
+    assert "new-session" in tmux_calls
+
+
+def test_stage211_continuation_watcher_requires_requested_nano_gaps(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="missing_requested_nano_gap",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "requested Nano-gap proof failed validation" in result.stdout
     assert "START_STAGE=full" in result.stdout
     assert "new-session" in tmux_calls
 

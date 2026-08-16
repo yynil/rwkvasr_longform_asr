@@ -400,8 +400,20 @@ def _requested_alignment_views(
     chinese = summaries_by_name.get("chinese_cer")
     if english is None or chinese is None:
         raise ValueError("Stage211 requested-stage view lacks English WER or Chinese CER.")
+    nano_english_wer = _finite_float(
+        english["nano_error_rate"], label="Nano English WER"
+    )
+    nano_chinese_cer = _finite_float(
+        chinese["nano_error_rate"], label="Nano Chinese CER"
+    )
 
     calibration_record = stage_records_by_name["calibration"]
+    calibration_english_wer = _finite_float(
+        english["stages"]["calibration"], label="calibration English WER"
+    )
+    calibration_chinese_cer = _finite_float(
+        chinese["stages"]["calibration"], label="calibration Chinese CER"
+    )
     initial_calibration_result = {
         "stage": "calibration",
         "role": "initial_baseline",
@@ -409,18 +421,26 @@ def _requested_alignment_views(
         "checkpoint_sha256": calibration_record["checkpoint_sha256"],
         "source_report_path": calibration_record["source_report_path"],
         "source_report_sha256": calibration_record["source_report_sha256"],
-        "english_wer": _finite_float(
-            english["stages"]["calibration"], label="calibration English WER"
-        ),
-        "chinese_cer": _finite_float(
-            chinese["stages"]["calibration"], label="calibration Chinese CER"
-        ),
+        "english_wer": calibration_english_wer,
+        "nano_english_wer": nano_english_wer,
+        "english_wer_gap_to_nano": calibration_english_wer - nano_english_wer,
+        "chinese_cer": calibration_chinese_cer,
+        "nano_chinese_cer": nano_chinese_cer,
+        "chinese_cer_gap_to_nano": calibration_chinese_cer - nano_chinese_cer,
     }
 
     requested_alignment_results = []
     for requested_stage in REQUESTED_ALIGNMENT_STAGE_ORDER:
         internal_stage = REQUESTED_TO_INTERNAL_STAGE[requested_stage]
         record = stage_records_by_name[internal_stage]
+        english_wer = _finite_float(
+            english["stages"][internal_stage],
+            label=f"{requested_stage} English WER",
+        )
+        chinese_cer = _finite_float(
+            chinese["stages"][internal_stage],
+            label=f"{requested_stage} Chinese CER",
+        )
         requested_alignment_results.append(
             {
                 "stage": requested_stage,
@@ -432,14 +452,12 @@ def _requested_alignment_views(
                 "source_report_path": record["source_report_path"],
                 "source_report_sha256": record["source_report_sha256"],
                 "gate_passed": record["gate_passed"],
-                "english_wer": _finite_float(
-                    english["stages"][internal_stage],
-                    label=f"{requested_stage} English WER",
-                ),
-                "chinese_cer": _finite_float(
-                    chinese["stages"][internal_stage],
-                    label=f"{requested_stage} Chinese CER",
-                ),
+                "english_wer": english_wer,
+                "nano_english_wer": nano_english_wer,
+                "english_wer_gap_to_nano": english_wer - nano_english_wer,
+                "chinese_cer": chinese_cer,
+                "nano_chinese_cer": nano_chinese_cer,
+                "chinese_cer_gap_to_nano": chinese_cer - nano_chinese_cer,
             }
         )
 
@@ -1847,14 +1865,19 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "## Requested Alignment Results",
         "",
-        "| Stage | Internal phase | Objective | English WER | Chinese CER | Gate |",
-        "|---|---|---|---:|---:|---:|",
+        "| Stage | Internal phase | Objective | English WER | Nano WER | WER gap | "
+        "Chinese CER | Nano CER | CER gap | Gate |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for result in report["requested_alignment_results"]:
         lines.append(
             f"| `{result['stage']}` | `{result['internal_stage']}` | "
             f"`{result['objective']}` | {float(result['english_wer']) * 100.0:.3f}% | "
+            f"{float(result['nano_english_wer']) * 100.0:.3f}% | "
+            f"{float(result['english_wer_gap_to_nano']) * 100.0:+.3f} pt | "
             f"{float(result['chinese_cer']) * 100.0:.3f}% | "
+            f"{float(result['nano_chinese_cer']) * 100.0:.3f}% | "
+            f"{float(result['chinese_cer_gap_to_nano']) * 100.0:+.3f} pt | "
             f"`{str(result['gate_passed']).lower()}` |"
         )
     lines.extend(

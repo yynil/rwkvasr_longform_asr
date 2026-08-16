@@ -95,6 +95,13 @@ stage211_periodic_cadence_results_valid() {
     '([.alignment_results[].step_eval_cadence | (.complete == true and .interval_steps == 10000 and .eval_samples_per_report == 256 and .source_count == (.sources | length) and .source_count >= 5 and .total_reports == ([.sources[].report_count] | add) and all(.sources[]; .terminal_step > 0 and .report_count > 0 and .eval_samples_per_report == 256))] | all) and ([.coverage_results[] | select(.stage == "sft")] | length) == 1 and ([.coverage_results[] | select(.stage == "sft") | .step_eval_cadence | (.complete == true and .interval_steps == 2000 and .eval_samples_per_report == 256 and .source_order == ["labeled_sft"] and .source_count == 1 and .total_reports == ([.sources[].report_count] | add) and all(.sources[]; .source == "labeled_sft" and .terminal_step > 0 and .report_count > 0 and .eval_samples_per_report == 256))] | all)'
 }
 
+stage211_requested_nano_gaps_valid() {
+  local path="$1"
+  stage211_json_matches \
+    "${path}" \
+    '. as $root | (["english_wer", "nano_english_wer", "english_wer_gap_to_nano", "chinese_cer", "nano_chinese_cer", "chinese_cer_gap_to_nano"] | all(.[]; ($root.initial_calibration_result[.] | type == "number" and isfinite))) and $root.initial_calibration_result.nano_english_wer == ($root.requested_alignment_language_metric_summaries[] | select(.name == "english_wer") | .nano_error_rate) and $root.initial_calibration_result.nano_chinese_cer == ($root.requested_alignment_language_metric_summaries[] | select(.name == "chinese_cer") | .nano_error_rate) and $root.initial_calibration_result.english_wer_gap_to_nano == ($root.initial_calibration_result.english_wer - $root.initial_calibration_result.nano_english_wer) and $root.initial_calibration_result.chinese_cer_gap_to_nano == ($root.initial_calibration_result.chinese_cer - $root.initial_calibration_result.nano_chinese_cer) and ([$root.requested_alignment_results[] | . as $result | (["english_wer", "nano_english_wer", "english_wer_gap_to_nano", "chinese_cer", "nano_chinese_cer", "chinese_cer_gap_to_nano"] | all(.[]; ($result[.] | type == "number" and isfinite))) and $result.nano_english_wer == ($root.requested_alignment_language_metric_summaries[] | select(.name == "english_wer") | .nano_error_rate) and $result.nano_chinese_cer == ($root.requested_alignment_language_metric_summaries[] | select(.name == "chinese_cer") | .nano_error_rate) and $result.english_wer_gap_to_nano == ($result.english_wer - $result.nano_english_wer) and $result.chinese_cer_gap_to_nano == ($result.chinese_cer - $result.nano_chinese_cer)] | all)'
+}
+
 stage211_choose_start_stage() {
   if stage211_selection_valid logits "${LOGITS_SELECTION}"; then
     printf '%s\n' sft
@@ -146,6 +153,10 @@ stage211_final_candidate_valid() {
   fi
   if ! stage211_periodic_cadence_results_valid "${final_stepwise_report}"; then
     stage211_log "final Stage211 periodic fixed-eval proof failed validation source=${final_report}"
+    return 1
+  fi
+  if ! stage211_requested_nano_gaps_valid "${final_stepwise_report}"; then
+    stage211_log "final Stage211 requested Nano-gap proof failed validation source=${final_report}"
     return 1
   fi
 }
