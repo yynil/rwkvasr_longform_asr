@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -30,7 +30,9 @@ PROFILE_PATTERN = re.compile(r"^(?P<name>[A-Za-z0-9_.-]+):(?P<batch>[1-9][0-9]*)
 TRAIN_LINE_MARKER = "[deepspeed-train]"
 STEP_PATTERN = re.compile(r"\bstep=([0-9]+)\b")
 LOSS_PATTERN = re.compile(r"\bloss=([^ ]+)")
-MATCH_PATTERN = re.compile(r"\bonline_layer_match=([0-9]+)/([0-9]+)\b")
+ONLINE_MATCH_PATTERN = re.compile(
+    r"\b(?P<name>online_[A-Za-z0-9_]+_match)=(?P<count>[0-9]+)/(?P<total>[0-9]+)\b"
+)
 COSINE_PATTERNS = (
     re.compile(r"\bonline_layer_mixer_cosine=([^ ]+)"),
     re.compile(r"\bonline_layer_block_cosine=([^ ]+)"),
@@ -64,6 +66,32 @@ class TrainTelemetry:
     match_total: int
     missing_total: int
     max_abs_frame_delta: int
+    match_fields: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+
+ONLINE_MATCH_WEIGHT_FIELDS = (
+    ("ctc_teacher_online_loss_weight", "online_teacher_match"),
+    ("ctc_teacher_online_blank_loss_weight", "online_blank_match"),
+    ("ctc_teacher_online_mass_loss_weight", "online_mass_match"),
+    ("ctc_teacher_online_full_loss_weight", "online_full_match"),
+    (
+        "ctc_teacher_online_conditional_nonblank_loss_weight",
+        "online_conditional_nonblank_match",
+    ),
+    (
+        "ctc_teacher_online_conditional_nonblank_hard_loss_weight",
+        "online_conditional_nonblank_hard_match",
+    ),
+    ("ctc_teacher_online_encoder_loss_weight", "online_encoder_match"),
+    ("ctc_teacher_online_decoder_hidden_loss_weight", "online_decoder_hidden_match"),
+    ("ctc_teacher_online_sequence_loss_weight", "online_sequence_match"),
+    (
+        "ctc_teacher_online_sequence_presence_loss_weight",
+        "online_sequence_presence_match",
+    ),
+    ("ctc_teacher_online_sequence_window_loss_weight", "online_sequence_window_match"),
+    ("ctc_teacher_online_nonblank_window_topk_loss_weight", "online_nonblank_window_topk_match"),
+)
 
 
 def sha256_file(path: Path, *, chunk_size: int = 8 << 20) -> str:
@@ -85,14 +113,52 @@ def parse_profile(value: str) -> BatchProfile:
     )
 
 
+def required_online_match_fields(config: dict[str, Any]) -> tuple[str, ...]:
+    required = [
+        match_field
+        for weight_field, match_field in ONLINE_MATCH_WEIGHT_FIELDS
+        if float(config.get(weight_field, 0.0) or 0.0) > 0.0
+    ]
+    if any(
+        float(config.get(field_name, 0.0) or 0.0) > 0.0
+        for field_name in (
+            "ctc_teacher_online_nonblank_hard_loss_weight",
+            "ctc_teacher_online_nonblank_margin_loss_weight",
+        )
+    ):
+        required.append("online_nonblank_match")
+    if any(
+        float(config.get(field_name, 0.0) or 0.0) > 0.0
+        for field_name in (
+            "ctc_teacher_online_nonblank_window_loss_weight",
+            "ctc_teacher_online_nonblank_window_margin_loss_weight",
+        )
+    ):
+        required.append("online_nonblank_window_match")
+    if any(
+        float(config.get(field_name, 0.0) or 0.0) > 0.0
+        for field_name in (
+            "ctc_teacher_online_layer_mixer_loss_weight",
+            "ctc_teacher_online_layer_ffn_loss_weight",
+            "ctc_teacher_online_layer_block_loss_weight",
+        )
+    ):
+        required.append("online_layer_match")
+    return tuple(required)
+
+
 def parse_train_telemetry(line: str, *, elapsed_seconds: float) -> TrainTelemetry | None:
     if TRAIN_LINE_MARKER not in line:
         return None
     step_match = STEP_PATTERN.search(line)
     loss_match = LOSS_PATTERN.search(line)
-    match_match = MATCH_PATTERN.search(line)
-    if step_match is None or loss_match is None or match_match is None:
+    match_fields = {
+        match.group("name"): (int(match.group("count")), int(match.group("total")))
+        for match in ONLINE_MATCH_PATTERN.finditer(line)
+    }
+    if step_match is None or loss_match is None or not match_fields:
         return None
+    primary_match = match_fields.get("online_layer_match") or next(iter(match_fields.values()))
     cosine: float | None = None
     for pattern in COSINE_PATTERNS:
         cosine_match = pattern.search(line)
@@ -106,10 +172,11 @@ def parse_train_telemetry(line: str, *, elapsed_seconds: float) -> TrainTelemetr
         elapsed_seconds=float(elapsed_seconds),
         loss=float(loss_match.group(1)),
         cosine=cosine,
-        match_count=int(match_match.group(1)),
-        match_total=int(match_match.group(2)),
+        match_count=int(primary_match[0]),
+        match_total=int(primary_match[1]),
         missing_total=sum(missing_values),
         max_abs_frame_delta=max(frame_deltas, default=0),
+        match_fields=match_fields,
     )
 
 
@@ -373,6 +440,7 @@ def summarize_profile(
     world_size: int,
     full_steps: int,
     max_peak_memory_gib: float,
+    required_match_fields: tuple[str, ...] = ("online_layer_match",),
 ) -> dict[str, Any]:
     points = [TrainTelemetry(**row) for row in result.get("telemetry", [])]
     by_step = {point.step: point for point in points}
@@ -391,8 +459,38 @@ def summarize_profile(
     finite_cosines = all(
         point.cosine is None or math.isfinite(point.cosine) for point in measured
     )
-    complete_matches = bool(measured) and all(
-        point.match_total > 0 and point.match_count == point.match_total for point in measured
+    if not required_match_fields:
+        raise ValueError("throughput preflight requires at least one online match field")
+    primary_match_field = (
+        "online_layer_match"
+        if "online_layer_match" in required_match_fields
+        else required_match_fields[0]
+    )
+
+    def point_match_fields(point: TrainTelemetry) -> dict[str, tuple[int, int]]:
+        if point.match_fields:
+            return {
+                name: (int(values[0]), int(values[1]))
+                for name, values in point.match_fields.items()
+            }
+        return {"online_layer_match": (point.match_count, point.match_total)}
+
+    missing_required_match_fields: dict[str, list[str]] = {}
+    incomplete_required_match_fields: dict[str, dict[str, list[int]]] = {}
+    for point in measured:
+        matches = point_match_fields(point)
+        missing_fields = [name for name in required_match_fields if name not in matches]
+        if missing_fields:
+            missing_required_match_fields[str(point.step)] = missing_fields
+        incomplete = {
+            name: [matches[name][0], matches[name][1]]
+            for name in required_match_fields
+            if name in matches and (matches[name][1] <= 0 or matches[name][0] != matches[name][1])
+        }
+        if incomplete:
+            incomplete_required_match_fields[str(point.step)] = incomplete
+    complete_matches = bool(measured) and not (
+        missing_required_match_fields or incomplete_required_match_fields
     )
     missing_total = sum(point.missing_total for point in measured)
     max_abs_frame_delta = max((point.max_abs_frame_delta for point in measured), default=0)
@@ -415,7 +513,9 @@ def summarize_profile(
             step_rate > 0.0,
         )
     )
-    local_samples = sum(point.match_total for point in measured)
+    local_samples = sum(
+        point_match_fields(point).get(primary_match_field, (0, 0))[1] for point in measured
+    )
     cosines = [point.cosine for point in measured if point.cosine is not None]
     return {
         "process_ok": process_ok,
@@ -431,6 +531,10 @@ def summarize_profile(
             sum(point.loss for point in measured) / len(measured) if measured else None
         ),
         "mean_cosine": sum(cosines) / len(cosines) if cosines else None,
+        "required_match_fields": list(required_match_fields),
+        "primary_match_field": primary_match_field,
+        "missing_required_match_fields": missing_required_match_fields,
+        "incomplete_required_match_fields": incomplete_required_match_fields,
         "complete_teacher_matches": complete_matches,
         "missing_total": missing_total,
         "max_abs_frame_delta": max_abs_frame_delta,
@@ -653,6 +757,11 @@ def main() -> int:
             max_steps=max_steps,
             world_size=int(args.world_size),
         )
+        required_match_fields = required_online_match_fields(config)
+        if not required_match_fields:
+            raise ValueError(
+                "Stage211 throughput preflight config enables no online teacher match fields."
+            )
         save_yaml(config_path, config)
         coverage = _profile_full_coverage(
             config,
@@ -665,6 +774,7 @@ def main() -> int:
             "config_path": str(config_path.resolve()),
             "config_sha256": sha256_file(config_path),
             "coverage": coverage,
+            "required_match_fields": list(required_match_fields),
             "command": _probe_command(
                 config_path,
                 world_size=int(args.world_size),
@@ -690,6 +800,7 @@ def main() -> int:
                 world_size=int(args.world_size),
                 full_steps=int(coverage["full_coverage_steps"]),
                 max_peak_memory_gib=float(args.max_peak_memory_gib),
+                required_match_fields=required_match_fields,
             )
         report["profiles"].append(row)
         _atomic_write_json(report_path, report)

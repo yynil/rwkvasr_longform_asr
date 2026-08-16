@@ -76,8 +76,82 @@ def test_parse_train_telemetry_collects_alignment_safety_fields() -> None:
     assert point.loss == 0.0812
     assert point.cosine == 0.9712
     assert point.match_count == point.match_total == 13
+    assert point.match_fields["online_layer_match"] == (13, 13)
     assert point.missing_total == 0
     assert point.max_abs_frame_delta == 0
+
+
+def test_required_online_match_fields_follow_enabled_phase_objectives() -> None:
+    mixer = {"ctc_teacher_online_layer_mixer_loss_weight": 1.0}
+    block = {
+        "ctc_teacher_online_encoder_loss_weight": 0.5,
+        "ctc_teacher_online_decoder_hidden_loss_weight": 0.5,
+        "ctc_teacher_online_layer_mixer_loss_weight": 0.25,
+        "ctc_teacher_online_layer_ffn_loss_weight": 0.25,
+        "ctc_teacher_online_layer_block_loss_weight": 1.0,
+    }
+    logits = {
+        **block,
+        "ctc_teacher_online_blank_loss_weight": 0.25,
+        "ctc_teacher_online_conditional_nonblank_loss_weight": 1.0,
+        "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.125,
+        "ctc_teacher_online_sequence_loss_weight": 0.2,
+        "ctc_teacher_online_nonblank_window_loss_weight": 0.25,
+    }
+
+    assert probe.required_online_match_fields(mixer) == ("online_layer_match",)
+    assert probe.required_online_match_fields(block) == (
+        "online_encoder_match",
+        "online_decoder_hidden_match",
+        "online_layer_match",
+    )
+    assert probe.required_online_match_fields(logits) == (
+        "online_blank_match",
+        "online_conditional_nonblank_match",
+        "online_conditional_nonblank_hard_match",
+        "online_encoder_match",
+        "online_decoder_hidden_match",
+        "online_sequence_match",
+        "online_nonblank_window_match",
+        "online_layer_match",
+    )
+
+
+def test_missing_or_partial_enabled_match_rejects_fast_candidate() -> None:
+    result = _result(name="candidate", seconds_per_step=0.5, peak_memory=8.0)
+    for row in result["telemetry"]:
+        row["match_fields"] = {
+            "online_layer_match": (8, 8),
+            "online_encoder_match": (7, 8),
+        }
+    summary = probe.summarize_profile(
+        result,
+        warmup_steps=2,
+        max_steps=6,
+        world_size=4,
+        full_steps=1000,
+        max_peak_memory_gib=22.0,
+        required_match_fields=(
+            "online_encoder_match",
+            "online_decoder_hidden_match",
+            "online_layer_match",
+        ),
+    )
+
+    assert summary["complete_teacher_matches"] is False
+    assert summary["safety_pass"] is False
+    assert summary["missing_required_match_fields"] == {
+        "3": ["online_decoder_hidden_match"],
+        "4": ["online_decoder_hidden_match"],
+        "5": ["online_decoder_hidden_match"],
+        "6": ["online_decoder_hidden_match"],
+    }
+    assert summary["incomplete_required_match_fields"] == {
+        "3": {"online_encoder_match": [7, 8]},
+        "4": {"online_encoder_match": [7, 8]},
+        "5": {"online_encoder_match": [7, 8]},
+        "6": {"online_encoder_match": [7, 8]},
+    }
 
 
 def _result(
