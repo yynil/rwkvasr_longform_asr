@@ -18,6 +18,7 @@ from rwkvasr.eval.stage211_gate import (
     build_stage211_trajectory_retention_gate,
     load_stage211_post_coverage_correction_receipts,
     sha256_file,
+    stage211_phase_gate_decision,
     validate_stage211_full_profile_smoke_binding,
     validate_stage211_global_dedup_manifest,
     validate_stage211_loaded_manifest_receipt,
@@ -415,11 +416,12 @@ def build_phase_gate(
         checkpoint_path=checkpoint_path,
     )
     trajectory_retention_gate_passed = bool(trajectory_retention["gate_passed"])
-    gate_passed = (
-        alignment_gate_passed
-        and public_progress_gate_passed
-        and trajectory_retention_gate_passed
-        and (phase != "logits" or benchmark.get("all_datasets_pass") is True)
+    gate_passed = stage211_phase_gate_decision(
+        phase=phase,
+        alignment_gate_passed=alignment_gate_passed,
+        public_progress_gate_passed=public_progress_gate_passed,
+        trajectory_retention_gate_passed=trajectory_retention_gate_passed,
+        all_datasets_pass=benchmark.get("all_datasets_pass") is True,
     )
     final_checkpoint_sha256 = sha256_file(checkpoint_path)
     report = {

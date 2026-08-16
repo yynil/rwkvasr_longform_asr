@@ -114,6 +114,27 @@ _STAGE211_LOGITS_REQUIRED_METRICS = (
     "matched_utterances",
     "missing_utterances",
 )
+
+
+def stage211_phase_gate_decision(
+    *,
+    phase: str,
+    alignment_gate_passed: bool,
+    public_progress_gate_passed: bool,
+    trajectory_retention_gate_passed: bool,
+    all_datasets_pass: bool,
+) -> bool:
+    if phase in {"mixer", "block"}:
+        return (
+            alignment_gate_passed
+            and public_progress_gate_passed
+            and trajectory_retention_gate_passed
+        )
+    if phase == "logits":
+        return alignment_gate_passed and all_datasets_pass and trajectory_retention_gate_passed
+    raise ValueError(f"Stage211 phase {phase!r} cannot promote.")
+
+
 _STAGE211_LOGITS_IDENTICAL_TEACHER_METRICS = (
     "teacher_nonblank_rate",
     "selected_frames",
@@ -4185,23 +4206,20 @@ def validate_stage211_phase_gate_report(
             f"Stage211 {expected_phase} public-progress decision does not match "
             "replayed WER/CER evidence."
         )
+    datasets_passed = benchmark.get("all_datasets_pass") is True
+    expected_gate_passed = stage211_phase_gate_decision(
+        phase=expected_phase,
+        alignment_gate_passed=alignment_gate_passed,
+        public_progress_gate_passed=public_progress_gate_passed,
+        trajectory_retention_gate_passed=trajectory_retention_gate_passed,
+        all_datasets_pass=datasets_passed,
+    )
     if expected_phase in {"mixer", "block"}:
-        expected_gate_passed = (
-            alignment_gate_passed
-            and public_progress_gate_passed
-            and trajectory_retention_gate_passed
-        )
         if require_passed and not public_progress_gate_passed:
             raise ValueError(f"Stage211 {expected_phase} public progress gate did not pass.")
     elif expected_phase == "logits":
-        datasets_passed = benchmark.get("all_datasets_pass") is True
-        expected_gate_passed = (
-            alignment_gate_passed and datasets_passed and trajectory_retention_gate_passed
-        )
         if require_passed and not datasets_passed:
             raise ValueError("Stage211 logits phase must pass the every-dataset Nano WER/CER gate.")
-    else:
-        raise ValueError(f"Stage211 phase {expected_phase!r} cannot promote.")
     if gate_passed != expected_gate_passed:
         raise ValueError("Stage211 phase gate decision is inconsistent with its sub-gates.")
     if require_passed and not trajectory_retention_gate_passed:

@@ -1873,6 +1873,36 @@ def test_stage211_public_progress_requires_macro_and_deletion_improvement() -> N
     assert rejected["results"][0]["within_regression_limit"] is False
 
 
+@pytest.mark.parametrize("phase", ("mixer", "block"))
+def test_stage211_hidden_phases_promote_on_bilingual_progress_before_nano_proximity(
+    phase: str,
+) -> None:
+    assert stage211_gate_module.stage211_phase_gate_decision(
+        phase=phase,
+        alignment_gate_passed=True,
+        public_progress_gate_passed=True,
+        trajectory_retention_gate_passed=True,
+        all_datasets_pass=False,
+    ) is True
+
+
+def test_stage211_logits_requires_every_dataset_nano_proximity() -> None:
+    assert stage211_gate_module.stage211_phase_gate_decision(
+        phase="logits",
+        alignment_gate_passed=True,
+        public_progress_gate_passed=True,
+        trajectory_retention_gate_passed=True,
+        all_datasets_pass=False,
+    ) is False
+    assert stage211_gate_module.stage211_phase_gate_decision(
+        phase="logits",
+        alignment_gate_passed=True,
+        public_progress_gate_passed=False,
+        trajectory_retention_gate_passed=True,
+        all_datasets_pass=True,
+    ) is True
+
+
 def test_stage211_full_phase_dry_run_expands_smoke_and_all_curricula(
     tmp_path: Path,
 ) -> None:
