@@ -76,6 +76,21 @@ def _write_manifest(root: Path) -> Path:
     return manifest
 
 
+def test_logits_correction_retains_direct_full_distribution_objective() -> None:
+    phase = correction_runner.replace(
+        correction_runner.PHASES["logits"],
+        lr=correction_runner.stage211_post_coverage_correction_lr("logits"),
+    )
+    contract = stage211_phase_train_config_contract("logits")
+
+    assert phase.full_weight == pytest.approx(1.0)
+    assert phase.sequence_weight == 0.0
+    assert phase.window_weight == 0.0
+    assert contract["ctc_teacher_online_full_loss_weight"] == pytest.approx(1.0)
+    assert contract["ctc_teacher_online_sequence_loss_weight"] == 0.0
+    assert contract["ctc_teacher_online_nonblank_window_loss_weight"] == 0.0
+
+
 def test_retention_correction_smoke_marker_binds_round_inputs(
     tmp_path: Path,
 ) -> None:

@@ -2398,6 +2398,7 @@ def test_stage211_mixer_phase_has_only_teacher_forced_mixer_objective(
     assert config["ctc_teacher_online_layer_block_loss_weight"] == 0.0
     assert config["ctc_teacher_online_encoder_loss_weight"] == 0.0
     assert config["ctc_teacher_online_decoder_hidden_loss_weight"] == 0.0
+    assert config["ctc_teacher_online_full_loss_weight"] == 0.0
     assert config["ctc_teacher_online_blank_loss_weight"] == 0.0
     assert config["ctc_teacher_online_conditional_nonblank_loss_weight"] == 0.0
     assert config["ctc_teacher_online_sequence_loss_weight"] == 0.0
@@ -2416,6 +2417,7 @@ def test_stage211_block_phase_chains_stacked_block_without_logits(
     assert config["ctc_teacher_online_layer_block_loss_weight"] == pytest.approx(1.0)
     assert config["ctc_teacher_online_encoder_loss_weight"] == pytest.approx(0.5)
     assert config["ctc_teacher_online_decoder_hidden_loss_weight"] == pytest.approx(0.5)
+    assert config["ctc_teacher_online_full_loss_weight"] == 0.0
     assert config["ctc_teacher_online_blank_loss_weight"] == 0.0
     assert config["ctc_teacher_online_conditional_nonblank_loss_weight"] == 0.0
     assert config["ctc_teacher_online_sequence_loss_weight"] == 0.0
@@ -2432,13 +2434,14 @@ def test_stage211_logits_phase_enables_outputs_after_hidden_anchors(
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(0.10)
     assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(0.10)
     assert config["ctc_teacher_online_layer_block_loss_weight"] == pytest.approx(0.25)
+    assert config["ctc_teacher_online_full_loss_weight"] == pytest.approx(1.0)
     assert config["ctc_teacher_online_blank_loss_weight"] == pytest.approx(0.25)
     assert config["ctc_teacher_online_conditional_nonblank_loss_weight"] == pytest.approx(1.0)
     assert config["ctc_teacher_online_conditional_nonblank_hard_loss_weight"] == pytest.approx(
         0.125
     )
-    assert config["ctc_teacher_online_sequence_loss_weight"] == pytest.approx(0.20)
-    assert config["ctc_teacher_online_nonblank_window_loss_weight"] == pytest.approx(0.25)
+    assert config["ctc_teacher_online_sequence_loss_weight"] == 0.0
+    assert config["ctc_teacher_online_nonblank_window_loss_weight"] == 0.0
     assert config["ctc_teacher_online_layer_include_boundaries"] is True
     assert config["ctc_teacher_online_layer_boundary_ids"] == list(stage211.HARD_LAYER_IDS)
 
@@ -2463,6 +2466,7 @@ def test_stage211_sft_phase_uses_labels_after_logits_with_low_teacher_anchors(
     assert config["freeze_encoder_except_time_mixer"] is True
     assert config["freeze_ctc_decoder"] is True
     assert config["freeze_ctc_head"] is True
+    assert config["ctc_teacher_online_full_loss_weight"] == 0.0
     assert config["ctc_teacher_online_blank_loss_weight"] == pytest.approx(0.05)
     assert config["ctc_teacher_online_conditional_nonblank_loss_weight"] == pytest.approx(0.10)
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(0.05)

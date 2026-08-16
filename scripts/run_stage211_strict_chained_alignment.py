@@ -142,6 +142,7 @@ class AlignmentPhase:
     block_weight: float
     encoder_weight: float
     decoder_hidden_weight: float
+    full_weight: float
     blank_weight: float
     conditional_weight: float
     conditional_hard_weight: float
@@ -164,6 +165,7 @@ PHASES: dict[str, AlignmentPhase] = {
         block_weight=0.0,
         encoder_weight=0.0,
         decoder_hidden_weight=0.0,
+        full_weight=0.0,
         blank_weight=0.0,
         conditional_weight=0.0,
         conditional_hard_weight=0.0,
@@ -184,6 +186,7 @@ PHASES: dict[str, AlignmentPhase] = {
         block_weight=1.0,
         encoder_weight=0.5,
         decoder_hidden_weight=0.5,
+        full_weight=0.0,
         blank_weight=0.0,
         conditional_weight=0.0,
         conditional_hard_weight=0.0,
@@ -204,11 +207,12 @@ PHASES: dict[str, AlignmentPhase] = {
         block_weight=0.25,
         encoder_weight=0.25,
         decoder_hidden_weight=0.25,
+        full_weight=1.0,
         blank_weight=0.25,
         conditional_weight=1.0,
         conditional_hard_weight=0.125,
-        sequence_weight=0.20,
-        window_weight=0.25,
+        sequence_weight=0.0,
+        window_weight=0.0,
         layer_sample_count=12,
         include_hard_layers=True,
         requires_labels=False,
@@ -224,6 +228,7 @@ PHASES: dict[str, AlignmentPhase] = {
         block_weight=0.10,
         encoder_weight=0.10,
         decoder_hidden_weight=0.10,
+        full_weight=0.0,
         blank_weight=0.05,
         conditional_weight=0.10,
         conditional_hard_weight=0.0,
@@ -1256,6 +1261,7 @@ def _config(
             "ctc_teacher_online_blank_frame_balance_mode": "all",
             "ctc_teacher_online_hidden_frame_balance_mode": "all",
             "ctc_teacher_online_keep_full_log_probs_on_device": phase.name == "logits",
+            "ctc_teacher_online_full_loss_weight": float(phase.full_weight),
             "ctc_teacher_online_blank_loss_weight": float(phase.blank_weight),
             "ctc_teacher_online_conditional_nonblank_loss_weight": float(phase.conditional_weight),
             "ctc_teacher_online_conditional_nonblank_hard_loss_weight": float(
