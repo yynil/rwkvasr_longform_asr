@@ -299,6 +299,11 @@ stage211_emit_sft_readiness() {
     "${SFT_PREPARATION_LOG}"
   stage211_emit_artifact_status sft_labeled_profile "${SFT_PROFILE_RECEIPT}"
   finalizer_record="$(tail -n 1 "${SFT_FINALIZER_LOG}" 2>/dev/null || true)"
+  if [[ -s "${SFT_PROFILE_RECEIPT}" && -s "${SFT_FINALIZER_LOG}" \
+      && "${SFT_PROFILE_RECEIPT}" -nt "${SFT_FINALIZER_LOG}" \
+      && "${finalizer_record}" =~ (Error|error|failed|Traceback) ]]; then
+    finalizer_record="profile validated stale_failure_superseded=true"
+  fi
   printf 'sft_labeled_finalizer=%s\n' "${finalizer_record:-pending}"
 }
 

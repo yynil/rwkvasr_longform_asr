@@ -98,3 +98,24 @@ def test_stage211_monitor_reports_missing_readiness_as_pending(tmp_path: Path) -
     assert "supplemental_combined_profile=pending" in output
     assert "supplemental_nine_cell_receipt=pending" in output
     assert "supplemental_replay_receipt=pending" in output
+
+
+def test_stage211_monitor_supersedes_stale_sft_finalizer_failure(
+    tmp_path: Path,
+) -> None:
+    labeled_root = tmp_path / "labeled"
+    labeled_root.mkdir()
+    finalizer_log = labeled_root / "finalize.log"
+    finalizer_log.write_text(
+        "ValueError: Stage211 SFT full input language counts mismatch.\n",
+        encoding="utf-8",
+    )
+    profile = labeled_root / "profile.json"
+    profile.write_text("validated-profile\n", encoding="utf-8")
+
+    output = _emit_readiness(tmp_path)
+
+    assert (
+        "sft_labeled_finalizer=profile validated stale_failure_superseded=true"
+        in output
+    )
