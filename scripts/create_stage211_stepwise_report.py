@@ -213,7 +213,100 @@ def _validate_calibration_receipt(path: Path) -> tuple[dict[str, Any], Path]:
     return receipt, checkpoint
 
 
-def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
+def _empty_sft_correction_coverage() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "applied": False,
+        "rounds": 0,
+        "unique_rows_per_round": 0,
+        "row_exposures": 0,
+        "hour_exposures": 0.0,
+        "steps": 0,
+        "tail_padding_sample_exposures": 0,
+        "executed_sample_exposures": 0,
+        "language_row_exposures": {},
+        "source_row_exposures": {},
+        "round_receipts": [],
+    }
+
+
+def _validate_sft_correction_coverage(
+    report: dict[str, Any],
+    *,
+    full_completion_path: Path,
+    full_checkpoint: Path,
+    final_checkpoint: Path,
+) -> dict[str, Any]:
+    correction_keys = (
+        "sft_correction_evaluation_path",
+        "sft_correction_evaluation_sha256",
+        "sft_correction_profile_path",
+        "sft_correction_profile_sha256",
+        "sft_correction_completion_receipts",
+        "sft_correction_coverage",
+        "sft_correction_public_progress",
+    )
+    if full_checkpoint == final_checkpoint:
+        if any(key in report for key in correction_keys):
+            raise ValueError("Uncorrected Stage211 SFT report contains correction evidence.")
+        return _empty_sft_correction_coverage()
+
+    try:
+        from scripts.evaluate_stage211_sft_correction import (
+            validate_correction_evaluation_report,
+        )
+    except ModuleNotFoundError as error:
+        if error.name != "scripts":
+            raise
+        from evaluate_stage211_sft_correction import (  # type: ignore[no-redef]
+            validate_correction_evaluation_report,
+        )
+
+    evaluation_path = _validate_bound_file(
+        report,
+        path_key="sft_correction_evaluation_path",
+        sha_key="sft_correction_evaluation_sha256",
+        label="Stage211 SFT correction evaluation",
+    )
+    profile_path = _validate_bound_file(
+        report,
+        path_key="sft_correction_profile_path",
+        sha_key="sft_correction_profile_sha256",
+        label="Stage211 SFT correction profile",
+    )
+    evaluation = validate_correction_evaluation_report(
+        evaluation_path,
+        expected_full_completion_path=full_completion_path,
+        expected_correction_profile_path=profile_path,
+        require_passed=True,
+    )
+    if (
+        Path(str(evaluation.get("checkpoint_path") or "")).resolve()
+        != final_checkpoint
+        or report.get("sft_correction_completion_receipts")
+        != evaluation.get("correction_completion_receipts")
+        or report.get("sft_correction_coverage")
+        != evaluation.get("correction_coverage")
+        or report.get("sft_correction_public_progress")
+        != evaluation.get("public_progress")
+    ):
+        raise ValueError("Stage211 SFT correction evidence chain mismatch.")
+    coverage = evaluation.get("correction_coverage")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("schema_version") != 1
+        or coverage.get("applied") is not True
+        or not 1 <= int(coverage.get("rounds", 0)) <= 3
+        or int(coverage.get("rounds", 0))
+        != len(coverage.get("round_receipts") or [])
+    ):
+        raise ValueError("Stage211 SFT correction coverage is incomplete.")
+    return dict(coverage)
+
+
+def _validate_sft_report(
+    path: Path,
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     report = _load_json(path, label="Stage211 SFT final report")
     expected = {
         "schema_version": 1,
@@ -299,13 +392,18 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
     completion_path = Path(str(report["sft_completion_path"])).resolve()
     completion, completion_checkpoint = _validate_sft_completion(
         completion_path,
-        checkpoint_path=checkpoint,
         require_full_profile=True,
     )
-    if completion_checkpoint != checkpoint or coverage != completion:
+    if coverage != completion:
         raise ValueError(
             "Stage211 SFT final report differs from its validated completion coverage."
         )
+    correction_coverage = _validate_sft_correction_coverage(
+        report,
+        full_completion_path=completion_path,
+        full_checkpoint=completion_checkpoint,
+        final_checkpoint=checkpoint,
+    )
     for key in (
         "nano_teacher_checkpoint_path",
         "nano_teacher_checkpoint_sha256",
@@ -339,7 +437,7 @@ def _validate_sft_report(path: Path) -> tuple[dict[str, Any], Path]:
         raise ValueError("Stage211 SFT Nano public-baseline checkpoint binding mismatch.")
     if baseline_receipt.get("public_overlap") != report.get("public_overlap"):
         raise ValueError("Stage211 SFT and Nano baseline overlap bindings differ.")
-    return report, checkpoint
+    return report, checkpoint, correction_coverage
 
 
 def _benchmark_rows(benchmark: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1144,7 +1242,12 @@ def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, 
     }
 
 
-def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
+def _coverage_record(
+    *,
+    stage: str,
+    coverage: dict[str, Any],
+    sft_correction_coverage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if stage in {"mixer", "block", "logits"}:
         unique_rows = int(coverage["total_unique_rows"])
         row_exposures = int(coverage["total_row_exposures"])
@@ -1242,6 +1345,22 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
         epochs = int(coverage["epochs"])
         total_hours = float(coverage["total_hours"])
         label_proof = _sft_ctc_label_proof(coverage)
+        correction = (
+            dict(sft_correction_coverage)
+            if sft_correction_coverage is not None
+            else _empty_sft_correction_coverage()
+        )
+        correction_rounds = int(correction["rounds"])
+        correction_rows = int(correction["row_exposures"])
+        correction_hours = float(correction["hour_exposures"])
+        correction_steps = int(correction["steps"])
+        correction_tail = int(correction["tail_padding_sample_exposures"])
+        correction_executed = int(correction["executed_sample_exposures"])
+        base_rows = int(coverage["train_samples"]) * epochs
+        base_hours = total_hours * epochs
+        base_steps = int(coverage["estimated_train_steps"])
+        base_tail = int(coverage["tail_padding_sample_exposures"])
+        base_executed = int(coverage["executed_sample_exposures"])
         return {
             "stage": stage,
             "label": STAGE_LABELS[stage],
@@ -1250,17 +1369,23 @@ def _coverage_record(*, stage: str, coverage: dict[str, Any]) -> dict[str, Any]:
             "evaluation_rows": int(coverage["eval_samples"]),
             "hours_per_epoch": total_hours,
             "epochs": epochs,
-            "row_exposures": int(coverage["train_samples"]) * epochs,
-            "hour_exposures": total_hours * epochs,
-            "steps": int(coverage["estimated_train_steps"]),
-            "tail_padding_sample_exposures": int(
-                coverage["tail_padding_sample_exposures"]
-            ),
-            "executed_sample_exposures": int(coverage["executed_sample_exposures"]),
-            "correction_rounds": 0,
-            "correction_row_exposures": 0,
-            "correction_hour_exposures": 0.0,
-            "effective_hour_exposures": total_hours * epochs,
+            "row_exposures": base_rows,
+            "hour_exposures": base_hours,
+            "steps": base_steps,
+            "tail_padding_sample_exposures": base_tail,
+            "executed_sample_exposures": base_executed,
+            "correction_rounds": correction_rounds,
+            "correction_row_exposures": correction_rows,
+            "correction_hour_exposures": correction_hours,
+            "correction_steps": correction_steps,
+            "correction_tail_padding_sample_exposures": correction_tail,
+            "correction_executed_sample_exposures": correction_executed,
+            "effective_row_exposures": base_rows + correction_rows,
+            "effective_hour_exposures": base_hours + correction_hours,
+            "effective_steps": base_steps + correction_steps,
+            "effective_tail_padding_sample_exposures": base_tail + correction_tail,
+            "effective_executed_sample_exposures": base_executed + correction_executed,
+            "correction": correction,
             "ctc_tokens": int(coverage["ctc_tokens"]),
             "ctc_unk_tokens": int(coverage["ctc_unk_tokens"]),
             "ctc_label_proof": label_proof,
@@ -1470,7 +1595,9 @@ def build_stepwise_report(
             checkpoint_path=checkpoint,
         )
         phase_checkpoints[phase] = checkpoint
-    sft, sft_checkpoint = _validate_sft_report(sft_final_report_path)
+    sft, sft_checkpoint, sft_correction_coverage = _validate_sft_report(
+        sft_final_report_path
+    )
     if Path(str(sft.get("mixer_phase_gate_path") or "")).resolve() != mixer_gate_path or sft.get(
         "mixer_phase_gate_sha256"
     ) != sha256_file(mixer_gate_path):
@@ -1741,6 +1868,9 @@ def build_stepwise_report(
                 if stage in {"mixer", "block", "logits"}
                 else sft["labeled_data_coverage"]
             ),
+            sft_correction_coverage=(
+                sft_correction_coverage if stage == "sft" else None
+            ),
         )
         for stage in ("mixer", "block", "logits", "sft")
     ]
@@ -1770,6 +1900,7 @@ def build_stepwise_report(
         "nano_initialization_source_chain_passed": initialization["loader_source_chain_passed"],
         "ctc_label_normalization_chain_passed": True,
         "ctc_label_proof": ctc_label_proof,
+        "sft_correction_evidence": sft_correction_coverage,
         "public_metric_definition_chain_passed": True,
         "public_metric_correction_receipt_path": str(public_metric_correction_receipt_path),
         "public_metric_correction_receipt_sha256": sha256_file(
@@ -2141,7 +2272,10 @@ def render_markdown(report: dict[str, Any]) -> str:
             else (
                 f"{int(coverage['correction_rounds'])} round(s), "
                 f"{int(coverage['correction_row_exposures']):,} rows / "
-                f"{float(coverage['correction_hour_exposures']):,.3f} h"
+                f"{float(coverage['correction_hour_exposures']):,.3f} h / "
+                f"{int(coverage['correction_steps']):,} steps / "
+                f"{int(coverage['correction_executed_sample_exposures']):,} "
+                "executed"
             )
         )
         lines.append(
@@ -2152,6 +2286,28 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{int(coverage['epochs'])} | "
             f"{int(coverage['executed_sample_exposures']):,} | {correction} |"
         )
+    correction_evidence = report["sft_correction_evidence"]
+    lines.extend(("", "## SFT Correction Proof", ""))
+    if correction_evidence["applied"] is not True:
+        lines.append("No correction round was applied; all correction exposures are zero.")
+    else:
+        lines.extend(
+            (
+                "| Round | Rows | Hours | Steps | Tail padding | Executed exposures | "
+                "Receipt SHA-256 |",
+                "|---:|---:|---:|---:|---:|---:|---|",
+            )
+        )
+        for receipt in correction_evidence["round_receipts"]:
+            lines.append(
+                f"| {int(receipt['round'])} | "
+                f"{int(receipt['row_exposures']):,} | "
+                f"{float(receipt['hour_exposures']):,.3f} | "
+                f"{int(receipt['steps']):,} | "
+                f"{int(receipt['tail_padding_sample_exposures']):,} | "
+                f"{int(receipt['executed_sample_exposures']):,} | "
+                f"`{receipt['receipt_sha256']}` |"
+            )
     lines.extend(
         (
             "",

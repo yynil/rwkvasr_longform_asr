@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -69,6 +70,8 @@ except ModuleNotFoundError as error:
 
 
 DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_eval" / "stage211_phase_gates" / "sft_correction"
+SFT_CORRECTION_EVALUATION_SCHEMA_VERSION = 2
+SFT_CORRECTION_COVERAGE_SCHEMA_VERSION = 1
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -139,6 +142,133 @@ def _ordered_completion_bindings(
     return bindings, completions
 
 
+def _correction_coverage(
+    *,
+    bindings: Sequence[Mapping[str, Any]],
+    completions: Sequence[Mapping[str, Any]],
+    profile: Mapping[str, Any],
+    correction_profile_path: Path,
+    full_completion_path: Path,
+    full_completion: Mapping[str, Any],
+    full_checkpoint: Path,
+    candidate_checkpoint: Path,
+) -> dict[str, Any]:
+    if not 1 <= len(completions) <= 3 or len(bindings) != len(completions):
+        raise ValueError("Stage211D correction coverage has an invalid round count.")
+    previous_checkpoint = full_checkpoint.resolve()
+    row_exposures = 0
+    hour_exposures = 0.0
+    steps = 0
+    tail_padding = 0
+    executed_exposures = 0
+    language_exposures: dict[str, int] = {}
+    source_exposures: dict[str, int] = {}
+    round_receipts: list[dict[str, Any]] = []
+    expected_rows = int(profile["train_samples"])
+    expected_hours = float(profile["total_train_hours"])
+    expected_steps = int(profile["estimated_train_steps"])
+    expected_tail = int(profile["tail_padding_samples"])
+    expected_executed = int(profile["executed_sample_exposures"])
+    expected_languages = dict(profile["language_counts"])
+    expected_sources = dict(profile["source_counts"])
+    expected_nano_path = Path(
+        str(full_completion["nano_teacher_checkpoint_path"])
+    ).resolve()
+    expected_nano_sha256 = str(full_completion["nano_teacher_checkpoint_sha256"])
+    for index, (binding, completion) in enumerate(
+        zip(bindings, completions, strict=True),
+        start=1,
+    ):
+        init_checkpoint = Path(str(completion["init_checkpoint_path"])).resolve()
+        completion_checkpoint = Path(
+            str(completion["completion_checkpoint_path"])
+        ).resolve()
+        if init_checkpoint != previous_checkpoint:
+            raise ValueError("Stage211D correction checkpoint chain is not contiguous.")
+        if (
+            int(completion.get("round", -1)) != index
+            or int(completion.get("rows", -1)) != expected_rows
+            or int(completion.get("row_exposures", -1)) != expected_rows
+            or not math.isclose(
+                float(completion.get("hours", float("nan"))),
+                expected_hours,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            or int(completion.get("steps", -1)) != expected_steps
+            or int(completion.get("tail_padding_samples", -1)) != expected_tail
+            or int(completion.get("executed_sample_exposures", -1))
+            != expected_executed
+            or completion.get("language_counts") != expected_languages
+            or completion.get("source_counts") != expected_sources
+            or Path(str(completion.get("nano_teacher_checkpoint_path") or "")).resolve()
+            != expected_nano_path
+            or completion.get("nano_teacher_checkpoint_sha256")
+            != expected_nano_sha256
+        ):
+            raise ValueError("Stage211D correction receipt differs from its shared profile.")
+        row_exposures += expected_rows
+        hour_exposures += expected_hours
+        steps += expected_steps
+        tail_padding += expected_tail
+        executed_exposures += expected_executed
+        for language, count in expected_languages.items():
+            language_exposures[str(language)] = (
+                language_exposures.get(str(language), 0) + int(count)
+            )
+        for source, count in expected_sources.items():
+            source_exposures[str(source)] = source_exposures.get(str(source), 0) + int(
+                count
+            )
+        round_receipts.append(
+            {
+                "round": index,
+                "receipt_path": str(Path(str(binding["path"])).resolve()),
+                "receipt_sha256": str(binding["sha256"]),
+                "init_checkpoint_path": str(init_checkpoint),
+                "init_checkpoint_sha256": str(completion["init_checkpoint_sha256"]),
+                "completion_checkpoint_path": str(completion_checkpoint),
+                "completion_checkpoint_sha256": str(
+                    completion["completion_checkpoint_sha256"]
+                ),
+                "row_exposures": expected_rows,
+                "hour_exposures": expected_hours,
+                "steps": expected_steps,
+                "tail_padding_sample_exposures": expected_tail,
+                "executed_sample_exposures": expected_executed,
+            }
+        )
+        previous_checkpoint = completion_checkpoint
+    if previous_checkpoint != candidate_checkpoint.resolve():
+        raise ValueError("Stage211D correction coverage does not reach the final checkpoint.")
+    if sum(language_exposures.values()) != row_exposures or sum(
+        source_exposures.values()
+    ) != row_exposures:
+        raise ValueError("Stage211D correction exposure subtotals are inconsistent.")
+    return {
+        "schema_version": SFT_CORRECTION_COVERAGE_SCHEMA_VERSION,
+        "applied": True,
+        "rounds": len(completions),
+        "unique_rows_per_round": expected_rows,
+        "row_exposures": row_exposures,
+        "hour_exposures": hour_exposures,
+        "steps": steps,
+        "tail_padding_sample_exposures": tail_padding,
+        "executed_sample_exposures": executed_exposures,
+        "language_row_exposures": dict(sorted(language_exposures.items())),
+        "source_row_exposures": dict(sorted(source_exposures.items())),
+        "full_sft_completion_path": str(full_completion_path.resolve()),
+        "full_sft_completion_sha256": sha256_file(full_completion_path),
+        "correction_profile_path": str(correction_profile_path.resolve()),
+        "correction_profile_sha256": sha256_file(correction_profile_path),
+        "initial_checkpoint_path": str(full_checkpoint.resolve()),
+        "initial_checkpoint_sha256": sha256_file(full_checkpoint),
+        "final_checkpoint_path": str(candidate_checkpoint.resolve()),
+        "final_checkpoint_sha256": sha256_file(candidate_checkpoint),
+        "round_receipts": round_receipts,
+    }
+
+
 def validate_correction_evaluation_report(
     report_path: Path,
     *,
@@ -150,7 +280,7 @@ def validate_correction_evaluation_report(
     report_path = report_path.expanduser().resolve()
     report = _load_json(report_path, label="Stage211D correction evaluation")
     required = {
-        "schema_version": 1,
+        "schema_version": SFT_CORRECTION_EVALUATION_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "sft_correction_evaluation",
         "phase": "sft",
@@ -220,6 +350,18 @@ def validate_correction_evaluation_report(
         "estimated_train_steps": profile["estimated_train_steps"],
     }:
         raise ValueError("Stage211D correction evaluation profile summary mismatch.")
+    correction_coverage = _correction_coverage(
+        bindings=bindings,
+        completions=completions,
+        profile=profile,
+        correction_profile_path=correction_profile_path,
+        full_completion_path=full_completion_path,
+        full_completion=full_completion,
+        full_checkpoint=full_checkpoint,
+        candidate_checkpoint=candidate_checkpoint,
+    )
+    if report.get("correction_coverage") != correction_coverage:
+        raise ValueError("Stage211D correction coverage differs from deep replay.")
 
     embedded_candidate = report.get("public_benchmark")
     if not isinstance(embedded_candidate, dict):
@@ -445,6 +587,7 @@ def _write_passed_final_report(
         "sft_correction_completion_receipts": evaluation[
             "correction_completion_receipts"
         ],
+        "sft_correction_coverage": evaluation["correction_coverage"],
         "sft_correction_public_progress": evaluation["public_progress"],
     }
     _write_immutable_json(final_path, report)
@@ -562,8 +705,24 @@ def evaluate_correction(args: argparse.Namespace) -> Path:
         candidate_benchmark.get("all_datasets_pass")
     )
     profile = validate_correction_profile(correction_profile_path)
+    correction_bindings, correction_completions = _ordered_completion_bindings(
+        records,
+        expected_round=round_index,
+        full_completion_path=full_completion_path,
+        correction_profile_path=correction_profile_path,
+    )
+    correction_coverage = _correction_coverage(
+        bindings=correction_bindings,
+        completions=correction_completions,
+        profile=profile,
+        correction_profile_path=correction_profile_path,
+        full_completion_path=full_completion_path,
+        full_completion=full_completion,
+        full_checkpoint=full_checkpoint,
+        candidate_checkpoint=candidate_checkpoint,
+    )
     report = {
-        "schema_version": 1,
+        "schema_version": SFT_CORRECTION_EVALUATION_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "sft_correction_evaluation",
         "phase": "sft",
@@ -584,6 +743,7 @@ def evaluate_correction(args: argparse.Namespace) -> Path:
             "estimated_train_steps": profile["estimated_train_steps"],
         },
         "correction_completion_receipts": records,
+        "correction_coverage": correction_coverage,
         "baseline_public_comparison_report_path": str(baseline_report_path),
         "baseline_public_comparison_report_sha256": sha256_file(baseline_report_path),
         "public_comparison_report_path": str(comparison_json),

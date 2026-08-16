@@ -33,6 +33,9 @@ sys.path.insert(0, str(REPO_ROOT))
 sft_runner = importlib.import_module("scripts.run_stage211_labeled_sft")
 sft_finalizer = importlib.import_module("scripts.finalize_stage211_labeled_sft")
 sft_correction_loop = importlib.import_module("scripts.run_stage211_sft_correction_loop")
+sft_correction_evaluator = importlib.import_module(
+    "scripts.evaluate_stage211_sft_correction"
+)
 stepwise_report = importlib.import_module("scripts.create_stage211_stepwise_report")
 public_compare = importlib.import_module("scripts.compare_public_ctc_with_nano")
 LABELED_EXPECTED = sft_runner.LABELED_EXPECTED
@@ -682,6 +685,192 @@ def test_stage211_sft_correction_requires_full_profile_completion(
     assert observed["path"] == (tmp_path / "sft_complete.json").resolve()
     assert observed["checkpoint_path"] is None
     assert observed["require_full_profile"] is True
+
+
+def test_stage211_sft_correction_coverage_sums_contiguous_rounds(
+    tmp_path: Path,
+) -> None:
+    full_completion = tmp_path / "sft_complete.json"
+    correction_profile = tmp_path / "correction_profile.json"
+    full_checkpoint = tmp_path / "full.pt"
+    nano_checkpoint = tmp_path / "nano.pt"
+    round_one_checkpoint = tmp_path / "round-one.pt"
+    round_two_checkpoint = tmp_path / "round-two.pt"
+    for path, payload in (
+        (full_completion, b"{}\n"),
+        (correction_profile, b"{}\n"),
+        (full_checkpoint, b"full"),
+        (nano_checkpoint, b"nano"),
+        (round_one_checkpoint, b"round-one"),
+        (round_two_checkpoint, b"round-two"),
+    ):
+        path.write_bytes(payload)
+    receipt_paths = [tmp_path / "round-one.json", tmp_path / "round-two.json"]
+    for index, receipt_path in enumerate(receipt_paths, start=1):
+        receipt_path.write_text(json.dumps({"round": index}) + "\n", encoding="utf-8")
+    profile = {
+        "train_samples": 10,
+        "total_train_hours": 1.5,
+        "estimated_train_steps": 2,
+        "tail_padding_samples": 6,
+        "executed_sample_exposures": 16,
+        "language_counts": {"en": 5, "zh": 5},
+        "source_counts": {"english": 5, "chinese": 5},
+    }
+    checkpoints = [full_checkpoint, round_one_checkpoint, round_two_checkpoint]
+    completions = []
+    bindings = []
+    for index, receipt_path in enumerate(receipt_paths, start=1):
+        completions.append(
+            {
+                "round": index,
+                "rows": 10,
+                "row_exposures": 10,
+                "hours": 1.5,
+                "steps": 2,
+                "tail_padding_samples": 6,
+                "executed_sample_exposures": 16,
+                "language_counts": {"en": 5, "zh": 5},
+                "source_counts": {"english": 5, "chinese": 5},
+                "nano_teacher_checkpoint_path": str(nano_checkpoint),
+                "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+                "init_checkpoint_path": str(checkpoints[index - 1]),
+                "init_checkpoint_sha256": sha256_file(checkpoints[index - 1]),
+                "completion_checkpoint_path": str(checkpoints[index]),
+                "completion_checkpoint_sha256": sha256_file(checkpoints[index]),
+            }
+        )
+        bindings.append(
+            {
+                "round": index,
+                "path": str(receipt_path),
+                "sha256": sha256_file(receipt_path),
+            }
+        )
+
+    coverage = sft_correction_evaluator._correction_coverage(
+        bindings=bindings,
+        completions=completions,
+        profile=profile,
+        correction_profile_path=correction_profile,
+        full_completion_path=full_completion,
+        full_completion={
+            "nano_teacher_checkpoint_path": str(nano_checkpoint),
+            "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+        },
+        full_checkpoint=full_checkpoint,
+        candidate_checkpoint=round_two_checkpoint,
+    )
+
+    assert coverage["applied"] is True
+    assert coverage["rounds"] == 2
+    assert coverage["row_exposures"] == 20
+    assert coverage["hour_exposures"] == pytest.approx(3.0)
+    assert coverage["steps"] == 4
+    assert coverage["tail_padding_sample_exposures"] == 12
+    assert coverage["executed_sample_exposures"] == 32
+    assert coverage["language_row_exposures"] == {"en": 10, "zh": 10}
+    assert [receipt["round"] for receipt in coverage["round_receipts"]] == [1, 2]
+
+    broken = [dict(completion) for completion in completions]
+    broken[1]["init_checkpoint_path"] = str(full_checkpoint)
+    with pytest.raises(ValueError, match="checkpoint chain is not contiguous"):
+        sft_correction_evaluator._correction_coverage(
+            bindings=bindings,
+            completions=broken,
+            profile=profile,
+            correction_profile_path=correction_profile,
+            full_completion_path=full_completion,
+            full_completion={
+                "nano_teacher_checkpoint_path": str(nano_checkpoint),
+                "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+            },
+            full_checkpoint=full_checkpoint,
+            candidate_checkpoint=round_two_checkpoint,
+        )
+
+
+def test_stage211_stepwise_sft_correction_evidence_is_not_hidden(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_completion = tmp_path / "sft_complete.json"
+    evaluation_path = tmp_path / "correction_evaluation.json"
+    profile_path = tmp_path / "correction_profile.json"
+    full_checkpoint = tmp_path / "full.pt"
+    corrected_checkpoint = tmp_path / "corrected.pt"
+    for path, payload in (
+        (full_completion, b"{}\n"),
+        (evaluation_path, b"{}\n"),
+        (profile_path, b"{}\n"),
+        (full_checkpoint, b"full"),
+        (corrected_checkpoint, b"corrected"),
+    ):
+        path.write_bytes(payload)
+    correction_coverage = {
+        "schema_version": 1,
+        "applied": True,
+        "rounds": 1,
+        "unique_rows_per_round": 10,
+        "row_exposures": 10,
+        "hour_exposures": 1.5,
+        "steps": 2,
+        "tail_padding_sample_exposures": 6,
+        "executed_sample_exposures": 16,
+        "language_row_exposures": {"en": 5, "zh": 5},
+        "source_row_exposures": {"english": 5, "chinese": 5},
+        "round_receipts": [{"round": 1}],
+    }
+    completion_receipts = [{"round": 1, "path": "/proof/round.json", "sha256": "a" * 64}]
+    public_progress = {"gate_passed": True}
+    evaluation = {
+        "checkpoint_path": str(corrected_checkpoint),
+        "correction_completion_receipts": completion_receipts,
+        "correction_coverage": correction_coverage,
+        "public_progress": public_progress,
+    }
+    report = {
+        "sft_correction_evaluation_path": str(evaluation_path),
+        "sft_correction_evaluation_sha256": sha256_file(evaluation_path),
+        "sft_correction_profile_path": str(profile_path),
+        "sft_correction_profile_sha256": sha256_file(profile_path),
+        "sft_correction_completion_receipts": completion_receipts,
+        "sft_correction_coverage": correction_coverage,
+        "sft_correction_public_progress": public_progress,
+    }
+    monkeypatch.setattr(
+        sft_correction_evaluator,
+        "validate_correction_evaluation_report",
+        lambda *args, **kwargs: evaluation,
+    )
+
+    assert stepwise_report._validate_sft_correction_coverage(
+        report,
+        full_completion_path=full_completion,
+        full_checkpoint=full_checkpoint,
+        final_checkpoint=corrected_checkpoint,
+    ) == correction_coverage
+
+    forged = dict(report)
+    forged["sft_correction_coverage"] = {
+        **correction_coverage,
+        "row_exposures": 11,
+    }
+    with pytest.raises(ValueError, match="correction evidence chain mismatch"):
+        stepwise_report._validate_sft_correction_coverage(
+            forged,
+            full_completion_path=full_completion,
+            full_checkpoint=full_checkpoint,
+            final_checkpoint=corrected_checkpoint,
+        )
+
+    with pytest.raises(ValueError, match="Uncorrected"):
+        stepwise_report._validate_sft_correction_coverage(
+            report,
+            full_completion_path=full_completion,
+            full_checkpoint=full_checkpoint,
+            final_checkpoint=full_checkpoint,
+        )
 
 
 def test_stage211_sft_public_gate_requires_zero_dataset_regressions() -> None:
@@ -1940,12 +2129,13 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         path: Path,
         checkpoint_path: Path | None = None,
         require_full_profile: bool = False,
-    ) -> tuple[dict[str, object], Path | None]:
+    ) -> tuple[dict[str, object], Path]:
         del path
+        assert checkpoint_path is None
         completion_validation_modes.append(require_full_profile)
         return (
             sft_payload["labeled_data_coverage"],
-            checkpoint_path,
+            checkpoints["sft"],
         )
 
     monkeypatch.setattr(
@@ -2192,6 +2382,26 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     assert (
         report["coverage_results"][-1]["tail_padding_sample_exposures"]
         == LABELED_EXPECTED["tail_padding_sample_exposures"]
+    )
+    assert report["sft_correction_evidence"] == {
+        "schema_version": 1,
+        "applied": False,
+        "rounds": 0,
+        "unique_rows_per_round": 0,
+        "row_exposures": 0,
+        "hour_exposures": 0.0,
+        "steps": 0,
+        "tail_padding_sample_exposures": 0,
+        "executed_sample_exposures": 0,
+        "language_row_exposures": {},
+        "source_row_exposures": {},
+        "round_receipts": [],
+    }
+    assert report["coverage_results"][-1]["correction"] == report[
+        "sft_correction_evidence"
+    ]
+    assert report["coverage_results"][-1]["effective_row_exposures"] == (
+        LABELED_EXPECTED["train_samples"]
     )
     assert report["coverage_results"][-1]["step_eval_cadence"] == {
         "complete": True,

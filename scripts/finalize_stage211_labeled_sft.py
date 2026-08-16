@@ -273,6 +273,15 @@ def _validate_final_report(
         if completion_checkpoint_value is not None
         else checkpoint.resolve()
     )
+    correction_keys = (
+        "sft_correction_evaluation_path",
+        "sft_correction_evaluation_sha256",
+        "sft_correction_profile_path",
+        "sft_correction_profile_sha256",
+        "sft_correction_completion_receipts",
+        "sft_correction_coverage",
+        "sft_correction_public_progress",
+    )
     if checkpoint.resolve() != full_sft_checkpoint:
         try:
             from scripts.evaluate_stage211_sft_correction import (
@@ -318,10 +327,14 @@ def _validate_final_report(
             != checkpoint.resolve()
             or report.get("sft_correction_completion_receipts")
             != correction_evaluation.get("correction_completion_receipts")
+            or report.get("sft_correction_coverage")
+            != correction_evaluation.get("correction_coverage")
             or report.get("sft_correction_public_progress")
             != correction_evaluation.get("public_progress")
         ):
             raise ValueError("Stage211 final report correction evidence chain mismatch.")
+    elif any(key in report for key in correction_keys):
+        raise ValueError("Uncorrected Stage211 final report contains correction evidence.")
     promotion_receipt = _load_json(
         Path(str(report["logits_promotion_receipt_path"])).resolve(),
         label="Stage211 logits promotion receipt",

@@ -6675,6 +6675,9 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert "stage211_requested_nano_gaps_valid" in script
     assert "english_wer_gap_to_nano" in script
     assert "chinese_cer_gap_to_nano" in script
+    assert "stage211_sft_correction_coverage_valid" in script
+    assert ".sft_correction_evidence" in script
+    assert ".effective_executed_sample_exposures" in script
     assert "post_mixer" in script
     assert "tmux kill-session" not in script
     assert '[[ "${BASH_SOURCE[0]}" == "$0" ]]' in script
@@ -7013,7 +7016,12 @@ def _run_stage211_continuation_watcher_fixture(
         'sft_cadence=\'{"complete":true,"interval_steps":2000,"eval_samples_per_report":256,"source_order":["labeled_sft"],"source_count":1,"total_reports":19,"sources":[{"source":"labeled_sft","terminal_step":37506,"report_count":19,"eval_samples_per_report":256}]}\'\n'
         'full_labeled_profile=\'{"labeled_profile_schema_version":2,"labeled_profile_receipt_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","all_accepted_unique_rows_required":true,"source_language_interleave_required":true,"train_samples":1418201,"eval_samples":7142,"total_samples":1425343,"unique_utterance_ids":1425343,"pronunciation_target_samples":1425343,"ctc_feasible_samples":1425343,"ctc_tokens":21711995,"ctc_unk_tokens":0,"ctc_forbidden_tokens":0,"source_counts":{"aishell3":63262,"commonvoice_cn":32712,"commonvoice_en":1109477,"librispeech":219892},"language_counts":{"en":1329369,"zh":95974}}\'\n'
         'sft_coverage=\'{"unique_or_train_rows":1418201,"evaluation_rows":7142,"hours_per_epoch":2421.999430555555,"epochs":1,"row_exposures":1418201,"hour_exposures":2421.999430555555,"steps":37506,"tail_padding_sample_exposures":567,"executed_sample_exposures":1418768}\'\n'
-        'jq -c --argjson trajectory "${trajectory}" --argjson phase_cadence "${phase_cadence}" --argjson sft_cadence "${sft_cadence}" --argjson full_labeled_profile "${full_labeled_profile}" --argjson sft_coverage "${sft_coverage}" \'.alignment_results |= map(. + {trajectory_retention: $trajectory, step_eval_cadence: $phase_cadence}) | (.coverage_results[] | select(.stage == "sft")).step_eval_cadence = $sft_cadence | (.coverage_results[] | select(.stage == "sft")) += $sft_coverage | .ctc_label_proof += $full_labeled_profile | .requested_alignment_language_metric_summaries |= map(. + {nano_error_rate: 0.1}) | .initial_calibration_result += {nano_english_wer: 0.1, nano_chinese_cer: 0.1} | .initial_calibration_result.english_wer_gap_to_nano = (.initial_calibration_result.english_wer - .initial_calibration_result.nano_english_wer) | .initial_calibration_result.chinese_cer_gap_to_nano = (.initial_calibration_result.chinese_cer - .initial_calibration_result.nano_chinese_cer) | .requested_alignment_results |= map(. + {nano_english_wer: 0.1, nano_chinese_cer: 0.1} | .english_wer_gap_to_nano = (.english_wer - .nano_english_wer) | .chinese_cer_gap_to_nano = (.chinese_cer - .nano_chinese_cer))\' "${output_json}" >"${output_json}.tmp"\n'
+        'if [[ "${SFT_CORRECTION_MODE}" == corrected ]]; then\n'
+        '  sft_correction=\'{"schema_version":1,"applied":true,"rounds":1,"unique_rows_per_round":191024,"row_exposures":191024,"hour_exposures":309.737461,"steps":5147,"tail_padding_sample_exposures":432,"executed_sample_exposures":191456,"language_row_exposures":{"en":95512,"zh":95512},"source_row_exposures":{"aishell3":62952,"commonvoice_cn":32560,"commonvoice_en":47756,"librispeech":47756},"full_sft_completion_path":"/proof/sft_complete.json","full_sft_completion_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","correction_profile_path":"/proof/correction_profile.json","correction_profile_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","initial_checkpoint_path":"/proof/full_sft.pt","initial_checkpoint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","final_checkpoint_path":"/proof/corrected.pt","final_checkpoint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","round_receipts":[{"round":1,"receipt_path":"/proof/round1.json","receipt_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","init_checkpoint_path":"/proof/full_sft.pt","init_checkpoint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","completion_checkpoint_path":"/proof/corrected.pt","completion_checkpoint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","row_exposures":191024,"hour_exposures":309.737461,"steps":5147,"tail_padding_sample_exposures":432,"executed_sample_exposures":191456}]}\'\n'
+        'else\n'
+        '  sft_correction=\'{"schema_version":1,"applied":false,"rounds":0,"unique_rows_per_round":0,"row_exposures":0,"hour_exposures":0,"steps":0,"tail_padding_sample_exposures":0,"executed_sample_exposures":0,"language_row_exposures":{},"source_row_exposures":{},"round_receipts":[]}\'\n'
+        'fi\n'
+        'jq -c --argjson trajectory "${trajectory}" --argjson phase_cadence "${phase_cadence}" --argjson sft_cadence "${sft_cadence}" --argjson full_labeled_profile "${full_labeled_profile}" --argjson sft_coverage "${sft_coverage}" --argjson sft_correction "${sft_correction}" \'.alignment_results |= map(. + {trajectory_retention: $trajectory, step_eval_cadence: $phase_cadence}) | (.coverage_results[] | select(.stage == "sft")).step_eval_cadence = $sft_cadence | (.coverage_results[] | select(.stage == "sft")) += ($sft_coverage + {correction_rounds:$sft_correction.rounds,correction_row_exposures:$sft_correction.row_exposures,correction_hour_exposures:$sft_correction.hour_exposures,correction_steps:$sft_correction.steps,correction_tail_padding_sample_exposures:$sft_correction.tail_padding_sample_exposures,correction_executed_sample_exposures:$sft_correction.executed_sample_exposures,effective_row_exposures:($sft_coverage.row_exposures + $sft_correction.row_exposures),effective_hour_exposures:($sft_coverage.hour_exposures + $sft_correction.hour_exposures),effective_steps:($sft_coverage.steps + $sft_correction.steps),effective_tail_padding_sample_exposures:($sft_coverage.tail_padding_sample_exposures + $sft_correction.tail_padding_sample_exposures),effective_executed_sample_exposures:($sft_coverage.executed_sample_exposures + $sft_correction.executed_sample_exposures),correction:$sft_correction}) | .sft_correction_evidence = $sft_correction | .ctc_label_proof += $full_labeled_profile | .requested_alignment_language_metric_summaries |= map(. + {nano_error_rate: 0.1}) | .initial_calibration_result += {nano_english_wer: 0.1, nano_chinese_cer: 0.1} | .initial_calibration_result.english_wer_gap_to_nano = (.initial_calibration_result.english_wer - .initial_calibration_result.nano_english_wer) | .initial_calibration_result.chinese_cer_gap_to_nano = (.initial_calibration_result.chinese_cer - .initial_calibration_result.nano_chinese_cer) | .requested_alignment_results |= map(. + {nano_english_wer: 0.1, nano_chinese_cer: 0.1} | .english_wer_gap_to_nano = (.english_wer - .nano_english_wer) | .chinese_cer_gap_to_nano = (.chinese_cer - .nano_chinese_cer))\' "${output_json}" >"${output_json}.tmp"\n'
         'mv "${output_json}.tmp" "${output_json}"\n'
         'if [[ "${UV_MODE}" == missing_alignment ]]; then\n'
         '  sed -i \'s/"all_stage_alignment_results_complete":true/"all_stage_alignment_results_complete":false/\' "${output_json}"\n'
@@ -7028,6 +7036,12 @@ def _run_stage211_continuation_watcher_fixture(
         '  mv "${output_json}.tmp" "${output_json}"\n'
         'elif [[ "${UV_MODE}" == legacy_sft_labeled_profile ]]; then\n'
         '  jq \'.ctc_label_proof.total_samples = 285302\' "${output_json}" >"${output_json}.tmp"\n'
+        '  mv "${output_json}.tmp" "${output_json}"\n'
+        'elif [[ "${UV_MODE}" == missing_sft_correction_coverage ]]; then\n'
+        '  jq \'.sft_correction_evidence = null\' "${output_json}" >"${output_json}.tmp"\n'
+        '  mv "${output_json}.tmp" "${output_json}"\n'
+        'elif [[ "${UV_MODE}" == forged_sft_correction_exposure ]]; then\n'
+        '  jq \'.sft_correction_evidence.row_exposures += 1\' "${output_json}" >"${output_json}.tmp"\n'
         '  mv "${output_json}.tmp" "${output_json}"\n'
         'elif [[ "${UV_MODE}" == missing_requested_alignment ]]; then\n'
         '  sed -i \'s/"all_requested_alignment_metrics_complete":true/"all_requested_alignment_metrics_complete":false/\' "${output_json}"\n'
@@ -7072,6 +7086,9 @@ def _run_stage211_continuation_watcher_fixture(
             "TMUX_STATE": str(tmp_path / "tmux-state"),
             "FINAL_REPORT_PATH": str(final_report),
             "UV_MODE": uv_mode,
+            "SFT_CORRECTION_MODE": (
+                "corrected" if corrected_final_report else "uncorrected"
+            ),
             "PHASE_GATE_ROOT": str(phase_gate_root),
             "FULL_OUTPUT_ROOT": str(tmp_path / "runs"),
             "WATCH_LOG": str(tmp_path / "watch.log"),
@@ -7223,6 +7240,26 @@ def test_stage211_continuation_watcher_rejects_legacy_sft_labeled_profile(
 
     assert result.returncode == 0, result.stderr
     assert "full-labeled profile proof failed validation" in result.stdout
+    assert "START_STAGE=full" in result.stdout
+    assert "new-session" in tmux_calls
+
+
+@pytest.mark.parametrize(
+    "uv_mode",
+    ("missing_sft_correction_coverage", "forged_sft_correction_exposure"),
+)
+def test_stage211_continuation_watcher_requires_exact_sft_correction_coverage(
+    tmp_path: Path,
+    uv_mode: str,
+) -> None:
+    result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode=uv_mode,
+        corrected_final_report=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "SFT correction-coverage proof failed validation" in result.stdout
     assert "START_STAGE=full" in result.stdout
     assert "new-session" in tmux_calls
 
