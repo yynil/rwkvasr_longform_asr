@@ -13,11 +13,16 @@ from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
     DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
     STAGE211_AUDIO_CURRICULUM,
+    STAGE211_PUBLIC_BENCHMARKS,
     build_stage211_full_data_coverage,
     load_stage211_post_coverage_correction_receipts,
     sha256_file,
     validate_stage211_full_data_coverage,
     validate_stage211_nano_public_baseline_receipt,
+)
+from rwkvasr.eval.stage211_public_metrics import (
+    build_stage211_student_public_prediction_receipt,
+    validate_stage211_student_public_prediction_receipt,
 )
 
 try:
@@ -84,6 +89,14 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"{label} must be a JSON object: {path}")
     return payload
+
+
+def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
+    rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    if path.is_file() and path.read_text(encoding="utf-8") != rendered:
+        raise ValueError(f"Refusing to overwrite a different Stage211 artifact: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(rendered, encoding="utf-8")
 
 
 def _run(command: list[str], *, dry_run: bool, env: dict[str, str] | None = None) -> None:
@@ -159,7 +172,7 @@ def _run_public_eval(
     manifest_dir: Path,
     devices: str,
     dry_run: bool,
-) -> None:
+) -> Path:
     env = {
         **os.environ,
         "CHECKPOINT_PATH": str(checkpoint),
@@ -180,6 +193,31 @@ def _run_public_eval(
         dry_run=dry_run,
         env=env,
     )
+    receipt_path = output_dir / "student_prediction_receipt.json"
+    if dry_run:
+        return receipt_path
+    manifest_paths = {
+        dataset: (manifest_dir / f"{dataset}.jsonl").resolve() for dataset in DATASETS
+    }
+    prediction_paths = {
+        dataset: (output_dir / "predictions" / f"{dataset}.ctc.jsonl").resolve()
+        for dataset in DATASETS
+    }
+    receipt = build_stage211_student_public_prediction_receipt(
+        checkpoint_path=checkpoint,
+        manifest_paths=manifest_paths,
+        prediction_paths=prediction_paths,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+    )
+    _write_immutable_json(receipt_path, receipt)
+    validate_stage211_student_public_prediction_receipt(
+        receipt_path,
+        expected_checkpoint=checkpoint,
+        expected_manifest_paths=manifest_paths,
+        expected_prediction_paths=prediction_paths,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+    )
+    return receipt_path
 
 
 def _validate_public_eval_inputs(
@@ -231,6 +269,7 @@ def _run_nano_comparison(
     nano_prediction_dir: Path,
     comparison_json: Path,
     comparison_md: Path,
+    student_prediction_receipt: Path,
     dry_run: bool,
 ) -> None:
     command = [
@@ -238,6 +277,8 @@ def _run_nano_comparison(
         str(COMPARE_SCRIPT),
         "--student-prediction-dir",
         str(public_output_dir / "predictions"),
+        "--student-prediction-receipt",
+        str(student_prediction_receipt),
     ]
     for dataset in DATASETS:
         command.extend(
@@ -484,7 +525,7 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     public_output = output_dir / "public"
     comparison_json = output_dir / "nano_comparison.json"
     comparison_md = output_dir / "nano_comparison.md"
-    _run_public_eval(
+    student_prediction_receipt = _run_public_eval(
         checkpoint=checkpoint,
         output_dir=public_output,
         manifest_dir=manifest_dir,
@@ -497,6 +538,7 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         nano_prediction_dir=nano_prediction_dir,
         comparison_json=comparison_json,
         comparison_md=comparison_md,
+        student_prediction_receipt=student_prediction_receipt,
         dry_run=bool(args.dry_run),
     )
 

@@ -14,31 +14,51 @@ from rwkvasr.eval import (
     compute_text_error_stats,
     normalize_asr_text_for_metrics,
 )
+from rwkvasr.eval.stage211_public_metrics import (
+    validate_stage211_student_public_prediction_receipt,
+)
 
 
-DATASETS: dict[str, dict[str, str]] = {
-    "aishell1_test": {"language": "zh", "label": "AISHELL-1 test", "metric": "cer"},
+DATASETS: dict[str, dict[str, str | int]] = {
+    "aishell1_test": {
+        "language": "zh",
+        "label": "AISHELL-1 test",
+        "metric": "cer",
+        "samples": 7_176,
+    },
     "librispeech_test_clean": {
         "language": "en",
         "label": "LibriSpeech test-clean",
         "metric": "wer",
+        "samples": 2_620,
     },
     "librispeech_test_other": {
         "language": "en",
         "label": "LibriSpeech test-other",
         "metric": "wer",
+        "samples": 2_939,
     },
     "commonvoice_en_test": {
         "language": "en",
         "label": "Common Voice 22 en test",
         "metric": "wer",
+        "samples": 14_922,
     },
     "wenetspeech_test_net": {
         "language": "zh",
         "label": "WenetSpeech TEST_NET",
         "metric": "cer",
+        "samples": 24_774,
     },
 }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _load_references(
@@ -206,6 +226,7 @@ def build_report(
     max_relative_ratio: float,
     max_absolute_gap_points: float,
     student_checkpoint: Path | None = None,
+    student_prediction_receipt: Path | None = None,
 ) -> dict[str, Any]:
     missing = sorted(set(DATASETS) - set(nano_predictions))
     extra = sorted(set(nano_predictions) - set(DATASETS))
@@ -254,12 +275,51 @@ def build_report(
         student_checkpoint = student_checkpoint.resolve()
         if not student_checkpoint.is_file():
             raise FileNotFoundError(f"Student checkpoint missing: {student_checkpoint}")
-        digest = hashlib.sha256()
-        with student_checkpoint.open("rb") as source:
-            while chunk := source.read(8 * 1024 * 1024):
-                digest.update(chunk)
         report["student_checkpoint_path"] = str(student_checkpoint)
-        report["student_checkpoint_sha256"] = digest.hexdigest()
+        report["student_checkpoint_sha256"] = _sha256_file(student_checkpoint)
+    if student_prediction_receipt is not None:
+        if student_checkpoint is None:
+            raise ValueError(
+                "--student-prediction-receipt requires --student-checkpoint."
+            )
+        student_prediction_receipt = student_prediction_receipt.expanduser().resolve()
+        receipt_payload = json.loads(student_prediction_receipt.read_text(encoding="utf-8"))
+        if not isinstance(receipt_payload, dict):
+            raise ValueError("Student prediction receipt must be a JSON object.")
+        receipt_results = receipt_payload.get("results")
+        if not isinstance(receipt_results, list):
+            raise ValueError("Student prediction receipt results are invalid.")
+        receipt_by_dataset = {
+            str(result.get("dataset")): result
+            for result in receipt_results
+            if isinstance(result, dict)
+        }
+        if set(receipt_by_dataset) != set(DATASETS):
+            raise ValueError("Student prediction receipt dataset coverage mismatch.")
+        validate_stage211_student_public_prediction_receipt(
+            student_prediction_receipt,
+            expected_checkpoint=student_checkpoint,
+            expected_manifest_paths={
+                dataset: Path(str(receipt_by_dataset[dataset].get("manifest_path") or ""))
+                for dataset in DATASETS
+            },
+            expected_prediction_paths={
+                dataset: student_prediction_dir / f"{dataset}.ctc.jsonl"
+                for dataset in DATASETS
+            },
+            benchmarks={
+                dataset: {
+                    "language": str(info["language"]),
+                    "metric": str(info["metric"]),
+                    "samples": int(info["samples"]),
+                }
+                for dataset, info in DATASETS.items()
+            },
+        )
+        report["student_prediction_receipt_path"] = str(student_prediction_receipt)
+        report["student_prediction_receipt_sha256"] = _sha256_file(
+            student_prediction_receipt
+        )
     return report
 
 
@@ -340,6 +400,7 @@ def main() -> None:
     parser.add_argument("--max-relative-ratio", type=float, default=1.20)
     parser.add_argument("--max-absolute-gap-points", type=float, default=3.0)
     parser.add_argument("--student-checkpoint", type=Path, default=None)
+    parser.add_argument("--student-prediction-receipt", type=Path, default=None)
     args = parser.parse_args()
 
     report = build_report(
@@ -349,6 +410,7 @@ def main() -> None:
         max_relative_ratio=args.max_relative_ratio,
         max_absolute_gap_points=args.max_absolute_gap_points,
         student_checkpoint=args.student_checkpoint,
+        student_prediction_receipt=args.student_prediction_receipt,
     )
     output_json = Path(args.output_json)
     output_md = Path(args.output_md)

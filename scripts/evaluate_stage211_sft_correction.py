@@ -264,6 +264,7 @@ def validate_correction_evaluation_report(
         manifest_paths=manifest_paths,
         benchmarks=STAGE211_PUBLIC_BENCHMARKS,
         expected_checkpoint=candidate_checkpoint,
+        require_student_prediction_receipt=True,
     )
     progress = build_stage211_sft_correction_public_progress(
         baseline=replayed_baseline,
@@ -508,7 +509,7 @@ def evaluate_correction(args: argparse.Namespace) -> Path:
             nano_prediction_dir=nano_prediction_dir,
             nano_public_baseline_receipt=nano_receipt_path,
         )
-    _run_public_eval(
+    student_prediction_receipt = _run_public_eval(
         checkpoint=candidate_checkpoint,
         output_dir=public_output,
         manifest_dir=manifest_dir,
@@ -521,6 +522,7 @@ def evaluate_correction(args: argparse.Namespace) -> Path:
         nano_prediction_dir=nano_prediction_dir,
         comparison_json=comparison_json,
         comparison_md=comparison_md,
+        student_prediction_receipt=student_prediction_receipt,
         dry_run=bool(args.dry_run),
     )
     if args.dry_run:
@@ -536,6 +538,7 @@ def evaluate_correction(args: argparse.Namespace) -> Path:
     candidate_benchmark = _enrich_public_benchmark(
         _load_json(comparison_json, label="Correction public comparison"),
         manifest_dir=manifest_dir,
+        require_student_prediction_receipt=True,
     )
     progress = build_stage211_sft_correction_public_progress(
         baseline=baseline_benchmark,

@@ -129,6 +129,127 @@ def _jsonl_predictions(
     return records
 
 
+def build_stage211_student_public_prediction_receipt(
+    *,
+    checkpoint_path: Path,
+    manifest_paths: dict[str, Path],
+    prediction_paths: dict[str, Path],
+    benchmarks: dict[str, dict[str, str | int]],
+) -> dict[str, Any]:
+    checkpoint_path = _bound_file(checkpoint_path, label="student public checkpoint")
+    if set(manifest_paths) != set(benchmarks):
+        raise ValueError("Stage211 student public receipt manifest map is incomplete.")
+    if set(prediction_paths) != set(benchmarks):
+        raise ValueError("Stage211 student public receipt prediction map is incomplete.")
+
+    results: list[dict[str, Any]] = []
+    for dataset, expected in benchmarks.items():
+        language = str(expected["language"])
+        metric = str(expected["metric"])
+        expected_samples = int(expected["samples"])
+        manifest_path = _bound_file(
+            manifest_paths[dataset],
+            label=f"{dataset} student public manifest",
+        )
+        prediction_path = _bound_file(
+            prediction_paths[dataset],
+            label=f"{dataset} student public predictions",
+        )
+        manifest_references = _jsonl_references(
+            manifest_path,
+            language=language,
+            reference_keys=("text", "transcript", "ref_text", "reference"),
+        )
+        predictions = _jsonl_predictions(prediction_path, language=language)
+        if (
+            len(manifest_references) != expected_samples
+            or len(predictions) != expected_samples
+            or set(predictions) != set(manifest_references)
+        ):
+            raise ValueError(f"Stage211 {dataset} student public receipt coverage mismatch.")
+        if any(
+            predictions[utt_id][0] != reference
+            for utt_id, reference in manifest_references.items()
+        ):
+            raise ValueError(
+                f"Stage211 {dataset} student public receipt normalized references mismatch."
+            )
+        results.append(
+            {
+                "dataset": dataset,
+                "language": language,
+                "metric": metric,
+                "sample_count": expected_samples,
+                "identical_utt_coverage": True,
+                "normalized_reference_mismatch_count": 0,
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": _sha256_file(manifest_path),
+                "student_prediction_path": str(prediction_path),
+                "student_prediction_sha256": _sha256_file(prediction_path),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "student_public_prediction_receipt",
+        "complete": True,
+        "decode": "greedy_ctc",
+        "mode": "bi",
+        "normalization": "ctc",
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": _sha256_file(checkpoint_path),
+        "dataset_count": len(results),
+        "total_samples": sum(int(result["sample_count"]) for result in results),
+        "results": results,
+    }
+
+
+def validate_stage211_student_public_prediction_receipt(
+    receipt_path: Path,
+    *,
+    expected_checkpoint: Path,
+    expected_manifest_paths: dict[str, Path],
+    expected_prediction_paths: dict[str, Path],
+    benchmarks: dict[str, dict[str, str | int]],
+) -> dict[str, Any]:
+    receipt_path = _bound_file(receipt_path, label="student public prediction receipt")
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Stage211 student public prediction receipt must be a JSON object.")
+    expected_checkpoint = expected_checkpoint.expanduser().resolve()
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("pipeline") != "stage211"
+        or payload.get("artifact") != "student_public_prediction_receipt"
+        or payload.get("complete") is not True
+        or payload.get("decode") != "greedy_ctc"
+        or payload.get("mode") != "bi"
+        or payload.get("normalization") != "ctc"
+    ):
+        raise ValueError("Stage211 student public prediction receipt contract mismatch.")
+    if Path(str(payload.get("checkpoint_path") or "")).expanduser().resolve() != (
+        expected_checkpoint
+    ) or payload.get("checkpoint_sha256") != _sha256_file(expected_checkpoint):
+        raise ValueError("Stage211 student public prediction receipt checkpoint mismatch.")
+    rebuilt = build_stage211_student_public_prediction_receipt(
+        checkpoint_path=expected_checkpoint,
+        manifest_paths={
+            dataset: path.expanduser().resolve()
+            for dataset, path in expected_manifest_paths.items()
+        },
+        prediction_paths={
+            dataset: path.expanduser().resolve()
+            for dataset, path in expected_prediction_paths.items()
+        },
+        benchmarks=benchmarks,
+    )
+    if payload != rebuilt:
+        raise ValueError(
+            "Stage211 student public prediction receipt does not match current files."
+        )
+    return payload
+
+
 def _score_prediction_records(
     records: dict[str, tuple[str, str]],
     *,
@@ -309,6 +430,7 @@ def replay_stage211_public_comparison(
     manifest_paths: dict[str, Path],
     benchmarks: dict[str, dict[str, str | int]],
     expected_checkpoint: Path | None = None,
+    require_student_prediction_receipt: bool = False,
 ) -> dict[str, Any]:
     if report.get("decode") != "greedy_ctc" or report.get("normalization") != "ctc":
         raise ValueError("Stage211 public comparison must use greedy CTC and CTC normalization.")
@@ -348,6 +470,36 @@ def replay_stage211_public_comparison(
     }
     if set(by_dataset) != set(benchmarks):
         raise ValueError("Stage211 public comparison dataset set is incomplete or unexpected.")
+
+    receipt_path_value = report.get("student_prediction_receipt_path")
+    receipt_sha256 = report.get("student_prediction_receipt_sha256")
+    has_receipt_binding = receipt_path_value is not None or receipt_sha256 is not None
+    if require_student_prediction_receipt and not has_receipt_binding:
+        raise ValueError("Stage211 public comparison lacks student prediction provenance.")
+    if has_receipt_binding:
+        if receipt_path_value is None or receipt_sha256 is None:
+            raise ValueError("Stage211 student prediction provenance binding is incomplete.")
+        receipt_path = _bound_file(
+            receipt_path_value,
+            label="student public prediction receipt",
+        )
+        if receipt_sha256 != _sha256_file(receipt_path):
+            raise ValueError("Stage211 student public prediction receipt SHA-256 mismatch.")
+        receipt_checkpoint = expected_checkpoint
+        if receipt_checkpoint is None:
+            receipt_checkpoint = Path(
+                str(report.get("student_checkpoint_path") or "")
+            ).expanduser().resolve()
+        validate_stage211_student_public_prediction_receipt(
+            receipt_path,
+            expected_checkpoint=receipt_checkpoint,
+            expected_manifest_paths=manifest_paths,
+            expected_prediction_paths={
+                dataset: Path(str(by_dataset[dataset].get("student_prediction_path") or ""))
+                for dataset in benchmarks
+            },
+            benchmarks=benchmarks,
+        )
 
     replayed_results: list[dict[str, Any]] = []
     for dataset, expected in benchmarks.items():
@@ -754,6 +906,7 @@ def replay_stage211_sft_public_evidence(
         manifest_paths=manifest_paths,
         benchmarks=benchmarks,
         expected_checkpoint=expected_candidate_checkpoint,
+        require_student_prediction_receipt=True,
     )
     replayed_progress = build_stage211_sft_public_progress(
         baseline=replayed_baseline,

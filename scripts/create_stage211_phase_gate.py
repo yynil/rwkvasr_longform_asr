@@ -130,6 +130,7 @@ def _enrich_public_benchmark(
     report: dict[str, Any],
     *,
     manifest_dir: Path,
+    require_student_prediction_receipt: bool = False,
 ) -> dict[str, Any]:
     return replay_stage211_public_comparison(
         report,
@@ -138,6 +139,7 @@ def _enrich_public_benchmark(
             for dataset in STAGE211_PUBLIC_BENCHMARKS
         },
         benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        require_student_prediction_receipt=require_student_prediction_receipt,
     )
 
 
@@ -342,7 +344,11 @@ def build_phase_gate(
     else:
         raise ValueError(f"Stage211 {phase} requires an independent alignment gate report.")
 
-    benchmark = _enrich_public_benchmark(public_report, manifest_dir=manifest_dir.resolve())
+    benchmark = _enrich_public_benchmark(
+        public_report,
+        manifest_dir=manifest_dir.resolve(),
+        require_student_prediction_receipt=True,
+    )
     public_overlap_receipt_path = public_overlap_receipt_path.expanduser().resolve()
     public_overlap_binding = {
         "receipt_path": str(public_overlap_receipt_path),

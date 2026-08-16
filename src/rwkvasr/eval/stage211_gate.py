@@ -3980,6 +3980,7 @@ def validate_stage211_phase_gate_report(
         manifest_paths=manifest_paths,
         benchmarks=STAGE211_PUBLIC_BENCHMARKS,
         expected_checkpoint=checkpoint_path,
+        require_student_prediction_receipt=True,
     )
     _validate_stage211_replayed_value(
         benchmark,

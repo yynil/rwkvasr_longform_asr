@@ -18,6 +18,7 @@ from rwkvasr.eval.stage211_gate import (
     stage211_phase_train_config_contract,
 )
 from rwkvasr.eval.stage211_public_metrics import (
+    build_stage211_student_public_prediction_receipt,
     build_stage211_sft_public_progress,
     replay_stage211_public_comparison,
     replay_stage211_sft_public_evidence,
@@ -673,6 +674,23 @@ def test_stage211_sft_public_evidence_replays_baseline_candidate_and_progress(
 
     baseline_source = source_report(checkpoint=baseline_checkpoint, student=baseline)
     candidate_source = source_report(checkpoint=candidate_checkpoint, student=candidate)
+    candidate_receipt_path = tmp_path / "candidate-prediction-receipt.json"
+    candidate_receipt = build_stage211_student_public_prediction_receipt(
+        checkpoint_path=candidate_checkpoint,
+        manifest_paths={dataset: manifest},
+        prediction_paths={dataset: candidate},
+        benchmarks=benchmarks,
+    )
+    candidate_receipt_path.write_text(
+        json.dumps(candidate_receipt) + "\n",
+        encoding="utf-8",
+    )
+    candidate_source["student_prediction_receipt_path"] = str(
+        candidate_receipt_path.resolve()
+    )
+    candidate_source["student_prediction_receipt_sha256"] = sha256_file(
+        candidate_receipt_path
+    )
     baseline_source_path = tmp_path / "baseline-comparison.json"
     candidate_source_path = tmp_path / "candidate-comparison.json"
     baseline_source_path.write_text(json.dumps(baseline_source) + "\n", encoding="utf-8")

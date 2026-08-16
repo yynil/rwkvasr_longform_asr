@@ -412,7 +412,7 @@ def finalize_sft(args: argparse.Namespace) -> Path:
             nano_prediction_dir=nano_prediction_dir,
             nano_public_baseline_receipt=nano_public_baseline_receipt_path,
         )
-    _run_public_eval(
+    student_prediction_receipt = _run_public_eval(
         checkpoint=checkpoint,
         output_dir=public_output,
         manifest_dir=manifest_dir,
@@ -425,6 +425,7 @@ def finalize_sft(args: argparse.Namespace) -> Path:
         nano_prediction_dir=nano_prediction_dir,
         comparison_json=comparison_json,
         comparison_md=comparison_md,
+        student_prediction_receipt=student_prediction_receipt,
         dry_run=bool(args.dry_run),
     )
     final_report_path = output_dir / "stage211_complete.json"
@@ -456,6 +457,7 @@ def finalize_sft(args: argparse.Namespace) -> Path:
     candidate_benchmark = _enrich_public_benchmark(
         candidate_report,
         manifest_dir=manifest_dir,
+        require_student_prediction_receipt=True,
     )
     public_overlap_receipt_path = (
         Path(getattr(args, "public_overlap_receipt", DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT))

@@ -44,7 +44,11 @@ from rwkvasr.eval.stage211_supplemental import (
     STAGE211_SUPPLEMENTAL_SOURCES,
     stage211_supplemental_profile,
 )
-from rwkvasr.eval.stage211_public_metrics import replay_stage211_public_comparison
+from rwkvasr.eval.stage211_public_metrics import (
+    build_stage211_student_public_prediction_receipt,
+    replay_stage211_public_comparison,
+    validate_stage211_student_public_prediction_receipt,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -253,16 +257,16 @@ def test_stage211_public_eval_shards_large_second_stage(
         dry_run: bool,
         env: dict[str, str] | None = None,
     ) -> None:
-        assert dry_run is False
+        assert dry_run is True
         calls.append((command, env))
 
     monkeypatch.setattr(stage211_phase_finalizer, "_run", fake_run)
-    stage211_phase_finalizer._run_public_eval(
+    receipt_path = stage211_phase_finalizer._run_public_eval(
         checkpoint=tmp_path / "checkpoint.pt",
         output_dir=tmp_path / "output",
         manifest_dir=tmp_path / "manifests",
         devices="0,1,2,3",
-        dry_run=False,
+        dry_run=True,
     )
 
     assert len(calls) == 1
@@ -270,6 +274,7 @@ def test_stage211_public_eval_shards_large_second_stage(
     assert calls[0][1]["CTC_SHARD_STAGE2"] == "1"
     assert calls[0][1]["CTC_TEXT_NORMALIZATION"] == "ctc"
     assert calls[0][1]["METRIC_NORMALIZATION"] == "ctc"
+    assert receipt_path == tmp_path / "output" / "student_prediction_receipt.json"
 
 
 def test_stage211_public_eval_preflight_binds_canonical_directories(
@@ -451,6 +456,91 @@ def test_stage211_public_replay_matches_canonical_metric_implementation(
     assert replayed["results"][0]["student_error_rate"] == pytest.approx(0.25)
     for key, expected in canonical.items():
         assert replayed["results"][0][key] == expected
+
+
+def test_stage211_public_prediction_receipt_binds_checkpoint_and_predictions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = "librispeech_test_clean"
+    benchmarks = {dataset: {"language": "en", "metric": "wer", "samples": 2}}
+    checkpoint = tmp_path / "checkpoint.pt"
+    other_checkpoint = tmp_path / "other.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    other_checkpoint.write_bytes(b"other")
+    manifest = tmp_path / f"{dataset}.jsonl"
+    prediction = tmp_path / f"{dataset}.ctc.jsonl"
+    manifest.write_text(
+        '{"utt_id":"one","text":"hello world"}\n'
+        '{"utt_id":"two","text":"speech test"}\n',
+        encoding="utf-8",
+    )
+    prediction.write_text(
+        '{"utt_id":"one","ref_text":"hello world","pred_text":"hello world"}\n'
+        '{"utt_id":"two","ref_text":"speech test","pred_text":"speech"}\n',
+        encoding="utf-8",
+    )
+    receipt = build_stage211_student_public_prediction_receipt(
+        checkpoint_path=checkpoint,
+        manifest_paths={dataset: manifest},
+        prediction_paths={dataset: prediction},
+        benchmarks=benchmarks,
+    )
+    receipt_path = tmp_path / "student_prediction_receipt.json"
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+
+    validated = validate_stage211_student_public_prediction_receipt(
+        receipt_path,
+        expected_checkpoint=checkpoint,
+        expected_manifest_paths={dataset: manifest},
+        expected_prediction_paths={dataset: prediction},
+        benchmarks=benchmarks,
+    )
+    assert validated["total_samples"] == 2
+    monkeypatch.setattr(
+        public_compare,
+        "DATASETS",
+        {
+            dataset: {
+                "language": "en",
+                "label": "LibriSpeech test-clean",
+                "metric": "wer",
+                "samples": 2,
+            }
+        },
+    )
+    comparison = public_compare.build_report(
+        student_prediction_dir=tmp_path,
+        nano_predictions={dataset: prediction},
+        normalization="ctc",
+        max_relative_ratio=1.20,
+        max_absolute_gap_points=3.0,
+        student_checkpoint=checkpoint,
+        student_prediction_receipt=receipt_path,
+    )
+    assert comparison["student_prediction_receipt_path"] == str(receipt_path.resolve())
+    assert comparison["student_prediction_receipt_sha256"] == sha256_file(receipt_path)
+    with pytest.raises(ValueError, match="checkpoint mismatch"):
+        validate_stage211_student_public_prediction_receipt(
+            receipt_path,
+            expected_checkpoint=other_checkpoint,
+            expected_manifest_paths={dataset: manifest},
+            expected_prediction_paths={dataset: prediction},
+            benchmarks=benchmarks,
+        )
+
+    prediction.write_text(
+        prediction.read_text(encoding="utf-8").replace('"speech"}', '"speech test"}'),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="does not match current files"):
+        validate_stage211_student_public_prediction_receipt(
+            receipt_path,
+            expected_checkpoint=checkpoint,
+            expected_manifest_paths={dataset: manifest},
+            expected_prediction_paths={dataset: prediction},
+            benchmarks=benchmarks,
+        )
 
 
 def test_stage211_mixer_finalizer_evaluates_latest_retention_checkpoint(
@@ -3857,6 +3947,7 @@ def _write_public_comparison_evidence_fixture(
     candidate_results: list[dict[str, object]] = []
     baseline_results: list[dict[str, object]] = []
     manifest_paths: dict[str, Path] = {}
+    candidate_prediction_paths: dict[str, Path] = {}
     public_labels = {
         "aishell1_test": "AISHELL-1 test",
         "librispeech_test_clean": "LibriSpeech test-clean",
@@ -3920,6 +4011,7 @@ def _write_public_comparison_evidence_fixture(
         os.link(nano_path, candidate_path)
         baseline_path.write_text("".join(baseline_rows), encoding="utf-8")
         manifest_paths[dataset] = manifest_path.resolve()
+        candidate_prediction_paths[dataset] = candidate_path.resolve()
 
         def fixture_result(*, student_path: Path, baseline: bool) -> dict[str, object]:
             nano_wer = (
@@ -4023,6 +4115,27 @@ def _write_public_comparison_evidence_fixture(
         path=candidate_report_path,
         student_checkpoint=checkpoint,
         results=candidate_results,
+    )
+    candidate_receipt_path = tmp_path / "candidate-public-prediction-receipt.json"
+    candidate_receipt = build_stage211_student_public_prediction_receipt(
+        checkpoint_path=checkpoint,
+        manifest_paths=manifest_paths,
+        prediction_paths=candidate_prediction_paths,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+    )
+    candidate_receipt_path.write_text(
+        json.dumps(candidate_receipt, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    candidate_report["student_prediction_receipt_path"] = str(
+        candidate_receipt_path.resolve()
+    )
+    candidate_report["student_prediction_receipt_sha256"] = sha256_file(
+        candidate_receipt_path
+    )
+    candidate_report_path.write_text(
+        json.dumps(candidate_report) + "\n",
+        encoding="utf-8",
     )
     baseline_report_path = tmp_path / "baseline-public-comparison.json"
     baseline_report = write_report(
@@ -5075,6 +5188,37 @@ def _write_corrected_phase_gate(
     public_source = json.loads(public_source_path.read_text(encoding="utf-8"))
     public_source["student_checkpoint_path"] = str(checkpoint.resolve())
     public_source["student_checkpoint_sha256"] = sha256_file(checkpoint)
+    prior_receipt_path = Path(public_source["student_prediction_receipt_path"])
+    prior_receipt = json.loads(prior_receipt_path.read_text(encoding="utf-8"))
+    receipt_results = {
+        str(result["dataset"]): result for result in prior_receipt["results"]
+    }
+    public_results = {
+        str(result["dataset"]): result for result in public_source["results"]
+    }
+    corrected_receipt = build_stage211_student_public_prediction_receipt(
+        checkpoint_path=checkpoint,
+        manifest_paths={
+            dataset: Path(str(receipt_results[dataset]["manifest_path"]))
+            for dataset in STAGE211_PUBLIC_BENCHMARKS
+        },
+        prediction_paths={
+            dataset: Path(str(public_results[dataset]["student_prediction_path"]))
+            for dataset in STAGE211_PUBLIC_BENCHMARKS
+        },
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+    )
+    corrected_receipt_path = tmp_path / "corrected-public-prediction-receipt.json"
+    corrected_receipt_path.write_text(
+        json.dumps(corrected_receipt) + "\n",
+        encoding="utf-8",
+    )
+    public_source["student_prediction_receipt_path"] = str(
+        corrected_receipt_path.resolve()
+    )
+    public_source["student_prediction_receipt_sha256"] = sha256_file(
+        corrected_receipt_path
+    )
     corrected_public_source_path = tmp_path / "corrected-public-comparison.json"
     corrected_public_source_path.write_text(
         json.dumps(public_source) + "\n",
@@ -5084,6 +5228,12 @@ def _write_corrected_phase_gate(
     report["public_comparison_report_sha256"] = sha256_file(corrected_public_source_path)
     report["public_benchmark"]["student_checkpoint_path"] = str(checkpoint.resolve())
     report["public_benchmark"]["student_checkpoint_sha256"] = sha256_file(checkpoint)
+    report["public_benchmark"]["student_prediction_receipt_path"] = str(
+        corrected_receipt_path.resolve()
+    )
+    report["public_benchmark"]["student_prediction_receipt_sha256"] = sha256_file(
+        corrected_receipt_path
+    )
     corrected_gate = tmp_path / "corrected_phase_gate.json"
     corrected_gate.write_text(json.dumps(report) + "\n", encoding="utf-8")
     return corrected_gate
@@ -5355,6 +5505,33 @@ def test_stage211_phase_gate_replays_public_wer_cer_from_predictions(
     gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="replayed student_error_rate mismatch"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="logits",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_missing_student_prediction_provenance(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="logits",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    comparison_path = Path(gate["public_comparison_report_path"])
+    comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+    comparison.pop("student_prediction_receipt_path")
+    comparison.pop("student_prediction_receipt_sha256")
+    comparison_path.write_text(json.dumps(comparison) + "\n", encoding="utf-8")
+    gate["public_comparison_report_sha256"] = sha256_file(comparison_path)
+    gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lacks student prediction provenance"):
         validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="logits",
