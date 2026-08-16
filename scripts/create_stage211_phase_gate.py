@@ -15,6 +15,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
     build_stage211_full_data_coverage,
+    build_stage211_trajectory_retention_gate,
     load_stage211_post_coverage_correction_receipts,
     sha256_file,
     validate_stage211_full_profile_smoke_binding,
@@ -400,9 +401,18 @@ def build_phase_gate(
             "path": str(baseline_public_comparison_report_path),
             "sha256": sha256_file(baseline_public_comparison_report_path),
         }
+    trajectory_retention = build_stage211_trajectory_retention_gate(
+        phase=phase,
+        segments=coverage,
+        supplemental_segment=supplemental_coverage,
+        post_coverage_corrections=correction_receipts,
+        checkpoint_path=checkpoint_path,
+    )
+    trajectory_retention_gate_passed = bool(trajectory_retention["gate_passed"])
     gate_passed = (
         alignment_gate_passed
         and public_progress_gate_passed
+        and trajectory_retention_gate_passed
         and (phase != "logits" or benchmark.get("all_datasets_pass") is True)
     )
     final_checkpoint_sha256 = sha256_file(checkpoint_path)
@@ -416,6 +426,8 @@ def build_phase_gate(
         "gate_passed": gate_passed,
         "alignment_gate_passed": alignment_gate_passed,
         "public_progress_gate_passed": public_progress_gate_passed,
+        "trajectory_retention_gate_passed": trajectory_retention_gate_passed,
+        "trajectory_retention": trajectory_retention,
         "preflight_smoke": preflight_smoke,
         "global_dedup_manifest_path": str(global_dedup_manifest_path),
         "global_dedup_manifest_sha256": sha256_file(global_dedup_manifest_path),

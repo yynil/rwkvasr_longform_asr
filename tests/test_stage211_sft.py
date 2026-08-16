@@ -1249,6 +1249,17 @@ def _write_stepwise_inputs(
             baseline_checkpoint=checkpoints[previous],
             checkpoint=checkpoints[stage],
         )
+        trajectory_source_order = [
+            "easy",
+            "medium",
+            "hard",
+            "long",
+            "supplemental_natural",
+        ]
+        trajectory_entries = [
+            {"source_name": source_name, "eval_loss": 0.5}
+            for source_name in trajectory_source_order
+        ]
         gate = tmp_path / f"{stage}-gate.json"
         gate.write_text(
             json.dumps(
@@ -1258,6 +1269,26 @@ def _write_stepwise_inputs(
                     "checkpoint_path": str(checkpoints[stage].resolve()),
                     "checkpoint_sha256": sha256_file(checkpoints[stage]),
                     "alignment_gate_passed": True,
+                    "trajectory_retention_gate_passed": True,
+                    "trajectory_retention": {
+                        "gate_passed": True,
+                        "fixed_eval_samples": 256,
+                        "max_relative_regression_pct": 10.0,
+                        "source_order": trajectory_source_order,
+                        "entries": trajectory_entries,
+                        "best_prior": {
+                            "source_name": "easy",
+                            "eval_loss": 0.5,
+                        },
+                        "candidate": {
+                            "source_name": "supplemental_natural",
+                            "eval_loss": 0.5,
+                            "checkpoint_sha256": sha256_file(checkpoints[stage]),
+                        },
+                        "best_prior_loss": 0.5,
+                        "candidate_loss": 0.5,
+                        "relative_regression_pct": 0.0,
+                    },
                     "alignment_report": {
                         "path": str(alignment_path.resolve()),
                         "sha256": sha256_file(alignment_path),

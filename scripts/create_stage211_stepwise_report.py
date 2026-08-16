@@ -815,6 +815,57 @@ def _decoder_result(raw: Any, *, label: str) -> dict[str, Any] | None:
     }
 
 
+def _trajectory_retention_result(
+    *,
+    phase: str,
+    phase_report: dict[str, Any],
+) -> dict[str, Any]:
+    trajectory = phase_report.get("trajectory_retention")
+    if (
+        not isinstance(trajectory, dict)
+        or phase_report.get("trajectory_retention_gate_passed") is not True
+        or trajectory.get("gate_passed") is not True
+        or int(trajectory.get("fixed_eval_samples", -1)) != 256
+        or float(trajectory.get("max_relative_regression_pct", float("nan"))) != 10.0
+    ):
+        raise ValueError(f"Stage211 {phase} trajectory-retention evidence did not pass.")
+    source_order = trajectory.get("source_order")
+    entries = trajectory.get("entries")
+    required_prefix = ["easy", "medium", "hard", "long", "supplemental_natural"]
+    if (
+        not isinstance(source_order, list)
+        or source_order[: len(required_prefix)] != required_prefix
+        or not isinstance(entries, list)
+        or len(entries) != len(source_order)
+    ):
+        raise ValueError(f"Stage211 {phase} trajectory-retention source order is invalid.")
+    best_prior = trajectory.get("best_prior")
+    candidate = trajectory.get("candidate")
+    if not isinstance(best_prior, dict) or not isinstance(candidate, dict):
+        raise ValueError(f"Stage211 {phase} trajectory-retention endpoints are invalid.")
+    if candidate.get("checkpoint_sha256") != phase_report.get("checkpoint_sha256"):
+        raise ValueError(f"Stage211 {phase} trajectory candidate checkpoint mismatch.")
+    return {
+        "gate_passed": True,
+        "fixed_eval_samples": 256,
+        "source_order": [str(value) for value in source_order],
+        "terminal_entries": len(entries),
+        "best_prior_source": str(best_prior.get("source_name") or ""),
+        "best_prior_loss": _finite_float(
+            trajectory.get("best_prior_loss"), label=f"{phase} trajectory best-prior loss"
+        ),
+        "candidate_source": str(candidate.get("source_name") or ""),
+        "candidate_loss": _finite_float(
+            trajectory.get("candidate_loss"), label=f"{phase} trajectory candidate loss"
+        ),
+        "relative_regression_pct": _finite_float(
+            trajectory.get("relative_regression_pct"),
+            label=f"{phase} trajectory relative regression",
+        ),
+        "max_relative_regression_pct": 10.0,
+    }
+
+
 def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, Any]:
     record = phase_report.get("alignment_report")
     if not isinstance(record, dict):
@@ -857,6 +908,10 @@ def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, 
             int(cell.get("samples", -1))
             for cell in stratified["cells"].values()
             if isinstance(cell, dict)
+        ),
+        "trajectory_retention": _trajectory_retention_result(
+            phase=phase,
+            phase_report=phase_report,
         ),
     }
     if common["fixed_eval_samples"] != 256 or common["stratified_samples"] != 256 * len(
@@ -1913,6 +1968,27 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{int(alignment['stratified_samples']):,} | "
             f"{len(alignment['stratified_cells'])} | "
             f"`{alignment['source_report_sha256']}` | pass |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Intra-Phase Retention",
+            "",
+            "| Stage | Terminal reports | Best prior segment | Best loss | "
+            "Candidate segment | Candidate loss | Regression | Limit | Gate |",
+            "|---|---:|---|---:|---|---:|---:|---:|---:|",
+        )
+    )
+    for alignment in report["alignment_results"]:
+        trajectory = alignment["trajectory_retention"]
+        lines.append(
+            f"| {alignment['label']} | {int(trajectory['terminal_entries'])} | "
+            f"`{trajectory['best_prior_source']}` | "
+            f"{float(trajectory['best_prior_loss']):.6f} | "
+            f"`{trajectory['candidate_source']}` | "
+            f"{float(trajectory['candidate_loss']):.6f} | "
+            f"{float(trajectory['relative_regression_pct']):+.3f}% | "
+            f"{float(trajectory['max_relative_regression_pct']):.3f}% | pass |"
         )
     lines.extend(
         (

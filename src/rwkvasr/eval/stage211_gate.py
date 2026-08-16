@@ -25,8 +25,9 @@ from rwkvasr.eval.stage211_supplemental import (
 )
 
 
-STAGE211_PHASE_GATE_SCHEMA_VERSION = 1
+STAGE211_PHASE_GATE_SCHEMA_VERSION = 2
 STAGE211_NANO_PUBLIC_BASELINE_SCHEMA_VERSION = 1
+STAGE211_TRAJECTORY_RETENTION_SCHEMA_VERSION = 1
 STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
@@ -76,6 +77,7 @@ _STAGE211_ALIGNMENT_PHASE_COMPONENTS = {
 }
 _STAGE211_ALIGNMENT_MIN_IMPROVED_LAYERS = 68
 _STAGE211_ALIGNMENT_MAX_CELL_REGRESSION_PCT = 10.0
+STAGE211_MAX_TRAJECTORY_RETENTION_REGRESSION_PCT = 10.0
 _STAGE211_LOGITS_MIN_KL_RELATIVE_REDUCTION = 0.05
 _STAGE211_LOGITS_RATIO_MIN = 0.90
 _STAGE211_LOGITS_RATIO_MAX = 1.10
@@ -2286,6 +2288,254 @@ def load_stage211_post_coverage_correction_receipts(
     return corrections
 
 
+def _stage211_trajectory_retention_entry(
+    *,
+    phase: str,
+    order: int,
+    source_kind: str,
+    source_name: str,
+    record: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[tuple[str, int], ...]]:
+    if record.get("phase") != phase:
+        raise ValueError(
+            f"Stage211 {source_name} trajectory source phase mismatch: "
+            f"expected={phase!r} actual={record.get('phase')!r}"
+        )
+    run_dir = Path(str(record.get("run_dir") or "")).expanduser().resolve()
+    if not run_dir.is_dir():
+        raise ValueError(f"Stage211 {source_name} trajectory run directory is unavailable.")
+    try:
+        step = int(record.get("steps", -1))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Stage211 {source_name} trajectory terminal step is invalid.") from error
+    if step <= 0:
+        raise ValueError(f"Stage211 {source_name} trajectory terminal step is invalid.")
+
+    receipt_path = _validate_bound_file(
+        record,
+        path_key="receipt_path",
+        sha256_key="receipt_sha256",
+        label=f"Stage211 {phase}/{source_name} trajectory receipt",
+    )
+    checkpoint_path = _validate_bound_file(
+        record,
+        path_key="completion_checkpoint_path",
+        sha256_key="completion_checkpoint_sha256",
+        label=f"Stage211 {phase}/{source_name} trajectory checkpoint",
+    )
+    train_config_path = _validate_bound_file(
+        record,
+        path_key="train_config_path",
+        sha256_key="train_config_sha256",
+        label=f"Stage211 {phase}/{source_name} trajectory train config",
+    )
+    manifest_path = _validate_bound_file(
+        record,
+        path_key="bucket_manifest_path",
+        sha256_key="bucket_manifest_sha256",
+        label=f"Stage211 {phase}/{source_name} trajectory bucket manifest",
+    )
+    eval_report_path = run_dir / f"step_eval_layers_step-{step}.yaml"
+    if not eval_report_path.is_file() or eval_report_path.stat().st_size <= 0:
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} terminal fixed-eval report is unavailable: "
+            f"{eval_report_path}"
+        )
+    eval_report = load_yaml(eval_report_path)
+    if not isinstance(eval_report, dict):
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} terminal fixed-eval report must be an object."
+        )
+    if (
+        int(eval_report.get("step", -1)) != step
+        or int(eval_report.get("eval_samples", -1)) != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
+    ):
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} terminal fixed-eval step or coverage mismatch."
+        )
+    eval_loss = _stage211_alignment_float(
+        eval_report.get("eval_loss"),
+        label=f"{phase}/{source_name} trajectory fixed loss",
+    )
+    if eval_loss < 0.0:
+        raise ValueError(f"Stage211 {phase}/{source_name} trajectory loss is negative.")
+    provenance = eval_report.get("eval_provenance")
+    fingerprint = _validate_stage211_alignment_eval_provenance(
+        provenance,
+        label=f"{phase}/{source_name} trajectory",
+    )
+    assert isinstance(provenance, dict)
+    if (
+        Path(str(provenance.get("bucket_manifest_path") or "")).expanduser().resolve()
+        != manifest_path
+        or provenance.get("bucket_manifest_sha256") != record.get("bucket_manifest_sha256")
+    ):
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} trajectory eval manifest binding mismatch."
+        )
+    raw_feature_seed = provenance.get("feature_seed")
+    legacy_missing_feature_seed = (
+        raw_feature_seed is None
+        and "feature_seed" not in provenance
+        and phase == "mixer"
+        and source_kind == "curriculum"
+        and source_name == "easy"
+    )
+    if raw_feature_seed != 0 and not legacy_missing_feature_seed:
+        raise ValueError(
+            f"Stage211 {phase}/{source_name} trajectory fixed feature seed mismatch."
+        )
+
+    try:
+        components = _STAGE211_ALIGNMENT_PHASE_COMPONENTS[phase]
+    except KeyError as error:
+        raise ValueError(f"Unsupported Stage211 trajectory phase: {phase!r}.") from error
+    for component in components:
+        _stage211_alignment_component_layers(
+            eval_report,
+            phase=phase,
+            role=f"{source_name} trajectory",
+            component=component,
+        )
+    if phase in {"block", "logits"}:
+        decoder_hidden = eval_report.get("decoder_hidden_metrics")
+        if not isinstance(decoder_hidden, dict):
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} trajectory lacks decoder hidden metrics."
+            )
+        _stage211_alignment_float(
+            decoder_hidden.get("loss"),
+            label=f"{phase}/{source_name} trajectory decoder hidden loss",
+        )
+    if phase == "logits":
+        _validate_stage211_logits_metrics(
+            eval_report.get("logit_metrics"),
+            label=f"{phase}/{source_name} trajectory",
+            expected_matched=STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        )
+
+    return (
+        {
+            "order": order,
+            "source_kind": source_kind,
+            "source_name": source_name,
+            "run_dir": str(run_dir),
+            "receipt_path": str(receipt_path),
+            "receipt_sha256": str(record["receipt_sha256"]),
+            "step": step,
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_sha256": str(record["completion_checkpoint_sha256"]),
+            "train_config_path": str(train_config_path),
+            "train_config_sha256": str(record["train_config_sha256"]),
+            "eval_report_path": str(eval_report_path),
+            "eval_report_sha256": sha256_file(eval_report_path),
+            "eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+            "feature_seed": 0,
+            "legacy_missing_feature_seed": legacy_missing_feature_seed,
+            "eval_loss": eval_loss,
+            "eval_part_fingerprint": [
+                {"sha256": sha256, "num_samples": num_samples}
+                for sha256, num_samples in fingerprint
+            ],
+        },
+        fingerprint,
+    )
+
+
+def build_stage211_trajectory_retention_gate(
+    *,
+    phase: str,
+    segments: list[dict[str, Any]],
+    supplemental_segment: dict[str, Any],
+    post_coverage_corrections: list[dict[str, Any]] | None,
+    checkpoint_path: str | Path,
+) -> dict[str, Any]:
+    if not isinstance(segments, list) or any(not isinstance(segment, dict) for segment in segments):
+        raise ValueError("Stage211 trajectory retention curriculum records are invalid.")
+    if not isinstance(supplemental_segment, dict):
+        raise ValueError("Stage211 trajectory retention lacks supplemental_natural coverage.")
+    expected_difficulties = tuple(STAGE211_AUDIO_CURRICULUM)
+    actual_difficulties = tuple(str(segment.get("difficulty") or "") for segment in segments)
+    if actual_difficulties != expected_difficulties:
+        raise ValueError(
+            "Stage211 trajectory retention requires ordered easy, medium, hard, and long."
+        )
+    if supplemental_segment.get("difficulty") != STAGE211_SUPPLEMENTAL_DIFFICULTY:
+        raise ValueError("Stage211 trajectory retention lacks supplemental_natural coverage.")
+    corrections = list(post_coverage_corrections or [])
+    sources = [
+        ("curriculum", str(segment["difficulty"]), segment) for segment in segments
+    ]
+    sources.append(
+        ("curriculum", STAGE211_SUPPLEMENTAL_DIFFICULTY, supplemental_segment)
+    )
+    sources.extend(
+        ("correction", f"correction_round_{index}", correction)
+        for index, correction in enumerate(corrections, start=1)
+    )
+
+    entries: list[dict[str, Any]] = []
+    shared_fingerprint: tuple[tuple[str, int], ...] | None = None
+    for order, (source_kind, source_name, record) in enumerate(sources):
+        entry, fingerprint = _stage211_trajectory_retention_entry(
+            phase=phase,
+            order=order,
+            source_kind=source_kind,
+            source_name=source_name,
+            record=record,
+        )
+        if shared_fingerprint is not None and fingerprint != shared_fingerprint:
+            raise ValueError(
+                f"Stage211 {phase}/{source_name} trajectory uses different fixed-eval samples."
+            )
+        shared_fingerprint = fingerprint
+        entries.append(entry)
+
+    if len(entries) < 2:
+        raise ValueError("Stage211 trajectory retention requires prior and candidate entries.")
+    checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+    candidate = entries[-1]
+    if (
+        Path(str(candidate["checkpoint_path"])).resolve() != checkpoint_path
+        or candidate["checkpoint_sha256"] != sha256_file(checkpoint_path)
+    ):
+        raise ValueError("Stage211 trajectory candidate is not the phase checkpoint.")
+    best_prior_index = min(
+        range(len(entries) - 1),
+        key=lambda index: float(entries[index]["eval_loss"]),
+    )
+    best_prior = entries[best_prior_index]
+    best_prior_loss = float(best_prior["eval_loss"])
+    candidate_loss = float(candidate["eval_loss"])
+    max_candidate_loss = best_prior_loss * (
+        1.0 + STAGE211_MAX_TRAJECTORY_RETENTION_REGRESSION_PCT / 100.0
+    )
+    relative_regression_pct = (
+        (candidate_loss - best_prior_loss) / max(abs(best_prior_loss), 1.0e-12) * 100.0
+    )
+    gate_passed = candidate_loss <= max_candidate_loss + _STAGE211_ALIGNMENT_TOLERANCE
+    return {
+        "schema_version": STAGE211_TRAJECTORY_RETENTION_SCHEMA_VERSION,
+        "pipeline": "stage211",
+        "artifact": "intra_phase_trajectory_retention_gate",
+        "phase": phase,
+        "gate_passed": gate_passed,
+        "fixed_eval_samples": STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
+        "max_relative_regression_pct": STAGE211_MAX_TRAJECTORY_RETENTION_REGRESSION_PCT,
+        "source_order": [entry["source_name"] for entry in entries],
+        "eval_part_fingerprint": list(entries[0]["eval_part_fingerprint"]),
+        "entries": entries,
+        "best_prior_index": best_prior_index,
+        "best_prior": dict(best_prior),
+        "candidate_index": len(entries) - 1,
+        "candidate": dict(candidate),
+        "best_prior_loss": best_prior_loss,
+        "candidate_loss": candidate_loss,
+        "max_candidate_loss": max_candidate_loss,
+        "relative_regression_pct": relative_regression_pct,
+    }
+
+
 def build_stage211_full_data_coverage(
     *,
     phase: str,
@@ -3496,6 +3746,25 @@ def validate_stage211_phase_gate_report(
         init_checkpoint=phase_init_checkpoint,
         easy_manifest=Path(str(easy_segment.get("bucket_manifest_path") or "")).resolve(),
     )
+    replayed_trajectory_retention = build_stage211_trajectory_retention_gate(
+        phase=expected_phase,
+        segments=phase_segments,
+        supplemental_segment=coverage.get("supplemental_natural"),
+        post_coverage_corrections=coverage.get("post_coverage_corrections", []),
+        checkpoint_path=checkpoint_path,
+    )
+    _validate_stage211_replayed_value(
+        report.get("trajectory_retention"),
+        replayed_trajectory_retention,
+        label=f"{expected_phase} intra-phase trajectory retention gate",
+    )
+    trajectory_retention_gate_passed = report.get("trajectory_retention_gate_passed")
+    if not isinstance(trajectory_retention_gate_passed, bool):
+        raise ValueError("Stage211 phase gate lacks a boolean trajectory-retention decision.")
+    if trajectory_retention_gate_passed != bool(replayed_trajectory_retention["gate_passed"]):
+        raise ValueError(
+            "Stage211 phase trajectory-retention decision does not match replayed evidence."
+        )
     benchmark = validate_stage211_public_benchmark(
         report.get("public_benchmark"),
         require_metric_source_recomputed=True,
@@ -3725,16 +3994,24 @@ def validate_stage211_phase_gate_report(
             "replayed WER/CER evidence."
         )
     if expected_phase in {"mixer", "block"}:
-        expected_gate_passed = alignment_gate_passed and public_progress_gate_passed
+        expected_gate_passed = (
+            alignment_gate_passed
+            and public_progress_gate_passed
+            and trajectory_retention_gate_passed
+        )
         if require_passed and not public_progress_gate_passed:
             raise ValueError(f"Stage211 {expected_phase} public progress gate did not pass.")
     elif expected_phase == "logits":
         datasets_passed = benchmark.get("all_datasets_pass") is True
-        expected_gate_passed = alignment_gate_passed and datasets_passed
+        expected_gate_passed = (
+            alignment_gate_passed and datasets_passed and trajectory_retention_gate_passed
+        )
         if require_passed and not datasets_passed:
             raise ValueError("Stage211 logits phase must pass the every-dataset Nano WER/CER gate.")
     else:
         raise ValueError(f"Stage211 phase {expected_phase!r} cannot promote.")
     if gate_passed != expected_gate_passed:
         raise ValueError("Stage211 phase gate decision is inconsistent with its sub-gates.")
+    if require_passed and not trajectory_retention_gate_passed:
+        raise ValueError("Stage211 phase intra-phase trajectory retention gate did not pass.")
     return report

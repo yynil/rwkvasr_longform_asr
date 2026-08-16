@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from rwkvasr.config import save_yaml
+from rwkvasr.config import load_yaml, save_yaml
 from rwkvasr.eval.stage211_gate import (
     STAGE211_ALLOWED_OPERATOR_KEY_MARKERS,
     STAGE211_AUDIO_CURRICULUM,
@@ -25,10 +25,12 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
     STAGE211_GLOBAL_DEDUP_TOTAL_HOURS,
+    STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
     STAGE211_RETENTION_CORRECTION_EPOCHS,
     STAGE211_RETENTION_CORRECTION_LR,
     build_stage211_full_data_coverage,
+    build_stage211_trajectory_retention_gate,
     sha256_file,
     stage211_post_coverage_correction_exposure,
     stage211_phase_train_config_contract,
@@ -2716,6 +2718,8 @@ def _write_supplemental_coverage_fixture(
     nano_teacher_dir: Path,
 ) -> tuple[dict[str, object], dict[str, object]]:
     inventory_path, profile = _write_supplemental_inventory_fixture(tmp_path)
+    run_dir = tmp_path / f"{phase}-supplemental-run"
+    run_dir.mkdir(exist_ok=True)
     provenance = tmp_path / "supplemental-provenance.json"
     provenance.write_text("{}\n", encoding="utf-8")
     train_config = tmp_path / "supplemental-train-config.yaml"
@@ -2759,6 +2763,7 @@ def _write_supplemental_coverage_fixture(
         "hour_exposures": profile["hour_exposures"],
         "steps_per_epoch": profile["steps_per_epoch"],
         "steps": profile["steps"],
+        "run_dir": str(run_dir.resolve()),
         "supplemental_inventory_path": str(inventory_path.resolve()),
         "supplemental_inventory_sha256": sha256_file(inventory_path),
         "provenance_path": str(provenance.resolve()),
@@ -4068,6 +4073,72 @@ def _write_public_comparison_evidence_fixture(
     )
 
 
+def _write_trajectory_eval_fixture(
+    *,
+    phase: str,
+    record: dict[str, object],
+    eval_loss: float,
+    eval_parts: list[dict[str, object]] | None = None,
+) -> Path:
+    run_dir = Path(str(record["run_dir"]))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(str(record["bucket_manifest_path"]))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    eval_split = manifest["splits"]["eval"]
+    parts = list(eval_parts or [])
+    if not parts:
+        for bucket in eval_split["buckets"]:
+            for raw_part in bucket["parts"]:
+                part_path = Path(str(raw_part["path"]))
+                if not part_path.is_absolute():
+                    manifest_relative = manifest_path.parent / part_path
+                    part_path = (
+                        manifest_relative
+                        if manifest_relative.is_file()
+                        else Path(str(manifest.get("root") or manifest_path.parent)) / part_path
+                    )
+                part_path = part_path.resolve()
+                parts.append(
+                    {
+                        "path": str(part_path),
+                        "sha256": sha256_file(part_path),
+                        "num_samples": int(raw_part["num_samples"]),
+                    }
+                )
+    components = _ALIGNMENT_PHASE_COMPONENTS[phase]
+    report: dict[str, object] = {
+        "step": int(record["steps"]),
+        "eval_loss": eval_loss,
+        "eval_samples": 256,
+        "eval_provenance": {
+            "schema_version": 1,
+            "split": "eval",
+            "requested_samples": 256,
+            "feature_seed": 0,
+            "bucket_manifest_path": str(manifest_path.resolve()),
+            "bucket_manifest_sha256": sha256_file(manifest_path),
+            "split_samples": 256,
+            "parts": parts,
+        },
+        "layers": _alignment_layers(candidate=True),
+        "layer_components": {
+            component: _alignment_layers(candidate=True) for component in components
+        },
+        "decoder_hidden_metrics": {},
+        "logit_metrics": {},
+    }
+    if phase in {"block", "logits"}:
+        report["decoder_hidden_metrics"] = {"loss": eval_loss}
+    if phase == "logits":
+        report["logit_metrics"] = _alignment_logits_metrics(
+            candidate=True,
+            matched_utterances=256,
+        )
+    output = run_dir / f"step_eval_layers_step-{int(record['steps'])}.yaml"
+    save_yaml(output, report)
+    return output
+
+
 def _write_valid_phase_gate(
     tmp_path: Path,
     *,
@@ -4084,14 +4155,16 @@ def _write_valid_phase_gate(
     previous_checkpoint = tmp_path / "phase-init.pt"
     previous_checkpoint.write_bytes(b"phase-init")
     for index, (difficulty, expected) in enumerate(STAGE211_AUDIO_CURRICULUM.items()):
+        run_dir = tmp_path / f"{phase}-{difficulty}-run"
+        run_dir.mkdir()
         manifest = runtime_manifests[difficulty]
-        provenance = tmp_path / f"{difficulty}-provenance.json"
+        provenance = run_dir / "stage211_provenance.json"
         provenance.write_text("{}\n", encoding="utf-8")
-        train_config = tmp_path / f"{difficulty}-train-config.yaml"
+        train_config = run_dir / "train_config.yaml"
         train_config_payload = stage211_phase_train_config_contract(phase)
         train_config_payload["ctc_teacher_online_model_path"] = str(nano_teacher_dir.resolve())
         save_yaml(train_config, train_config_payload)
-        completion = tmp_path / f"{difficulty}.pt"
+        completion = run_dir / f"step-{int(expected['steps'])}.pt"
         completion.write_bytes(f"checkpoint-{index}".encode())
         runtime_epoch_coverage = _write_runtime_epoch_coverage(
             tmp_path,
@@ -4128,6 +4201,7 @@ def _write_valid_phase_gate(
             "hour_exposures": expected["hours"] * STAGE211_FULL_DATA_EPOCHS,
             "steps_per_epoch": expected["steps_per_epoch"],
             "steps": expected["steps"],
+            "run_dir": str(run_dir.resolve()),
             "provenance_path": str(provenance.resolve()),
             "provenance_sha256": sha256_file(provenance),
             "train_config_path": str(train_config.resolve()),
@@ -4159,6 +4233,11 @@ def _write_valid_phase_gate(
         receipt.write_text(json.dumps(segment) + "\n", encoding="utf-8")
         segment["receipt_path"] = str(receipt.resolve())
         segment["receipt_sha256"] = sha256_file(receipt)
+        _write_trajectory_eval_fixture(
+            phase=phase,
+            record=segment,
+            eval_loss=1.0 - index * 0.1,
+        )
         segments.append(segment)
         previous_checkpoint = completion
 
@@ -4169,10 +4248,30 @@ def _write_valid_phase_gate(
         completion_checkpoint=checkpoint,
         nano_teacher_dir=nano_teacher_dir,
     )
+    _write_trajectory_eval_fixture(
+        phase=phase,
+        record=supplemental_segment,
+        eval_loss=0.5,
+        eval_parts=list(
+            load_yaml(
+                Path(str(segments[0]["run_dir"]))
+                / f"step_eval_layers_step-{int(segments[0]['steps'])}.yaml"
+            )[
+                "eval_provenance"
+            ]["parts"]
+        ),
+    )
     full_data_coverage = build_stage211_full_data_coverage(
         phase=phase,
         segments=segments,
         supplemental_segment=supplemental_segment,
+        checkpoint_path=checkpoint,
+    )
+    trajectory_retention = build_stage211_trajectory_retention_gate(
+        phase=phase,
+        segments=segments,
+        supplemental_segment=supplemental_segment,
+        post_coverage_corrections=[],
         checkpoint_path=checkpoint,
     )
 
@@ -4305,7 +4404,7 @@ def _write_valid_phase_gate(
     gate_report.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": STAGE211_PHASE_GATE_SCHEMA_VERSION,
                 "pipeline": "stage211",
                 "artifact": "phase_gate",
                 "phase": phase,
@@ -4314,6 +4413,8 @@ def _write_valid_phase_gate(
                 "gate_passed": True,
                 "alignment_gate_passed": True,
                 "public_progress_gate_passed": True,
+                "trajectory_retention_gate_passed": True,
+                "trajectory_retention": trajectory_retention,
                 "public_comparison_report_path": str(public_comparison_report.resolve()),
                 "public_comparison_report_sha256": sha256_file(public_comparison_report),
                 "baseline_public_comparison_report": (
@@ -4384,12 +4485,189 @@ def test_stage211_stepwise_alignment_disclosure_accepts_deep_phase_evidence(
     assert disclosure["fixed_eval_samples"] == 256
     assert disclosure["stratified_samples"] == 2_304
     assert disclosure["stratified_cells"] == list(stage211_stepwise_report.ALIGNMENT_CELLS)
+    assert disclosure["trajectory_retention"] == {
+        "gate_passed": True,
+        "fixed_eval_samples": 256,
+        "source_order": [
+            "easy",
+            "medium",
+            "hard",
+            "long",
+            STAGE211_SUPPLEMENTAL_DIFFICULTY,
+        ],
+        "terminal_entries": 5,
+        "best_prior_source": "long",
+        "best_prior_loss": pytest.approx(0.7),
+        "candidate_source": STAGE211_SUPPLEMENTAL_DIFFICULTY,
+        "candidate_loss": pytest.approx(0.5),
+        "relative_regression_pct": pytest.approx(-28.5714285714),
+        "max_relative_regression_pct": 10.0,
+    }
     if phase == "logits":
         assert disclosure["fixed"]["metrics"]["full_kl"]["candidate"] == pytest.approx(0.8)
         assert set(disclosure["fixed"]["hidden_components"]) == {"mixer", "ffn", "block"}
     else:
         expected_components = {"mixer"} if phase == "mixer" else {"mixer", "ffn", "block"}
         assert set(disclosure["fixed"]["components"]) == expected_components
+
+
+def test_stage211_phase_gate_fails_trajectory_regression_from_best_prior(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-105.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_path = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    coverage = gate["full_data_coverage"]
+    candidate_report_path = Path(
+        gate["trajectory_retention"]["candidate"]["eval_report_path"]
+    )
+    candidate_report = load_yaml(candidate_report_path)
+    candidate_report["eval_loss"] = 0.8
+    save_yaml(candidate_report_path, candidate_report)
+    trajectory = build_stage211_trajectory_retention_gate(
+        phase="mixer",
+        segments=coverage["segments"],
+        supplemental_segment=coverage["supplemental_natural"],
+        post_coverage_corrections=[],
+        checkpoint_path=checkpoint,
+    )
+    assert trajectory["best_prior"]["source_name"] == "long"
+    assert trajectory["best_prior_loss"] == pytest.approx(0.7)
+    assert trajectory["candidate_loss"] == pytest.approx(0.8)
+    assert trajectory["relative_regression_pct"] == pytest.approx(14.2857142857)
+    assert trajectory["gate_passed"] is False
+
+    gate["trajectory_retention"] = trajectory
+    gate["trajectory_retention_gate_passed"] = False
+    gate["gate_passed"] = False
+    gate_path.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+    validated = validate_stage211_phase_gate_report(
+        gate_path,
+        expected_phase="mixer",
+        checkpoint_path=checkpoint,
+        require_passed=False,
+    )
+    assert validated["alignment_gate_passed"] is True
+    assert validated["public_progress_gate_passed"] is True
+    assert validated["trajectory_retention_gate_passed"] is False
+    assert validated["gate_passed"] is False
+
+
+def test_stage211_phase_gate_builder_emits_trajectory_retention(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-105.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    fixture_path = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    coverage = fixture["full_data_coverage"]
+    report = stage211_phase_gate.build_phase_gate(
+        phase="mixer",
+        checkpoint_path=checkpoint,
+        public_comparison_report_path=Path(fixture["public_comparison_report_path"]),
+        manifest_dir=tmp_path,
+        coverage_receipt_paths=[
+            Path(segment["receipt_path"])
+            for segment in [*coverage["segments"], coverage["supplemental_natural"]]
+        ],
+        preflight_smoke_marker_path=Path(fixture["preflight_smoke"]["marker_path"]),
+        global_dedup_manifest_path=GLOBAL_DEDUP_FIXTURE,
+        loaded_manifest_receipt_path=Path(fixture["loaded_manifest_receipt_path"]),
+        alignment_report_path=Path(fixture["alignment_report"]["path"]),
+        baseline_public_comparison_report_path=Path(
+            fixture["baseline_public_comparison_report"]["path"]
+        ),
+        nano_public_baseline_receipt_path=Path(
+            fixture["nano_public_baseline_receipt_path"]
+        ),
+        public_overlap_receipt_path=Path(fixture["public_overlap"]["receipt_path"]),
+    )
+    assert report["schema_version"] == STAGE211_PHASE_GATE_SCHEMA_VERSION
+    assert report["trajectory_retention_gate_passed"] is True
+    assert report["trajectory_retention"]["source_order"] == [
+        "easy",
+        "medium",
+        "hard",
+        "long",
+        STAGE211_SUPPLEMENTAL_DIFFICULTY,
+    ]
+    assert report["gate_passed"] is True
+
+
+def test_stage211_phase_gate_rejects_mutated_trajectory_terminal_report(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_path = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    candidate_report_path = Path(
+        gate["trajectory_retention"]["candidate"]["eval_report_path"]
+    )
+    candidate_report = load_yaml(candidate_report_path)
+    candidate_report["eval_loss"] = 0.6
+    save_yaml(candidate_report_path, candidate_report)
+
+    with pytest.raises(ValueError, match="trajectory retention gate"):
+        validate_stage211_phase_gate_report(
+            gate_path,
+            expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_trajectory_allows_only_legacy_mixer_easy_missing_seed(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_path = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    coverage = gate["full_data_coverage"]
+    easy_report_path = Path(
+        gate["trajectory_retention"]["entries"][0]["eval_report_path"]
+    )
+    easy_report = load_yaml(easy_report_path)
+    easy_report["eval_provenance"].pop("feature_seed")
+    save_yaml(easy_report_path, easy_report)
+
+    trajectory = build_stage211_trajectory_retention_gate(
+        phase="mixer",
+        segments=coverage["segments"],
+        supplemental_segment=coverage["supplemental_natural"],
+        post_coverage_corrections=[],
+        checkpoint_path=checkpoint,
+    )
+    assert trajectory["entries"][0]["legacy_missing_feature_seed"] is True
+    medium_report_path = Path(trajectory["entries"][1]["eval_report_path"])
+    medium_report = load_yaml(medium_report_path)
+    medium_report["eval_provenance"].pop("feature_seed")
+    save_yaml(medium_report_path, medium_report)
+    with pytest.raises(ValueError, match="fixed feature seed mismatch"):
+        build_stage211_trajectory_retention_gate(
+            phase="mixer",
+            segments=coverage["segments"],
+            supplemental_segment=coverage["supplemental_natural"],
+            post_coverage_corrections=[],
+            checkpoint_path=checkpoint,
+        )
 
 
 def _write_failed_phase_gate(gate_report: Path) -> Path:
@@ -4439,9 +4717,52 @@ def _write_retention_correction(
     replay_root = tmp_path / "retention-replay"
     replay_root.mkdir()
     replay_manifest = replay_root / "manifest.json"
-    replay_manifest.write_text("{}\n", encoding="utf-8")
     replay_part = replay_root / "part.jsonl"
     replay_part.write_text('{"key":"replay-1"}\n', encoding="utf-8")
+    prior_eval_report = Path(
+        str(failed["trajectory_retention"]["entries"][0]["eval_report_path"])
+    )
+    prior_eval_provenance = load_yaml(prior_eval_report)["eval_provenance"]
+    replay_manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "root": "/",
+                "splits": {
+                    "train": {
+                        "num_samples": 8,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": 8,
+                                "parts": [
+                                    {"path": str(replay_part.resolve()), "num_samples": 8}
+                                ],
+                            }
+                        ],
+                    },
+                    "eval": {
+                        "num_samples": 256,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": 256,
+                                "parts": [
+                                    {
+                                        "path": part["path"],
+                                        "num_samples": part["num_samples"],
+                                    }
+                                    for part in prior_eval_provenance["parts"]
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     replay_builder = replay_root / "builder.py"
     replay_builder.write_text("# builder\n", encoding="utf-8")
     replay_preflight = replay_root / "capacity.json"
@@ -4652,11 +4973,17 @@ def _write_retention_correction(
     }
     receipt_path = run_dir / "correction_receipt.json"
     receipt_path.write_text(json.dumps(correction) + "\n", encoding="utf-8")
-    return {
+    bound_correction = {
         **correction,
         "receipt_path": str(receipt_path.resolve()),
         "receipt_sha256": sha256_file(receipt_path),
-    }, replay_part
+    }
+    _write_trajectory_eval_fixture(
+        phase="mixer",
+        record=bound_correction,
+        eval_loss=0.45,
+    )
+    return bound_correction, replay_part
 
 
 def _write_corrected_phase_gate(
@@ -4733,6 +5060,16 @@ def _write_corrected_phase_gate(
         supplemental_segment=supplemental_segment,
         checkpoint_path=checkpoint,
         post_coverage_corrections=[correction],
+    )
+    report["trajectory_retention"] = build_stage211_trajectory_retention_gate(
+        phase="mixer",
+        segments=original_segments,
+        supplemental_segment=supplemental_segment,
+        post_coverage_corrections=[correction],
+        checkpoint_path=checkpoint,
+    )
+    report["trajectory_retention_gate_passed"] = bool(
+        report["trajectory_retention"]["gate_passed"]
     )
     public_source_path = Path(report["public_comparison_report_path"])
     public_source = json.loads(public_source_path.read_text(encoding="utf-8"))
