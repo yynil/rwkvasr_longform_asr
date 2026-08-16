@@ -42,7 +42,7 @@ if [[ ! -s "${ARCHIVED_SOCIAL_OVERLAP_RECEIPT}" ]]; then
 fi
 wait_for_artifact "base supplemental inventory" "${BASE_INVENTORY}"
 
-env CUDA_VISIBLE_DEVICES='' uv run python \
+nice -n 10 ionice -c 3 env CUDA_VISIBLE_DEVICES='' uv run python \
   scripts/audit_stage211_base_public_pcm_overlap.py \
   --base-inventory "${BASE_INVENTORY}" \
   --output-root "${BASE_PUBLIC_OVERLAP_ROOT}" \
