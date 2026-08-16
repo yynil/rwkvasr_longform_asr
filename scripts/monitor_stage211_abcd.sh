@@ -272,8 +272,8 @@ stage211_emit_artifact_status() {
 stage211_emit_sft_readiness() {
   local latest_record processed=0 kept=0 progress state finalizer_record
   latest_record="$(
-    rg 'ctc-align progress processed=[0-9]+ kept=[0-9]+' "${SFT_PREPARATION_LOG}" \
-      2>/dev/null | tail -n 1 || true
+    rg 'ctc-align (progress|lengths complete) processed=[0-9]+ kept=[0-9]+' \
+      "${SFT_PREPARATION_LOG}" 2>/dev/null | tail -n 1 || true
   )"
   if [[ -n "${latest_record}" ]]; then
     processed="$(sed -nE 's/.*processed=([0-9]+).*/\1/p' <<<"${latest_record}")"

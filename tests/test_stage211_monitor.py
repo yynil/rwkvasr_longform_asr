@@ -52,6 +52,7 @@ def test_stage211_monitor_reports_full_readiness_without_data_scan(tmp_path: Pat
     preparation_log = labeled_root / "prepare.log"
     preparation_log.write_text(
         "[rwkvasr] ctc-align progress processed=75 kept=70 elapsed=1.0s current=a.tar\n"
+        "[rwkvasr] ctc-align lengths complete processed=100 kept=92 lengths=index.jsonl\n"
         "CTC-aligned clean preprocessing complete\n",
         encoding="utf-8",
     )
@@ -70,7 +71,7 @@ def test_stage211_monitor_reports_full_readiness_without_data_scan(tmp_path: Pat
 
     assert (
         "sft_labeled_preparation=complete processed=100 expected=100 "
-        "progress_pct=100.0000 kept=70"
+        "progress_pct=100.0000 kept=92"
     ) in output
     assert "sft_labeled_finalizer=profile validated" in output
     for label, path in (
