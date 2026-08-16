@@ -433,8 +433,11 @@ def build_stage211_public_progress(
     candidate_results = {str(result["dataset"]): result for result in candidate["results"]}
     if set(baseline_results) != set(benchmarks) or set(candidate_results) != set(benchmarks):
         raise ValueError("Stage211 baseline/candidate public datasets differ.")
+    benchmark_languages = {str(expected["language"]) for expected in benchmarks.values()}
+    if benchmark_languages != {"en", "zh"}:
+        raise ValueError("Stage211 public progress requires English and Chinese benchmarks.")
     rows: list[dict[str, Any]] = []
-    for dataset in benchmarks:
+    for dataset, expected in benchmarks.items():
         baseline_result = baseline_results[dataset]
         candidate_result = candidate_results[dataset]
         for hash_key in ("manifest_sha256", "nano_prediction_sha256"):
@@ -447,6 +450,8 @@ def build_stage211_public_progress(
         rows.append(
             {
                 "dataset": dataset,
+                "language": str(expected["language"]),
+                "metric": str(expected["metric"]),
                 "baseline_error_rate": baseline_error,
                 "candidate_error_rate": candidate_error,
                 "absolute_change": candidate_error - baseline_error,
@@ -463,11 +468,46 @@ def build_stage211_public_progress(
     macro_candidate_deletion = sum(float(row["candidate_deletion_rate"]) for row in rows) / len(
         rows
     )
+    language_summaries: dict[str, dict[str, Any]] = {}
+    for language in ("en", "zh"):
+        language_rows = [row for row in rows if row["language"] == language]
+        metrics = {str(row["metric"]) for row in language_rows}
+        if not language_rows or len(metrics) != 1:
+            raise ValueError(f"Stage211 {language} public progress metric coverage mismatch.")
+        baseline_error = sum(float(row["baseline_error_rate"]) for row in language_rows) / len(
+            language_rows
+        )
+        candidate_error = sum(float(row["candidate_error_rate"]) for row in language_rows) / len(
+            language_rows
+        )
+        baseline_deletion = sum(
+            float(row["baseline_deletion_rate"]) for row in language_rows
+        ) / len(language_rows)
+        candidate_deletion = sum(
+            float(row["candidate_deletion_rate"]) for row in language_rows
+        ) / len(language_rows)
+        error_improved = candidate_error < baseline_error
+        deletion_improved = candidate_deletion < baseline_deletion
+        improved_datasets = sum(bool(row["improved"]) for row in language_rows)
+        language_summaries[language] = {
+            "language": language,
+            "metric": next(iter(metrics)),
+            "dataset_count": len(language_rows),
+            "datasets": [str(row["dataset"]) for row in language_rows],
+            "macro_baseline_error_rate": baseline_error,
+            "macro_candidate_error_rate": candidate_error,
+            "macro_baseline_deletion_rate": baseline_deletion,
+            "macro_candidate_deletion_rate": candidate_deletion,
+            "improved_datasets": improved_datasets,
+            "error_improved": error_improved,
+            "deletion_improved": deletion_improved,
+            "gate_passed": error_improved and deletion_improved and improved_datasets > 0,
+        }
     gate_passed = (
         all(bool(row["within_regression_limit"]) for row in rows)
         and macro_candidate_error < macro_baseline_error
         and macro_candidate_deletion < macro_baseline_deletion
-        and any(bool(row["improved"]) for row in rows)
+        and all(bool(summary["gate_passed"]) for summary in language_summaries.values())
     )
     return {
         "gate_passed": gate_passed,
@@ -477,6 +517,7 @@ def build_stage211_public_progress(
         "macro_baseline_deletion_rate": macro_baseline_deletion,
         "macro_candidate_deletion_rate": macro_candidate_deletion,
         "improved_datasets": sum(bool(row["improved"]) for row in rows),
+        "language_summaries": language_summaries,
         "results": rows,
         "baseline_public_benchmark": baseline,
     }

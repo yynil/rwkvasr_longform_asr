@@ -1613,7 +1613,25 @@ def test_stage211_public_progress_requires_macro_and_deletion_improvement() -> N
 
     assert progress["gate_passed"] is True
     assert progress["improved_datasets"] == len(STAGE211_PUBLIC_BENCHMARKS)
+    assert progress["language_summaries"]["en"]["gate_passed"] is True
+    assert progress["language_summaries"]["zh"]["gate_passed"] is True
 
+    for result in candidate_results:
+        dataset = str(result["dataset"])
+        if STAGE211_PUBLIC_BENCHMARKS[dataset]["language"] == "en":
+            result["student_error_rate"] = 0.8
+            result["student_deletion_rate"] = 0.6
+    one_language_only = stage211_phase_gate._build_public_progress(
+        baseline={"results": baseline_results},
+        candidate={"results": candidate_results},
+    )
+    assert one_language_only["gate_passed"] is False
+    assert one_language_only["language_summaries"]["en"]["gate_passed"] is False
+    assert one_language_only["language_summaries"]["zh"]["gate_passed"] is True
+
+    for result in candidate_results:
+        result["student_error_rate"] = 0.7
+        result["student_deletion_rate"] = 0.5
     candidate_results[0]["student_error_rate"] = 0.84
     rejected = stage211_phase_gate._build_public_progress(
         baseline={"results": baseline_results},
