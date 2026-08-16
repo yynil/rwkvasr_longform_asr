@@ -112,6 +112,8 @@ def test_stage211_monitor_supersedes_stale_sft_finalizer_failure(
     )
     profile = labeled_root / "profile.json"
     profile.write_text("validated-profile\n", encoding="utf-8")
+    os.utime(finalizer_log, (1_000_000, 1_000_000))
+    os.utime(profile, (1_000_001, 1_000_001))
 
     output = _emit_readiness(tmp_path)
 
