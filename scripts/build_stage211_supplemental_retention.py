@@ -1071,6 +1071,98 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _reuse_validated_supplemental_retention(
+    *,
+    base_replay_receipt_path: Path,
+    base_stratified_receipt_path: Path,
+    supplemental_inventory_path: Path,
+    supplemental_profile_receipt_path: Path,
+    output_root: Path,
+    replay_per_language: int,
+    eval_per_cell: int,
+) -> dict[str, Any] | None:
+    replay_receipt_path = output_root / "retention_replay_v2" / "receipt.json"
+    stratified_receipt_path = output_root / "stratified_hidden_eval_v2" / "receipt.json"
+    if not replay_receipt_path.is_file() or not stratified_receipt_path.is_file():
+        return None
+    try:
+        try:
+            from scripts.validate_stage211_supplemental_retention import (
+                validate_stratified_hidden_eval_v2,
+                validate_supplemental_retention_replay,
+            )
+        except ModuleNotFoundError:
+            from validate_stage211_supplemental_retention import (  # type: ignore[no-redef]
+                validate_stratified_hidden_eval_v2,
+                validate_supplemental_retention_replay,
+            )
+
+        stratified = validate_stratified_hidden_eval_v2(stratified_receipt_path)
+        replay = validate_supplemental_retention_replay(replay_receipt_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        print(
+            "stage211_supplemental_retention_reuse_rejected "
+            f"reason={type(error).__name__}",
+            flush=True,
+        )
+        return None
+
+    base_replay_receipt_path = base_replay_receipt_path.expanduser().resolve()
+    base_stratified_receipt_path = base_stratified_receipt_path.expanduser().resolve()
+    supplemental_inventory_path = supplemental_inventory_path.expanduser().resolve()
+    supplemental_profile_receipt_path = supplemental_profile_receipt_path.expanduser().resolve()
+    expected_supplemental = {
+        "inventory_path": str(supplemental_inventory_path),
+        "inventory_sha256": sha256_file(supplemental_inventory_path),
+        "profile_receipt_path": str(supplemental_profile_receipt_path),
+        "profile_receipt_sha256": sha256_file(supplemental_profile_receipt_path),
+    }
+    expected_base_replay = {
+        "path": str(base_replay_receipt_path),
+        "sha256": sha256_file(base_replay_receipt_path),
+    }
+    expected_base_stratified = {
+        "path": str(base_stratified_receipt_path),
+        "sha256": sha256_file(base_stratified_receipt_path),
+    }
+
+    def bound_matches(record: Any, expected: Mapping[str, str]) -> bool:
+        return isinstance(record, Mapping) and all(
+            record.get(key) == value for key, value in expected.items()
+        )
+
+    replay_selection = replay.get("selection")
+    stratified_selection = stratified.get("selection")
+    reusable = (
+        bound_matches(replay.get("base_replay_receipt"), expected_base_replay)
+        and bound_matches(
+            stratified.get("base_stratified_receipt"),
+            expected_base_stratified,
+        )
+        and bound_matches(replay.get("supplemental_inputs"), expected_supplemental)
+        and bound_matches(stratified.get("supplemental_inputs"), expected_supplemental)
+        and bound_matches(
+            replay.get("stratified_hidden_eval"),
+            {
+                "path": str(stratified_receipt_path.resolve()),
+                "sha256": sha256_file(stratified_receipt_path),
+            },
+        )
+        and isinstance(replay_selection, Mapping)
+        and replay_selection.get("supplemental_cell_targets")
+        == {cell: replay_per_language for cell in SUPPLEMENTAL_CELLS}
+        and isinstance(stratified_selection, Mapping)
+        and int(stratified_selection.get("per_cell", -1)) == eval_per_cell
+    )
+    if not reusable:
+        print(
+            "stage211_supplemental_retention_reuse_rejected reason=input_binding",
+            flush=True,
+        )
+        return None
+    return replay
+
+
 def main() -> int:
     args = build_parser().parse_args()
     output_root = args.output_root.expanduser().resolve()
@@ -1078,7 +1170,7 @@ def main() -> int:
     lock_path = output_root / ".stage211_supplemental_retention_v2.lock"
     with lock_path.open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        receipt = build_supplemental_retention(
+        receipt = _reuse_validated_supplemental_retention(
             base_replay_receipt_path=args.base_replay_receipt,
             base_stratified_receipt_path=args.base_stratified_receipt,
             supplemental_inventory_path=args.supplemental_inventory,
@@ -1087,8 +1179,20 @@ def main() -> int:
             replay_per_language=args.replay_per_language,
             eval_per_cell=args.eval_per_cell,
         )
+        reused = receipt is not None
+        if receipt is None:
+            receipt = build_supplemental_retention(
+                base_replay_receipt_path=args.base_replay_receipt,
+                base_stratified_receipt_path=args.base_stratified_receipt,
+                supplemental_inventory_path=args.supplemental_inventory,
+                supplemental_profile_receipt_path=args.supplemental_profile_receipt,
+                output_root=output_root,
+                replay_per_language=args.replay_per_language,
+                eval_per_cell=args.eval_per_cell,
+            )
     print(
         "stage211_supplemental_retention_complete "
+        f"reused={str(reused).lower()} "
         f"samples={receipt['samples']} hours={receipt['total_hours']:.6f} "
         f"manifest={receipt['manifest_path']}",
         flush=True,
