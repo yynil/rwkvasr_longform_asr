@@ -707,6 +707,101 @@ def _stage211_correction_focus_report_pair(
         )
 
 
+def _stage211_correction_focus_trajectory(
+    records: dict[int, dict[str, Any]],
+    *,
+    phase: str,
+    admission_gate: dict[str, Any],
+) -> dict[str, Any]:
+    trajectory = admission_gate.get("trajectory_retention")
+    if not isinstance(trajectory, dict):
+        raise ValueError("Stage211 correction focus lacks trajectory-retention evidence.")
+    if trajectory.get("phase") != phase or not isinstance(
+        trajectory.get("gate_passed"), bool
+    ):
+        raise ValueError("Stage211 correction-focus trajectory contract mismatch.")
+    entries = trajectory.get("entries")
+    if not isinstance(entries, list) or len(entries) < 2 or any(
+        not isinstance(entry, dict) for entry in entries
+    ):
+        raise ValueError("Stage211 correction-focus trajectory entries are invalid.")
+    try:
+        best_prior_index = int(trajectory.get("best_prior_index", -1))
+        candidate_index = int(trajectory.get("candidate_index", -1))
+    except (TypeError, ValueError) as error:
+        raise ValueError("Stage211 correction-focus trajectory indices are invalid.") from error
+    if (
+        best_prior_index not in range(len(entries) - 1)
+        or candidate_index != len(entries) - 1
+        or best_prior_index == candidate_index
+    ):
+        raise ValueError("Stage211 correction-focus trajectory indices are invalid.")
+    _validate_stage211_replayed_value(
+        trajectory.get("best_prior"),
+        entries[best_prior_index],
+        label=f"{phase} correction-focus trajectory best prior",
+    )
+    _validate_stage211_replayed_value(
+        trajectory.get("candidate"),
+        entries[candidate_index],
+        label=f"{phase} correction-focus trajectory candidate",
+    )
+
+    reports: dict[str, dict[str, Any]] = {}
+    sources: dict[str, dict[str, Any]] = {}
+    for role, entry in (
+        ("best_prior", entries[best_prior_index]),
+        ("candidate", entries[candidate_index]),
+    ):
+        report_path = _validate_bound_file(
+            entry,
+            path_key="eval_report_path",
+            sha256_key="eval_report_sha256",
+            label=f"Stage211 {phase} correction-focus trajectory {role} report",
+        )
+        report = load_yaml(report_path)
+        if not isinstance(report, dict):
+            raise ValueError(
+                f"Stage211 {phase} correction-focus trajectory {role} report "
+                "must be an object."
+            )
+        if int(report.get("step", -1)) != int(entry.get("step", -2)):
+            raise ValueError(
+                f"Stage211 {phase} correction-focus trajectory {role} step mismatch."
+            )
+        sources[role] = report
+        reports[role] = {
+            "source_name": str(entry.get("source_name") or ""),
+            "step": int(entry["step"]),
+            "path": str(report_path),
+            "sha256": sha256_file(report_path),
+        }
+    trajectory_failed = trajectory["gate_passed"] is False
+    if trajectory_failed:
+        _stage211_correction_focus_report_pair(
+            records,
+            phase=phase,
+            scope="trajectory_retention",
+            baseline_report=sources["best_prior"],
+            candidate_report=sources["candidate"],
+        )
+    return {
+        "gate_passed": bool(trajectory["gate_passed"]),
+        "failure_signals_used": trajectory_failed,
+        "best_prior_index": best_prior_index,
+        "candidate_index": candidate_index,
+        "best_prior_loss": _stage211_alignment_float(
+            trajectory.get("best_prior_loss"),
+            label=f"{phase} correction-focus trajectory best-prior loss",
+        ),
+        "candidate_loss": _stage211_alignment_float(
+            trajectory.get("candidate_loss"),
+            label=f"{phase} correction-focus trajectory candidate loss",
+        ),
+        "reports": reports,
+    }
+
+
 def build_stage211_correction_layer_focus(
     *,
     phase: str,
@@ -783,6 +878,11 @@ def build_stage211_correction_layer_focus(
         scope="fixed",
         baseline_report=fixed_sources["baseline"],
         candidate_report=fixed_sources["candidate"],
+    )
+    trajectory_evidence = _stage211_correction_focus_trajectory(
+        records,
+        phase=phase,
+        admission_gate=admission_gate,
     )
 
     for component in components:
@@ -905,6 +1005,7 @@ def build_stage211_correction_layer_focus(
         "required_components": list(components),
         "evaluated_scopes": [
             "fixed",
+            "trajectory_retention",
             "stratified_macro",
             *(f"stratified:{cell}" for cell in sorted(_STAGE211_ALIGNMENT_STRATIFIED_CELLS)),
         ],
@@ -921,6 +1022,7 @@ def build_stage211_correction_layer_focus(
         "stratified_summary_path": str(summary_path),
         "stratified_summary_sha256": sha256_file(summary_path),
         "fixed_report_bindings": fixed_reports,
+        "trajectory_evidence": trajectory_evidence,
         "stratified_report_bindings": canonical_report_bindings,
     }
 

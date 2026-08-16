@@ -105,14 +105,15 @@ def _focus_fixture(
     *,
     phase: str,
     failed: set[int],
+    trajectory_failed: set[int] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     components = PHASE_COMPONENTS[phase]
     reports: dict[str, dict[str, dict[str, str]]] = {}
 
-    def source(*, candidate: bool) -> dict[str, object]:
+    def source(*, candidate: bool, failed_layers: set[int] = failed) -> dict[str, object]:
         return {
             "layer_components": {
-                component: _layers(failed=failed, candidate=candidate)
+                component: _layers(failed=failed_layers, candidate=candidate)
                 for component in components
             }
         }
@@ -149,11 +150,46 @@ def _focus_fixture(
         "stratified_summary": summary,
     }
     alignment_path = _write_json(tmp_path / "alignment.json", alignment)
+    trajectory_reports: dict[str, Path] = {}
+    for role, candidate in (("best-prior", False), ("candidate", True)):
+        trajectory_reports[role] = _write_json(
+            tmp_path / f"trajectory-{role}.yaml",
+            {
+                "step": 1 if role == "best-prior" else 2,
+                **source(
+                    candidate=candidate,
+                    failed_layers=trajectory_failed or set(),
+                ),
+            },
+        )
+    best_prior = {
+        "source_name": "medium",
+        "step": 1,
+        "eval_report_path": str(trajectory_reports["best-prior"]),
+        "eval_report_sha256": sha256_file(trajectory_reports["best-prior"]),
+    }
+    candidate = {
+        "source_name": "supplemental_natural",
+        "step": 2,
+        "eval_report_path": str(trajectory_reports["candidate"]),
+        "eval_report_sha256": sha256_file(trajectory_reports["candidate"]),
+    }
     gate = {
         "gate_passed": False,
         "alignment_report": {
             "path": str(alignment_path),
             "sha256": sha256_file(alignment_path),
+        },
+        "trajectory_retention": {
+            "phase": phase,
+            "gate_passed": trajectory_failed is None,
+            "entries": [best_prior, candidate],
+            "best_prior_index": 0,
+            "best_prior": best_prior,
+            "candidate_index": 1,
+            "candidate": candidate,
+            "best_prior_loss": 1.0,
+            "candidate_loss": 0.5 if trajectory_failed is None else 1.2,
         },
     }
     gate_path = _write_json(tmp_path / "phase-gate.json", gate)
@@ -224,6 +260,29 @@ def test_stage211_correction_focus_preserves_uniform_schedule_without_hidden_fai
     assert focus["strategy"] == "uniform_full_rotation"
     assert focus["boundary_layer_ids"] == []
     assert focus["rotating_slots"] == 8
+
+
+def test_stage211_correction_focus_includes_failed_trajectory_layers(tmp_path: Path) -> None:
+    trajectory_failed = {55, 68, 69}
+    gate_path, gate = _focus_fixture(
+        tmp_path,
+        phase="mixer",
+        failed=set(),
+        trajectory_failed=trajectory_failed,
+    )
+
+    focus = build_stage211_correction_layer_focus(
+        phase="mixer",
+        admission_gate_path=gate_path,
+        admission_gate=gate,
+    )
+
+    assert focus["all_failed_layer_ids"] == sorted(trajectory_failed)
+    assert focus["selected_failure_layer_ids"] == [69, 68, 55]
+    assert focus["trajectory_evidence"]["failure_signals_used"] is True
+    assert all(
+        "trajectory_retention" in row["scopes"] for row in focus["ranking"]
+    )
 
 
 def test_stage211_correction_focus_replay_rejects_modified_selection(tmp_path: Path) -> None:
