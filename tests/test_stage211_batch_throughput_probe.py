@@ -11,11 +11,13 @@ sys.path.insert(0, str(REPO_ROOT))
 probe = importlib.import_module("scripts.benchmark_stage211_batch_profiles")
 
 
-def test_default_profiles_cover_baseline_and_two_larger_candidates() -> None:
+def test_default_profiles_cover_baseline_and_four_larger_candidates() -> None:
     assert probe.DEFAULT_PROFILES == (
         probe.BatchProfile("baseline", 36, 24_000),
         probe.BatchProfile("batch48_frames42k", 48, 42_000),
         probe.BatchProfile("batch64_frames56k", 64, 56_000),
+        probe.BatchProfile("batch80_frames70k", 80, 70_000),
+        probe.BatchProfile("batch96_frames84k", 96, 84_000),
     )
 
 
@@ -250,6 +252,43 @@ def test_missing_teacher_alignment_rejects_fast_candidate() -> None:
     assert rows[1]["summary"]["safety_pass"] is False
     assert selection["decision"] == "keep_baseline"
     assert selection["recommended_profile"] == "baseline"
+
+
+def test_failed_larger_candidate_does_not_mask_safe_candidate() -> None:
+    baseline_result = _result(name="baseline", seconds_per_step=1.0, peak_memory=8.0)
+    safe_result = _result(name="safe", seconds_per_step=1.0, peak_memory=16.0)
+    failed_result = _result(name="failed", seconds_per_step=0.5, peak_memory=20.0)
+    failed_result["return_code"] = 1
+    rows = []
+    for result, full_steps in (
+        (baseline_result, 1_000),
+        (safe_result, 700),
+        (failed_result, 400),
+    ):
+        rows.append(
+            {
+                "profile": result["profile"],
+                "summary": probe.summarize_profile(
+                    result,
+                    warmup_steps=2,
+                    max_steps=6,
+                    world_size=4,
+                    full_steps=full_steps,
+                    max_peak_memory_gib=22.0,
+                ),
+            }
+        )
+
+    selection = probe.select_profile(
+        rows,
+        baseline_name="baseline",
+        min_improvement_ratio=0.10,
+    )
+
+    assert rows[2]["summary"]["process_ok"] is False
+    assert rows[2]["summary"]["safety_pass"] is False
+    assert selection["decision"] == "candidate_recommended"
+    assert selection["recommended_profile"] == "safe"
 
 
 def test_alignment_quality_regression_rejects_faster_candidate() -> None:

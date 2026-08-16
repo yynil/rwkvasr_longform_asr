@@ -53,6 +53,8 @@ DEFAULT_PROFILES = (
     BatchProfile("baseline", 36, 24_000),
     BatchProfile("batch48_frames42k", 48, 42_000),
     BatchProfile("batch64_frames56k", 64, 56_000),
+    BatchProfile("batch80_frames70k", 80, 70_000),
+    BatchProfile("batch96_frames84k", 96, 84_000),
 )
 
 
