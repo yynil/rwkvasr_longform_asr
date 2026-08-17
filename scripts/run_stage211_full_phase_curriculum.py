@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shlex
 import subprocess
@@ -99,7 +100,46 @@ BAD_SMOKE_PATTERNS = (
     re.compile(r"\bdropped_tail(?:_samples)?=[1-9][0-9]*\b"),
     re.compile(r"\bskipped_samples=[1-9][0-9]*\b"),
 )
-ONLINE_FULL_MATCH_PATTERN = re.compile(r"\bonline_full_match=([0-9]+)/([0-9]+)\b")
+SMOKE_RUNTIME_MATCH_FIELDS = {
+    "block": (
+        "online_encoder_match",
+        "online_decoder_hidden_match",
+        "online_layer_match",
+    ),
+    "logits": (
+        "online_blank_match",
+        "online_full_match",
+        "online_conditional_nonblank_match",
+        "online_conditional_nonblank_hard_match",
+        "online_encoder_match",
+        "online_decoder_hidden_match",
+        "online_layer_match",
+    ),
+}
+SMOKE_RUNTIME_LOSS_FIELDS = {
+    "block": (
+        "online_layer_mixer",
+        "online_layer_ffn",
+        "online_layer_block",
+        "online_ctc_encoder",
+        "online_ctc_decoder_hidden",
+    ),
+    "logits": (
+        "online_ctc_blank",
+        "online_ctc_full",
+        "online_ctc_conditional_nonblank",
+        "online_ctc_conditional_nonblank_hard",
+        "online_ctc_encoder",
+        "online_ctc_decoder_hidden",
+        "online_layer_mixer",
+        "online_layer_ffn",
+        "online_layer_block",
+    ),
+}
+SMOKE_RUNTIME_PRIMARY_LOSS_FIELD = {
+    "block": "online_layer_block",
+    "logits": "online_ctc_full",
+}
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -126,6 +166,50 @@ def _checkpoint_step(path: Path) -> int:
         return int(payload.get("step", 0))
     finally:
         del payload
+
+
+def _smoke_runtime_objective_evidence(*, phase: str, step_two_line: str) -> dict[str, Any]:
+    if phase not in SMOKE_RUNTIME_MATCH_FIELDS:
+        raise ValueError(f"Stage211 {phase} has no strict runtime-objective smoke contract.")
+    match_fields: dict[str, dict[str, int]] = {}
+    for field in SMOKE_RUNTIME_MATCH_FIELDS[phase]:
+        match = re.search(rf"\b{re.escape(field)}=([0-9]+)/([0-9]+)\b", step_two_line)
+        if match is None:
+            raise ValueError(f"Stage211 {phase} smoke lacks step-2 {field} evidence.")
+        matched, total = (int(value) for value in match.groups())
+        if total <= 0 or matched != total:
+            raise ValueError(
+                f"Stage211 {phase} smoke has incomplete step-2 {field}: {matched}/{total}"
+            )
+        match_fields[field] = {"matched": matched, "total": total}
+
+    loss_fields: dict[str, float] = {}
+    for field in SMOKE_RUNTIME_LOSS_FIELDS[phase]:
+        match = re.search(rf"\b{re.escape(field)}=([^ ]+)", step_two_line)
+        if match is None:
+            raise ValueError(f"Stage211 {phase} smoke lacks step-2 {field} telemetry.")
+        try:
+            value = float(match.group(1))
+        except ValueError as error:
+            raise ValueError(
+                f"Stage211 {phase} smoke has non-numeric step-2 {field} telemetry."
+            ) from error
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"Stage211 {phase} smoke has invalid step-2 {field} telemetry: {value}"
+            )
+        loss_fields[field] = value
+
+    primary_field = SMOKE_RUNTIME_PRIMARY_LOSS_FIELD[phase]
+    if loss_fields[primary_field] <= 0.0:
+        raise ValueError(f"Stage211 {phase} smoke primary step-2 {primary_field} must be positive.")
+    return {
+        "schema_version": 1,
+        "step": 2,
+        "required_match_fields": match_fields,
+        "active_loss_fields": loss_fields,
+        "primary_loss_field": primary_field,
+    }
 
 
 def _formal_phase_training_started(phase_root: Path) -> bool:
@@ -195,9 +279,7 @@ def _parse_batch_profile_admissions(values: list[str]) -> dict[str, Path]:
                 f"{STAGE211_SUPPLEMENTAL_DIFFICULTY}."
             )
         if difficulty in admissions:
-            raise ValueError(
-                f"Stage211 batch-profile admission was supplied twice: {difficulty}"
-            )
+            raise ValueError(f"Stage211 batch-profile admission was supplied twice: {difficulty}")
         admissions[difficulty] = Path(raw_path).expanduser().resolve()
     return admissions
 
@@ -222,9 +304,9 @@ def _require_loaded_manifest_bindings(
     for difficulty in STAGE211_AUDIO_CURRICULUM:
         manifest = manifests[difficulty].expanduser().resolve()
         segment = segments[difficulty]
-        recorded_manifest = Path(
-            str(segment.get("runtime_manifest_path") or "")
-        ).expanduser().resolve()
+        recorded_manifest = (
+            Path(str(segment.get("runtime_manifest_path") or "")).expanduser().resolve()
+        )
         if manifest != recorded_manifest:
             raise ValueError(
                 f"Stage211 {difficulty} manifest differs from loaded-manifest provenance."
@@ -462,11 +544,7 @@ def _ensure_automatic_batch_profile(
         manifest_path=manifest_path,
     )
     init_sha256 = sha256_file(init_checkpoint)
-    preflight_root = (
-        phase_root
-        / "batch_profile_preflight"
-        / f"{difficulty}-{init_sha256[:16]}"
-    )
+    preflight_root = phase_root / "batch_profile_preflight" / f"{difficulty}-{init_sha256[:16]}"
     report_path = preflight_root / "batch_throughput_preflight.json"
     if report_path.is_file():
         measured = validate_stage211_batch_profile_preflight(
@@ -507,9 +585,7 @@ def _ensure_automatic_batch_profile(
         )
         return None
     admission_path = (
-        phase_root
-        / "batch_profile_preflight"
-        / f"{difficulty}-{init_sha256[:16]}-admission.json"
+        phase_root / "batch_profile_preflight" / f"{difficulty}-{init_sha256[:16]}-admission.json"
     )
     _run_command(
         _profile_admission_command(
@@ -625,23 +701,17 @@ def _audit_smoke(
             raise ValueError(
                 f"Stage211 {phase} smoke contains a rejected condition: {match.group(0)}"
             )
-    if phase == "logits":
+    runtime_objective_evidence: dict[str, Any] | None = None
+    if phase in SMOKE_RUNTIME_MATCH_FIELDS:
         step_two_lines = [
             line
             for line in log_text.splitlines()
             if re.search(r"\[deepspeed-train\] step=2\b", line) is not None
         ]
-        full_match = (
-            ONLINE_FULL_MATCH_PATTERN.search(step_two_lines[-1]) if step_two_lines else None
+        runtime_objective_evidence = _smoke_runtime_objective_evidence(
+            phase=phase,
+            step_two_line=step_two_lines[-1],
         )
-        if full_match is None:
-            raise ValueError("Stage211 logits smoke lacks step-2 online full-logit matching.")
-        matched, total = (int(value) for value in full_match.groups())
-        if total <= 0 or matched != total:
-            raise ValueError(
-                "Stage211 logits smoke has incomplete step-2 online full-logit matching: "
-                f"{matched}/{total}"
-            )
     peak_values = [
         float(value) for value in re.findall(r"peak_reserved=([0-9]+(?:\.[0-9]+)?)GiB", log_text)
     ]
@@ -653,7 +723,7 @@ def _audit_smoke(
             f"Stage211 {phase} smoke peak memory is unsafe: "
             f"{peak_reserved_gib:.2f} GiB > {max_peak_reserved_gib:.2f} GiB"
         )
-    return {
+    report = {
         "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "full_profile_smoke",
@@ -670,6 +740,9 @@ def _audit_smoke(
         "peak_reserved_gib": peak_reserved_gib,
         "max_peak_reserved_gib": max_peak_reserved_gib,
     }
+    if runtime_objective_evidence is not None:
+        report["runtime_objective_evidence"] = runtime_objective_evidence
+    return report
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
@@ -720,8 +793,7 @@ def _migrate_legacy_curriculum_summary(*, phase_root: Path, phase: str) -> None:
         if archive_path.is_file():
             if summary_path.read_bytes() != archive_path.read_bytes():
                 raise ValueError(
-                    "Stage211 legacy summary differs from its existing archive: "
-                    f"{summary_path}"
+                    f"Stage211 legacy summary differs from its existing archive: {summary_path}"
                 )
             summary_path.unlink()
         else:
@@ -795,8 +867,7 @@ def _run_smoke(
         return
     if _formal_phase_training_started(phase_root) and not dry_run:
         raise ValueError(
-            f"Stage211 {phase} formal training has progress but lacks its preflight "
-            "smoke marker."
+            f"Stage211 {phase} formal training has progress but lacks its preflight smoke marker."
         )
     latest_step = _latest_step(smoke_run_dir)
     command = _runner_command(
@@ -884,9 +955,7 @@ def _validate_reusable_runtime_coverage(
                 int(record.get("completed_epoch_batch_count", -1)) != steps_per_epoch,
             )
         ):
-            raise ValueError(
-                f"Stage211 {difficulty} reusable epoch {epoch} coverage is invalid."
-            )
+            raise ValueError(f"Stage211 {difficulty} reusable epoch {epoch} coverage is invalid.")
         checkpoint = Path(str(record.get("checkpoint_path") or "")).resolve()
         if not checkpoint.is_file():
             raise ValueError(
@@ -931,9 +1000,7 @@ def _load_reusable_receipt(
         batch_size = int(profile["batch_size"])
         frame_budget = int(profile["frame_budget"])
         steps_per_epoch = int(coverage["steps_per_epoch"])
-        tail_padding_samples_per_epoch = int(
-            coverage["tail_padding_samples_per_epoch"]
-        )
+        tail_padding_samples_per_epoch = int(coverage["tail_padding_samples_per_epoch"])
         schema_version = 2
     total_steps = steps_per_epoch * STAGE211_FULL_DATA_EPOCHS
     expected_fields = {
@@ -950,14 +1017,9 @@ def _load_reusable_receipt(
         "frame_budget": frame_budget,
         "rows": int(expected["rows"]),
         "row_exposures": int(expected["rows"]) * STAGE211_FULL_DATA_EPOCHS,
-        "tail_padding_sample_exposures": int(
-            tail_padding_samples_per_epoch
-        )
+        "tail_padding_sample_exposures": int(tail_padding_samples_per_epoch)
         * STAGE211_FULL_DATA_EPOCHS,
-        "executed_sample_exposures": (
-            int(expected["rows"])
-            + tail_padding_samples_per_epoch
-        )
+        "executed_sample_exposures": (int(expected["rows"]) + tail_padding_samples_per_epoch)
         * STAGE211_FULL_DATA_EPOCHS,
         "hours": float(expected["hours"]),
         "hour_exposures": float(expected["hours"]) * STAGE211_FULL_DATA_EPOCHS,
@@ -1165,12 +1227,8 @@ def run_phase(args: argparse.Namespace) -> Path | None:
                 nano_checkpoint=nano_checkpoint,
                 master_port=int(args.master_port),
                 init_checkpoint=current_init,
-                curriculum_receipt=(
-                    preceding_receipt if difficulty != "easy" else None
-                ),
-                promotion_receipt=(
-                    promotion_receipt if difficulty == "easy" else None
-                ),
+                curriculum_receipt=(preceding_receipt if difficulty != "easy" else None),
+                promotion_receipt=(promotion_receipt if difficulty == "easy" else None),
                 smoke=False,
                 dry_run=True,
                 supplemental_inventory=None,
@@ -1297,17 +1355,13 @@ def run_phase(args: argparse.Namespace) -> Path | None:
                 raise ValueError(f"Stage211 receipt cannot admit {next_difficulty}: {receipt_path}")
 
     supplemental_run_dir = phase_root / STAGE211_SUPPLEMENTAL_DIFFICULTY
-    supplemental_receipt_path = (
-        phase_root / "receipts" / f"{STAGE211_SUPPLEMENTAL_DIFFICULTY}.json"
-    )
+    supplemental_receipt_path = phase_root / "receipts" / f"{STAGE211_SUPPLEMENTAL_DIFFICULTY}.json"
     if loaded_manifest_receipt is not None:
         _require_loaded_manifest_bindings(
             manifests=manifests,
             receipt=loaded_manifest_receipt,
         )
-    supplemental_batch_profile_path = batch_profile_admissions.get(
-        STAGE211_SUPPLEMENTAL_DIFFICULTY
-    )
+    supplemental_batch_profile_path = batch_profile_admissions.get(STAGE211_SUPPLEMENTAL_DIFFICULTY)
     supplemental_latest_step = _latest_step(supplemental_run_dir)
     supplemental_batch_profile_path = _resolve_segment_batch_profile_admission(
         run_dir=supplemental_run_dir,
@@ -1556,9 +1610,7 @@ def main() -> int:
     parser.add_argument(
         "--supplemental-profile-receipt",
         type=Path,
-        default=(
-            DEFAULT_STAGE211_SUPPLEMENTAL_ROOT / "supplemental_profile_receipt.json"
-        ),
+        default=(DEFAULT_STAGE211_SUPPLEMENTAL_ROOT / "supplemental_profile_receipt.json"),
     )
     parser.add_argument("--master-port", type=int, default=29631)
     parser.add_argument("--max-peak-reserved-gib", type=float, default=22.0)

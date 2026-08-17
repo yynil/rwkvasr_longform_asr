@@ -76,6 +76,16 @@ stage211_supplemental_profile_receipt = importlib.import_module(
 stage211_gate_module = importlib.import_module("rwkvasr.eval.stage211_gate")
 
 
+def _stage211_smoke_runtime_fields(phase: str) -> str:
+    matches = " ".join(
+        f"{field}=8/8" for field in stage211_full_phase.SMOKE_RUNTIME_MATCH_FIELDS[phase]
+    )
+    losses = " ".join(
+        f"{field}=0.1250" for field in stage211_full_phase.SMOKE_RUNTIME_LOSS_FIELDS[phase]
+    )
+    return f"{matches} {losses}"
+
+
 @pytest.fixture(autouse=True)
 def _compact_public_replay_for_phase_gate_tests(
     request: pytest.FixtureRequest,
@@ -161,7 +171,8 @@ def test_stage211_full_phase_smoke_marker_rebuilds_source_evidence(
     (log_dir / "block_smoke_2steps.log").write_text(
         "[rwkvasr] Distributed init complete.\n"
         "[deepspeed-train] step=1 loss=0.8 peak_reserved=5.50GiB\n"
-        "[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB\n",
+        "[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB "
+        f"{_stage211_smoke_runtime_fields('block')}\n",
         encoding="utf-8",
     )
     marker = stage211_full_phase._audit_smoke(
@@ -171,6 +182,18 @@ def test_stage211_full_phase_smoke_marker_rebuilds_source_evidence(
         easy_manifest=easy_manifest,
         max_peak_reserved_gib=22.0,
     )
+    assert marker["runtime_objective_evidence"] == {
+        "schema_version": 1,
+        "step": 2,
+        "required_match_fields": {
+            field: {"matched": 8, "total": 8}
+            for field in stage211_full_phase.SMOKE_RUNTIME_MATCH_FIELDS["block"]
+        },
+        "active_loss_fields": {
+            field: 0.125 for field in stage211_full_phase.SMOKE_RUNTIME_LOSS_FIELDS["block"]
+        },
+        "primary_loss_field": "online_layer_block",
+    }
     marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
 
     assert (
@@ -2481,10 +2504,12 @@ def test_stage211_logits_smoke_requires_complete_full_logit_match(
     log_path = log_dir / "logits_smoke_2steps.log"
 
     def audit(match_field: str) -> dict[str, object]:
+        runtime_fields = _stage211_smoke_runtime_fields(phase)
+        runtime_fields = runtime_fields.replace("online_full_match=8/8", match_field)
         log_path.write_text(
             "[rwkvasr] Distributed init complete. world_size=4\n"
             "[deepspeed-train] step=2 loss=0.2000 peak_reserved=20.50GiB "
-            f"{match_field} online_full_missing=0\n",
+            f"{runtime_fields} online_full_missing=0\n",
             encoding="utf-8",
         )
         return stage211_full_phase._audit_smoke(
@@ -2496,12 +2521,35 @@ def test_stage211_logits_smoke_requires_complete_full_logit_match(
         )
 
     assert audit("online_full_match=8/8")["complete"] is True
-    with pytest.raises(ValueError, match="lacks step-2 online full-logit matching"):
+    with pytest.raises(ValueError, match="lacks step-2 online_full_match evidence"):
         audit("")
-    with pytest.raises(ValueError, match="incomplete step-2 online full-logit matching: 7/8"):
+    with pytest.raises(ValueError, match="incomplete step-2 online_full_match: 7/8"):
         audit("online_full_match=7/8")
-    with pytest.raises(ValueError, match="incomplete step-2 online full-logit matching: 0/0"):
+    with pytest.raises(ValueError, match="incomplete step-2 online_full_match: 0/0"):
         audit("online_full_match=0/0")
+
+
+def test_stage211_block_smoke_requires_each_runtime_objective() -> None:
+    valid = _stage211_smoke_runtime_fields("block")
+    evidence = stage211_full_phase._smoke_runtime_objective_evidence(
+        phase="block",
+        step_two_line=f"[deepspeed-train] step=2 {valid}",
+    )
+    assert evidence["primary_loss_field"] == "online_layer_block"
+
+    missing_ffn = valid.replace("online_layer_ffn=0.1250", "")
+    with pytest.raises(ValueError, match="lacks step-2 online_layer_ffn telemetry"):
+        stage211_full_phase._smoke_runtime_objective_evidence(
+            phase="block",
+            step_two_line=f"[deepspeed-train] step=2 {missing_ffn}",
+        )
+
+    zero_primary = valid.replace("online_layer_block=0.1250", "online_layer_block=0.0000")
+    with pytest.raises(ValueError, match="online_layer_block must be positive"):
+        stage211_full_phase._smoke_runtime_objective_evidence(
+            phase="block",
+            step_two_line=f"[deepspeed-train] step=2 {zero_primary}",
+        )
 
 
 def test_stage211_formal_rejects_volatile_output_but_smoke_allows_it(
