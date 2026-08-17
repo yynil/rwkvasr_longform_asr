@@ -1221,6 +1221,62 @@ def test_ctc_teacher_decoder_hidden_loss_aligns_all_decoder_states() -> None:
         assert torch.isfinite(hidden.grad).all()
 
 
+def test_ctc_teacher_decoder_hidden_loss_packs_metric_kernels_by_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(23)
+    batch_size = 4
+    state_names = ("input", "layer_0", "layer_1")
+    lengths = torch.tensor([5, 4, 3, 2])
+    student_hiddens = {
+        name: torch.randn(batch_size, 5, 8, requires_grad=True) for name in state_names
+    }
+    teacher_records = {
+        f"utt-{sample_idx}": {
+            "ctc_decoder_hiddens": {
+                name: student_hiddens[name][
+                    sample_idx, : int(lengths[sample_idx])
+                ].detach().to(dtype=torch.float16)
+                for name in state_names
+            }
+        }
+        for sample_idx in range(batch_size)
+    }
+    calls = {"layer_norm": 0, "cosine": 0}
+    original_layer_norm = F.layer_norm
+    original_cosine = F.cosine_similarity
+
+    def counted_layer_norm(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["layer_norm"] += 1
+        return original_layer_norm(*args, **kwargs)
+
+    def counted_cosine(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["cosine"] += 1
+        return original_cosine(*args, **kwargs)
+
+    monkeypatch.setattr(F, "layer_norm", counted_layer_norm)
+    monkeypatch.setattr(F, "cosine_similarity", counted_cosine)
+    result = _ctc_teacher_decoder_hidden_loss(
+        student_hiddens,
+        lengths,
+        tuple(teacher_records),
+        teacher_records,
+        normalized_mse_weight=1.0,
+        cosine_weight=0.25,
+        energy_mse_weight=0.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=0.0,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+
+    assert calls == {"layer_norm": len(state_names) * 2, "cosine": len(state_names)}
+    assert result.events == batch_size * len(state_names)
+    assert result.matched_samples == batch_size
+    result.loss.backward()
+    assert all(hidden.grad is not None for hidden in student_hiddens.values())
+
+
 def test_ctc_teacher_decoder_hidden_loss_balances_teacher_active_and_blank_frames() -> None:
     student = torch.tensor(
         [[[2.0, 2.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]],
@@ -1657,6 +1713,60 @@ def test_ctc_teacher_hidden_loss_matches_equal_encoder_states() -> None:
     assert matched == 1
     assert missing == 0
     assert torch.equal(loss, torch.zeros_like(loss))
+
+
+@pytest.mark.parametrize("time_map", ["nearest", "linear"])
+def test_ctc_teacher_hidden_loss_maps_different_encoder_lengths(time_map: str) -> None:
+    student = torch.randn(2, 5, 4, requires_grad=True)
+    records = {
+        "utt0": {"encoder_out": torch.randn(3, 4, dtype=torch.float16)},
+        "utt1": {"encoder_out": torch.randn(4, 4, dtype=torch.float16)},
+    }
+
+    loss, matched, missing = _ctc_teacher_hidden_loss(
+        student,
+        torch.tensor([5, 4]),
+        ("utt0", "utt1"),
+        records,
+        teacher_field="encoder_out",
+        time_map=time_map,
+        missing_policy="error",
+    )
+
+    assert matched == 2
+    assert missing == 0
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("time_map", ["nearest", "linear"])
+def test_ctc_teacher_hidden_loss_maps_gpu_teacher_indices_on_teacher_device(
+    time_map: str,
+) -> None:
+    device = torch.device("cuda:0")
+    student = torch.randn(1, 5, 4, device=device, requires_grad=True)
+    teacher = torch.randn(3, 4, device=device, dtype=torch.float16)
+
+    loss, matched, missing = _ctc_teacher_hidden_loss(
+        student,
+        torch.tensor([5], device=device),
+        ("utt0",),
+        {"utt0": {"encoder_out": teacher}},
+        teacher_field="encoder_out",
+        time_map=time_map,
+        missing_policy="error",
+    )
+
+    assert matched == 1
+    assert missing == 0
+    assert loss.device == device
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
 
 
 def test_ctc_teacher_hidden_loss_can_filter_to_teacher_nonblank_frames() -> None:

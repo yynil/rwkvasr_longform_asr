@@ -1984,6 +1984,112 @@ def _ctc_frame_group_mean(group_sums: torch.Tensor, group_denoms: torch.Tensor) 
     return (means * weights).sum() / weights.sum().clamp_min(1.0)
 
 
+@dataclass(frozen=True)
+class _PackedHiddenFrameLoss:
+    frame_loss: torch.Tensor
+    cosine: torch.Tensor | None
+    student_power: torch.Tensor | None
+    teacher_power: torch.Tensor | None
+    energy_mse: torch.Tensor | None
+    log_rms: torch.Tensor | None
+
+
+def _pack_teacher_hidden_rows(
+    rows: list[torch.Tensor],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    if not rows:
+        raise ValueError("Cannot pack an empty teacher hidden row list.")
+    first_dtype = rows[0].dtype
+    if all(row.device == device and row.dtype == first_dtype for row in rows):
+        return torch.cat(rows, dim=0).to(dtype=torch.float32)
+    return torch.cat(
+        [row.to(device=device, dtype=torch.float32) for row in rows],
+        dim=0,
+    )
+
+
+def _packed_hidden_frame_loss(
+    student_slice: torch.Tensor,
+    teacher_slice: torch.Tensor,
+    *,
+    normalized_mse_weight: float,
+    cosine_weight: float,
+    energy_mse_weight: float,
+    log_rms_weight: float,
+    raw_mse_weight: float,
+    collect_stats: bool,
+) -> _PackedHiddenFrameLoss:
+    if student_slice.ndim != 2 or teacher_slice.ndim != 2 or student_slice.shape != teacher_slice.shape:
+        raise ValueError(
+            "Packed hidden tensors must have the same [frames, hidden] shape, "
+            f"got student={tuple(student_slice.shape)} teacher={tuple(teacher_slice.shape)}."
+        )
+    frame_count = int(student_slice.size(0))
+    frame_loss = student_slice.new_zeros((frame_count,), dtype=torch.float32)
+    need_cosine = bool(collect_stats or cosine_weight > 0.0)
+    need_power = bool(collect_stats or energy_mse_weight > 0.0 or log_rms_weight > 0.0)
+    cosine = (
+        F.cosine_similarity(student_slice, teacher_slice, dim=-1, eps=1.0e-6)
+        if need_cosine
+        else None
+    )
+    student_power = student_slice.square().mean(dim=-1) if need_power else None
+    teacher_power = teacher_slice.square().mean(dim=-1) if need_power else None
+    energy_mse: torch.Tensor | None = None
+    log_rms: torch.Tensor | None = None
+    if need_power:
+        if student_power is None or teacher_power is None:
+            raise RuntimeError("Packed hidden power calculation is incomplete.")
+        diff_power = (student_slice - teacher_slice).square().mean(dim=-1)
+        energy_mse = 2.0 * diff_power / (student_power + teacher_power + 1.0e-6)
+        log_rms_delta = 0.5 * (
+            torch.log(student_power + 1.0e-6) - torch.log(teacher_power + 1.0e-6)
+        )
+        log_rms = F.smooth_l1_loss(
+            log_rms_delta,
+            torch.zeros_like(log_rms_delta),
+            reduction="none",
+            beta=0.25,
+        )
+    if normalized_mse_weight > 0.0:
+        hidden_size = int(student_slice.size(-1))
+        student_norm = F.layer_norm(student_slice, (hidden_size,))
+        teacher_norm = F.layer_norm(teacher_slice, (hidden_size,))
+        frame_loss = frame_loss + F.mse_loss(
+            student_norm,
+            teacher_norm,
+            reduction="none",
+        ).mean(dim=-1) * float(normalized_mse_weight)
+    if cosine_weight > 0.0:
+        if cosine is None:
+            raise RuntimeError("Packed hidden cosine calculation is incomplete.")
+        frame_loss = frame_loss + (1.0 - cosine) * float(cosine_weight)
+    if energy_mse_weight > 0.0:
+        if energy_mse is None:
+            raise RuntimeError("Packed hidden energy calculation is incomplete.")
+        frame_loss = frame_loss + energy_mse * float(energy_mse_weight)
+    if log_rms_weight > 0.0:
+        if log_rms is None:
+            raise RuntimeError("Packed hidden log-RMS calculation is incomplete.")
+        frame_loss = frame_loss + log_rms * float(log_rms_weight)
+    if raw_mse_weight > 0.0:
+        frame_loss = frame_loss + F.mse_loss(
+            student_slice,
+            teacher_slice,
+            reduction="none",
+        ).mean(dim=-1) * float(raw_mse_weight)
+    return _PackedHiddenFrameLoss(
+        frame_loss=frame_loss,
+        cosine=cosine,
+        student_power=student_power,
+        teacher_power=teacher_power,
+        energy_mse=energy_mse,
+        log_rms=log_rms,
+    )
+
+
 def _ctc_teacher_layer_hidden_loss(
     student_hiddens: dict[int, dict[str, torch.Tensor]],
     student_lengths: torch.Tensor | None,
@@ -2077,6 +2183,14 @@ def _ctc_teacher_layer_hidden_loss(
     missing_ids: set[str] = set()
     events = 0
     max_frame_delta = 0
+    packed_events: dict[
+        tuple[int, str],
+        list[tuple[int, int, torch.Tensor, torch.Tensor | None]],
+    ] = {
+        (layer_id, component): []
+        for layer_id in layer_ids
+        for component in active_components
+    }
 
     student_times = tuple(
         int(value) for value in clipped_lengths[:batch_size].detach().cpu().tolist()
@@ -2133,7 +2247,7 @@ def _ctc_teacher_layer_hidden_loss(
                             f"Missing {component} hidden tensor at layer={layer_id} for utt_id={utt_id!r}."
                         )
                     continue
-                teacher_hidden = torch.as_tensor(teacher_hidden_raw, dtype=torch.float32)
+                teacher_hidden = torch.as_tensor(teacher_hidden_raw)
                 if teacher_hidden.ndim != 2 or int(student_hidden.size(-1)) != int(teacher_hidden.size(-1)):
                     raise ValueError(
                         f"Layer hidden shape mismatch for utt_id={utt_id!r} layer={layer_id} "
@@ -2151,79 +2265,18 @@ def _ctc_teacher_layer_hidden_loss(
                 aligned_time = min(student_time, teacher_time)
                 if aligned_time <= 0:
                     continue
-                student_slice = student_hidden[sample_idx, :aligned_time, :].float()
-                teacher_slice = teacher_hidden[:aligned_time].to(device=student_slice.device)
-                frame_loss = student_slice.new_zeros((aligned_time,), dtype=torch.float32)
-                cosine = F.cosine_similarity(student_slice, teacher_slice, dim=-1, eps=1.0e-6)
-                student_power = student_slice.square().mean(dim=-1)
-                teacher_power = teacher_slice.square().mean(dim=-1)
-                diff_power = (student_slice - teacher_slice).square().mean(dim=-1)
-                energy_mse = 2.0 * diff_power / (student_power + teacher_power + 1.0e-6)
-                log_rms_delta = 0.5 * (
-                    torch.log(student_power + 1.0e-6) - torch.log(teacher_power + 1.0e-6)
+                packed_events[(layer_id, component)].append(
+                    (
+                        sample_idx,
+                        aligned_time,
+                        teacher_hidden[:aligned_time],
+                        (
+                            teacher_nonblank_mask[:aligned_time]
+                            if teacher_nonblank_mask is not None
+                            else None
+                        ),
+                    )
                 )
-                log_rms = F.smooth_l1_loss(
-                    log_rms_delta,
-                    torch.zeros_like(log_rms_delta),
-                    reduction="none",
-                    beta=0.25,
-                )
-                if normalized_mse_weight > 0.0:
-                    student_norm = F.layer_norm(student_slice, (int(student_slice.size(-1)),))
-                    teacher_norm = F.layer_norm(teacher_slice, (int(teacher_slice.size(-1)),))
-                    frame_loss = frame_loss + F.mse_loss(
-                        student_norm,
-                        teacher_norm,
-                        reduction="none",
-                    ).mean(dim=-1) * float(normalized_mse_weight)
-                if cosine_weight > 0.0:
-                    frame_loss = frame_loss + (1.0 - cosine) * float(cosine_weight)
-                if energy_mse_weight > 0.0:
-                    frame_loss = frame_loss + energy_mse * float(energy_mse_weight)
-                if log_rms_weight > 0.0:
-                    frame_loss = frame_loss + log_rms * float(log_rms_weight)
-                if raw_mse_weight > 0.0:
-                    frame_loss = frame_loss + F.mse_loss(
-                        student_slice,
-                        teacher_slice,
-                        reduction="none",
-                    ).mean(dim=-1) * float(raw_mse_weight)
-                event_sums, event_denoms = _ctc_frame_group_sums(
-                    frame_loss,
-                    frame_balance_mode=frame_balance_mode,
-                    teacher_nonblank_mask=(
-                        teacher_nonblank_mask[:aligned_time]
-                        if teacher_nonblank_mask is not None
-                        else None
-                    ),
-                )
-                component_sums[component] = component_sums[component] + event_sums
-                component_denoms[component] = component_denoms[component] + event_denoms
-                layer_sums[layer_id] = layer_sums[layer_id] + event_sums * component_weight
-                layer_denoms[layer_id] = layer_denoms[layer_id] + event_denoms * component_weight
-                detached_student_sq = student_slice.detach().square().sum()
-                detached_teacher_sq = teacher_slice.detach().square().sum()
-                detached_elements = student_slice.new_tensor(float(student_slice.numel()))
-                detached_energy = energy_mse.detach().sum()
-                detached_log_rms = log_rms.detach().sum()
-                detached_cosine = cosine.detach().sum()
-                detached_frames = student_slice.new_tensor(float(aligned_time))
-                component_stat = component_stats[component]
-                component_stat["student_sq"] += detached_student_sq
-                component_stat["teacher_sq"] += detached_teacher_sq
-                component_stat["elements"] += detached_elements
-                component_stat["energy"] += detached_energy
-                component_stat["log_rms"] += detached_log_rms
-                component_stat["cosine"] += detached_cosine
-                component_stat["frames"] += detached_frames
-                layer_stat = layer_stats[layer_id]
-                layer_stat["student_sq"] += detached_student_sq * component_weight
-                layer_stat["teacher_sq"] += detached_teacher_sq * component_weight
-                layer_stat["elements"] += detached_elements * component_weight
-                layer_stat["energy"] += detached_energy * component_weight
-                layer_stat["log_rms"] += detached_log_rms * component_weight
-                layer_stat["cosine"] += detached_cosine * component_weight
-                layer_stat["frames"] += detached_frames * component_weight
                 events += 1
                 sample_had_event = True
         if sample_had_event:
@@ -2231,6 +2284,90 @@ def _ctc_teacher_layer_hidden_loss(
 
     if events <= 0:
         raise RuntimeError("Layer hidden distillation produced no matched layer/component events.")
+    for layer_id in layer_ids:
+        student_components = student_hiddens.get(layer_id)
+        if not isinstance(student_components, dict):
+            continue
+        for component, component_weight in active_components.items():
+            component_events = packed_events[(layer_id, component)]
+            if not component_events:
+                continue
+            student_hidden = student_components.get(component)
+            if not isinstance(student_hidden, torch.Tensor):
+                raise RuntimeError(
+                    f"Student layer={layer_id} component={component} disappeared after validation."
+                )
+            student_slice = torch.cat(
+                [
+                    student_hidden[sample_idx, :aligned_time, :]
+                    for sample_idx, aligned_time, _, _ in component_events
+                ],
+                dim=0,
+            ).float()
+            teacher_slice = _pack_teacher_hidden_rows(
+                [teacher_hidden for _, _, teacher_hidden, _ in component_events],
+                device=student_slice.device,
+            )
+            packed_loss = _packed_hidden_frame_loss(
+                student_slice,
+                teacher_slice,
+                normalized_mse_weight=float(normalized_mse_weight),
+                cosine_weight=float(cosine_weight),
+                energy_mse_weight=float(energy_mse_weight),
+                log_rms_weight=float(log_rms_weight),
+                raw_mse_weight=float(raw_mse_weight),
+                collect_stats=True,
+            )
+            packed_nonblank_mask = (
+                torch.cat(
+                    [
+                        mask
+                        for _, _, _, mask in component_events
+                        if isinstance(mask, torch.Tensor)
+                    ],
+                    dim=0,
+                )
+                if group_count == 2
+                else None
+            )
+            event_sums, event_denoms = _ctc_frame_group_sums(
+                packed_loss.frame_loss,
+                frame_balance_mode=frame_balance_mode,
+                teacher_nonblank_mask=packed_nonblank_mask,
+            )
+            component_sums[component] = component_sums[component] + event_sums
+            component_denoms[component] = component_denoms[component] + event_denoms
+            layer_sums[layer_id] = layer_sums[layer_id] + event_sums * component_weight
+            layer_denoms[layer_id] = layer_denoms[layer_id] + event_denoms * component_weight
+            if (
+                packed_loss.cosine is None
+                or packed_loss.energy_mse is None
+                or packed_loss.log_rms is None
+            ):
+                raise RuntimeError("Layer hidden telemetry calculation is incomplete.")
+            detached_student_sq = student_slice.detach().square().sum()
+            detached_teacher_sq = teacher_slice.detach().square().sum()
+            detached_elements = student_slice.new_tensor(float(student_slice.numel()))
+            detached_energy = packed_loss.energy_mse.detach().sum()
+            detached_log_rms = packed_loss.log_rms.detach().sum()
+            detached_cosine = packed_loss.cosine.detach().sum()
+            detached_frames = student_slice.new_tensor(float(student_slice.size(0)))
+            component_stat = component_stats[component]
+            component_stat["student_sq"] += detached_student_sq
+            component_stat["teacher_sq"] += detached_teacher_sq
+            component_stat["elements"] += detached_elements
+            component_stat["energy"] += detached_energy
+            component_stat["log_rms"] += detached_log_rms
+            component_stat["cosine"] += detached_cosine
+            component_stat["frames"] += detached_frames
+            layer_stat = layer_stats[layer_id]
+            layer_stat["student_sq"] += detached_student_sq * component_weight
+            layer_stat["teacher_sq"] += detached_teacher_sq * component_weight
+            layer_stat["elements"] += detached_elements * component_weight
+            layer_stat["energy"] += detached_energy * component_weight
+            layer_stat["log_rms"] += detached_log_rms * component_weight
+            layer_stat["cosine"] += detached_cosine * component_weight
+            layer_stat["frames"] += detached_frames * component_weight
     component_losses = {
         name: _ctc_frame_group_mean(component_sums[name], component_denoms[name])
         for name in active_components
@@ -5428,6 +5565,12 @@ def _ctc_teacher_hidden_loss(
             min=0,
             max=max_student_time,
         )
+    student_times = tuple(
+        int(value) for value in clipped_lengths[:batch_size].detach().cpu().tolist()
+    )
+    packed_student_rows: list[torch.Tensor] = []
+    packed_teacher_rows: list[torch.Tensor] = []
+    packed_nonblank_masks: list[torch.Tensor] = []
 
     for sample_idx in range(batch_size):
         utt_id = str(utt_ids[sample_idx])
@@ -5456,7 +5599,7 @@ def _ctc_teacher_hidden_loss(
                 f"teacher={int(teacher_hidden.size(-1))} student={int(student_hidden.size(-1))}"
             )
         teacher_time = int(teacher_hidden.size(0))
-        student_time = int(clipped_lengths[sample_idx].item())
+        student_time = student_times[sample_idx]
         if teacher_time <= 0 or student_time <= 0:
             continue
 
@@ -5530,7 +5673,10 @@ def _ctc_teacher_hidden_loss(
                     ).to(dtype=torch.long)
                     filter_indices = filter_indices.clamp(min=0, max=filter_time - 1)
                     teacher_filter_mask = teacher_filter_mask.index_select(0, filter_indices)
-        if time_map == "nearest" or student_time == 1 or teacher_time == 1:
+        if student_time == teacher_time:
+            selected_hidden = teacher_hidden
+            selected_frame_mask = teacher_filter_mask
+        elif time_map == "nearest" or student_time == 1 or teacher_time == 1:
             if student_time == 1 or teacher_time == 1:
                 frame_indices_device = torch.zeros(student_time, device=student_hidden.device, dtype=torch.long)
             else:
@@ -5539,7 +5685,8 @@ def _ctc_teacher_hidden_loss(
                     dtype=torch.long
                 )
             frame_indices_device = frame_indices_device.clamp(min=0, max=teacher_time - 1)
-            selected_hidden = teacher_hidden.index_select(0, frame_indices_device.cpu())
+            teacher_frame_indices = frame_indices_device.to(device=teacher_hidden.device)
+            selected_hidden = teacher_hidden.index_select(0, teacher_frame_indices)
             selected_frame_mask = (
                 teacher_filter_mask.index_select(0, frame_indices_device)
                 if teacher_filter_mask is not None
@@ -5550,9 +5697,14 @@ def _ctc_teacher_hidden_loss(
             scaled = positions * float(teacher_time - 1) / float(student_time - 1)
             lo = torch.floor(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
             hi = torch.ceil(scaled).to(dtype=torch.long).clamp(min=0, max=teacher_time - 1)
-            alpha = (scaled - lo.to(dtype=torch.float32)).to(dtype=torch.float32).cpu().unsqueeze(-1)
-            lo_hidden = teacher_hidden.index_select(0, lo.cpu())
-            hi_hidden = teacher_hidden.index_select(0, hi.cpu())
+            lo_teacher = lo.to(device=teacher_hidden.device)
+            hi_teacher = hi.to(device=teacher_hidden.device)
+            alpha = (scaled - lo.to(dtype=torch.float32)).to(
+                device=teacher_hidden.device,
+                dtype=torch.float32,
+            ).unsqueeze(-1)
+            lo_hidden = teacher_hidden.index_select(0, lo_teacher)
+            hi_hidden = teacher_hidden.index_select(0, hi_teacher)
             selected_hidden = lo_hidden * (1.0 - alpha) + hi_hidden * alpha
             selected_frame_mask = (
                 teacher_filter_mask.index_select(0, lo) | teacher_filter_mask.index_select(0, hi)
@@ -5560,18 +5712,39 @@ def _ctc_teacher_hidden_loss(
                 else None
             )
         selected_hidden = selected_hidden.to(device=student_hidden.device, dtype=torch.float32)
-        frame_loss = F.mse_loss(student_slice, selected_hidden, reduction="none").mean(dim=-1)
         if selected_frame_mask is not None:
-            selected_frame_mask = selected_frame_mask.to(device=frame_loss.device, dtype=torch.bool)
+            selected_frame_mask = selected_frame_mask.to(
+                device=student_slice.device,
+                dtype=torch.bool,
+            )
             if not bool(selected_frame_mask.any().item()):
                 continue
-            frame_loss = frame_loss.masked_select(selected_frame_mask)
+            student_slice = student_slice[selected_frame_mask]
+            selected_hidden = selected_hidden[selected_frame_mask]
             if selected_nonblank_mask is not None:
                 selected_nonblank_mask = selected_nonblank_mask.masked_select(selected_frame_mask)
+        packed_student_rows.append(student_slice)
+        packed_teacher_rows.append(selected_hidden)
+        if selected_nonblank_mask is not None:
+            packed_nonblank_masks.append(selected_nonblank_mask)
+
+    if packed_student_rows:
+        packed_student = torch.cat(packed_student_rows, dim=0)
+        packed_teacher = torch.cat(packed_teacher_rows, dim=0)
+        frame_loss = F.mse_loss(
+            packed_student,
+            packed_teacher,
+            reduction="none",
+        ).mean(dim=-1)
+        packed_nonblank_mask = (
+            torch.cat(packed_nonblank_masks, dim=0)
+            if group_count == 2
+            else None
+        )
         event_sums, event_denoms = _ctc_frame_group_sums(
             frame_loss,
             frame_balance_mode=frame_balance_mode,
-            teacher_nonblank_mask=selected_nonblank_mask,
+            teacher_nonblank_mask=packed_nonblank_mask,
         )
         total = total + event_sums
         denom = denom + event_denoms
@@ -5658,6 +5831,10 @@ def _ctc_teacher_decoder_hidden_loss(
     missing_ids: set[str] = set()
     events = 0
     max_frame_delta = 0
+    packed_events: dict[
+        str,
+        list[tuple[int, int, torch.Tensor, torch.Tensor | None]],
+    ] = {name: [] for name in state_names}
     student_times = tuple(int(value) for value in clipped_lengths.detach().cpu().tolist())
 
     for sample_idx in range(batch_size):
@@ -5699,7 +5876,7 @@ def _ctc_teacher_decoder_hidden_loss(
                         f"Missing Nano CTC decoder state={state_name!r} for utt_id={utt_id!r}."
                     )
                 continue
-            teacher_hidden = torch.as_tensor(teacher_hidden_raw, dtype=torch.float32)
+            teacher_hidden = torch.as_tensor(teacher_hidden_raw)
             if teacher_hidden.ndim != 2 or int(teacher_hidden.size(-1)) != int(student_hidden.size(-1)):
                 raise ValueError(
                     f"CTC decoder hidden shape mismatch for utt_id={utt_id!r} state={state_name!r}: "
@@ -5716,53 +5893,18 @@ def _ctc_teacher_decoder_hidden_loss(
             aligned_time = min(student_time, teacher_time)
             if aligned_time <= 0:
                 continue
-            student_slice = student_hidden[sample_idx, :aligned_time, :].float()
-            teacher_slice = teacher_hidden[:aligned_time].to(device=student_slice.device)
-            frame_loss = student_slice.new_zeros((aligned_time,), dtype=torch.float32)
-            student_power = student_slice.square().mean(dim=-1)
-            teacher_power = teacher_slice.square().mean(dim=-1)
-            if normalized_mse_weight > 0.0:
-                student_norm = F.layer_norm(student_slice, (int(student_slice.size(-1)),))
-                teacher_norm = F.layer_norm(teacher_slice, (int(teacher_slice.size(-1)),))
-                frame_loss += F.mse_loss(student_norm, teacher_norm, reduction="none").mean(dim=-1) * float(
-                    normalized_mse_weight
+            packed_events[state_name].append(
+                (
+                    sample_idx,
+                    aligned_time,
+                    teacher_hidden[:aligned_time],
+                    (
+                        teacher_nonblank_mask[:aligned_time]
+                        if teacher_nonblank_mask is not None
+                        else None
+                    ),
                 )
-            if cosine_weight > 0.0:
-                frame_loss += (
-                    1.0 - F.cosine_similarity(student_slice, teacher_slice, dim=-1, eps=1.0e-6)
-                ) * float(cosine_weight)
-            if energy_mse_weight > 0.0:
-                diff_power = (student_slice - teacher_slice).square().mean(dim=-1)
-                frame_loss += (
-                    2.0 * diff_power / (student_power + teacher_power + 1.0e-6)
-                ) * float(energy_mse_weight)
-            if log_rms_weight > 0.0:
-                log_rms_delta = 0.5 * (
-                    torch.log(student_power + 1.0e-6) - torch.log(teacher_power + 1.0e-6)
-                )
-                frame_loss += F.smooth_l1_loss(
-                    log_rms_delta,
-                    torch.zeros_like(log_rms_delta),
-                    reduction="none",
-                    beta=0.25,
-                ) * float(log_rms_weight)
-            if raw_mse_weight > 0.0:
-                frame_loss += F.mse_loss(student_slice, teacher_slice, reduction="none").mean(dim=-1) * float(
-                    raw_mse_weight
-                )
-            event_sums, event_denoms = _ctc_frame_group_sums(
-                frame_loss,
-                frame_balance_mode=frame_balance_mode,
-                teacher_nonblank_mask=(
-                    teacher_nonblank_mask[:aligned_time]
-                    if teacher_nonblank_mask is not None
-                    else None
-                ),
             )
-            total = total + event_sums
-            denom = denom + event_denoms
-            state_sums[state_name] = state_sums[state_name] + event_sums
-            state_denoms[state_name] = state_denoms[state_name] + event_denoms
             events += 1
             sample_had_event = True
         if sample_had_event:
@@ -5770,6 +5912,49 @@ def _ctc_teacher_decoder_hidden_loss(
 
     if events <= 0:
         raise RuntimeError("CTC decoder hidden distillation produced no matched state events.")
+    for state_name in state_names:
+        state_events = packed_events[state_name]
+        if not state_events:
+            continue
+        student_hidden = student_hiddens[state_name]
+        student_slice = torch.cat(
+            [
+                student_hidden[sample_idx, :aligned_time, :]
+                for sample_idx, aligned_time, _, _ in state_events
+            ],
+            dim=0,
+        ).float()
+        teacher_slice = _pack_teacher_hidden_rows(
+            [teacher_hidden for _, _, teacher_hidden, _ in state_events],
+            device=student_slice.device,
+        )
+        packed_loss = _packed_hidden_frame_loss(
+            student_slice,
+            teacher_slice,
+            normalized_mse_weight=float(normalized_mse_weight),
+            cosine_weight=float(cosine_weight),
+            energy_mse_weight=float(energy_mse_weight),
+            log_rms_weight=float(log_rms_weight),
+            raw_mse_weight=float(raw_mse_weight),
+            collect_stats=False,
+        )
+        packed_nonblank_mask = (
+            torch.cat(
+                [mask for _, _, _, mask in state_events if isinstance(mask, torch.Tensor)],
+                dim=0,
+            )
+            if group_count == 2
+            else None
+        )
+        event_sums, event_denoms = _ctc_frame_group_sums(
+            packed_loss.frame_loss,
+            frame_balance_mode=frame_balance_mode,
+            teacher_nonblank_mask=packed_nonblank_mask,
+        )
+        total = total + event_sums
+        denom = denom + event_denoms
+        state_sums[state_name] = state_sums[state_name] + event_sums
+        state_denoms[state_name] = state_denoms[state_name] + event_denoms
     return _DecoderHiddenDistillationResult(
         loss=_ctc_frame_group_mean(total, denom),
         state_losses={

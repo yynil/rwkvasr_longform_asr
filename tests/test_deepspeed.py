@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from rwkvasr.data import ASRBatch
 from rwkvasr.cli.train_ctc_deepspeed import _resolve_deepspeed_train_config, build_parser
@@ -726,6 +727,241 @@ def test_layer_hidden_loss_matches_identical_sampled_components() -> None:
     assert result.max_frame_delta == 0
     result.loss.backward()
     assert student_hiddens[0]["mixer"].grad is not None
+
+
+def test_layer_hidden_loss_packs_metric_kernels_by_layer_and_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(17)
+    batch_size = 4
+    layer_ids = (0, 2)
+    active_components = ("mixer", "block")
+    lengths = torch.tensor([5, 4, 3, 2])
+    student_hiddens = {
+        layer_id: {
+            component: torch.randn(batch_size, 5, 8, requires_grad=True)
+            for component in active_components
+        }
+        for layer_id in layer_ids
+    }
+    records = {
+        f"utt-{sample_idx}": {
+            "encoder_layer_hiddens": {
+                str(layer_id): {
+                    component: student_hiddens[layer_id][component][
+                        sample_idx, : int(lengths[sample_idx])
+                    ].detach().to(dtype=torch.float16)
+                    for component in active_components
+                }
+                for layer_id in layer_ids
+            }
+        }
+        for sample_idx in range(batch_size)
+    }
+    calls = {"layer_norm": 0, "cosine": 0}
+    original_layer_norm = F.layer_norm
+    original_cosine = F.cosine_similarity
+
+    def counted_layer_norm(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["layer_norm"] += 1
+        return original_layer_norm(*args, **kwargs)
+
+    def counted_cosine(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["cosine"] += 1
+        return original_cosine(*args, **kwargs)
+
+    monkeypatch.setattr(F, "layer_norm", counted_layer_norm)
+    monkeypatch.setattr(F, "cosine_similarity", counted_cosine)
+    result = _ctc_teacher_layer_hidden_loss(
+        student_hiddens,
+        lengths,
+        tuple(records),
+        records,
+        layer_ids=layer_ids,
+        component_weights={"mixer": 0.25, "ffn": 0.0, "block": 1.0},
+        normalized_mse_weight=1.0,
+        cosine_weight=0.25,
+        energy_mse_weight=0.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=0.0,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+
+    packed_groups = len(layer_ids) * len(active_components)
+    assert calls == {"layer_norm": packed_groups * 2, "cosine": packed_groups}
+    assert result.events == batch_size * packed_groups
+    assert result.matched_samples == batch_size
+    result.loss.backward()
+    assert all(
+        student_hiddens[layer_id][component].grad is not None
+        for layer_id in layer_ids
+        for component in active_components
+    )
+
+
+def test_layer_hidden_packed_reduction_matches_legacy_event_objective_and_gradients() -> None:
+    torch.manual_seed(31)
+    layer_ids = (0, 2)
+    components = ("mixer", "block")
+    lengths = torch.tensor([5, 4, 3])
+    base = {
+        layer_id: {
+            component: torch.randn(3, 5, 7)
+            for component in components
+        }
+        for layer_id in layer_ids
+    }
+    packed_student = {
+        layer_id: {
+            component: value.clone().requires_grad_()
+            for component, value in layer.items()
+        }
+        for layer_id, layer in base.items()
+    }
+    legacy_student = {
+        layer_id: {
+            component: value.clone().requires_grad_()
+            for component, value in layer.items()
+        }
+        for layer_id, layer in base.items()
+    }
+    records: dict[str, dict[str, object]] = {}
+    for sample_idx, student_time in enumerate(lengths.tolist()):
+        records[f"utt-{sample_idx}"] = {
+            "encoder_layer_hiddens": {
+                str(layer_id): {
+                    component: torch.randn(
+                        student_time - ((sample_idx + layer_id + component_idx) % 2),
+                        7,
+                    ).to(dtype=torch.float16)
+                    for component_idx, component in enumerate(components)
+                }
+                for layer_id in layer_ids
+            }
+        }
+    component_weights = {"mixer": 0.25, "ffn": 0.0, "block": 1.0}
+    metric_weights = {
+        "normalized_mse_weight": 1.0,
+        "cosine_weight": 0.25,
+        "energy_mse_weight": 0.5,
+        "log_rms_weight": 0.1,
+        "raw_mse_weight": 0.2,
+    }
+    result = _ctc_teacher_layer_hidden_loss(
+        packed_student,
+        lengths,
+        tuple(records),
+        records,
+        layer_ids=layer_ids,
+        component_weights=component_weights,
+        frame_tolerance=1,
+        missing_policy="error",
+        **metric_weights,
+    )
+
+    component_sums = {
+        component: legacy_student[layer_ids[0]][component].new_zeros(())
+        for component in components
+    }
+    component_frames = {component: 0 for component in components}
+    layer_sums = {
+        layer_id: legacy_student[layer_id][components[0]].new_zeros(())
+        for layer_id in layer_ids
+    }
+    layer_frames = {layer_id: 0.0 for layer_id in layer_ids}
+    for sample_idx, student_time in enumerate(lengths.tolist()):
+        teacher_layers = records[f"utt-{sample_idx}"]["encoder_layer_hiddens"]
+        assert isinstance(teacher_layers, dict)
+        for layer_id in layer_ids:
+            teacher_components = teacher_layers[str(layer_id)]
+            assert isinstance(teacher_components, dict)
+            for component in components:
+                teacher = torch.as_tensor(teacher_components[component], dtype=torch.float32)
+                aligned_time = min(student_time, int(teacher.size(0)))
+                student = legacy_student[layer_id][component][sample_idx, :aligned_time].float()
+                teacher = teacher[:aligned_time]
+                student_power = student.square().mean(dim=-1)
+                teacher_power = teacher.square().mean(dim=-1)
+                diff_power = (student - teacher).square().mean(dim=-1)
+                energy_mse = 2.0 * diff_power / (student_power + teacher_power + 1.0e-6)
+                log_rms_delta = 0.5 * (
+                    torch.log(student_power + 1.0e-6)
+                    - torch.log(teacher_power + 1.0e-6)
+                )
+                frame_loss = F.mse_loss(
+                    F.layer_norm(student, (7,)),
+                    F.layer_norm(teacher, (7,)),
+                    reduction="none",
+                ).mean(dim=-1)
+                frame_loss = frame_loss + (
+                    1.0 - F.cosine_similarity(student, teacher, dim=-1, eps=1.0e-6)
+                ) * metric_weights["cosine_weight"]
+                frame_loss = frame_loss + energy_mse * metric_weights["energy_mse_weight"]
+                frame_loss = frame_loss + F.smooth_l1_loss(
+                    log_rms_delta,
+                    torch.zeros_like(log_rms_delta),
+                    reduction="none",
+                    beta=0.25,
+                ) * metric_weights["log_rms_weight"]
+                frame_loss = frame_loss + F.mse_loss(
+                    student,
+                    teacher,
+                    reduction="none",
+                ).mean(dim=-1) * metric_weights["raw_mse_weight"]
+                component_sums[component] = component_sums[component] + frame_loss.sum()
+                component_frames[component] += aligned_time
+                weight = component_weights[component]
+                layer_sums[layer_id] = layer_sums[layer_id] + frame_loss.sum() * weight
+                layer_frames[layer_id] += aligned_time * weight
+    legacy_component_losses = {
+        component: component_sums[component] / component_frames[component]
+        for component in components
+    }
+    legacy_layer_losses = {
+        layer_id: layer_sums[layer_id] / layer_frames[layer_id]
+        for layer_id in layer_ids
+    }
+    legacy_loss = sum(
+        legacy_component_losses[component] * component_weights[component]
+        for component in components
+    )
+
+    torch.testing.assert_close(result.loss, legacy_loss, rtol=1.0e-6, atol=1.0e-7)
+    for component in components:
+        torch.testing.assert_close(
+            result.component_losses[component],
+            legacy_component_losses[component],
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+    for layer_id in layer_ids:
+        torch.testing.assert_close(
+            result.layer_losses[layer_id],
+            legacy_layer_losses[layer_id],
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+    packed_parameters = [
+        packed_student[layer_id][component]
+        for layer_id in layer_ids
+        for component in components
+    ]
+    legacy_parameters = [
+        legacy_student[layer_id][component]
+        for layer_id in layer_ids
+        for component in components
+    ]
+    packed_gradients = torch.autograd.grad(result.loss, packed_parameters)
+    legacy_gradients = torch.autograd.grad(legacy_loss, legacy_parameters)
+    for packed_gradient, legacy_gradient in zip(
+        packed_gradients,
+        legacy_gradients,
+        strict=True,
+    ):
+        torch.testing.assert_close(packed_gradient, legacy_gradient, rtol=1.0e-5, atol=1.0e-6)
+    assert result.events == len(lengths) * len(layer_ids) * len(components)
+    assert result.max_frame_delta == 1
 
 
 def test_teacher_top1_balanced_reduction_weights_blank_and_nonblank_equally() -> None:
