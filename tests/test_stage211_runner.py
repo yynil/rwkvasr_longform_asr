@@ -5866,6 +5866,7 @@ def _write_retention_correction(
                 "replay_receipt_sha256": sha256_file(replay_receipt),
                 "admission_gate_path": str(failed_gate.resolve()),
                 "admission_gate_sha256": sha256_file(failed_gate),
+                "admission_mode": "failed_gate",
                 "layer_focus_path": str(layer_focus.resolve()),
                 "layer_focus_sha256": sha256_file(layer_focus),
                 "layer_rotation_offset": 0,
@@ -5918,6 +5919,7 @@ def _write_retention_correction(
             "stage211_post_coverage_correction_phase": "mixer",
             "stage211_post_coverage_replay_receipt_path": str(replay_receipt.resolve()),
             "stage211_post_coverage_admission_gate_path": str(failed_gate.resolve()),
+            "stage211_post_coverage_admission_mode": "failed_gate",
             "stage211_post_coverage_layer_focus_path": str(layer_focus.resolve()),
             "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
             "stage211_post_coverage_layer_rotation_offset": 0,
@@ -5970,6 +5972,7 @@ def _write_retention_correction(
                 "replay_manifest_sha256": sha256_file(replay_manifest),
                 "admission_gate_path": str(failed_gate.resolve()),
                 "admission_gate_sha256": sha256_file(failed_gate),
+                "admission_mode": "failed_gate",
                 "init_checkpoint_path": str(init_checkpoint.resolve()),
                 "init_checkpoint_sha256": sha256_file(init_checkpoint),
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
@@ -6054,6 +6057,7 @@ def _write_retention_correction(
         "bucket_manifest_sha256": sha256_file(replay_manifest),
         "admission_gate_path": str(failed_gate.resolve()),
         "admission_gate_sha256": sha256_file(failed_gate),
+        "admission_mode": "failed_gate",
         "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
         "batch_profile_preflight_path": str(batch_profile_path.resolve()),
@@ -6365,6 +6369,76 @@ def test_stage211_phase_gate_rejects_mutated_correction_focus_summary(
     )
 
     with pytest.raises(ValueError, match="layer-focus summary mismatch"):
+        validate_stage211_phase_gate_report(
+            corrected_gate,
+            expected_phase="mixer",
+            checkpoint_path=corrected_checkpoint,
+            require_passed=False,
+        )
+
+
+def test_stage211_phase_gate_rejects_spoofed_early_pass_admission_mode(
+    tmp_path: Path,
+) -> None:
+    original_checkpoint = tmp_path / "long-complete.pt"
+    original_checkpoint.write_bytes(b"long-complete")
+    failed_gate = _write_failed_phase_gate(
+        _write_valid_phase_gate(
+            tmp_path,
+            phase="mixer",
+            checkpoint=original_checkpoint,
+        )
+    )
+    corrected_checkpoint = tmp_path / "retention-complete.pt"
+    corrected_checkpoint.write_bytes(b"retention-complete")
+    correction, _ = _write_retention_correction(
+        tmp_path,
+        failed_gate=failed_gate,
+        completion_checkpoint=corrected_checkpoint,
+    )
+    spoofed_mode = "early_pass_mandatory_continuation"
+
+    smoke_path = Path(str(correction["smoke_marker_path"]))
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["admission_mode"] = spoofed_mode
+    smoke_path.write_text(json.dumps(smoke) + "\n", encoding="utf-8")
+
+    config_path = Path(str(correction["train_config_path"]))
+    config = load_yaml(config_path)
+    config["stage211_post_coverage_admission_mode"] = spoofed_mode
+    config["stage211_post_coverage_smoke_marker_sha256"] = sha256_file(smoke_path)
+    save_yaml(config_path, config)
+
+    provenance_path = Path(str(correction["provenance_path"]))
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["admission_mode"] = spoofed_mode
+    provenance["smoke_marker_sha256"] = sha256_file(smoke_path)
+    provenance_path.write_text(json.dumps(provenance) + "\n", encoding="utf-8")
+
+    receipt_path = Path(str(correction["receipt_path"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt.update(
+        {
+            "admission_mode": spoofed_mode,
+            "smoke_marker_sha256": sha256_file(smoke_path),
+            "train_config_sha256": sha256_file(config_path),
+            "provenance_sha256": sha256_file(provenance_path),
+        }
+    )
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    correction = {
+        **receipt,
+        "receipt_path": str(receipt_path.resolve()),
+        "receipt_sha256": sha256_file(receipt_path),
+    }
+    corrected_gate = _write_corrected_phase_gate(
+        tmp_path,
+        failed_gate=failed_gate,
+        checkpoint=corrected_checkpoint,
+        correction=correction,
+    )
+
+    with pytest.raises(ValueError, match="admission mode mismatch"):
         validate_stage211_phase_gate_report(
             corrected_gate,
             expected_phase="mixer",

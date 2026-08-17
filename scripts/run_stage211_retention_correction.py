@@ -22,6 +22,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
     build_stage211_correction_layer_focus,
     sha256_file,
+    stage211_correction_admission_mode,
     stage211_correction_layer_rotation_offset,
     stage211_post_coverage_correction_lr,
     validate_stage211_correction_layer_focus,
@@ -125,22 +126,23 @@ def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(rendered, encoding="utf-8")
 
 
-def _admit_failed_gate(
+def _admit_gate(
     *,
     admission_gate_path: Path,
     init_checkpoint: Path,
     round_index: int,
     phase: str = "mixer",
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, str]:
     gate = validate_stage211_phase_gate_report(
         admission_gate_path,
         expected_phase=phase,
         checkpoint_path=init_checkpoint,
         require_passed=False,
     )
-    if gate.get("gate_passed") is not False:
-        phase_label = "Mixer" if phase == "mixer" else phase.capitalize()
-        raise ValueError(f"Stage211 correction requires an explicitly failed {phase_label} gate.")
+    admission_mode = stage211_correction_admission_mode(
+        gate_passed=gate.get("gate_passed"),
+        round_index=round_index,
+    )
     coverage = gate.get("full_data_coverage")
     if not isinstance(coverage, dict):
         raise ValueError("Stage211 correction admission gate lacks full-data coverage.")
@@ -159,7 +161,7 @@ def _admit_failed_gate(
     }
     if len(teacher_values) != 1 or len(next(iter(teacher_values), "")) != 64:
         raise ValueError("Stage211 correction admission gate has mixed Nano teachers.")
-    return gate, next(iter(teacher_values))
+    return gate, next(iter(teacher_values)), admission_mode
 
 
 def _audit_replay_storage(replay: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
@@ -233,6 +235,7 @@ def _provenance_payload(
     replay_receipt: Path,
     replay_manifest: Path,
     admission_gate: Path,
+    admission_mode: str,
     init_checkpoint: Path,
     nano_checkpoint: Path,
     smoke_marker: Path,
@@ -257,6 +260,7 @@ def _provenance_payload(
         "replay_manifest_sha256": sha256_file(replay_manifest),
         "admission_gate_path": str(admission_gate),
         "admission_gate_sha256": sha256_file(admission_gate),
+        "admission_mode": admission_mode,
         "init_checkpoint_path": str(init_checkpoint),
         "init_checkpoint_sha256": sha256_file(init_checkpoint),
         "nano_teacher_checkpoint_path": str(nano_checkpoint),
@@ -307,6 +311,7 @@ def _correction_config_metadata(
     round_index: int,
     replay_receipt: Path,
     admission_gate: Path,
+    admission_mode: str,
     layer_focus: Path,
     layer_rotation_offset: int,
     batch_profile_preflight: dict[str, Any],
@@ -319,6 +324,7 @@ def _correction_config_metadata(
         "stage211_post_coverage_correction_round": round_index,
         "stage211_post_coverage_replay_receipt_path": str(replay_receipt),
         "stage211_post_coverage_admission_gate_path": str(admission_gate),
+        "stage211_post_coverage_admission_mode": admission_mode,
         "stage211_post_coverage_layer_focus_path": str(layer_focus),
         "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
         "stage211_post_coverage_layer_rotation_offset": layer_rotation_offset,
@@ -354,6 +360,7 @@ def _validate_correction_smoke_marker(
     replay_receipt: Path,
     replay_manifest: Path,
     admission_gate: Path,
+    admission_mode: str,
     layer_focus: Path,
     layer_rotation_offset: int,
     nano_checkpoint: Path,
@@ -381,6 +388,7 @@ def _validate_correction_smoke_marker(
         "replay_receipt_sha256": sha256_file(replay_receipt),
         "admission_gate_path": str(admission_gate),
         "admission_gate_sha256": sha256_file(admission_gate),
+        "admission_mode": admission_mode,
         "layer_focus_path": str(layer_focus),
         "layer_focus_sha256": sha256_file(layer_focus),
         "layer_rotation_offset": layer_rotation_offset,
@@ -432,6 +440,7 @@ def _run_correction_smoke(
     replay_receipt: Path,
     replay_manifest: Path,
     admission_gate: Path,
+    admission_mode: str,
     layer_focus: Path,
     layer_focus_payload: dict[str, Any],
     layer_rotation_offset: int,
@@ -456,6 +465,7 @@ def _run_correction_smoke(
             replay_receipt=replay_receipt,
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
+            admission_mode=admission_mode,
             layer_focus=layer_focus,
             layer_rotation_offset=layer_rotation_offset,
             nano_checkpoint=nano_checkpoint,
@@ -496,6 +506,7 @@ def _run_correction_smoke(
             round_index=round_index,
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
+            admission_mode=admission_mode,
             layer_focus=layer_focus,
             layer_rotation_offset=layer_rotation_offset,
             batch_profile_preflight=batch_profile_preflight,
@@ -534,6 +545,7 @@ def _run_correction_smoke(
             "replay_receipt_sha256": sha256_file(replay_receipt),
             "admission_gate_path": str(admission_gate),
             "admission_gate_sha256": sha256_file(admission_gate),
+            "admission_mode": admission_mode,
             "layer_focus_path": str(layer_focus),
             "layer_focus_sha256": sha256_file(layer_focus),
             "layer_rotation_offset": layer_rotation_offset,
@@ -571,6 +583,7 @@ def _run_correction_smoke(
         replay_receipt=replay_receipt,
         replay_manifest=replay_manifest,
         admission_gate=admission_gate,
+        admission_mode=admission_mode,
         layer_focus=layer_focus,
         layer_rotation_offset=layer_rotation_offset,
         nano_checkpoint=nano_checkpoint,
@@ -602,7 +615,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
 
     replay = validate_retention_replay(replay_receipt)
     replay_manifest, audio_data_audit = _audit_replay_storage(replay)
-    admitted_gate, teacher_sha256 = _admit_failed_gate(
+    admitted_gate, teacher_sha256, admission_mode = _admit_gate(
         admission_gate_path=admission_gate,
         init_checkpoint=init_checkpoint,
         round_index=round_index,
@@ -640,6 +653,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         phase=phase_name,
         admission_gate_path=admission_gate,
         admission_gate=admitted_gate,
+        round_index=round_index,
     )
     _write_immutable_json(layer_focus_path, layer_focus)
     layer_focus = validate_stage211_correction_layer_focus(
@@ -647,6 +661,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         phase=phase_name,
         admission_gate_path=admission_gate,
         admission_gate=admitted_gate,
+        round_index=round_index,
     )
     layer_rotation_offset = stage211_correction_layer_rotation_offset(
         round_index=round_index,
@@ -814,6 +829,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             round_index=round_index,
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
+            admission_mode=admission_mode,
             layer_focus=layer_focus_path,
             layer_rotation_offset=layer_rotation_offset,
             batch_profile_preflight=batch_profile_preflight,
@@ -828,6 +844,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         replay_receipt=replay_receipt,
         replay_manifest=replay_manifest,
         admission_gate=admission_gate,
+        admission_mode=admission_mode,
         layer_focus=layer_focus_path,
         layer_focus_payload=layer_focus,
         layer_rotation_offset=layer_rotation_offset,
@@ -860,6 +877,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             replay_receipt=replay_receipt,
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
+            admission_mode=admission_mode,
             init_checkpoint=init_checkpoint,
             nano_checkpoint=nano_checkpoint,
             smoke_marker=smoke_marker_path,
@@ -888,6 +906,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         f"frame_budget={runtime_frame_budget} num_workers={runtime_num_workers} "
         f"focus_layers={','.join(str(value) for value in layer_focus['boundary_layer_ids']) or '-'} "
         f"layer_rotation_offset={layer_rotation_offset} "
+        f"admission_mode={admission_mode} "
         f"latest_step={latest_step} run_dir={run_dir}",
         flush=True,
     )

@@ -24,6 +24,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_RETENTION_CORRECTION_MAX_ROUNDS,
     resolve_stage211_nano_teacher_checkpoint,
     sha256_file,
+    stage211_correction_admission_mode,
     stage211_correction_layer_rotation_offset,
     stage211_post_coverage_correction_lr,
     stage211_post_coverage_train_config_contract,
@@ -82,6 +83,7 @@ def _validate_correction_smoke_marker(
     replay_receipt: Path,
     replay_manifest: Path,
     admission_gate: Path,
+    admission_mode: str,
     layer_focus: Path,
     layer_rotation_offset: int,
     init_checkpoint: Path,
@@ -106,6 +108,7 @@ def _validate_correction_smoke_marker(
         "replay_receipt_sha256": sha256_file(replay_receipt),
         "admission_gate_path": str(admission_gate),
         "admission_gate_sha256": sha256_file(admission_gate),
+        "admission_mode": admission_mode,
         "layer_focus_path": str(layer_focus),
         "layer_focus_sha256": sha256_file(layer_focus),
         "layer_rotation_offset": layer_rotation_offset,
@@ -164,6 +167,7 @@ def _validate_correction_train_config(
     replay_manifest: Path,
     replay_receipt: Path,
     admission_gate: Path,
+    admission_mode: str,
     layer_focus: Path,
     layer_focus_payload: dict[str, Any],
     init_checkpoint: Path,
@@ -214,6 +218,7 @@ def _validate_correction_train_config(
         "stage211_post_coverage_correction_round": round_index,
         "stage211_post_coverage_replay_receipt_path": str(replay_receipt),
         "stage211_post_coverage_admission_gate_path": str(admission_gate),
+        "stage211_post_coverage_admission_mode": admission_mode,
         "stage211_post_coverage_layer_focus_path": str(layer_focus),
         "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
         "stage211_post_coverage_layer_rotation_offset": layer_rotation_offset,
@@ -355,8 +360,10 @@ def build_receipt(
         checkpoint_path=init_checkpoint_path,
         require_passed=False,
     )
-    if admission_gate.get("gate_passed") is not False:
-        raise ValueError("Stage211 correction requires an explicitly failed admission gate.")
+    admission_mode = stage211_correction_admission_mode(
+        gate_passed=admission_gate.get("gate_passed"),
+        round_index=round_index,
+    )
     admission_coverage = admission_gate.get("full_data_coverage")
     prior_corrections = (
         admission_coverage.get("post_coverage_corrections", [])
@@ -399,6 +406,7 @@ def build_receipt(
         phase=phase,
         admission_gate_path=admission_gate_path,
         admission_gate=admission_gate,
+        round_index=round_index,
     )
     layer_rotation_offset = stage211_correction_layer_rotation_offset(
         round_index=round_index,
@@ -488,6 +496,7 @@ def build_receipt(
         "replay_receipt_sha256": sha256_file(replay_receipt_path),
         "admission_gate_path": str(admission_gate_path),
         "admission_gate_sha256": sha256_file(admission_gate_path),
+        "admission_mode": admission_mode,
         "init_checkpoint_path": str(init_checkpoint_path),
         "init_checkpoint_sha256": sha256_file(init_checkpoint_path),
         "replay_manifest_path": str(replay_manifest),
@@ -539,6 +548,7 @@ def build_receipt(
         replay_manifest=replay_manifest,
         replay_receipt=replay_receipt_path,
         admission_gate=admission_gate_path,
+        admission_mode=admission_mode,
         layer_focus=layer_focus_path,
         layer_focus_payload=layer_focus,
         init_checkpoint=init_checkpoint_path,
@@ -562,6 +572,7 @@ def build_receipt(
         replay_receipt=replay_receipt_path,
         replay_manifest=replay_manifest,
         admission_gate=admission_gate_path,
+        admission_mode=admission_mode,
         layer_focus=layer_focus_path,
         layer_rotation_offset=layer_rotation_offset,
         init_checkpoint=init_checkpoint_path,
@@ -644,6 +655,7 @@ def build_receipt(
         "bucket_manifest_sha256": sha256_file(replay_manifest),
         "admission_gate_path": str(admission_gate_path),
         "admission_gate_sha256": sha256_file(admission_gate_path),
+        "admission_mode": admission_mode,
         "correction_extension_decision_path": (
             str(extension_decision_path) if extension_decision_path is not None else None
         ),

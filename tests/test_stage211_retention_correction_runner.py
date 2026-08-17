@@ -59,7 +59,7 @@ def test_stage211_phase_correction_uses_phase_objective_and_lr(
     assert provenance_lr == expected_lr
 
 
-def test_stage211_correction_admission_requires_immediate_failed_gate(
+def test_stage211_correction_admission_supports_mandatory_early_pass_continuation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -81,25 +81,56 @@ def test_stage211_correction_admission_requires_immediate_failed_gate(
         lambda *args, **kwargs: gate,
     )
 
-    admitted, admitted_teacher = runner._admit_failed_gate(
+    admitted, admitted_teacher, admission_mode = runner._admit_gate(
         admission_gate_path=gate_path,
         init_checkpoint=checkpoint,
         round_index=2,
     )
     assert admitted is gate
     assert admitted_teacher == teacher_sha256
+    assert admission_mode == "failed_gate"
 
     gate["gate_passed"] = True
-    with pytest.raises(ValueError, match="explicitly failed Mixer gate"):
-        runner._admit_failed_gate(
+    admitted, admitted_teacher, admission_mode = runner._admit_gate(
+        admission_gate_path=gate_path,
+        init_checkpoint=checkpoint,
+        round_index=2,
+    )
+    assert admitted is gate
+    assert admitted_teacher == teacher_sha256
+    assert admission_mode == "early_pass_mandatory_continuation"
+
+    gate["full_data_coverage"]["post_coverage_corrections"] = [
+        {"round": 1},
+        {"round": 2},
+    ]
+    _, _, admission_mode = runner._admit_gate(
+        admission_gate_path=gate_path,
+        init_checkpoint=checkpoint,
+        round_index=3,
+    )
+    assert admission_mode == "early_pass_mandatory_continuation"
+
+    gate["full_data_coverage"]["post_coverage_corrections"].append({"round": 3})
+    with pytest.raises(ValueError, match="failed gate or an early passing gate"):
+        runner._admit_gate(
             admission_gate_path=gate_path,
             init_checkpoint=checkpoint,
-            round_index=2,
+            round_index=4,
         )
+
+    gate["full_data_coverage"]["post_coverage_corrections"] = []
+    with pytest.raises(ValueError, match="failed gate or an early passing gate"):
+        runner._admit_gate(
+            admission_gate_path=gate_path,
+            init_checkpoint=checkpoint,
+            round_index=1,
+        )
+
     gate["gate_passed"] = False
     gate["full_data_coverage"]["post_coverage_corrections"] = []
     with pytest.raises(ValueError, match="immediately follow"):
-        runner._admit_failed_gate(
+        runner._admit_gate(
             admission_gate_path=gate_path,
             init_checkpoint=checkpoint,
             round_index=2,
@@ -135,6 +166,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
         replay_receipt=replay_receipt,
         replay_manifest=replay_manifest,
         admission_gate=gate,
+        admission_mode="failed_gate",
         init_checkpoint=init_checkpoint,
         nano_checkpoint=nano_checkpoint,
         smoke_marker=smoke_marker,
@@ -153,6 +185,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     assert provenance["learning_rate"] == runner.CORRECTION_LR
     assert provenance["trainable_boundary"] == "mixer_only"
     assert provenance["early_stopping"] is False
+    assert provenance["admission_mode"] == "failed_gate"
     assert len(provenance["admission_gate_sha256"]) == 64
     assert provenance["smoke_marker_sha256"] == runner.sha256_file(smoke_marker)
     assert provenance["layer_focus_sha256"] == runner.sha256_file(layer_focus)
@@ -196,6 +229,7 @@ def test_stage211_downstream_correction_provenance_records_phase_objective_with_
         replay_receipt=inputs["replay.json"],
         replay_manifest=inputs["manifest.json"],
         admission_gate=inputs["gate.json"],
+        admission_mode="early_pass_mandatory_continuation",
         init_checkpoint=inputs["init.pt"],
         nano_checkpoint=inputs["model.pt"],
         smoke_marker=inputs["smoke.json"],
@@ -212,3 +246,4 @@ def test_stage211_downstream_correction_provenance_records_phase_objective_with_
     assert provenance["learning_rate"] == expected_lr
     assert provenance["trainable_boundary"] == "mixer_only"
     assert provenance["early_stopping"] is False
+    assert provenance["admission_mode"] == "early_pass_mandatory_continuation"

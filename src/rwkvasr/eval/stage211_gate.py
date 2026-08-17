@@ -46,6 +46,8 @@ STAGE211_RETENTION_CORRECTION_MAX_ROUNDS = 32
 STAGE211_RETENTION_CORRECTION_STALL_PATIENCE = 3
 STAGE211_RETENTION_CORRECTION_EPOCHS = 1
 STAGE211_RETENTION_CORRECTION_LR = 1.0e-6
+STAGE211_CORRECTION_ADMISSION_FAILED_GATE = "failed_gate"
+STAGE211_CORRECTION_ADMISSION_EARLY_PASS = "early_pass_mandatory_continuation"
 STAGE211_CORRECTION_EXTENSION_DECISION_SCHEMA_VERSION = 2
 STAGE211_CORRECTION_LAYER_FOCUS_SCHEMA_VERSION = 2
 STAGE211_HARD_LAYER_IDS = (0, 11, 12, 17, 20, 49, 50, 69)
@@ -138,6 +140,21 @@ _STAGE211_LOGITS_REQUIRED_METRICS = (
     "matched_utterances",
     "missing_utterances",
 )
+
+
+def stage211_correction_admission_mode(*, gate_passed: Any, round_index: int) -> str:
+    """Derive the correction admission mode from immutable gate state and round order."""
+    if gate_passed is False:
+        return STAGE211_CORRECTION_ADMISSION_FAILED_GATE
+    if (
+        gate_passed is True
+        and 1 < round_index <= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
+    ):
+        return STAGE211_CORRECTION_ADMISSION_EARLY_PASS
+    raise ValueError(
+        "Stage211 correction admission requires a failed gate or an early passing gate "
+        "that must continue through the guaranteed correction rounds."
+    )
 
 
 def stage211_phase_gate_decision(
@@ -863,6 +880,7 @@ def build_stage211_correction_layer_focus(
     phase: str,
     admission_gate_path: Path,
     admission_gate: dict[str, Any],
+    round_index: int = 1,
 ) -> dict[str, Any]:
     if phase not in _STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS:
         raise ValueError(f"Unsupported Stage211 correction focus phase: {phase!r}")
@@ -871,8 +889,10 @@ def build_stage211_correction_layer_focus(
         raise ValueError(
             f"Stage211 correction focus admission gate is unavailable: {admission_gate_path}"
         )
-    if admission_gate.get("gate_passed") is not False:
-        raise ValueError("Stage211 correction focus requires an explicitly failed admission gate.")
+    admission_mode = stage211_correction_admission_mode(
+        gate_passed=admission_gate.get("gate_passed"),
+        round_index=round_index,
+    )
     alignment_binding = admission_gate.get("alignment_report")
     if not isinstance(alignment_binding, dict):
         raise ValueError("Stage211 correction focus lacks an alignment-report binding.")
@@ -1075,6 +1095,7 @@ def build_stage211_correction_layer_focus(
         "pipeline": "stage211",
         "artifact": "post_coverage_correction_layer_focus",
         "phase": phase,
+        "admission_mode": admission_mode,
         "strategy": strategy,
         "sample_count": sample_count,
         "failed_layer_count": failed_layer_count,
@@ -1114,6 +1135,7 @@ def validate_stage211_correction_layer_focus(
     phase: str,
     admission_gate_path: Path,
     admission_gate: dict[str, Any],
+    round_index: int = 1,
 ) -> dict[str, Any]:
     focus_path = focus_path.expanduser().resolve()
     focus = _load_json_object(
@@ -1124,6 +1146,7 @@ def validate_stage211_correction_layer_focus(
         phase=phase,
         admission_gate_path=admission_gate_path,
         admission_gate=admission_gate,
+        round_index=round_index,
     )
     if focus != rebuilt:
         raise ValueError("Stage211 correction-layer focus differs from failed-gate evidence.")
@@ -4010,6 +4033,7 @@ def _validate_stage211_correction_train_config(
         "stage211_post_coverage_admission_gate_path": str(
             Path(str(correction["admission_gate_path"])).resolve()
         ),
+        "stage211_post_coverage_admission_mode": str(correction["admission_mode"]),
         "stage211_post_coverage_layer_focus_path": str(layer_focus_path),
         "stage211_post_coverage_layer_focus_sha256": str(correction["layer_focus_sha256"]),
         "stage211_post_coverage_layer_rotation_offset": layer_rotation_offset,
@@ -4142,6 +4166,7 @@ def _validate_stage211_correction_smoke_marker(
         "replay_receipt_sha256": str(correction["replay_receipt_sha256"]),
         "admission_gate_path": str(admission_gate),
         "admission_gate_sha256": sha256_file(admission_gate),
+        "admission_mode": str(correction["admission_mode"]),
         "layer_focus_path": str(Path(str(correction["layer_focus_path"])).resolve()),
         "layer_focus_sha256": str(correction["layer_focus_sha256"]),
         "layer_rotation_offset": int(correction["layer_rotation_offset"]),
@@ -4377,6 +4402,7 @@ def _validate_stage211_post_coverage_corrections(
             "artifact": "retention_correction_run",
             "phase": phase,
             "round": round_index,
+            "admission_mode": str(correction.get("admission_mode") or ""),
             "layer_focus_path": str(Path(str(correction.get("layer_focus_path") or "")).resolve()),
             "layer_focus_sha256": str(correction.get("layer_focus_sha256") or ""),
             "layer_rotation_offset": int(correction["layer_rotation_offset"]),
@@ -4423,15 +4449,20 @@ def _validate_stage211_post_coverage_corrections(
             checkpoint_path=init_checkpoint,
             require_passed=False,
         )
-        if admission_gate.get("gate_passed") is not False:
+        admission_mode = stage211_correction_admission_mode(
+            gate_passed=admission_gate.get("gate_passed"),
+            round_index=round_index,
+        )
+        if correction.get("admission_mode") != admission_mode:
             raise ValueError(
-                f"Stage211 {phase} correction round {round_index} admission gate passed."
+                f"Stage211 {phase} correction round {round_index} admission mode mismatch."
             )
         replayed_layer_focus = validate_stage211_correction_layer_focus(
             Path(str(correction["layer_focus_path"])).resolve(),
             phase=phase,
             admission_gate_path=admission_gate_path,
             admission_gate=admission_gate,
+            round_index=round_index,
         )
         if configured_layer_focus != replayed_layer_focus:
             raise ValueError(

@@ -13,6 +13,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_RETENTION_CORRECTION_MAX_ROUNDS,
     build_stage211_correction_extension_decision,
     sha256_file,
+    stage211_correction_admission_mode,
     validate_stage211_correction_extension_decision,
     validate_stage211_phase_gate_report,
 )
@@ -387,6 +388,7 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
             raise ValueError(f"Stage211 original {phase} finalizer produced no phase gate.")
 
     prior_gate_path = original_gate_path
+    last_failed_gate_path: Path | None = None
     correction_receipts: list[Path] = []
     for round_index in range(0, int(args.max_rounds) + 1):
         gate_dir = (
@@ -400,9 +402,17 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
             receipt = run_dir / "correction_receipt.json"
             if not receipt.is_file():
                 prior_gate = _validate_gate_for_phase(prior_gate_path, phase=phase)
-                if prior_gate.get("gate_passed") is not False:
-                    raise ValueError("Stage211 correction admission gate unexpectedly passed.")
+                admission_mode = stage211_correction_admission_mode(
+                    gate_passed=prior_gate.get("gate_passed"),
+                    round_index=round_index,
+                )
                 init_checkpoint = Path(str(prior_gate["checkpoint_path"])).resolve()
+                print(
+                    "[stage211-correction-loop] correction admission "
+                    f"phase={phase} round={round_index} mode={admission_mode} "
+                    f"gate={prior_gate_path}",
+                    flush=True,
+                )
                 _run(
                     _correction_command(
                         args,
@@ -434,10 +444,14 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
         gate = _validate_gate_for_phase(gate_path, phase=phase)
         if gate.get("gate_passed") is True:
             if 0 < round_index < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
-                raise ValueError(
-                    f"Stage211 {phase} gate passed before the guaranteed "
-                    f"{STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS} correction rounds."
+                print(
+                    "[stage211-correction-loop] early gate pass requires mandatory continuation "
+                    f"phase={phase} completed_round={round_index} "
+                    f"guaranteed_rounds={STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS}",
+                    flush=True,
                 )
+                prior_gate_path = gate_path
+                continue
             promotion = _ensure_promotion(
                 gate_dir=gate_dir,
                 gate=gate,
@@ -470,11 +484,14 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
         if round_index >= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS and round_index < int(
             args.max_rounds
         ):
-            prior_gate = _validate_gate_for_phase(prior_gate_path, phase=phase)
+            if last_failed_gate_path is None:
+                raise ValueError("Stage211 correction extension lacks a prior failed gate.")
+            progress_gate_path = last_failed_gate_path
+            prior_gate = _validate_gate_for_phase(progress_gate_path, phase=phase)
             decision = _correction_extension_decision(
                 phase=phase,
                 completed_round=round_index,
-                prior_gate_path=prior_gate_path,
+                prior_gate_path=progress_gate_path,
                 prior_gate=prior_gate,
                 current_gate_path=gate_path,
                 current_gate=gate,
@@ -495,6 +512,7 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
                     f"Stage211 {phase} correction stalled after round {round_index}; "
                     f"extension evidence is preserved at {decision_path}."
                 )
+        last_failed_gate_path = gate_path
         prior_gate_path = gate_path
 
     raise ValueError(

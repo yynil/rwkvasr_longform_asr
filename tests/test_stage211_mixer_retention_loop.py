@@ -293,37 +293,138 @@ def test_retention_loop_requires_three_complete_rounds_before_promotion(
     assert round3_finalizer.count("--post-coverage-correction-receipt") == 3
 
 
-def test_retention_loop_rejects_promotion_before_guaranteed_rounds(
+def test_retention_loop_continues_early_passes_and_promotes_only_after_round_three(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args = _args(tmp_path)
-    initial_checkpoint = tmp_path / "initial.pt"
-    round1_checkpoint = tmp_path / "round1.pt"
-    initial_checkpoint.write_bytes(b"initial")
-    round1_checkpoint.write_bytes(b"round1")
+    checkpoints = [tmp_path / f"round-{index}.pt" for index in range(4)]
+    for checkpoint in checkpoints:
+        checkpoint.write_bytes(checkpoint.name.encode())
     original_gate = args.original_gate_dir / "phase_gate.json"
     original_gate.write_text("{}\n", encoding="utf-8")
-    round1_run = args.correction_run_root / "round_01"
-    round1_run.mkdir(parents=True)
-    (round1_run / "correction_receipt.json").write_text("{}\n", encoding="utf-8")
-    round1_gate = args.correction_gate_root / "round_01" / "phase_gate.json"
-    round1_gate.parent.mkdir(parents=True)
-    round1_gate.write_text("{}\n", encoding="utf-8")
+    commands: list[list[str]] = []
+    promoted_rounds: list[str] = []
 
     def fake_validate_gate(path: Path) -> dict[str, object]:
         if path == original_gate:
-            return {"gate_passed": False, "checkpoint_path": str(initial_checkpoint)}
-        if path == round1_gate:
-            return {"gate_passed": True, "checkpoint_path": str(round1_checkpoint)}
-        raise AssertionError(path)
+            return {"gate_passed": False, "checkpoint_path": str(checkpoints[0])}
+        round_index = int(path.parent.name.removeprefix("round_"))
+        return {"gate_passed": True, "checkpoint_path": str(checkpoints[round_index])}
+
+    def fake_run(
+        command: list[str],
+        *,
+        dry_run: bool,
+        allow_failure: bool = False,
+    ) -> int:
+        assert dry_run is False
+        commands.append(command)
+        if str(loop.CORRECTION_RUNNER) in command:
+            run_dir = Path(command[command.index("--output-dir") + 1])
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "correction_receipt.json").write_text("{}\n", encoding="utf-8")
+            return 0
+        if str(loop.FINALIZER) in command:
+            gate_dir = Path(command[command.index("--output-dir") + 1])
+            gate_dir.mkdir(parents=True, exist_ok=True)
+            (gate_dir / "phase_gate.json").write_text("{}\n", encoding="utf-8")
+            return 0
+        raise AssertionError(command)
+
+    def fake_ensure_promotion(**kwargs: object) -> Path:
+        gate_dir = Path(str(kwargs["gate_dir"]))
+        promoted_rounds.append(gate_dir.name)
+        promotion = gate_dir / "mixer_promotion_receipt.json"
+        promotion.write_text("{}\n", encoding="utf-8")
+        return promotion
 
     monkeypatch.setattr(loop, "_validate_gate", fake_validate_gate)
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop, "_ensure_promotion", fake_ensure_promotion)
 
-    with pytest.raises(ValueError, match="passed before the guaranteed 3 correction rounds"):
-        loop.run_retention_loop(args)
+    selected_path = loop.run_retention_loop(args)
 
-    assert not args.selection.exists()
+    assert selected_path == args.selection
+    selection = json.loads(args.selection.read_text(encoding="utf-8"))
+    assert selection["correction_round"] == 3
+    assert promoted_rounds == ["round_03"]
+    correction_commands = [
+        command for command in commands if str(loop.CORRECTION_RUNNER) in command
+    ]
+    assert len(correction_commands) == 3
+    assert correction_commands[1][correction_commands[1].index("--admission-gate") + 1].endswith(
+        "round_01/phase_gate.json"
+    )
+    assert correction_commands[2][correction_commands[2].index("--admission-gate") + 1].endswith(
+        "round_02/phase_gate.json"
+    )
+
+
+def test_retention_loop_compares_round_three_failure_to_latest_failed_gate_after_early_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _args(tmp_path)
+    args.max_rounds = 4
+    checkpoints = [tmp_path / f"checkpoint-{index}.pt" for index in range(5)]
+    for checkpoint in checkpoints:
+        checkpoint.write_bytes(checkpoint.name.encode())
+    original_gate = args.original_gate_dir / "phase_gate.json"
+    original_gate.write_text("{}\n", encoding="utf-8")
+    gates = {original_gate: (False, checkpoints[0])}
+    for round_index in range(1, 5):
+        run_dir = args.correction_run_root / f"round_{round_index:02d}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "correction_receipt.json").write_text("{}\n", encoding="utf-8")
+        gate_path = args.correction_gate_root / f"round_{round_index:02d}" / "phase_gate.json"
+        gate_path.parent.mkdir(parents=True)
+        gate_path.write_text("{}\n", encoding="utf-8")
+        gates[gate_path] = (round_index in {1, 2, 4}, checkpoints[round_index])
+
+    monkeypatch.setattr(
+        loop,
+        "_validate_gate",
+        lambda path: {
+            "gate_passed": gates[path][0],
+            "checkpoint_path": str(gates[path][1]),
+        },
+    )
+    extension_inputs: list[dict[str, object]] = []
+
+    def fake_extension(**kwargs: object) -> dict[str, object]:
+        extension_inputs.append(kwargs)
+        return {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "post_coverage_correction_extension_decision",
+            "phase": "mixer",
+            "completed_round": 3,
+            "continue_training": True,
+            "improved_metrics": ["trajectory_candidate_loss"],
+        }
+
+    monkeypatch.setattr(loop, "_correction_extension_decision", fake_extension)
+    monkeypatch.setattr(
+        loop,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("complete fixtures must not launch commands"),
+    )
+
+    def fake_ensure_promotion(**kwargs: object) -> Path:
+        gate_dir = Path(str(kwargs["gate_dir"]))
+        promotion = gate_dir / "mixer_promotion_receipt.json"
+        promotion.write_text("{}\n", encoding="utf-8")
+        return promotion
+
+    monkeypatch.setattr(loop, "_ensure_promotion", fake_ensure_promotion)
+
+    assert loop.run_retention_loop(args) == args.selection
+    assert len(extension_inputs) == 1
+    assert extension_inputs[0]["prior_gate_path"] == original_gate
+    assert extension_inputs[0]["current_gate_path"] == (
+        args.correction_gate_root / "round_03" / "phase_gate.json"
+    )
 
 
 def test_correction_extension_tracks_progress_and_bounded_stall_patience(

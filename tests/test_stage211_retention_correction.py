@@ -209,6 +209,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
                 "replay_receipt_sha256": correction.sha256_file(replay_receipt),
                 "admission_gate_path": str(admission_gate.resolve()),
                 "admission_gate_sha256": correction.sha256_file(admission_gate),
+                "admission_mode": "failed_gate",
                 "layer_focus_path": str(layer_focus.resolve()),
                 "layer_focus_sha256": correction.sha256_file(layer_focus),
                 "layer_rotation_offset": 0,
@@ -235,6 +236,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
         replay_receipt=replay_receipt,
         replay_manifest=replay_manifest,
         admission_gate=admission_gate,
+        admission_mode="failed_gate",
         layer_focus=layer_focus,
         layer_rotation_offset=0,
         nano_checkpoint=nano_checkpoint,
@@ -252,6 +254,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
             replay_receipt=replay_receipt,
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
+            admission_mode="failed_gate",
             layer_focus=layer_focus,
             layer_rotation_offset=0,
             nano_checkpoint=nano_checkpoint,
@@ -271,6 +274,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
             replay_receipt=replay_receipt,
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
+            admission_mode="failed_gate",
             layer_focus=layer_focus,
             layer_rotation_offset=0,
             nano_checkpoint=nano_checkpoint,
@@ -290,6 +294,7 @@ def test_retention_correction_resume_requires_smoke_marker(
             replay_receipt=tmp_path / "replay.json",
             replay_manifest=tmp_path / "manifest.json",
             admission_gate=tmp_path / "gate.json",
+            admission_mode="failed_gate",
             layer_focus=tmp_path / "focus.json",
             layer_focus_payload={"boundary_layer_ids": []},
             layer_rotation_offset=0,
@@ -430,6 +435,7 @@ def test_create_stage211_retention_correction_receipt(
                 "replay_receipt_sha256": correction.sha256_file(replay_receipt),
                 "admission_gate_path": str(admission_gate.resolve()),
                 "admission_gate_sha256": correction.sha256_file(admission_gate),
+                "admission_mode": "failed_gate",
                 "layer_focus_path": str(layer_focus.resolve()),
                 "layer_focus_sha256": correction.sha256_file(layer_focus),
                 "layer_rotation_offset": 0,
@@ -483,6 +489,7 @@ def test_create_stage211_retention_correction_receipt(
             "stage211_post_coverage_correction_phase": phase,
             "stage211_post_coverage_replay_receipt_path": str(replay_receipt.resolve()),
             "stage211_post_coverage_admission_gate_path": str(admission_gate.resolve()),
+            "stage211_post_coverage_admission_mode": "failed_gate",
             "stage211_post_coverage_layer_focus_path": str(layer_focus.resolve()),
             "stage211_post_coverage_layer_focus_sha256": correction.sha256_file(layer_focus),
             "stage211_post_coverage_layer_rotation_offset": 0,
@@ -544,6 +551,7 @@ def test_create_stage211_retention_correction_receipt(
         "replay_receipt_sha256": correction.sha256_file(replay_receipt),
         "admission_gate_path": str(admission_gate.resolve()),
         "admission_gate_sha256": correction.sha256_file(admission_gate),
+        "admission_mode": "failed_gate",
         "layer_focus_path": str(layer_focus.resolve()),
         "layer_focus_sha256": correction.sha256_file(layer_focus),
         "layer_rotation_offset": 0,
@@ -643,6 +651,7 @@ def test_create_stage211_retention_correction_receipt(
 
     assert receipt["artifact"] == "post_coverage_correction"
     assert receipt["round"] == 1
+    assert receipt["admission_mode"] == "failed_gate"
     assert receipt["schema_version"] == 2
     assert receipt["rows"] == 8
     assert receipt["steps"] == 1
@@ -686,7 +695,7 @@ def test_create_stage211_retention_correction_receipt(
     )
 
     gate_payload["gate_passed"] = True
-    with pytest.raises(ValueError, match="explicitly failed admission gate"):
+    with pytest.raises(ValueError, match="failed gate or an early passing gate"):
         correction.build_receipt(
             round_index=1,
             run_dir=run_dir,
