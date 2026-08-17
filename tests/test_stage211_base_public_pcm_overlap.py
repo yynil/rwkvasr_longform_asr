@@ -523,6 +523,58 @@ def test_base_public_pcm_rebase_reuses_fingerprints_without_audio_decode(
         assert source_fingerprint.samefile(destination_fingerprint)
         assert source_receipt.read_bytes() != destination_receipt.read_bytes()
     assert rebase.validate_rebase_receipt(destination_root / "rebase_receipt.json") == receipt
+    assert (
+        rebase.rebase_and_finalize(
+            base_inventory=inventory_path,
+            source_audit_receipt=source_root / "audit_receipt.json",
+            output_root=destination_root,
+            public_manifests={"public_test": corrected_manifest},
+            expected_public_rows={"public_test": 1},
+        )
+        == receipt
+    )
+
+    alternate_inventory = tmp_path / "alternate_base_inventory.json"
+    alternate_inventory.write_bytes(inventory_path.read_bytes())
+    with pytest.raises(ValueError, match="requested base inventory"):
+        rebase.rebase_and_finalize(
+            base_inventory=alternate_inventory,
+            source_audit_receipt=source_root / "audit_receipt.json",
+            output_root=destination_root,
+            public_manifests={"public_test": corrected_manifest},
+            expected_public_rows={"public_test": 1},
+        )
+
+    alternate_source_audit = tmp_path / "alternate_source_audit.json"
+    alternate_source_audit.write_bytes((source_root / "audit_receipt.json").read_bytes())
+    with pytest.raises(ValueError, match="requested source audit"):
+        rebase.rebase_and_finalize(
+            base_inventory=inventory_path,
+            source_audit_receipt=alternate_source_audit,
+            output_root=destination_root,
+            public_manifests={"public_test": corrected_manifest},
+            expected_public_rows={"public_test": 1},
+        )
+
+    alternate_manifest = tmp_path / "alternate_corrected_public.jsonl"
+    alternate_manifest.write_bytes(corrected_manifest.read_bytes())
+    with pytest.raises(ValueError, match="requested public manifest: public_test"):
+        rebase.rebase_and_finalize(
+            base_inventory=inventory_path,
+            source_audit_receipt=source_root / "audit_receipt.json",
+            output_root=destination_root,
+            public_manifests={"public_test": alternate_manifest},
+            expected_public_rows={"public_test": 1},
+        )
+
+    with pytest.raises(ValueError, match="requested public row map"):
+        rebase.rebase_and_finalize(
+            base_inventory=inventory_path,
+            source_audit_receipt=source_root / "audit_receipt.json",
+            output_root=destination_root,
+            public_manifests={"public_test": corrected_manifest},
+            expected_public_rows={"public_test": 2},
+        )
 
 
 def test_base_public_pcm_prefetch_overlaps_next_copy_with_current_decode(

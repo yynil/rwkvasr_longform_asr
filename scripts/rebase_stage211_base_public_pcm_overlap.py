@@ -132,6 +132,71 @@ def validate_rebase_receipt(path: str | Path) -> dict[str, Any]:
     return receipt
 
 
+def _validate_reusable_rebase_receipt(
+    *,
+    receipt_path: Path,
+    base_inventory: Path,
+    source_audit_receipt: Path,
+    public_manifests: dict[str, Path],
+    expected_public_rows: dict[str, int],
+) -> dict[str, Any]:
+    receipt = validate_rebase_receipt(receipt_path)
+    if (
+        receipt.get("source_audit_receipt_path") != str(source_audit_receipt)
+        or receipt.get("source_audit_receipt_sha256") != _sha256(source_audit_receipt)
+    ):
+        raise ValueError(
+            "Stage211 existing base PCM rebase does not bind the requested source audit."
+        )
+    source_audit = _load_json(
+        source_audit_receipt,
+        label="Stage211 requested base PCM source audit",
+    )
+    if (
+        source_audit.get("base_inventory_path") != str(base_inventory)
+        or source_audit.get("base_inventory_sha256") != _sha256(base_inventory)
+    ):
+        raise ValueError(
+            "Stage211 existing base PCM rebase does not bind the requested base inventory."
+        )
+    expected_rows = {str(key): int(value) for key, value in expected_public_rows.items()}
+    if receipt.get("public_manifest_rows") != dict(sorted(expected_rows.items())):
+        raise ValueError(
+            "Stage211 existing base PCM rebase does not bind the requested public row map."
+        )
+    destination_audit = _load_json(
+        Path(str(receipt.get("destination_audit_receipt_path") or "")).resolve(),
+        label="Stage211 rebased destination audit",
+    )
+    records = destination_audit.get("public_fingerprint_receipts")
+    by_dataset = {
+        str(record.get("dataset")): record
+        for record in records or []
+        if isinstance(record, dict)
+    }
+    if (
+        not isinstance(records, list)
+        or len(records) != len(expected_rows)
+        or set(public_manifests) != set(expected_rows)
+        or set(by_dataset) != set(expected_rows)
+    ):
+        raise ValueError(
+            "Stage211 existing base PCM rebase public manifest set does not match the request."
+        )
+    for dataset, manifest_path in public_manifests.items():
+        record = by_dataset[dataset]
+        if (
+            record.get("manifest_path") != str(manifest_path)
+            or record.get("manifest_sha256") != _sha256(manifest_path)
+            or int(record.get("rows", -1)) != expected_rows[dataset]
+        ):
+            raise ValueError(
+                "Stage211 existing base PCM rebase does not bind the requested "
+                f"public manifest: {dataset}."
+            )
+    return receipt
+
+
 def rebase_and_finalize(
     *,
     base_inventory: Path,
@@ -140,10 +205,22 @@ def rebase_and_finalize(
     public_manifests: dict[str, Path],
     expected_public_rows: dict[str, int],
 ) -> dict[str, Any]:
+    base_inventory = base_inventory.expanduser().resolve()
+    source_audit_receipt = source_audit_receipt.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
+    public_manifests = {
+        str(dataset): path.expanduser().resolve()
+        for dataset, path in public_manifests.items()
+    }
     receipt_path = output_root / "rebase_receipt.json"
     if receipt_path.is_file():
-        return validate_rebase_receipt(receipt_path)
+        return _validate_reusable_rebase_receipt(
+            receipt_path=receipt_path,
+            base_inventory=base_inventory,
+            source_audit_receipt=source_audit_receipt,
+            public_manifests=public_manifests,
+            expected_public_rows=expected_public_rows,
+        )
     base = validate_base_inventory(base_inventory)
     rebase = rebase_archive_fingerprints(
         base=base,

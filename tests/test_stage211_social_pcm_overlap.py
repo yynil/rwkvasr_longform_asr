@@ -425,3 +425,40 @@ def test_social_pcm_rebase_reuses_source_fingerprints_without_audio_decode(
         assert source_part.samefile(destination_part)
         assert source_receipt.read_bytes() != destination_receipt.read_bytes()
     assert pcm_rebase.validate_rebase_receipt(destination_root / "rebase_receipt.json") == receipt
+    assert (
+        pcm_rebase.rebase_and_finalize(
+            source_filtered_inventory=source_root / "filtered_inventory.json",
+            output_root=destination_root,
+            public_manifests={"public_test": corrected_manifest},
+            expected_public_rows={"public_test": 1},
+        )
+        == receipt
+    )
+
+    alternate_source = tmp_path / "alternate_filtered_inventory.json"
+    alternate_source.write_bytes((source_root / "filtered_inventory.json").read_bytes())
+    with pytest.raises(ValueError, match="requested source inventory"):
+        pcm_rebase.rebase_and_finalize(
+            source_filtered_inventory=alternate_source,
+            output_root=destination_root,
+            public_manifests={"public_test": corrected_manifest},
+            expected_public_rows={"public_test": 1},
+        )
+
+    alternate_manifest = tmp_path / "alternate_corrected_public.jsonl"
+    alternate_manifest.write_bytes(corrected_manifest.read_bytes())
+    with pytest.raises(ValueError, match="requested public manifest: public_test"):
+        pcm_rebase.rebase_and_finalize(
+            source_filtered_inventory=source_root / "filtered_inventory.json",
+            output_root=destination_root,
+            public_manifests={"public_test": alternate_manifest},
+            expected_public_rows={"public_test": 1},
+        )
+
+    with pytest.raises(ValueError, match="requested public row map"):
+        pcm_rebase.rebase_and_finalize(
+            source_filtered_inventory=source_root / "filtered_inventory.json",
+            output_root=destination_root,
+            public_manifests={"public_test": corrected_manifest},
+            expected_public_rows={"public_test": 2},
+        )
