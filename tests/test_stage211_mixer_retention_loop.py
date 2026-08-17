@@ -322,7 +322,7 @@ def test_retention_loop_rejects_promotion_before_guaranteed_rounds(
     assert not args.selection.exists()
 
 
-def test_correction_extension_requires_strict_deterministic_progress(
+def test_correction_extension_tracks_progress_and_bounded_stall_patience(
     tmp_path: Path,
 ) -> None:
     prior_path, prior = _write_progress_gate(
@@ -353,6 +353,8 @@ def test_correction_extension_requires_strict_deterministic_progress(
     assert decision["continue_training"] is True
     assert decision["next_round"] == 4
     assert decision["improved_metrics"] == ["trajectory_candidate_loss"]
+    assert decision["consecutive_non_improving_rounds"] == 0
+    assert decision["stall_patience"] == 3
     assert decision["prior_gate_sha256"] == loop.sha256_file(prior_path)
     assert decision["current_gate_sha256"] == loop.sha256_file(current_path)
 
@@ -363,7 +365,7 @@ def test_correction_extension_requires_strict_deterministic_progress(
         public_error=0.45,
         alignment_loss=0.20,
     )
-    plateau_decision = loop._correction_extension_decision(
+    round_three_decision = loop._correction_extension_decision(
         phase="mixer",
         completed_round=3,
         prior_gate_path=prior_path,
@@ -372,9 +374,64 @@ def test_correction_extension_requires_strict_deterministic_progress(
         current_gate=plateau,
         max_rounds=8,
     )
-    assert plateau_decision["continue_training"] is False
-    assert plateau_decision["next_round"] is None
-    assert plateau_decision["improved_metrics"] == []
+    assert round_three_decision["continue_training"] is True
+    assert round_three_decision["next_round"] == 4
+    assert round_three_decision["improved_metrics"] == []
+    assert round_three_decision["consecutive_non_improving_rounds"] == 1
+
+    round_three_decision_path = tmp_path / "round-three-decision.json"
+    round_three_decision_path.write_text(
+        json.dumps(round_three_decision) + "\n",
+        encoding="utf-8",
+    )
+    round_four_path, round_four = _write_progress_gate(
+        tmp_path,
+        name="round-four-plateau",
+        trajectory_loss=0.18,
+        public_error=0.45,
+        alignment_loss=0.20,
+    )
+    round_four_decision = stage211_gate.build_stage211_correction_extension_decision(
+        phase="mixer",
+        completed_round=4,
+        prior_gate_path=plateau_path,
+        prior_gate=plateau,
+        current_gate_path=round_four_path,
+        current_gate=round_four,
+        max_rounds=8,
+        prior_extension_decision_path=round_three_decision_path,
+        prior_extension_decision=round_three_decision,
+    )
+    assert round_four_decision["continue_training"] is True
+    assert round_four_decision["next_round"] == 5
+    assert round_four_decision["consecutive_non_improving_rounds"] == 2
+
+    round_four_decision_path = tmp_path / "round-four-decision.json"
+    round_four_decision_path.write_text(
+        json.dumps(round_four_decision) + "\n",
+        encoding="utf-8",
+    )
+    round_five_path, round_five = _write_progress_gate(
+        tmp_path,
+        name="round-five-plateau",
+        trajectory_loss=0.18,
+        public_error=0.45,
+        alignment_loss=0.20,
+    )
+    round_five_decision = stage211_gate.build_stage211_correction_extension_decision(
+        phase="mixer",
+        completed_round=5,
+        prior_gate_path=round_four_path,
+        prior_gate=round_four,
+        current_gate_path=round_five_path,
+        current_gate=round_five,
+        max_rounds=8,
+        prior_extension_decision_path=round_four_decision_path,
+        prior_extension_decision=round_four_decision,
+    )
+    assert round_five_decision["continue_training"] is False
+    assert round_five_decision["next_round"] is None
+    assert round_five_decision["consecutive_non_improving_rounds"] == 3
 
 
 def test_correction_extension_validator_replays_bound_progress_decision(
@@ -433,33 +490,112 @@ def test_correction_extension_validator_replays_bound_progress_decision(
         )
 
 
+def test_correction_extension_validator_recursively_replays_stall_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate_paths: list[Path] = []
+    gates: list[dict[str, object]] = []
+    for round_index, loss in ((2, 0.20), (3, 0.20), (4, 0.20), (5, 0.19)):
+        gate_path, gate = _write_progress_gate(
+            tmp_path,
+            name=f"recursive-round-{round_index}",
+            trajectory_loss=loss,
+            public_error=loss + 0.20,
+            alignment_loss=loss + 0.02,
+        )
+        gate_paths.append(gate_path)
+        gates.append(gate)
+
+    prior_decision_path: Path | None = None
+    prior_decision: dict[str, object] | None = None
+    decision_paths: list[Path] = []
+    decisions: list[dict[str, object]] = []
+    for completed_round in range(3, 6):
+        offset = completed_round - 3
+        decision = stage211_gate.build_stage211_correction_extension_decision(
+            phase="mixer",
+            completed_round=completed_round,
+            prior_gate_path=gate_paths[offset],
+            prior_gate=gates[offset],
+            current_gate_path=gate_paths[offset + 1],
+            current_gate=gates[offset + 1],
+            max_rounds=8,
+            prior_extension_decision_path=prior_decision_path,
+            prior_extension_decision=prior_decision,
+        )
+        decision_path = tmp_path / f"recursive-round-{completed_round}-decision.json"
+        decision_path.write_text(json.dumps(decision) + "\n", encoding="utf-8")
+        decision_paths.append(decision_path)
+        decisions.append(decision)
+        prior_decision_path, prior_decision = decision_path, decision
+
+    gate_by_path = dict(zip(gate_paths, gates, strict=True))
+    monkeypatch.setattr(
+        stage211_gate,
+        "validate_stage211_phase_gate_report",
+        lambda path, **kwargs: gate_by_path[Path(path).resolve()],
+    )
+    validated = stage211_gate.validate_stage211_correction_extension_decision(
+        decision_paths[-1],
+        phase="mixer",
+        next_round=6,
+        admission_gate_path=gate_paths[-1],
+        admission_gate=gates[-1],
+    )
+
+    assert validated == decisions[-1]
+    assert validated["prior_consecutive_non_improving_rounds"] == 2
+    assert validated["consecutive_non_improving_rounds"] == 0
+    assert validated["continue_training"] is True
+
+    decision_paths[1].write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        stage211_gate.validate_stage211_correction_extension_decision(
+            decision_paths[-1],
+            phase="mixer",
+            next_round=6,
+            admission_gate_path=gate_paths[-1],
+            admission_gate=gates[-1],
+        )
+
+
 def test_progress_can_extend_beyond_the_superseded_round_eight_cap(
     tmp_path: Path,
 ) -> None:
     prior_path, prior = _write_progress_gate(
         tmp_path,
-        name="round-seven",
+        name="round-two",
         trajectory_loss=0.18,
         public_error=0.45,
         alignment_loss=0.20,
     )
-    current_path, current = _write_progress_gate(
-        tmp_path,
-        name="round-eight",
-        trajectory_loss=0.17,
-        public_error=0.44,
-        alignment_loss=0.19,
-    )
-
-    decision = stage211_gate.build_stage211_correction_extension_decision(
-        phase="mixer",
-        completed_round=8,
-        prior_gate_path=prior_path,
-        prior_gate=prior,
-        current_gate_path=current_path,
-        current_gate=current,
-        max_rounds=32,
-    )
+    prior_decision_path: Path | None = None
+    prior_decision: dict[str, object] | None = None
+    decision: dict[str, object] = {}
+    for completed_round in range(3, 9):
+        current_path, current = _write_progress_gate(
+            tmp_path,
+            name=f"round-{completed_round}",
+            trajectory_loss=0.18 - completed_round * 0.001,
+            public_error=0.45 - completed_round * 0.001,
+            alignment_loss=0.20 - completed_round * 0.001,
+        )
+        decision = stage211_gate.build_stage211_correction_extension_decision(
+            phase="mixer",
+            completed_round=completed_round,
+            prior_gate_path=prior_path,
+            prior_gate=prior,
+            current_gate_path=current_path,
+            current_gate=current,
+            max_rounds=32,
+            prior_extension_decision_path=prior_decision_path,
+            prior_extension_decision=prior_decision,
+        )
+        decision_path = tmp_path / f"round-{completed_round}-decision.json"
+        decision_path.write_text(json.dumps(decision) + "\n", encoding="utf-8")
+        prior_path, prior = current_path, current
+        prior_decision_path, prior_decision = decision_path, decision
 
     assert decision["continue_training"] is True
     assert decision["completed_round"] == 8
@@ -467,19 +603,19 @@ def test_progress_can_extend_beyond_the_superseded_round_eight_cap(
     assert decision["max_rounds"] == 32
 
 
-def test_retention_loop_stops_after_guaranteed_rounds_without_progress(
+def test_retention_loop_stops_after_three_consecutive_non_improving_rounds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args = _args(tmp_path)
-    args.max_rounds = 4
-    checkpoints = [tmp_path / f"round-{index}.pt" for index in range(4)]
+    args.max_rounds = 6
+    checkpoints = [tmp_path / f"round-{index}.pt" for index in range(6)]
     for checkpoint in checkpoints:
         checkpoint.write_bytes(checkpoint.name.encode())
     original_gate = args.original_gate_dir / "phase_gate.json"
     original_gate.write_text("{}\n", encoding="utf-8")
     gates = {original_gate: checkpoints[0]}
-    for round_index in range(1, 4):
+    for round_index in range(1, 6):
         run_dir = args.correction_run_root / f"round_{round_index:02d}"
         run_dir.mkdir(parents=True)
         (run_dir / "correction_receipt.json").write_text("{}\n", encoding="utf-8")
@@ -505,8 +641,8 @@ def test_retention_loop_stops_after_guaranteed_rounds_without_progress(
             "pipeline": "stage211",
             "artifact": "post_coverage_correction_extension_decision",
             "phase": "mixer",
-            "completed_round": 3,
-            "continue_training": False,
+            "completed_round": kwargs["completed_round"],
+            "continue_training": kwargs["completed_round"] < 5,
             "improved_metrics": [],
         },
     )
@@ -516,9 +652,9 @@ def test_retention_loop_stops_after_guaranteed_rounds_without_progress(
         lambda *args, **kwargs: pytest.fail("plateau must not launch another command"),
     )
 
-    with pytest.raises(ValueError, match="correction stalled after round 3"):
+    with pytest.raises(ValueError, match="correction stalled after round 5"):
         loop.run_retention_loop(args)
-    decision_path = args.correction_gate_root / "round_03" / "correction_extension_decision.json"
+    decision_path = args.correction_gate_root / "round_05" / "correction_extension_decision.json"
     assert decision_path.is_file()
     assert json.loads(decision_path.read_text(encoding="utf-8"))["continue_training"] is False
 

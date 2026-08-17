@@ -11,8 +11,9 @@ from typing import Any
 from rwkvasr.eval.stage211_gate import (
     STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
     STAGE211_RETENTION_CORRECTION_MAX_ROUNDS,
-    build_stage211_correction_extension_decision as _correction_extension_decision,
+    build_stage211_correction_extension_decision,
     sha256_file,
+    validate_stage211_correction_extension_decision,
     validate_stage211_phase_gate_report,
 )
 
@@ -207,6 +208,42 @@ def _validate_gate_for_phase(gate_path: Path, *, phase: str) -> dict[str, Any]:
     if phase == "mixer":
         return _validate_gate(gate_path)
     return _validate_gate(gate_path, phase=phase)
+
+
+def _correction_extension_decision(
+    *,
+    phase: str,
+    completed_round: int,
+    prior_gate_path: Path,
+    prior_gate: dict[str, Any],
+    current_gate_path: Path,
+    current_gate: dict[str, Any],
+    max_rounds: int,
+) -> dict[str, Any]:
+    prior_extension_decision_path: Path | None = None
+    prior_extension_decision: dict[str, Any] | None = None
+    if completed_round > STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+        prior_extension_decision_path = (
+            prior_gate_path.parent / "correction_extension_decision.json"
+        )
+        prior_extension_decision = validate_stage211_correction_extension_decision(
+            prior_extension_decision_path,
+            phase=phase,
+            next_round=completed_round,
+            admission_gate_path=prior_gate_path,
+            admission_gate=prior_gate,
+        )
+    return build_stage211_correction_extension_decision(
+        phase=phase,
+        completed_round=completed_round,
+        prior_gate_path=prior_gate_path,
+        prior_gate=prior_gate,
+        current_gate_path=current_gate_path,
+        current_gate=current_gate,
+        max_rounds=max_rounds,
+        prior_extension_decision_path=prior_extension_decision_path,
+        prior_extension_decision=prior_extension_decision,
+    )
 
 
 def _ensure_promotion(

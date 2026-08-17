@@ -38,8 +38,10 @@ STAGE211_FULL_DATA_WORLD_SIZE = 4
 STAGE211_FULL_DATA_FRAME_BUDGET = 24_000
 STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS = 3
 STAGE211_RETENTION_CORRECTION_MAX_ROUNDS = 32
+STAGE211_RETENTION_CORRECTION_STALL_PATIENCE = 3
 STAGE211_RETENTION_CORRECTION_EPOCHS = 1
 STAGE211_RETENTION_CORRECTION_LR = 1.0e-6
+STAGE211_CORRECTION_EXTENSION_DECISION_SCHEMA_VERSION = 2
 STAGE211_CORRECTION_LAYER_FOCUS_SCHEMA_VERSION = 2
 STAGE211_HARD_LAYER_IDS = (0, 11, 12, 17, 20, 49, 50, 69)
 STAGE211_POST_COVERAGE_CORRECTION_LRS = {
@@ -1104,6 +1106,8 @@ def build_stage211_correction_extension_decision(
     current_gate_path: Path,
     current_gate: dict[str, Any],
     max_rounds: int,
+    prior_extension_decision_path: Path | None = None,
+    prior_extension_decision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if completed_round < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
         raise ValueError("Stage211 correction extension is only evaluated after round three.")
@@ -1118,15 +1122,57 @@ def build_stage211_correction_extension_decision(
     improved_metrics = sorted(
         name for name in prior_metrics if current_metrics[name] < prior_metrics[name]
     )
-    continue_training = bool(improved_metrics)
+    has_prior_decision_path = prior_extension_decision_path is not None
+    has_prior_decision = prior_extension_decision is not None
+    if has_prior_decision_path != has_prior_decision:
+        raise ValueError("Stage211 correction extension prior-decision binding is incomplete.")
+    if completed_round == STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+        if has_prior_decision:
+            raise ValueError("Stage211 round-three extension must start a fresh stall streak.")
+        prior_non_improving_rounds = 0
+        prior_decision_path_value = None
+        prior_decision_sha256 = None
+    else:
+        if prior_extension_decision_path is None or prior_extension_decision is None:
+            raise ValueError("Stage211 correction extension lacks its preceding decision.")
+        prior_extension_decision_path = prior_extension_decision_path.resolve()
+        expected_prior = {
+            "schema_version": STAGE211_CORRECTION_EXTENSION_DECISION_SCHEMA_VERSION,
+            "pipeline": "stage211",
+            "artifact": "post_coverage_correction_extension_decision",
+            "phase": phase,
+            "completed_round": completed_round - 1,
+            "stall_patience": STAGE211_RETENTION_CORRECTION_STALL_PATIENCE,
+            "max_rounds": max_rounds,
+            "current_gate_path": str(prior_gate_path.resolve()),
+            "current_gate_sha256": sha256_file(prior_gate_path),
+            "continue_training": True,
+            "next_round": completed_round,
+        }
+        if any(prior_extension_decision.get(key) != value for key, value in expected_prior.items()):
+            raise ValueError("Stage211 preceding correction extension decision is invalid.")
+        prior_non_improving_rounds = int(
+            prior_extension_decision.get("consecutive_non_improving_rounds", -1)
+        )
+        if not 0 <= prior_non_improving_rounds < STAGE211_RETENTION_CORRECTION_STALL_PATIENCE:
+            raise ValueError("Stage211 preceding correction stall streak is invalid.")
+        prior_decision_path_value = str(prior_extension_decision_path)
+        prior_decision_sha256 = sha256_file(prior_extension_decision_path)
+    consecutive_non_improving_rounds = 0 if improved_metrics else prior_non_improving_rounds + 1
+    continue_training = bool(improved_metrics) or (
+        consecutive_non_improving_rounds < STAGE211_RETENTION_CORRECTION_STALL_PATIENCE
+    )
     return {
-        "schema_version": 1,
+        "schema_version": STAGE211_CORRECTION_EXTENSION_DECISION_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "post_coverage_correction_extension_decision",
         "phase": phase,
         "completed_round": completed_round,
         "guaranteed_rounds": STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
+        "stall_patience": STAGE211_RETENTION_CORRECTION_STALL_PATIENCE,
         "max_rounds": max_rounds,
+        "prior_extension_decision_path": prior_decision_path_value,
+        "prior_extension_decision_sha256": prior_decision_sha256,
         "prior_gate_path": str(prior_gate_path.resolve()),
         "prior_gate_sha256": sha256_file(prior_gate_path),
         "current_gate_path": str(current_gate_path.resolve()),
@@ -1134,6 +1180,8 @@ def build_stage211_correction_extension_decision(
         "prior_metrics": prior_metrics,
         "current_metrics": current_metrics,
         "improved_metrics": improved_metrics,
+        "prior_consecutive_non_improving_rounds": prior_non_improving_rounds,
+        "consecutive_non_improving_rounds": consecutive_non_improving_rounds,
         "continue_training": continue_training,
         "next_round": completed_round + 1 if continue_training else None,
     }
@@ -1174,6 +1222,22 @@ def validate_stage211_correction_extension_decision(
         checkpoint_path=prior_checkpoint,
         require_passed=False,
     )
+    prior_extension_decision_path: Path | None = None
+    prior_extension_decision: dict[str, Any] | None = None
+    if completed_round > STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+        prior_extension_decision_path = _validate_bound_file(
+            decision,
+            path_key="prior_extension_decision_path",
+            sha256_key="prior_extension_decision_sha256",
+            label=f"Stage211 {phase} preceding correction extension decision",
+        )
+        prior_extension_decision = validate_stage211_correction_extension_decision(
+            prior_extension_decision_path,
+            phase=phase,
+            next_round=completed_round,
+            admission_gate_path=prior_gate_path,
+            admission_gate=prior_gate,
+        )
     rebuilt = build_stage211_correction_extension_decision(
         phase=phase,
         completed_round=completed_round,
@@ -1182,6 +1246,8 @@ def validate_stage211_correction_extension_decision(
         current_gate_path=admission_gate_path,
         current_gate=admission_gate,
         max_rounds=max_rounds,
+        prior_extension_decision_path=prior_extension_decision_path,
+        prior_extension_decision=prior_extension_decision,
     )
     if decision != rebuilt or decision.get("continue_training") is not True:
         raise ValueError("Stage211 correction extension decision is stale or did not pass.")
