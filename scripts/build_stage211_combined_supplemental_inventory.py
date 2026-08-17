@@ -249,6 +249,72 @@ def _write_atomic_directory(
     return inventory
 
 
+def _validate_reusable_combined_inventory(
+    *,
+    output_inventory: Path,
+    base_inventory_path: Path,
+    base_public_overlap_audit_path: Path,
+    social_inventory_path: Path,
+    usb_coverage_receipt_path: Path,
+    archived_social_overlap_receipt_path: Path,
+) -> dict[str, Any]:
+    inventory = validate_stage211_supplemental_inventory(
+        output_inventory,
+        require_training_ready=True,
+        verify_part_sha256=True,
+    )["inventory"]
+    components = inventory.get("component_inventories")
+    if not isinstance(components, dict):
+        raise ValueError("Stage211 existing combined output lacks component bindings.")
+    requested_bindings = (
+        (
+            "base-natural inventory",
+            components.get("base_natural"),
+            "inventory_path",
+            "inventory_sha256",
+            base_inventory_path,
+        ),
+        (
+            "base/public overlap audit",
+            inventory.get("base_public_overlap_audit"),
+            "receipt_path",
+            "receipt_sha256",
+            base_public_overlap_audit_path,
+        ),
+        (
+            "social inventory",
+            components.get("social_vad"),
+            "inventory_path",
+            "inventory_sha256",
+            social_inventory_path,
+        ),
+        (
+            "USB top-level coverage receipt",
+            inventory.get("usb_top_level_coverage"),
+            "receipt_path",
+            "receipt_sha256",
+            usb_coverage_receipt_path,
+        ),
+        (
+            "archived-social overlap receipt",
+            inventory.get("archived_social_exclusion"),
+            "receipt_path",
+            "receipt_sha256",
+            archived_social_overlap_receipt_path,
+        ),
+    )
+    for label, record, path_key, sha256_key, requested_path in requested_bindings:
+        if (
+            not isinstance(record, dict)
+            or record.get(path_key) != str(requested_path)
+            or record.get(sha256_key) != _sha256(requested_path)
+        ):
+            raise ValueError(
+                f"Stage211 existing combined output does not bind the requested {label}."
+            )
+    return inventory
+
+
 def build_combined_inventory(
     *,
     base_inventory_path: Path,
@@ -262,6 +328,10 @@ def build_combined_inventory(
     base_inventory_path = base_inventory_path.expanduser().resolve()
     base_public_overlap_audit_path = base_public_overlap_audit_path.expanduser().resolve()
     social_inventory_path = social_inventory_path.expanduser().resolve()
+    usb_coverage_receipt_path = usb_coverage_receipt_path.expanduser().resolve()
+    archived_social_overlap_receipt_path = (
+        archived_social_overlap_receipt_path.expanduser().resolve()
+    )
     output_root = output_root.expanduser().resolve()
     output_inventory = output_root / "supplemental_inventory.json"
     if output_root.exists():
@@ -269,11 +339,14 @@ def build_combined_inventory(
             raise ValueError(
                 f"Stage211 combined output exists without its inventory: {output_root}"
             )
-        return validate_stage211_supplemental_inventory(
-            output_inventory,
-            require_training_ready=True,
-            verify_part_sha256=True,
-        )["inventory"]
+        return _validate_reusable_combined_inventory(
+            output_inventory=output_inventory,
+            base_inventory_path=base_inventory_path,
+            base_public_overlap_audit_path=base_public_overlap_audit_path,
+            social_inventory_path=social_inventory_path,
+            usb_coverage_receipt_path=usb_coverage_receipt_path,
+            archived_social_overlap_receipt_path=archived_social_overlap_receipt_path,
+        )
     output_root.parent.mkdir(parents=True, exist_ok=True)
 
     base_validated = validate_stage211_supplemental_inventory(
@@ -316,11 +389,6 @@ def build_combined_inventory(
         archived_social_overlap_receipt_path=archived_social_overlap_receipt_path,
         social=social,
     )
-    usb_coverage_receipt_path = usb_coverage_receipt_path.expanduser().resolve()
-    archived_social_overlap_receipt_path = (
-        archived_social_overlap_receipt_path.expanduser().resolve()
-    )
-
     base_manifest_path = Path(base_validated["bucket_manifest_path"])
     social_manifest_path = Path(social_validated["bucket_manifest_path"])
     base_buckets, base_rows, base_eval = _load_train_parts(base_manifest_path)

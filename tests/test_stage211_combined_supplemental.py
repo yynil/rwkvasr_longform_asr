@@ -526,6 +526,51 @@ def test_combined_supplemental_inventory_binds_both_components(tmp_path: Path) -
     )
 
 
+@pytest.mark.parametrize(
+    ("argument_name", "label"),
+    (
+        ("base_inventory_path", "base-natural inventory"),
+        ("base_public_overlap_audit_path", "base/public overlap audit"),
+        ("social_inventory_path", "social inventory"),
+        ("usb_coverage_receipt_path", "USB top-level coverage receipt"),
+        ("archived_social_overlap_receipt_path", "archived-social overlap receipt"),
+    ),
+)
+def test_combined_inventory_reuse_requires_exact_requested_inputs(
+    tmp_path: Path,
+    argument_name: str,
+    label: str,
+) -> None:
+    _, _, eval_split, fixed_binding = _fixed_eval(tmp_path)
+    base = _base_inventory(
+        tmp_path,
+        eval_split=eval_split,
+        fixed_binding=fixed_binding,
+    )
+    social = _social_inventory(
+        tmp_path,
+        eval_split=eval_split,
+        fixed_binding=fixed_binding,
+    )
+    base_public_audit = _base_public_audit(tmp_path, base_inventory=base)
+    coverage, overlap = _usb_proofs(tmp_path, social_inventory=social)
+    output = tmp_path / "combined"
+    inputs = {
+        "base_inventory_path": base,
+        "base_public_overlap_audit_path": base_public_audit,
+        "social_inventory_path": social,
+        "usb_coverage_receipt_path": coverage,
+        "archived_social_overlap_receipt_path": overlap,
+    }
+    combined.build_combined_inventory(**inputs, output_root=output)
+    alternate = tmp_path / f"alternate-{inputs[argument_name].name}"
+    alternate.write_bytes(inputs[argument_name].read_bytes())
+    inputs[argument_name] = alternate
+
+    with pytest.raises(ValueError, match=f"requested {label}"):
+        combined.build_combined_inventory(**inputs, output_root=output)
+
+
 def test_formal_stage211_clis_reject_base_only_supplemental_inventory(
     tmp_path: Path,
 ) -> None:
