@@ -34,7 +34,9 @@ from rwkvasr.eval.stage211_gate import STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PROFILE_PATTERN = re.compile(r"^(?P<name>[A-Za-z0-9_.-]+):(?P<batch>[1-9][0-9]*):(?P<frames>[1-9][0-9]*)$")
+PROFILE_PATTERN = re.compile(
+    r"^(?P<name>[A-Za-z0-9_.-]+):(?P<batch>[1-9][0-9]*):(?P<frames>[1-9][0-9]*)$"
+)
 TRAIN_LINE_MARKER = "[deepspeed-train]"
 STEP_PATTERN = re.compile(r"\bstep=([0-9]+)\b")
 LOSS_PATTERN = re.compile(r"\bloss=([^ ]+)")
@@ -69,6 +71,8 @@ DEFAULT_PROFILES = (
 )
 LOGITS_DEFAULT_PROFILES = (
     BatchProfile("baseline", 12, 8_000),
+    BatchProfile("batch16_frames10k", 16, 10_000),
+    BatchProfile("batch20_frames13k", 20, 13_000),
     BatchProfile("batch24_frames16k", 24, 16_000),
     BatchProfile("batch36_frames24k", 36, 24_000),
     *DEFAULT_PROFILES[1:],
@@ -255,9 +259,7 @@ def build_probe_config(
     deepspeed.update(
         {
             "train_micro_batch_size_per_gpu": int(profile.batch_size),
-            "train_batch_size": int(profile.batch_size)
-            * int(world_size)
-            * gradient_accumulation,
+            "train_batch_size": int(profile.batch_size) * int(world_size) * gradient_accumulation,
         }
     )
     config["deepspeed"] = deepspeed
@@ -556,9 +558,7 @@ def summarize_profile(
         if elapsed > 0.0:
             step_rate = (measured[-1].step - anchor.step) / elapsed
     finite_losses = bool(measured) and all(math.isfinite(point.loss) for point in measured)
-    finite_cosines = all(
-        point.cosine is None or math.isfinite(point.cosine) for point in measured
-    )
+    finite_cosines = all(point.cosine is None or math.isfinite(point.cosine) for point in measured)
     if not required_match_fields:
         raise ValueError("throughput preflight requires at least one online match field")
     primary_match_field = (
@@ -602,8 +602,7 @@ def summarize_profile(
     fixed_eval_complete = (
         isinstance(fixed_eval_quality, dict)
         and fixed_eval_quality.get("complete") is True
-        and int(fixed_eval_quality.get("eval_samples", -1))
-        == STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
+        and int(fixed_eval_quality.get("eval_samples", -1)) == STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
         and math.isfinite(float(fixed_eval_quality.get("eval_loss", float("nan"))))
         and math.isfinite(float(fixed_eval_quality.get("mean_cosine", float("nan"))))
         and isinstance(fixed_eval_quality.get("provenance"), dict)
@@ -764,8 +763,7 @@ def select_profile(
         if isinstance(candidate_cosine, (float, int)):
             cosine_regression = float(baseline_cosine) - float(candidate_cosine)
         fixed_eval_provenance_match = (
-            row["summary"].get("fixed_eval_provenance")
-            == baseline_fixed_eval_provenance
+            row["summary"].get("fixed_eval_provenance") == baseline_fixed_eval_provenance
         )
         quality_pass = (
             loss_regression_ratio is not None
@@ -897,9 +895,9 @@ def main() -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     base_config = load_yaml(base_config_path)
-    manifest_path = Path(
-        str(base_config.get("webdataset_bucket_manifest_path") or "")
-    ).expanduser().resolve()
+    manifest_path = (
+        Path(str(base_config.get("webdataset_bucket_manifest_path") or "")).expanduser().resolve()
+    )
     if not manifest_path.is_file():
         raise FileNotFoundError(str(manifest_path))
     max_steps = int(args.warmup_steps) + int(args.measure_steps)
@@ -1038,9 +1036,7 @@ def main() -> int:
                 row.setdefault(
                     "fixed_eval_capture",
                     {
-                        "schema_version": (
-                            STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION
-                        ),
+                        "schema_version": (STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION),
                         "artifact": "probe_fixed_eval_capture",
                         "source_name": f"step_eval_layers_step-{max_steps}.yaml",
                         "report_path": str((profile_root / "fixed_eval.yaml").resolve()),
