@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,10 @@ from rwkvasr.data.text_normalization import normalize_asr_text
 from rwkvasr.eval.stage211_gate import STAGE211_PUBLIC_BENCHMARKS, sha256_file
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 quote_repair = importlib.import_module("scripts.prepare_stage211_commonvoice_quote_repair")
+clean_install = importlib.import_module("scripts.install_stage211_clean_public_eval")
 unicode_correction = importlib.import_module(
     "scripts.install_stage211_unicode_metric_correction"
 )
@@ -139,3 +143,166 @@ def test_unicode_correction_prior_install_requires_v2_overlap(
     receipt.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="canonical-install receipt is invalid"):
         unicode_correction._validate_prior_install(receipt)
+
+
+def _canonical_install_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    clean_root = tmp_path / "clean"
+    manifest_dir = tmp_path / "canonical" / "manifests"
+    nano_root = tmp_path / "canonical" / "nano"
+    calibration_root = tmp_path / "canonical" / "calibration"
+    archive_root = tmp_path / "archive"
+    overlap_receipt = tmp_path / "overlap.json"
+    overlap_receipt.write_text("{}\n", encoding="utf-8")
+    derivation_path = clean_root / "derivation_receipt.json"
+    derivation_path.parent.mkdir(parents=True)
+    derivation = {
+        "total_samples": sum(
+            int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
+        )
+    }
+    derivation_path.write_text(json.dumps(derivation) + "\n", encoding="utf-8")
+
+    mapping = clean_install._canonical_archive_map(
+        manifest_dir=manifest_dir,
+        nano_root=nano_root,
+        calibration_root=calibration_root,
+        archive_root=archive_root,
+    )
+    installed_files = []
+    archived_files = []
+    for index, (canonical, archived) in enumerate(mapping.items()):
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(f"installed-{index}\n", encoding="utf-8")
+        archived.parent.mkdir(parents=True, exist_ok=True)
+        archived.write_text(f"archived-{index}\n", encoding="utf-8")
+        archive_sha256 = sha256_file(archived)
+        installed_files.append(
+            {"path": str(canonical.resolve()), "sha256": sha256_file(canonical)}
+        )
+        archived_files.append(
+            {
+                "archive_path": str(archived.resolve()),
+                "archive_sha256": archive_sha256,
+                "canonical_path": str(canonical.resolve()),
+                "canonical_sha256": archive_sha256,
+            }
+        )
+    archive = {
+        "artifact": "stage211_contaminated_public_archive",
+        "complete": True,
+        "files": archived_files,
+        "pipeline": "stage211",
+        "schema_version": 1,
+    }
+    archive_receipt = archive_root / "archive_receipt.json"
+    archive_receipt.write_text(json.dumps(archive) + "\n", encoding="utf-8")
+    receipt = {
+        "archive_receipt_path": str(archive_receipt.resolve()),
+        "archive_receipt_sha256": sha256_file(archive_receipt),
+        "artifact": "stage211_clean_public_canonical_install",
+        "commonvoice_clean_metrics": {
+            "sample_count": int(STAGE211_PUBLIC_BENCHMARKS["commonvoice_en_test"]["samples"])
+        },
+        "complete": True,
+        "derivation_receipt_path": str(derivation_path.resolve()),
+        "derivation_receipt_sha256": sha256_file(derivation_path),
+        "installed_files": installed_files,
+        "overlap_receipt_path": str(overlap_receipt.resolve()),
+        "overlap_receipt_sha256": sha256_file(overlap_receipt),
+        "pipeline": "stage211",
+        "schema_version": 1,
+        "source_archive": archive,
+    }
+    receipt_path = clean_root / "canonical_install_receipt.json"
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        clean_install,
+        "validate_stage211_public_overlap_receipt",
+        lambda path: {},
+    )
+    monkeypatch.setattr(clean_install, "_validate_derivation", lambda *args: derivation)
+    return {
+        "archive_root": archive_root,
+        "calibration_root": calibration_root,
+        "clean_root": clean_root,
+        "manifest_dir": manifest_dir,
+        "nano_root": nano_root,
+        "overlap_receipt": overlap_receipt,
+        "receipt": receipt,
+        "receipt_path": receipt_path,
+    }
+
+
+def _validate_canonical_install_fixture(fixture: dict[str, object]) -> dict[str, object] | None:
+    return clean_install._validate_existing_install(
+        fixture["receipt_path"],
+        clean_root=fixture["clean_root"],
+        manifest_dir=fixture["manifest_dir"],
+        nano_root=fixture["nano_root"],
+        calibration_root=fixture["calibration_root"],
+        archive_root=fixture["archive_root"],
+        overlap_receipt=fixture["overlap_receipt"],
+    )
+
+
+def test_clean_public_install_exact_reuse_is_deeply_validated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _canonical_install_fixture(tmp_path, monkeypatch)
+
+    assert _validate_canonical_install_fixture(fixture) == fixture["receipt"]
+
+    receipt = dict(fixture["receipt"])
+    installed = [dict(row) for row in receipt["installed_files"]]
+    installed[-1] = dict(installed[0])
+    receipt["installed_files"] = installed
+    fixture["receipt_path"].write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="paths are duplicated"):
+        _validate_canonical_install_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    "alternate",
+    ("overlap_receipt", "clean_root", "manifest_dir", "archive_root"),
+)
+def test_clean_public_install_rejects_byte_identical_alternate_request_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alternate: str,
+) -> None:
+    fixture = _canonical_install_fixture(tmp_path, monkeypatch)
+    requested = dict(fixture)
+    original = fixture[alternate]
+    assert isinstance(original, Path)
+    replacement = tmp_path / "alternate" / alternate
+    if original.is_file():
+        replacement.parent.mkdir(parents=True, exist_ok=True)
+        replacement.write_bytes(original.read_bytes())
+    else:
+        replacement.mkdir(parents=True)
+        if alternate == "clean_root":
+            derivation = original / "derivation_receipt.json"
+            (replacement / "derivation_receipt.json").write_bytes(derivation.read_bytes())
+    requested[alternate] = replacement
+
+    with pytest.raises(ValueError, match="mismatch"):
+        _validate_canonical_install_fixture(requested)
+
+
+def test_clean_public_install_rejects_changed_embedded_archive_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _canonical_install_fixture(tmp_path, monkeypatch)
+    receipt = dict(fixture["receipt"])
+    embedded = dict(receipt["source_archive"])
+    embedded["complete"] = False
+    receipt["source_archive"] = embedded
+    fixture["receipt_path"].write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="embedded archive receipt mismatch"):
+        _validate_canonical_install_fixture(fixture)

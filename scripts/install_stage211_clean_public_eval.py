@@ -165,21 +165,123 @@ def _restore(mapping: dict[Path, Path]) -> None:
         _atomic_copy(archived, canonical)
 
 
-def _validate_existing_install(receipt_path: Path) -> bool:
+def _validate_existing_install(
+    receipt_path: Path,
+    *,
+    clean_root: Path,
+    manifest_dir: Path,
+    nano_root: Path,
+    calibration_root: Path,
+    archive_root: Path,
+    overlap_receipt: Path,
+) -> dict[str, Any] | None:
     if not receipt_path.is_file():
-        return False
+        return None
     receipt = _load_json(receipt_path, label="Stage211 clean public install receipt")
-    if receipt.get("complete") is not True:
-        return False
-    files = receipt.get("installed_files")
-    if not isinstance(files, list):
-        return False
-    return all(
-        isinstance(row, dict)
-        and (path := Path(str(row.get("path") or ""))).is_file()
-        and row.get("sha256") == sha256_file(path)
-        for row in files
+    expected_contract = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "stage211_clean_public_canonical_install",
+        "complete": True,
+    }
+    if any(receipt.get(key) != value for key, value in expected_contract.items()):
+        raise ValueError("Stage211 clean public install receipt contract mismatch.")
+
+    validate_stage211_public_overlap_receipt(overlap_receipt)
+    derivation = _validate_derivation(clean_root, overlap_receipt)
+    derivation_path = (clean_root / "derivation_receipt.json").resolve()
+    if (
+        receipt_path.resolve() != (clean_root / "canonical_install_receipt.json").resolve()
+        or Path(str(receipt.get("overlap_receipt_path") or "")).resolve()
+        != overlap_receipt.resolve()
+        or receipt.get("overlap_receipt_sha256") != sha256_file(overlap_receipt)
+        or Path(str(receipt.get("derivation_receipt_path") or "")).resolve()
+        != derivation_path
+        or receipt.get("derivation_receipt_sha256") != sha256_file(derivation_path)
+        or int(derivation.get("total_samples", -1))
+        != sum(int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values())
+    ):
+        raise ValueError("Stage211 clean public install provenance mismatch.")
+
+    metrics = receipt.get("commonvoice_clean_metrics")
+    if (
+        not isinstance(metrics, dict)
+        or int(metrics.get("sample_count", -1))
+        != int(STAGE211_PUBLIC_BENCHMARKS["commonvoice_en_test"]["samples"])
+    ):
+        raise ValueError("Stage211 clean public install Common Voice coverage mismatch.")
+
+    mapping = _canonical_archive_map(
+        manifest_dir=manifest_dir,
+        nano_root=nano_root,
+        calibration_root=calibration_root,
+        archive_root=archive_root,
     )
+    resolved_mapping = {
+        canonical.resolve(): archived.resolve() for canonical, archived in mapping.items()
+    }
+    expected_paths = set(resolved_mapping)
+    files = receipt.get("installed_files")
+    if not isinstance(files, list) or len(files) != len(expected_paths):
+        raise ValueError("Stage211 clean public installed-file coverage mismatch.")
+    installed_by_path: dict[Path, dict[str, Any]] = {}
+    for row in files:
+        if not isinstance(row, dict):
+            raise ValueError("Stage211 clean public installed-file record is invalid.")
+        path = Path(str(row.get("path") or "")).resolve()
+        if path in installed_by_path:
+            raise ValueError("Stage211 clean public installed-file paths are duplicated.")
+        if not path.is_file() or row.get("sha256") != sha256_file(path):
+            raise ValueError(f"Stage211 clean public installed file changed: {path}")
+        installed_by_path[path] = row
+    if set(installed_by_path) != expected_paths:
+        raise ValueError("Stage211 clean public canonical destination set mismatch.")
+
+    archive_receipt_path = (archive_root / "archive_receipt.json").resolve()
+    if (
+        Path(str(receipt.get("archive_receipt_path") or "")).resolve()
+        != archive_receipt_path
+        or not archive_receipt_path.is_file()
+        or receipt.get("archive_receipt_sha256") != sha256_file(archive_receipt_path)
+    ):
+        raise ValueError("Stage211 clean public archive-receipt binding mismatch.")
+    archive = _load_json(
+        archive_receipt_path,
+        label="Stage211 contaminated public archive receipt",
+    )
+    if receipt.get("source_archive") != archive:
+        raise ValueError("Stage211 clean public embedded archive receipt mismatch.")
+    archive_files = archive.get("files")
+    if (
+        archive.get("schema_version") != 1
+        or archive.get("pipeline") != "stage211"
+        or archive.get("artifact") != "stage211_contaminated_public_archive"
+        or archive.get("complete") is not True
+        or not isinstance(archive_files, list)
+        or len(archive_files) != len(mapping)
+    ):
+        raise ValueError("Stage211 clean public source archive contract mismatch.")
+    archived_by_canonical: dict[Path, dict[str, Any]] = {}
+    for row in archive_files:
+        if not isinstance(row, dict):
+            raise ValueError("Stage211 clean public source archive record is invalid.")
+        canonical = Path(str(row.get("canonical_path") or "")).resolve()
+        archived = Path(str(row.get("archive_path") or "")).resolve()
+        if canonical in archived_by_canonical:
+            raise ValueError("Stage211 clean public source archive paths are duplicated.")
+        expected_archive = resolved_mapping.get(canonical)
+        if (
+            expected_archive is None
+            or archived != expected_archive
+            or not archived.is_file()
+            or row.get("archive_sha256") != sha256_file(archived)
+            or row.get("canonical_sha256") != row.get("archive_sha256")
+        ):
+            raise ValueError("Stage211 clean public source archive binding mismatch.")
+        archived_by_canonical[canonical] = row
+    if set(archived_by_canonical) != expected_paths:
+        raise ValueError("Stage211 clean public source archive destination set mismatch.")
+    return receipt
 
 
 def install_clean_public_eval(
@@ -198,8 +300,17 @@ def install_clean_public_eval(
     archive_root = archive_root.expanduser().resolve()
     overlap_receipt = overlap_receipt.expanduser().resolve()
     install_receipt_path = clean_root / "canonical_install_receipt.json"
-    if _validate_existing_install(install_receipt_path):
-        return _load_json(install_receipt_path, label="Stage211 clean public install receipt")
+    existing = _validate_existing_install(
+        install_receipt_path,
+        clean_root=clean_root,
+        manifest_dir=manifest_dir,
+        nano_root=nano_root,
+        calibration_root=calibration_root,
+        archive_root=archive_root,
+        overlap_receipt=overlap_receipt,
+    )
+    if existing is not None:
+        return existing
 
     validate_stage211_public_overlap_receipt(overlap_receipt)
     _validate_derivation(clean_root, overlap_receipt)
