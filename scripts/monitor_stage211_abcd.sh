@@ -7,6 +7,7 @@ SUPERVISOR_SESSION="${SUPERVISOR_SESSION:-rwkvasr_stage211_abcd_strict_superviso
 OUTPUT_ROOT="${OUTPUT_ROOT:-${HOME}/rwkvasr_runs/stage211_full_alignment}"
 CALIBRATION_ROOT="${CALIBRATION_ROOT:-${HOME}/rwkvasr_runs/sensevoice_rwkv_stage211a_recovery_stage210a30000_nanomlpfrozen_teacherforced_mixeronly_easy1490h_1ep_lr3e6_wd0_4x4090}"
 CALIBRATION_EVAL_ROOT="${CALIBRATION_EVAL_ROOT:-${HOME}/rwkvasr_eval/stage211_calibration_selected_full}"
+CORRECTED_PUBLIC_ROOT="${CORRECTED_PUBLIC_ROOT:-${HOME}/rwkvasr_eval/stage211_public_clean_v2}"
 PHASE_GATE_ROOT="${PHASE_GATE_ROOT:-${HOME}/rwkvasr_eval/stage211_phase_gates}"
 MONITOR_LOG="${MONITOR_LOG:-${OUTPUT_ROOT}/monitor_hourly.log}"
 BASE_PUBLIC_OVERLAP_ROOT="${BASE_PUBLIC_OVERLAP_ROOT:-${HOME}/rwkvasr_data/stage211_base_public_pcm_overlap_v1}"
@@ -327,6 +328,76 @@ stage211_emit_supplemental_readiness() {
     "${SUPPLEMENTAL_REPLAY_RECEIPT}"
 }
 
+stage211_public_expected_rows() {
+  case "$1" in
+    librispeech_test_clean) printf '%s\n' 2620 ;;
+    librispeech_test_other) printf '%s\n' 2939 ;;
+    commonvoice_en_test) printf '%s\n' 14927 ;;
+    aishell1_test) printf '%s\n' 7176 ;;
+    wenetspeech_test_net) printf '%s\n' 24774 ;;
+    *) return 1 ;;
+  esac
+}
+
+stage211_emit_public_prediction_coverage() {
+  local role="$1"
+  local prediction_path="$2"
+  local filename dataset expected_rows actual_rows status
+  filename="${prediction_path##*/}"
+  dataset="${filename%.ctc.jsonl}"
+  expected_rows="$(stage211_public_expected_rows "${dataset}" 2>/dev/null || true)"
+  if [[ -z "${expected_rows}" ]]; then
+    actual_rows=0
+    if [[ -f "${prediction_path}" ]]; then
+      actual_rows="$(wc -l <"${prediction_path}" | tr -d ' ')"
+    fi
+    printf 'public_prediction role=%s dataset=%s rows=%s expected_rows=unknown status=unexpected path=%s\n' \
+      "${role}" "${dataset}" "${actual_rows}" "${prediction_path}"
+    return
+  fi
+  if [[ ! -f "${prediction_path}" ]]; then
+    printf 'public_prediction role=%s dataset=%s rows=0 expected_rows=%s status=pending path=%s\n' \
+      "${role}" "${dataset}" "${expected_rows}" "${prediction_path}"
+    return
+  fi
+  actual_rows="$(wc -l <"${prediction_path}" | tr -d ' ')"
+  status=mismatch
+  if [[ "${actual_rows}" == "${expected_rows}" ]]; then
+    status=complete
+  fi
+  printf 'public_prediction role=%s dataset=%s rows=%s expected_rows=%s status=%s path=%s\n' \
+    "${role}" "${dataset}" "${actual_rows}" "${expected_rows}" "${status}" \
+    "${prediction_path}"
+}
+
+stage211_emit_public_evaluation_coverage() {
+  local dataset prediction_path role root
+  local datasets=(
+    librispeech_test_clean
+    librispeech_test_other
+    commonvoice_en_test
+    aishell1_test
+    wenetspeech_test_net
+  )
+  for role in corrected_calibration corrected_nano; do
+    if [[ "${role}" == corrected_calibration ]]; then
+      root="${CORRECTED_PUBLIC_ROOT}/calibration/predictions"
+    else
+      root="${CORRECTED_PUBLIC_ROOT}/nano_2512/predictions"
+    fi
+    for dataset in "${datasets[@]}"; do
+      stage211_emit_public_prediction_coverage \
+        "${role}" "${root}/${dataset}.ctc.jsonl"
+    done
+  done
+  while IFS= read -r -d '' prediction_path; do
+    stage211_emit_public_prediction_coverage phase_gate "${prediction_path}"
+  done < <(
+    find "${PHASE_GATE_ROOT}" -type f -name '*.ctc.jsonl' -print0 2>/dev/null |
+      sort -z
+  )
+}
+
 stage211_recent_logs() {
   local root
   for root in "$@"; do
@@ -352,7 +423,7 @@ stage211_recent_formal_training_logs() {
 }
 
 stage211_emit_snapshot() {
-  local log_path latest_record errors prediction_path
+  local log_path latest_record errors
   printf '\n===== %s =====\n' "$(date --iso-8601=seconds)"
   printf '%s\n' '-- sessions --'
   tmux list-sessions 2>&1 || true
@@ -371,15 +442,8 @@ stage211_emit_snapshot() {
   fi
   printf '%s\n' '-- supervisor tail --'
   tail -n 20 "${OUTPUT_ROOT}/supervisor.log" 2>&1 || true
-  printf '%s\n' '-- public evaluation coverage --'
-  while IFS= read -r -d '' prediction_path; do
-    printf '%s %s\n' \
-      "$(wc -l <"${prediction_path}" | tr -d ' ')" \
-      "${prediction_path}"
-  done < <(
-    find "${CALIBRATION_EVAL_ROOT}" "${PHASE_GATE_ROOT}" \
-      -type f -name '*.ctc.jsonl' -print0 2>/dev/null
-  )
+  printf '%s\n' '-- corrected public evaluation coverage --'
+  stage211_emit_public_evaluation_coverage
   printf '%s\n' '-- supplemental exact PCM audit --'
   if [[ -x "${MONITOR_PYTHON}" && -f "${SUPPLEMENTAL_PROGRESS_REPORTER}" && \
     -s "${BASE_PUBLIC_OVERLAP_ROOT}/manifest_location_index.sqlite" ]]; then

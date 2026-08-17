@@ -70,8 +70,7 @@ def test_stage211_monitor_reports_full_readiness_without_data_scan(tmp_path: Pat
     output = _emit_readiness(tmp_path)
 
     assert (
-        "sft_labeled_preparation=complete processed=100 expected=100 "
-        "progress_pct=100.0000 kept=92"
+        "sft_labeled_preparation=complete processed=100 expected=100 progress_pct=100.0000 kept=92"
     ) in output
     assert "sft_labeled_finalizer=profile validated" in output
     for label, path in (
@@ -89,8 +88,7 @@ def test_stage211_monitor_reports_missing_readiness_as_pending(tmp_path: Path) -
     output = _emit_readiness(tmp_path)
 
     assert (
-        "sft_labeled_preparation=incomplete processed=0 expected=100 "
-        "progress_pct=0.0000 kept=0"
+        "sft_labeled_preparation=incomplete processed=0 expected=100 progress_pct=0.0000 kept=0"
     ) in output
     assert "sft_labeled_profile=pending" in output
     assert "sft_labeled_finalizer=pending" in output
@@ -117,7 +115,72 @@ def test_stage211_monitor_supersedes_stale_sft_finalizer_failure(
 
     output = _emit_readiness(tmp_path)
 
-    assert (
-        "sft_labeled_finalizer=profile validated stale_failure_superseded=true"
-        in output
+    assert "sft_labeled_finalizer=profile validated stale_failure_superseded=true" in output
+
+
+def test_stage211_monitor_reports_only_authoritative_corrected_public_coverage(
+    tmp_path: Path,
+) -> None:
+    corrected_root = tmp_path / "corrected"
+    phase_gate_root = tmp_path / "phase-gates"
+    stale_root = tmp_path / "stale-calibration"
+    expected_rows = {
+        "librispeech_test_clean": 2620,
+        "librispeech_test_other": 2939,
+        "commonvoice_en_test": 14927,
+        "aishell1_test": 7176,
+        "wenetspeech_test_net": 24774,
+    }
+    for role_root in (
+        corrected_root / "calibration" / "predictions",
+        corrected_root / "nano_2512" / "predictions",
+    ):
+        role_root.mkdir(parents=True)
+        for dataset, rows in expected_rows.items():
+            (role_root / f"{dataset}.ctc.jsonl").write_text(
+                "{}\n" * rows,
+                encoding="utf-8",
+            )
+    candidate = phase_gate_root / "mixer" / "predictions" / "commonvoice_en_test.ctc.jsonl"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("{}\n" * 14926, encoding="utf-8")
+    stale = stale_root / "predictions" / "commonvoice_en_test.ctc.jsonl"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{}\n" * 14922, encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; stage211_emit_public_evaluation_coverage',
+            "stage211-monitor-test",
+            str(MONITOR),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "CORRECTED_PUBLIC_ROOT": str(corrected_root),
+            "PHASE_GATE_ROOT": str(phase_gate_root),
+            "CALIBRATION_EVAL_ROOT": str(stale_root),
+        },
     )
+
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert len(lines) == 11
+    assert sum("status=complete" in line for line in lines) == 10
+    assert (
+        "role=corrected_calibration dataset=commonvoice_en_test rows=14927 "
+        "expected_rows=14927 status=complete"
+    ) in result.stdout
+    assert (
+        "role=corrected_nano dataset=wenetspeech_test_net rows=24774 "
+        "expected_rows=24774 status=complete"
+    ) in result.stdout
+    assert (
+        "role=phase_gate dataset=commonvoice_en_test rows=14926 expected_rows=14927 status=mismatch"
+    ) in result.stdout
+    assert str(stale) not in result.stdout
