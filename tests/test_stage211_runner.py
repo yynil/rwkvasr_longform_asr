@@ -2828,6 +2828,46 @@ def test_stage211_stacked_full_profile_smoke_uses_safe_capacity(
     )
 
 
+def test_stage211_admitted_block_profile_can_disable_checkpointing(
+    tmp_path: Path,
+) -> None:
+    phase = stage211.PHASES["block"]
+    segment = stage211._segments(phase=phase, smoke=False)[0]
+    admission = {
+        "receipt_path": str((tmp_path / "admission.json").resolve()),
+        "receipt_sha256": "a" * 64,
+        "selected_profile": {
+            "name": "no_ckpt_batch12_frames8k",
+            "batch_size": 12,
+            "frame_budget": 8_000,
+            "num_workers": 8,
+            "gradient_checkpointing": False,
+        },
+    }
+
+    config = stage211._config(
+        phase=phase,
+        segment=segment,
+        output_dir=tmp_path / "block",
+        init_checkpoint=tmp_path / "selected.pt",
+        bucket_manifest=tmp_path / "manifest.json",
+        resume=False,
+        smoke=False,
+        full_data_profile=True,
+        batch_profile_admission=admission,
+    )
+
+    assert config["gradient_checkpointing"] is False
+    assert config["batch_size"] == 12
+    assert config["stage211_batch_profile_gradient_checkpointing"] is False
+    validated = validate_stage211_phase_train_config(config, phase="block")
+    assert validated["gradient_checkpointing"] is False
+
+    config["stage211_batch_profile_gradient_checkpointing"] = True
+    with pytest.raises(ValueError, match="gradient_checkpointing mismatch"):
+        validate_stage211_phase_train_config(config, phase="block")
+
+
 @pytest.mark.parametrize("phase_name", tuple(stage211.PHASES))
 def test_stage211_config_preflights_phase_objective_before_training(
     tmp_path: Path,
@@ -6071,6 +6111,7 @@ def _write_retention_correction(
                 "batch_size": int(selected_profile["batch_size"]),
                 "frame_budget": int(selected_profile["frame_budget"]),
                 "num_workers": int(selected_profile["num_workers"]),
+                "gradient_checkpointing": selected_profile["gradient_checkpointing"],
                 "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
                 "smoke_checkpoint_sha256": sha256_file(smoke_checkpoint),
                 "smoke_log_path": str(smoke_log.resolve()),
@@ -6126,6 +6167,9 @@ def _write_retention_correction(
             "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
             "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
             "stage211_post_coverage_num_workers": int(selected_profile["num_workers"]),
+            "stage211_post_coverage_gradient_checkpointing": selected_profile[
+                "gradient_checkpointing"
+            ],
             "stage211_post_coverage_original_coverage_unchanged": True,
             "stage211_post_coverage_smoke_marker_path": str(smoke_marker.resolve()),
             "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
@@ -6181,6 +6225,7 @@ def _write_retention_correction(
                 "batch_size": int(selected_profile["batch_size"]),
                 "frame_budget": int(selected_profile["frame_budget"]),
                 "num_workers": int(selected_profile["num_workers"]),
+                "gradient_checkpointing": selected_profile["gradient_checkpointing"],
                 "correction_extension_decision_path": None,
                 "correction_extension_decision_sha256": None,
                 "epochs": STAGE211_RETENTION_CORRECTION_EPOCHS,
@@ -6208,6 +6253,7 @@ def _write_retention_correction(
         "num_workers": int(selected_profile["num_workers"]),
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
         "frame_budget": int(selected_profile["frame_budget"]),
+        "gradient_checkpointing": selected_profile["gradient_checkpointing"],
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,

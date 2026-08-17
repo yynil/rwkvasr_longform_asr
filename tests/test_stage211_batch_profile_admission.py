@@ -52,7 +52,10 @@ def _profile_row(
     manifest: Path,
     eval_part: Path,
     num_workers: int = 8,
+    gradient_checkpointing: bool | None = None,
 ) -> dict[str, object]:
+    if gradient_checkpointing is None:
+        gradient_checkpointing = phase in {"block", "logits"}
     profile_root = root / name
     config_path = profile_root / "train_config.yaml"
     config = {
@@ -61,6 +64,7 @@ def _profile_row(
         "max_steps": 120,
         "batch_size": batch_size,
         "num_workers": num_workers,
+        "gradient_checkpointing": gradient_checkpointing,
         "batch_token_budget": frame_budget,
         "length_bucket_frame_budget": frame_budget,
         "length_bucket_drop_last": False,
@@ -212,6 +216,7 @@ def _profile_row(
             "batch_size": batch_size,
             "frame_budget": frame_budget,
             "num_workers": num_workers,
+            "gradient_checkpointing": gradient_checkpointing,
         },
         "config_path": str(config_path.resolve()),
         "config_sha256": sha256_file(config_path),
@@ -457,6 +462,7 @@ def test_measured_phase_specific_profile_can_be_admitted(tmp_path: Path) -> None
         "batch_size": 48,
         "frame_budget": 42_000,
         "num_workers": 8,
+        "gradient_checkpointing": False,
     }
 
 
@@ -481,6 +487,7 @@ def test_worker_only_profile_is_measured_admitted_and_tamper_evident(
         "batch_size": 36,
         "frame_budget": 24_000,
         "num_workers": 2,
+        "gradient_checkpointing": False,
     }
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -554,6 +561,7 @@ def test_logits_retained_safe_baseline_can_be_formally_admitted(tmp_path: Path) 
         "batch_size": 4,
         "frame_budget": 4_000,
         "num_workers": 8,
+        "gradient_checkpointing": True,
     }
     assert receipt["selected_comparison"] is None
     receipt_path = tmp_path / "admission.json"
@@ -579,6 +587,7 @@ def test_automatic_profile_routes_nonlegacy_retained_baseline_to_admission(
             "batch_size": 36,
             "length_bucket_frame_budget": 24_000,
             "num_workers": 8,
+            "gradient_checkpointing": False,
         },
     )
     retained_safe_logits = {
@@ -591,13 +600,14 @@ def test_automatic_profile_routes_nonlegacy_retained_baseline_to_admission(
                 "batch_size": 4,
                 "frame_budget": 4_000,
                 "num_workers": 8,
+                "gradient_checkpointing": True,
             }
         },
     }
     retained_legacy = copy.deepcopy(retained_safe_logits)
     retained_legacy["phase"] = "mixer"
     retained_legacy["selected_profile_row"]["profile"].update(
-        {"batch_size": 36, "frame_budget": 24_000}
+        {"batch_size": 36, "frame_budget": 24_000, "gradient_checkpointing": False}
     )
     admitted_candidate = copy.deepcopy(retained_legacy)
     admitted_candidate["selection_decision"] = "admit_candidate"
@@ -608,6 +618,108 @@ def test_automatic_profile_routes_nonlegacy_retained_baseline_to_admission(
     assert stage211_full_phase._automatic_profile_requires_admission(retained_safe_logits)
     assert not stage211_full_phase._automatic_profile_requires_admission(retained_legacy)
     assert stage211_full_phase._automatic_profile_requires_admission(admitted_candidate)
+
+
+def test_automatic_profile_treats_checkpoint_mode_change_as_admission_required(
+    tmp_path: Path,
+) -> None:
+    base_config = tmp_path / "base.yaml"
+    save_yaml(
+        base_config,
+        {
+            "batch_size": 4,
+            "length_bucket_frame_budget": 4_000,
+            "num_workers": 8,
+            "gradient_checkpointing": True,
+        },
+    )
+    measured = {
+        "phase": "block",
+        "selection_decision": "admit_candidate",
+        "base_config_path": str(base_config),
+        "selected_profile_row": {
+            "profile": {
+                "name": "no_ckpt_batch4_frames4k",
+                "batch_size": 4,
+                "frame_budget": 4_000,
+                "num_workers": 8,
+                "gradient_checkpointing": False,
+            }
+        },
+    }
+
+    assert stage211_full_phase._automatic_profile_requires_admission(measured)
+
+
+def test_profile_config_rejects_checkpoint_mode_mismatch(tmp_path: Path) -> None:
+    report_path = _report(
+        tmp_path,
+        phase="block",
+        baseline_batch_size=4,
+        baseline_frame_budget=4_000,
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["profiles"][1]["profile"]["gradient_checkpointing"] = False
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="gradient_checkpointing mismatch"):
+        validate_stage211_batch_profile_preflight(report_path, phase="block")
+
+
+def test_same_capacity_no_checkpoint_candidate_can_be_admitted(tmp_path: Path) -> None:
+    report_path = _report(
+        tmp_path,
+        phase="block",
+        baseline_batch_size=4,
+        baseline_frame_budget=4_000,
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    baseline, candidate = report["profiles"]
+    candidate_name = "no_ckpt_batch4_frames4k"
+    candidate["profile"].update(
+        {
+            "name": candidate_name,
+            "batch_size": 4,
+            "frame_budget": 4_000,
+            "gradient_checkpointing": False,
+        }
+    )
+    config_path = Path(candidate["config_path"])
+    config = load_yaml(config_path)
+    config.update(
+        {
+            "batch_size": 4,
+            "batch_token_budget": 4_000,
+            "length_bucket_frame_budget": 4_000,
+            "gradient_checkpointing": False,
+        }
+    )
+    config["deepspeed"].update(
+        {
+            "train_micro_batch_size_per_gpu": 4,
+            "train_batch_size": 16,
+        }
+    )
+    save_yaml(config_path, config)
+    candidate["config_sha256"] = sha256_file(config_path)
+    candidate["coverage"] = copy.deepcopy(baseline["coverage"])
+    full_steps = int(candidate["coverage"]["full_coverage_steps"])
+    candidate["summary"]["steps_per_second"] = full_steps / 2_100.0
+    report["selection"]["recommended_profile"] = candidate_name
+    report["selection"]["comparisons"][0]["profile"] = candidate_name
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    receipt = build_stage211_batch_profile_admission(
+        report_path,
+        phase="block",
+        admitted_by="test",
+        reason="same-capacity no-checkpoint candidate exceeded ten percent",
+    )
+    receipt_path = tmp_path / "no-checkpoint-admission.json"
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    validated = validate_stage211_batch_profile_admission(receipt_path, phase="block")
+
+    assert validated["selected_profile"] == candidate["profile"]
 
 
 def test_mixer_preflight_rejects_stacked_safe_baseline(tmp_path: Path) -> None:
@@ -798,6 +910,12 @@ def test_receipt_profile_tamper_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="differs from its measured report"):
         validate_stage211_batch_profile_admission(receipt_path, phase="mixer")
 
+    tampered = copy.deepcopy(receipt)
+    tampered["selected_profile"]["gradient_checkpointing"] = True
+    receipt_path.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="differs from its measured report"):
+        validate_stage211_batch_profile_admission(receipt_path, phase="mixer")
+
 
 def test_controller_threads_an_explicit_segment_admission(tmp_path: Path) -> None:
     admission = tmp_path / "admission.json"
@@ -909,6 +1027,7 @@ def test_schema2_profile_and_mixed_coverage_keep_dynamic_exposures(
         "world_size": 4,
         "frame_budget": 42_000,
         "num_workers": 8,
+        "gradient_checkpointing": False,
         "steps_per_epoch": selected["steps_per_epoch"],
         "steps": selected["full_coverage_steps"],
         "tail_padding_samples_per_epoch": selected["tail_padding_samples_per_epoch"],

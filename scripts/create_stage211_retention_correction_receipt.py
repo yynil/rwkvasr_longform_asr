@@ -117,9 +117,7 @@ def _validate_correction_smoke_marker(
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
         "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
         "batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -127,15 +125,16 @@ def _validate_correction_smoke_marker(
             else None
         ),
         "batch_profile_name": batch_profile_preflight["selected_profile_name"],
-        "batch_size": int(
-            batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]
-        ),
+        "batch_size": int(batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]),
         "frame_budget": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
         ),
         "num_workers": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
         ),
+        "gradient_checkpointing": batch_profile_preflight["selected_profile_row"]["profile"][
+            "gradient_checkpointing"
+        ],
     }
     if any(marker.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 correction smoke marker contract mismatch.")
@@ -229,9 +228,7 @@ def _validate_correction_train_config(
             "report_sha256"
         ],
         "stage211_post_coverage_batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "stage211_post_coverage_batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -242,6 +239,7 @@ def _validate_correction_train_config(
         "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
         "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
         "stage211_post_coverage_num_workers": int(selected_profile["num_workers"]),
+        "stage211_post_coverage_gradient_checkpointing": selected_profile["gradient_checkpointing"],
         "stage211_post_coverage_original_coverage_unchanged": True,
         "stage211_post_coverage_smoke_marker_path": str(smoke_marker),
         "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
@@ -254,9 +252,7 @@ def _validate_correction_train_config(
             )
     deepspeed = config.get("deepspeed")
     gradient_accumulation = (
-        int(deepspeed.get("gradient_accumulation_steps", 1))
-        if isinstance(deepspeed, dict)
-        else -1
+        int(deepspeed.get("gradient_accumulation_steps", 1)) if isinstance(deepspeed, dict) else -1
     )
     if not isinstance(deepspeed, dict) or any(
         (
@@ -271,9 +267,7 @@ def _validate_correction_train_config(
         raise ValueError("Stage211 correction train config DeepSpeed batch profile mismatch.")
     expected_admission_fields = {
         "stage211_batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "stage211_batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -282,6 +276,16 @@ def _validate_correction_train_config(
         ),
         "stage211_batch_profile_name": (
             batch_profile_admission["selected_profile"]["name"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_batch_profile_num_workers": (
+            int(batch_profile_admission["selected_profile"]["num_workers"])
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_batch_profile_gradient_checkpointing": (
+            batch_profile_admission["selected_profile"]["gradient_checkpointing"]
             if batch_profile_admission is not None
             else None
         ),
@@ -421,12 +425,10 @@ def build_receipt(
         require_candidate=False,
     )
     if (
-        batch_profile_preflight["report_sha256"]
-        != provenance.get("batch_profile_preflight_sha256")
+        batch_profile_preflight["report_sha256"] != provenance.get("batch_profile_preflight_sha256")
         or Path(str(batch_profile_preflight["init_checkpoint_path"])).resolve()
         != init_checkpoint_path
-        or Path(str(batch_profile_preflight["bucket_manifest_path"])).resolve()
-        != replay_manifest
+        or Path(str(batch_profile_preflight["bucket_manifest_path"])).resolve() != replay_manifest
     ):
         raise ValueError("Stage211 correction batch-profile preflight binding mismatch.")
     admission_path_value = provenance.get("batch_profile_admission_path")
@@ -475,8 +477,7 @@ def build_receipt(
     selected_coverage = batch_profile_preflight["selected_profile_row"]["coverage"]
     if (
         int(selected_coverage.get("steps_per_epoch", -1)) != steps_per_epoch
-        or int(selected_coverage.get("tail_padding_samples_per_epoch", -1))
-        != tail_padding_samples
+        or int(selected_coverage.get("tail_padding_samples_per_epoch", -1)) != tail_padding_samples
     ):
         raise ValueError("Stage211 correction batch-profile coverage changed.")
     if _checkpoint_step(completion_checkpoint_path) != steps_per_epoch:
@@ -514,9 +515,7 @@ def build_receipt(
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
         "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
         "batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -527,6 +526,7 @@ def build_receipt(
         "batch_size": batch_size,
         "frame_budget": frame_budget,
         "num_workers": int(selected_profile["num_workers"]),
+        "gradient_checkpointing": selected_profile["gradient_checkpointing"],
         "correction_extension_decision_path": (
             str(extension_decision_path) if extension_decision_path is not None else None
         ),
@@ -604,12 +604,11 @@ def build_receipt(
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
         "frame_budget": frame_budget,
         "num_workers": int(selected_profile["num_workers"]),
+        "gradient_checkpointing": selected_profile["gradient_checkpointing"],
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
         "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
         "batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]

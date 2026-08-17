@@ -17,37 +17,46 @@ probe = importlib.import_module("scripts.benchmark_stage211_batch_profiles")
 
 def test_default_profiles_cover_baseline_and_seven_larger_candidates() -> None:
     assert probe.DEFAULT_PROFILES == (
-        probe.BatchProfile("baseline", 36, 24_000),
-        probe.BatchProfile("batch48_frames42k", 48, 42_000),
-        probe.BatchProfile("batch64_frames56k", 64, 56_000),
-        probe.BatchProfile("batch80_frames70k", 80, 70_000),
-        probe.BatchProfile("batch96_frames84k", 96, 84_000),
-        probe.BatchProfile("batch128_frames112k", 128, 112_000),
-        probe.BatchProfile("batch160_frames140k", 160, 140_000),
-        probe.BatchProfile("batch192_frames168k", 192, 168_000),
+        probe.BatchProfile("baseline", 36, 24_000, 8, False),
+        probe.BatchProfile("batch48_frames42k", 48, 42_000, 8, False),
+        probe.BatchProfile("batch64_frames56k", 64, 56_000, 8, False),
+        probe.BatchProfile("batch80_frames70k", 80, 70_000, 8, False),
+        probe.BatchProfile("batch96_frames84k", 96, 84_000, 8, False),
+        probe.BatchProfile("batch128_frames112k", 128, 112_000, 8, False),
+        probe.BatchProfile("batch160_frames140k", 160, 140_000, 8, False),
+        probe.BatchProfile("batch192_frames168k", 192, 168_000, 8, False),
     )
 
 
 def test_stacked_default_profiles_start_from_memory_safe_baseline() -> None:
     assert probe.default_profiles_for_phase("block") == (
-        probe.BatchProfile("baseline", 4, 4_000),
-        probe.BatchProfile("batch8_frames6k", 8, 6_000),
-        probe.BatchProfile("batch12_frames8k", 12, 8_000),
-        probe.BatchProfile("batch16_frames10k", 16, 10_000),
-        probe.BatchProfile("batch24_frames16k", 24, 16_000),
-        probe.BatchProfile("batch36_frames24k", 36, 24_000),
-        probe.BatchProfile("batch48_frames32k", 48, 32_000),
-        probe.BatchProfile("batch64_frames42k", 64, 42_000),
+        probe.BatchProfile("baseline", 4, 4_000, 8, True),
+        probe.BatchProfile("no_ckpt_batch4_frames4k", 4, 4_000, 8, False),
+        probe.BatchProfile("no_ckpt_batch8_frames6k", 8, 6_000, 8, False),
+        probe.BatchProfile("no_ckpt_batch12_frames8k", 12, 8_000, 8, False),
+        probe.BatchProfile("no_ckpt_batch16_frames10k", 16, 10_000, 8, False),
+        probe.BatchProfile("no_ckpt_batch24_frames16k", 24, 16_000, 8, False),
+        probe.BatchProfile("batch8_frames6k", 8, 6_000, 8, True),
+        probe.BatchProfile("batch12_frames8k", 12, 8_000, 8, True),
+        probe.BatchProfile("batch16_frames10k", 16, 10_000, 8, True),
+        probe.BatchProfile("batch24_frames16k", 24, 16_000, 8, True),
+        probe.BatchProfile("batch36_frames24k", 36, 24_000, 8, True),
+        probe.BatchProfile("batch48_frames32k", 48, 32_000, 8, True),
+        probe.BatchProfile("batch64_frames42k", 64, 42_000, 8, True),
     )
     assert probe.default_profiles_for_phase("logits") == (
-        probe.BatchProfile("baseline", 4, 4_000),
-        probe.BatchProfile("batch8_frames6k", 8, 6_000),
-        probe.BatchProfile("batch12_frames8k", 12, 8_000),
-        probe.BatchProfile("batch16_frames10k", 16, 10_000),
-        probe.BatchProfile("batch20_frames13k", 20, 13_000),
-        probe.BatchProfile("batch24_frames16k", 24, 16_000),
-        probe.BatchProfile("batch36_frames24k", 36, 24_000),
-        probe.BatchProfile("batch48_frames32k", 48, 32_000),
+        probe.BatchProfile("baseline", 4, 4_000, 8, True),
+        probe.BatchProfile("no_ckpt_batch4_frames4k", 4, 4_000, 8, False),
+        probe.BatchProfile("no_ckpt_batch8_frames6k", 8, 6_000, 8, False),
+        probe.BatchProfile("no_ckpt_batch12_frames8k", 12, 8_000, 8, False),
+        probe.BatchProfile("no_ckpt_batch16_frames10k", 16, 10_000, 8, False),
+        probe.BatchProfile("batch8_frames6k", 8, 6_000, 8, True),
+        probe.BatchProfile("batch12_frames8k", 12, 8_000, 8, True),
+        probe.BatchProfile("batch16_frames10k", 16, 10_000, 8, True),
+        probe.BatchProfile("batch20_frames13k", 20, 13_000, 8, True),
+        probe.BatchProfile("batch24_frames16k", 24, 16_000, 8, True),
+        probe.BatchProfile("batch36_frames24k", 36, 24_000, 8, True),
+        probe.BatchProfile("batch48_frames32k", 48, 32_000, 8, True),
     )
     assert probe.default_profiles_for_phase("mixer") is probe.DEFAULT_PROFILES
 
@@ -132,6 +141,7 @@ def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> No
         "batch_size": 36,
         "batch_token_budget": 24_000,
         "length_bucket_frame_budget": 24_000,
+        "gradient_checkpointing": False,
         "wandb_enabled": True,
         "deepspeed": {
             "train_micro_batch_size_per_gpu": 36,
@@ -165,6 +175,7 @@ def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> No
     assert config["num_workers"] == 8
     assert config["batch_token_budget"] == 42_000
     assert config["length_bucket_frame_budget"] == 42_000
+    assert config["gradient_checkpointing"] is False
     assert config["deepspeed"]["train_micro_batch_size_per_gpu"] == 48
     assert config["deepspeed"]["train_batch_size"] == 384
 
@@ -179,6 +190,7 @@ def test_loader_worker_selection_requires_measured_ten_percent_gain() -> None:
                 "batch_size": 36,
                 "frame_budget": 24_000,
                 "num_workers": workers,
+                "gradient_checkpointing": False,
             },
             "summary": {
                 "safety_pass": True,

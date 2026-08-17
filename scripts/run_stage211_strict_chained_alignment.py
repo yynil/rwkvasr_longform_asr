@@ -579,6 +579,7 @@ def _validate_curriculum_receipt(
             "batch_size": int(profile["batch_size"]),
             "frame_budget": int(profile["frame_budget"]),
             "num_workers": int(profile["num_workers"]),
+            "gradient_checkpointing": profile["gradient_checkpointing"],
             "steps_per_epoch": int(coverage["steps_per_epoch"]),
             "steps": int(coverage["full_coverage_steps"]),
             "tail_padding_samples_per_epoch": int(coverage["tail_padding_samples_per_epoch"]),
@@ -1306,21 +1307,27 @@ def _config(
                 "batch_size": STAGE211_STACKED_SAFE_BATCH_SIZE,
                 "frame_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
                 "num_workers": int(config.get("num_workers", 8)),
+                "gradient_checkpointing": True,
             }
             if smoke and phase.name in {"block", "logits"}
             else {
                 "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
                 "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
                 "num_workers": int(config.get("num_workers", 8)),
+                "gradient_checkpointing": phase.name != "mixer",
             }
         )
         runtime_batch_size = int(selected_profile["batch_size"])
         runtime_frame_budget = int(selected_profile["frame_budget"])
         runtime_num_workers = int(selected_profile["num_workers"])
+        runtime_gradient_checkpointing = selected_profile["gradient_checkpointing"]
+        if type(runtime_gradient_checkpointing) is not bool:
+            raise ValueError("Stage211 runtime profile gradient_checkpointing must be boolean.")
         config.update(
             {
                 "batch_size": runtime_batch_size,
                 "num_workers": runtime_num_workers,
+                "gradient_checkpointing": runtime_gradient_checkpointing,
                 "batch_token_budget": runtime_frame_budget,
                 "length_bucket_drop_last": False,
                 "length_bucket_frame_budget": runtime_frame_budget,
@@ -1358,6 +1365,9 @@ def _config(
                         "name"
                     ],
                     "stage211_batch_profile_num_workers": runtime_num_workers,
+                    "stage211_batch_profile_gradient_checkpointing": (
+                        runtime_gradient_checkpointing
+                    ),
                 }
             )
     if phase.requires_labels:
@@ -1421,6 +1431,10 @@ def _config(
                 boundary_layer_ids=correction_layer_boundary_ids,
                 rotation_offset=correction_layer_rotation_offset,
             )
+            if batch_profile_admission is not None:
+                correction_contract["gradient_checkpointing"] = batch_profile_admission[
+                    "selected_profile"
+                ]["gradient_checkpointing"]
         else:
             if (
                 correction_layer_boundary_ids is not None
@@ -1592,6 +1606,9 @@ def _record_or_validate_provenance(
                 batch_profile_admission["selected_profile"]["frame_budget"]
             )
             payload["num_workers"] = int(batch_profile_admission["selected_profile"]["num_workers"])
+            payload["gradient_checkpointing"] = batch_profile_admission["selected_profile"][
+                "gradient_checkpointing"
+            ]
     if phase.requires_labels:
         payload["length_bucket_drop_last"] = False
         payload["skip_oversized_samples"] = False
@@ -1651,6 +1668,9 @@ def _validate_resume_provenance(
             expected["num_workers"] = int(
                 batch_profile_admission["selected_profile"]["num_workers"]
             )
+            expected["gradient_checkpointing"] = batch_profile_admission["selected_profile"][
+                "gradient_checkpointing"
+            ]
     if phase.requires_labels:
         expected["length_bucket_drop_last"] = False
         expected["skip_oversized_samples"] = False
@@ -1668,6 +1688,7 @@ def _validate_resume_provenance(
         "batch_size",
         "frame_budget",
         "num_workers",
+        "gradient_checkpointing",
     )
     if batch_profile_admission is None and any(
         payload.get(key) is not None for key in admission_keys

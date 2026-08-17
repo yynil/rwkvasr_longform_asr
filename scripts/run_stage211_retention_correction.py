@@ -273,9 +273,7 @@ def _provenance_payload(
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
         "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
         "batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -283,15 +281,16 @@ def _provenance_payload(
             else None
         ),
         "batch_profile_name": batch_profile_preflight["selected_profile_name"],
-        "batch_size": int(
-            batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]
-        ),
+        "batch_size": int(batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]),
         "frame_budget": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
         ),
         "num_workers": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
         ),
+        "gradient_checkpointing": batch_profile_preflight["selected_profile_row"]["profile"][
+            "gradient_checkpointing"
+        ],
         "correction_extension_decision_path": (
             str(extension_decision) if extension_decision is not None else None
         ),
@@ -335,9 +334,7 @@ def _correction_config_metadata(
             "report_sha256"
         ],
         "stage211_post_coverage_batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "stage211_post_coverage_batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -348,6 +345,7 @@ def _correction_config_metadata(
         "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
         "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
         "stage211_post_coverage_num_workers": int(selected_profile["num_workers"]),
+        "stage211_post_coverage_gradient_checkpointing": selected_profile["gradient_checkpointing"],
         "stage211_post_coverage_original_coverage_unchanged": True,
     }
 
@@ -397,9 +395,7 @@ def _validate_correction_smoke_marker(
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
         "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
         "batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -407,15 +403,16 @@ def _validate_correction_smoke_marker(
             else None
         ),
         "batch_profile_name": batch_profile_preflight["selected_profile_name"],
-        "batch_size": int(
-            batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]
-        ),
+        "batch_size": int(batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]),
         "frame_budget": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
         ),
         "num_workers": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
         ),
+        "gradient_checkpointing": batch_profile_preflight["selected_profile_row"]["profile"][
+            "gradient_checkpointing"
+        ],
     }
     if any(marker.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 correction smoke marker binding mismatch.")
@@ -573,6 +570,9 @@ def _run_correction_smoke(
             "num_workers": int(
                 batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
             ),
+            "gradient_checkpointing": batch_profile_preflight["selected_profile_row"]["profile"][
+                "gradient_checkpointing"
+            ],
         }
     )
     _write_immutable_json(marker_path, marker)
@@ -750,21 +750,19 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             raise ValueError(
                 "Stage211 correction formal progress lacks its checkpoint-bound batch profile."
             )
-        batch_profile_preflight, batch_profile_admission_path = (
-            _ensure_measured_batch_profile(
-                phase=phase_name,
-                scope=profile_scope,
-                phase_root=run_dir.parent,
-                base_config=profile_config_path,
-                manifest_path=replay_manifest,
-                init_checkpoint=init_checkpoint,
-                master_port=int(args.batch_profile_master_port),
-                admitted_by="stage211-auto-correction-boundary",
-                reason=(
-                    "correction phase/checkpoint/retention-manifest-specific four-GPU profile "
-                    "passed memory, objective-match, fixed-eval, and projected-time gates"
-                ),
-            )
+        batch_profile_preflight, batch_profile_admission_path = _ensure_measured_batch_profile(
+            phase=phase_name,
+            scope=profile_scope,
+            phase_root=run_dir.parent,
+            base_config=profile_config_path,
+            manifest_path=replay_manifest,
+            init_checkpoint=init_checkpoint,
+            master_port=int(args.batch_profile_master_port),
+            admitted_by="stage211-auto-correction-boundary",
+            reason=(
+                "correction phase/checkpoint/retention-manifest-specific four-GPU profile "
+                "passed memory, objective-match, fixed-eval, and projected-time gates"
+            ),
         )
         batch_profile_admission = (
             validate_stage211_batch_profile_admission(

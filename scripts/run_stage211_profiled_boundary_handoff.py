@@ -25,9 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = Path(sys.executable).resolve()
 STRICT_RUNNER = REPO_ROOT / "scripts" / "run_stage211_strict_chained_alignment.py"
 RECEIPT_CREATOR = REPO_ROOT / "scripts" / "create_stage211_curriculum_receipt.py"
-PROFILE_RECEIPT_CREATOR = (
-    REPO_ROOT / "scripts" / "create_stage211_supplemental_profile_receipt.py"
-)
+PROFILE_RECEIPT_CREATOR = REPO_ROOT / "scripts" / "create_stage211_supplemental_profile_receipt.py"
 PROFILE_BENCHMARK = REPO_ROOT / "scripts" / "benchmark_stage211_batch_profiles.py"
 ADMISSION_CREATOR = REPO_ROOT / "scripts" / "create_stage211_batch_profile_admission.py"
 FULL_PHASE_CONTROLLER = REPO_ROOT / "scripts" / "run_stage211_full_phase_curriculum.py"
@@ -42,11 +40,8 @@ DEFAULT_CONFIG_ROOT = Path.home() / "rwkvasr_configs" / "stage211_full_alignment
 DEFAULT_METADATA_ROOT = Path.home() / "rwkvasr_data" / "stage211_full_curriculum"
 DEFAULT_PHASE_ROOT = DEFAULT_OUTPUT_ROOT / "stage211a_mixer_full_data_3ep"
 DEFAULT_INITIAL_CHECKPOINT = (
-    Path.home()
-    / "rwkvasr_runs"
-    / "sensevoice_rwkv_stage211a_recovery_stage210a30000_"
-    "nanomlpfrozen_teacherforced_mixeronly_easy1490h_1ep_lr3e6_wd0_4x4090"
-    / "step-30000.pt"
+    Path.home() / "rwkvasr_runs" / "sensevoice_rwkv_stage211a_recovery_stage210a30000_"
+    "nanomlpfrozen_teacherforced_mixeronly_easy1490h_1ep_lr3e6_wd0_4x4090" / "step-30000.pt"
 )
 DEFAULT_EASY_MANIFEST = (
     Path.home()
@@ -60,12 +55,8 @@ DEFAULT_LONG_MANIFEST = (
     / "webdataset_buckets_audio_text"
     / "manifest_stage211_fixed_eval.json"
 )
-DEFAULT_NANO_CHECKPOINT = (
-    Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
-)
-DEFAULT_SUPPLEMENTAL_ROOT = (
-    Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v3"
-)
+DEFAULT_NANO_CHECKPOINT = Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
+DEFAULT_SUPPLEMENTAL_ROOT = Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v3"
 DEFAULT_SUPPLEMENTAL_INVENTORY = DEFAULT_SUPPLEMENTAL_ROOT / "supplemental_inventory.json"
 DEFAULT_SUPPLEMENTAL_PROFILE_RECEIPT = (
     DEFAULT_SUPPLEMENTAL_ROOT / "supplemental_profile_receipt.json"
@@ -145,7 +136,11 @@ def _legacy_controller_state(pid: int) -> str:
     if "run_stage211_full_phase_curriculum.py --phase mixer" not in command:
         raise ValueError(f"PID {pid} is not the legacy Stage211 Mixer controller.")
     state_line = next(
-        (line for line in status_path.read_text(encoding="utf-8").splitlines() if line.startswith("State:")),
+        (
+            line
+            for line in status_path.read_text(encoding="utf-8").splitlines()
+            if line.startswith("State:")
+        ),
         "",
     )
     state = state_line.partition(":")[2].strip()
@@ -361,10 +356,9 @@ def _supplemental_profile_requires_admission(report: dict[str, object]) -> bool:
         int(profile["batch_size"]) != 36
         or int(profile["frame_budget"]) != 24_000
         or int(profile["num_workers"]) != 8
+        or profile["gradient_checkpointing"] is not False
     ):
-        raise ValueError(
-            "Stage211 Supplemental retained baseline differs from the formal default."
-        )
+        raise ValueError("Stage211 Supplemental retained baseline differs from the formal default.")
     return False
 
 

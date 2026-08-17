@@ -12,7 +12,13 @@ sys.path.insert(0, str(REPO_ROOT))
 runner = importlib.import_module("scripts.run_stage211_retention_correction")
 
 
-def _batch_profile(tmp_path: Path, *, batch_size: int = 36, frame_budget: int = 24_000):
+def _batch_profile(
+    tmp_path: Path,
+    *,
+    batch_size: int = 36,
+    frame_budget: int = 24_000,
+    gradient_checkpointing: bool = False,
+):
     report = tmp_path / "batch-profile.json"
     report.write_bytes(b"batch-profile")
     return {
@@ -25,6 +31,7 @@ def _batch_profile(tmp_path: Path, *, batch_size: int = 36, frame_budget: int = 
                 "batch_size": batch_size,
                 "frame_budget": frame_budget,
                 "num_workers": 8,
+                "gradient_checkpointing": gradient_checkpointing,
             }
         },
     }
@@ -194,6 +201,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     assert provenance["batch_size"] == 36
     assert provenance["frame_budget"] == 24_000
     assert provenance["num_workers"] == 8
+    assert provenance["gradient_checkpointing"] is False
     assert provenance["correction_extension_decision_path"] is None
     assert provenance["correction_extension_decision_sha256"] is None
 
@@ -221,7 +229,7 @@ def test_stage211_downstream_correction_provenance_records_phase_objective_with_
     }
     for path in inputs.values():
         path.write_bytes(path.name.encode())
-    batch_profile = _batch_profile(tmp_path)
+    batch_profile = _batch_profile(tmp_path, gradient_checkpointing=True)
 
     provenance = runner._provenance_payload(
         round_index=2,
@@ -247,3 +255,4 @@ def test_stage211_downstream_correction_provenance_records_phase_objective_with_
     assert provenance["trainable_boundary"] == "mixer_only"
     assert provenance["early_stopping"] is False
     assert provenance["admission_mode"] == "early_pass_mandatory_continuation"
+    assert provenance["gradient_checkpointing"] is True

@@ -150,6 +150,7 @@ def build_receipt(
     batch_size = STAGE211_FULL_DATA_BATCH_SIZE
     frame_budget = STAGE211_FULL_DATA_FRAME_BUDGET
     num_workers = 8
+    gradient_checkpointing = phase != "mixer"
     receipt_schema_version = 1
     if batch_profile_admission_path is not None:
         batch_profile_admission = validate_stage211_batch_profile_admission(
@@ -162,6 +163,9 @@ def build_receipt(
         batch_size = int(selected_profile["batch_size"])
         frame_budget = int(selected_profile["frame_budget"])
         num_workers = int(selected_profile["num_workers"])
+        gradient_checkpointing = selected_profile["gradient_checkpointing"]
+        if type(gradient_checkpointing) is not bool:
+            raise ValueError("Stage211 admitted gradient_checkpointing must be boolean.")
         receipt_schema_version = 2
     supplemental_profile: dict[str, Any] | None = None
     if difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY:
@@ -196,9 +200,11 @@ def build_receipt(
         exists = path.is_dir() if label == "run directory" else path.is_file()
         if not exists:
             raise FileNotFoundError(f"Stage211 {difficulty} {label} is unavailable: {path}")
-    if supplemental_profile is not None and bucket_manifest_path != Path(
-        str(supplemental_profile["bucket_manifest_path"])
-    ).resolve():
+    if (
+        supplemental_profile is not None
+        and bucket_manifest_path
+        != Path(str(supplemental_profile["bucket_manifest_path"])).resolve()
+    ):
         raise ValueError("Stage211 supplemental receipt manifest differs from its inventory.")
 
     manifest = load_webdataset_bucket_manifest(bucket_manifest_path)
@@ -258,9 +264,7 @@ def build_receipt(
     try:
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as error:
-        raise ValueError(
-            f"Stage211 curriculum provenance is invalid: {provenance_path}"
-        ) from error
+        raise ValueError(f"Stage211 curriculum provenance is invalid: {provenance_path}") from error
     if not isinstance(provenance, dict):
         raise ValueError("Stage211 curriculum provenance must be a JSON object.")
     admission_provenance_keys = (
@@ -270,6 +274,7 @@ def build_receipt(
         "batch_size",
         "frame_budget",
         "num_workers",
+        "gradient_checkpointing",
     )
     if batch_profile_admission is not None:
         expected_admission_provenance = {
@@ -279,18 +284,14 @@ def build_receipt(
             "batch_size": batch_size,
             "frame_budget": frame_budget,
             "num_workers": num_workers,
+            "gradient_checkpointing": gradient_checkpointing,
         }
         if any(
-            provenance.get(key) != value
-            for key, value in expected_admission_provenance.items()
+            provenance.get(key) != value for key, value in expected_admission_provenance.items()
         ):
-            raise ValueError(
-                f"Stage211 {difficulty} provenance batch-profile binding mismatch."
-            )
+            raise ValueError(f"Stage211 {difficulty} provenance batch-profile binding mismatch.")
     elif any(provenance.get(key) is not None for key in admission_provenance_keys):
-        raise ValueError(
-            f"Stage211 {difficulty} legacy provenance cannot bind a batch profile."
-        )
+        raise ValueError(f"Stage211 {difficulty} legacy provenance cannot bind a batch profile.")
     train_config_path = run_dir / "train_config.yaml"
     if not train_config_path.is_file():
         raise ValueError(f"Stage211 curriculum run lacks train config: {train_config_path}")
@@ -309,6 +310,7 @@ def build_receipt(
         "freeze_ctc_decoder": True,
         "freeze_ctc_head": True,
         "weight_decay": 0.0,
+        "gradient_checkpointing": gradient_checkpointing,
     }
     for key, value in expected_train_config.items():
         if train_config.get(key) != value:
@@ -319,13 +321,10 @@ def build_receipt(
     if batch_profile_admission is not None:
         expected_admission_config = {
             "stage211_batch_profile_admission_path": batch_profile_admission["receipt_path"],
-            "stage211_batch_profile_admission_sha256": batch_profile_admission[
-                "receipt_sha256"
-            ],
-            "stage211_batch_profile_name": batch_profile_admission["selected_profile"][
-                "name"
-            ],
+            "stage211_batch_profile_admission_sha256": batch_profile_admission["receipt_sha256"],
+            "stage211_batch_profile_name": batch_profile_admission["selected_profile"]["name"],
             "stage211_batch_profile_num_workers": num_workers,
+            "stage211_batch_profile_gradient_checkpointing": gradient_checkpointing,
         }
         for key, value in expected_admission_config.items():
             if train_config.get(key) != value:
@@ -340,18 +339,15 @@ def build_receipt(
             "stage211_batch_profile_admission_sha256",
             "stage211_batch_profile_name",
             "stage211_batch_profile_num_workers",
+            "stage211_batch_profile_gradient_checkpointing",
         )
     ):
         raise ValueError(
             f"Stage211 {difficulty} legacy receipt cannot bind an admitted batch profile."
         )
     validate_stage211_phase_train_config(train_config, phase=phase)
-    nano_teacher_checkpoint_path = resolve_stage211_nano_teacher_checkpoint(
-        train_config
-    )
-    tail_padding_sample_exposures = (
-        tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
-    )
+    nano_teacher_checkpoint_path = resolve_stage211_nano_teacher_checkpoint(train_config)
+    tail_padding_sample_exposures = tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
     parameter_delta_audit = audit_stage211_checkpoint_delta(
         init_checkpoint_path=init_checkpoint_path,
         completion_checkpoint_path=completion_checkpoint_path,
@@ -393,9 +389,7 @@ def build_receipt(
         "train_config_path": str(train_config_path),
         "train_config_sha256": sha256_file(train_config_path),
         "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint_path),
-        "nano_teacher_checkpoint_sha256": sha256_file(
-            nano_teacher_checkpoint_path
-        ),
+        "nano_teacher_checkpoint_sha256": sha256_file(nano_teacher_checkpoint_path),
         "bucket_manifest_path": str(bucket_manifest_path),
         "bucket_manifest_sha256": sha256_file(bucket_manifest_path),
         "init_checkpoint_path": str(init_checkpoint_path),
@@ -406,19 +400,14 @@ def build_receipt(
         "runtime_epoch_coverage": runtime_epoch_coverage,
     }
     if supplemental_profile is not None:
-        receipt["supplemental_inventory_path"] = str(
-            supplemental_profile["inventory_path"]
-        )
-        receipt["supplemental_inventory_sha256"] = str(
-            supplemental_profile["inventory_sha256"]
-        )
+        receipt["supplemental_inventory_path"] = str(supplemental_profile["inventory_path"])
+        receipt["supplemental_inventory_sha256"] = str(supplemental_profile["inventory_sha256"])
     if batch_profile_admission is not None:
         receipt["batch_profile_admission_path"] = batch_profile_admission["receipt_path"]
-        receipt["batch_profile_admission_sha256"] = batch_profile_admission[
-            "receipt_sha256"
-        ]
+        receipt["batch_profile_admission_sha256"] = batch_profile_admission["receipt_sha256"]
         receipt["batch_profile_name"] = batch_profile_admission["selected_profile"]["name"]
         receipt["num_workers"] = num_workers
+        receipt["gradient_checkpointing"] = gradient_checkpointing
     return receipt
 
 

@@ -696,8 +696,28 @@ def validate_stage211_phase_train_config(
     train_config: dict[str, Any],
     *,
     phase: str,
+    expected_gradient_checkpointing: bool | None = None,
 ) -> dict[str, Any]:
     contract = stage211_phase_train_config_contract(phase)
+    if expected_gradient_checkpointing is not None:
+        if type(expected_gradient_checkpointing) is not bool:
+            raise ValueError("Stage211 profiled gradient-checkpointing value must be boolean.")
+        contract["gradient_checkpointing"] = expected_gradient_checkpointing
+    elif "stage211_batch_profile_gradient_checkpointing" in train_config:
+        profiled_value = train_config["stage211_batch_profile_gradient_checkpointing"]
+        if type(profiled_value) is not bool:
+            raise ValueError("Stage211 admitted gradient-checkpointing value must be boolean.")
+        required_profile_fields = (
+            "stage211_batch_profile_admission_path",
+            "stage211_batch_profile_admission_sha256",
+            "stage211_batch_profile_name",
+            "stage211_batch_profile_num_workers",
+        )
+        if any(train_config.get(key) is None for key in required_profile_fields):
+            raise ValueError(
+                "Stage211 admitted gradient checkpointing lacks its batch-profile binding."
+            )
+        contract["gradient_checkpointing"] = profiled_value
     normalized_sha256 = hashlib.sha256(
         json.dumps(
             train_config,
@@ -4124,6 +4144,7 @@ def _validate_stage211_correction_batch_profile(
             or phase == "logits"
             or int(selected_profile["batch_size"]) != STAGE211_FULL_DATA_BATCH_SIZE
             or int(selected_profile["frame_budget"]) != STAGE211_FULL_DATA_FRAME_BUDGET
+            or selected_profile["gradient_checkpointing"] is not (phase != "mixer")
         ):
             raise ValueError(f"Stage211 {phase} correction lacks batch-profile admission.")
     elif isinstance(admission_path_value, str) and isinstance(admission_sha256_value, str):
@@ -4146,6 +4167,8 @@ def _validate_stage211_correction_batch_profile(
             int(correction.get("batch_size", -1)) != int(selected_profile["batch_size"]),
             int(correction.get("frame_budget", -1)) != int(selected_profile["frame_budget"]),
             int(correction.get("num_workers", -1)) != int(selected_profile["num_workers"]),
+            correction.get("gradient_checkpointing")
+            is not selected_profile["gradient_checkpointing"],
         )
     ):
         raise ValueError(f"Stage211 {phase} correction batch-profile summary mismatch.")
@@ -4190,11 +4213,13 @@ def _validate_stage211_correction_train_config(
     )
     if correction.get("layer_rotation_offset") != layer_rotation_offset:
         raise ValueError(f"Stage211 {phase} correction layer rotation offset mismatch.")
+    selected_profile = batch_profile_preflight["selected_profile_row"]["profile"]
     contract = stage211_post_coverage_train_config_contract(
         phase,
         boundary_layer_ids=layer_focus.get("boundary_layer_ids", []),
         rotation_offset=layer_rotation_offset,
     )
+    contract["gradient_checkpointing"] = selected_profile["gradient_checkpointing"]
     for key, expected in contract.items():
         actual = config.get(key)
         if type(actual) is not type(expected) or actual != expected:
@@ -4202,11 +4227,11 @@ def _validate_stage211_correction_train_config(
                 f"Stage211 {phase} correction train config contract mismatch: "
                 f"key={key} actual={actual!r} expected={expected!r}"
             )
-    selected_profile = batch_profile_preflight["selected_profile_row"]["profile"]
     expected_fields = {
         "max_steps": int(correction["steps_per_epoch"]),
         "batch_size": int(selected_profile["batch_size"]),
         "num_workers": int(selected_profile["num_workers"]),
+        "gradient_checkpointing": selected_profile["gradient_checkpointing"],
         "batch_token_budget": int(selected_profile["frame_budget"]),
         "length_bucket_frame_budget": int(selected_profile["frame_budget"]),
         "length_bucket_drop_last": False,
@@ -4243,6 +4268,7 @@ def _validate_stage211_correction_train_config(
         "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
         "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
         "stage211_post_coverage_num_workers": int(selected_profile["num_workers"]),
+        "stage211_post_coverage_gradient_checkpointing": selected_profile["gradient_checkpointing"],
         "stage211_post_coverage_original_coverage_unchanged": True,
         "stage211_post_coverage_smoke_marker_path": str(
             Path(str(correction["smoke_marker_path"])).resolve()
@@ -4271,6 +4297,11 @@ def _validate_stage211_correction_train_config(
         ),
         "stage211_batch_profile_num_workers": (
             int(batch_profile_admission["selected_profile"]["num_workers"])
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_batch_profile_gradient_checkpointing": (
+            batch_profile_admission["selected_profile"]["gradient_checkpointing"]
             if batch_profile_admission is not None
             else None
         ),
@@ -4374,6 +4405,9 @@ def _validate_stage211_correction_smoke_marker(
         "num_workers": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
         ),
+        "gradient_checkpointing": batch_profile_preflight["selected_profile_row"]["profile"][
+            "gradient_checkpointing"
+        ],
     }
     if any(marker.get(key) != value for key, value in expected.items()):
         raise ValueError(f"Stage211 {phase} correction smoke marker mismatch.")
@@ -4601,6 +4635,7 @@ def _validate_stage211_post_coverage_corrections(
             "batch_size": int(selected_profile["batch_size"]),
             "frame_budget": int(selected_profile["frame_budget"]),
             "num_workers": int(selected_profile["num_workers"]),
+            "gradient_checkpointing": selected_profile["gradient_checkpointing"],
         }
         if any(provenance.get(key) != value for key, value in expected_provenance_focus.items()):
             raise ValueError(
@@ -4767,6 +4802,7 @@ def _validate_stage211_segment_batch_profile(
             "steps_per_epoch": int(expected["steps_per_epoch"]),
             "steps": int(expected["steps"]),
             "tail_padding_samples_per_epoch": int(expected["tail_padding_samples_per_epoch"]),
+            "gradient_checkpointing": phase != "mixer",
         }
     if schema_version != 2:
         raise ValueError(
@@ -4796,6 +4832,7 @@ def _validate_stage211_segment_batch_profile(
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
         "frame_budget": int(profile["frame_budget"]),
         "num_workers": int(profile["num_workers"]),
+        "gradient_checkpointing": profile["gradient_checkpointing"],
         "steps_per_epoch": int(admitted_coverage["steps_per_epoch"]),
         "steps": int(admitted_coverage["full_coverage_steps"]),
         "tail_padding_samples_per_epoch": int(admitted_coverage["tail_padding_samples_per_epoch"]),
@@ -4936,6 +4973,7 @@ def _validate_stage211_supplemental_coverage_segment(
             "batch_size": int(runtime_profile["batch_size"]),
             "batch_token_budget": int(runtime_profile["frame_budget"]),
             "length_bucket_frame_budget": int(runtime_profile["frame_budget"]),
+            "gradient_checkpointing": runtime_profile["gradient_checkpointing"],
         }
         if any(train_config.get(key) != value for key, value in expected_config_fields.items()):
             raise ValueError("Stage211 supplemental train config step contract mismatch.")
@@ -5143,6 +5181,7 @@ def validate_stage211_full_data_coverage(
                 "batch_size": int(runtime_profile["batch_size"]),
                 "batch_token_budget": int(runtime_profile["frame_budget"]),
                 "length_bucket_frame_budget": int(runtime_profile["frame_budget"]),
+                "gradient_checkpointing": runtime_profile["gradient_checkpointing"],
             }
             if any(train_config.get(key) != value for key, value in expected_config_fields.items()):
                 raise ValueError(f"Stage211 {phase}/{difficulty} train config profile mismatch.")

@@ -63,17 +63,18 @@ class BatchProfile:
     batch_size: int
     frame_budget: int
     num_workers: int | None = 8
+    gradient_checkpointing: bool | None = None
 
 
 DEFAULT_PROFILES = (
-    BatchProfile("baseline", 36, 24_000, 8),
-    BatchProfile("batch48_frames42k", 48, 42_000, 8),
-    BatchProfile("batch64_frames56k", 64, 56_000, 8),
-    BatchProfile("batch80_frames70k", 80, 70_000, 8),
-    BatchProfile("batch96_frames84k", 96, 84_000, 8),
-    BatchProfile("batch128_frames112k", 128, 112_000, 8),
-    BatchProfile("batch160_frames140k", 160, 140_000, 8),
-    BatchProfile("batch192_frames168k", 192, 168_000, 8),
+    BatchProfile("baseline", 36, 24_000, 8, False),
+    BatchProfile("batch48_frames42k", 48, 42_000, 8, False),
+    BatchProfile("batch64_frames56k", 64, 56_000, 8, False),
+    BatchProfile("batch80_frames70k", 80, 70_000, 8, False),
+    BatchProfile("batch96_frames84k", 96, 84_000, 8, False),
+    BatchProfile("batch128_frames112k", 128, 112_000, 8, False),
+    BatchProfile("batch160_frames140k", 160, 140_000, 8, False),
+    BatchProfile("batch192_frames168k", 192, 168_000, 8, False),
 )
 BLOCK_DEFAULT_PROFILES = (
     BatchProfile(
@@ -81,14 +82,20 @@ BLOCK_DEFAULT_PROFILES = (
         STAGE211_STACKED_SAFE_BATCH_SIZE,
         STAGE211_STACKED_SAFE_FRAME_BUDGET,
         8,
+        True,
     ),
-    BatchProfile("batch8_frames6k", 8, 6_000, 8),
-    BatchProfile("batch12_frames8k", 12, 8_000, 8),
-    BatchProfile("batch16_frames10k", 16, 10_000, 8),
-    BatchProfile("batch24_frames16k", 24, 16_000, 8),
-    BatchProfile("batch36_frames24k", 36, 24_000, 8),
-    BatchProfile("batch48_frames32k", 48, 32_000, 8),
-    BatchProfile("batch64_frames42k", 64, 42_000, 8),
+    BatchProfile("no_ckpt_batch4_frames4k", 4, 4_000, 8, False),
+    BatchProfile("no_ckpt_batch8_frames6k", 8, 6_000, 8, False),
+    BatchProfile("no_ckpt_batch12_frames8k", 12, 8_000, 8, False),
+    BatchProfile("no_ckpt_batch16_frames10k", 16, 10_000, 8, False),
+    BatchProfile("no_ckpt_batch24_frames16k", 24, 16_000, 8, False),
+    BatchProfile("batch8_frames6k", 8, 6_000, 8, True),
+    BatchProfile("batch12_frames8k", 12, 8_000, 8, True),
+    BatchProfile("batch16_frames10k", 16, 10_000, 8, True),
+    BatchProfile("batch24_frames16k", 24, 16_000, 8, True),
+    BatchProfile("batch36_frames24k", 36, 24_000, 8, True),
+    BatchProfile("batch48_frames32k", 48, 32_000, 8, True),
+    BatchProfile("batch64_frames42k", 64, 42_000, 8, True),
 )
 LOGITS_DEFAULT_PROFILES = (
     BatchProfile(
@@ -96,14 +103,19 @@ LOGITS_DEFAULT_PROFILES = (
         STAGE211_STACKED_SAFE_BATCH_SIZE,
         STAGE211_STACKED_SAFE_FRAME_BUDGET,
         8,
+        True,
     ),
-    BatchProfile("batch8_frames6k", 8, 6_000, 8),
-    BatchProfile("batch12_frames8k", 12, 8_000, 8),
-    BatchProfile("batch16_frames10k", 16, 10_000, 8),
-    BatchProfile("batch20_frames13k", 20, 13_000, 8),
-    BatchProfile("batch24_frames16k", 24, 16_000, 8),
-    BatchProfile("batch36_frames24k", 36, 24_000, 8),
-    BatchProfile("batch48_frames32k", 48, 32_000, 8),
+    BatchProfile("no_ckpt_batch4_frames4k", 4, 4_000, 8, False),
+    BatchProfile("no_ckpt_batch8_frames6k", 8, 6_000, 8, False),
+    BatchProfile("no_ckpt_batch12_frames8k", 12, 8_000, 8, False),
+    BatchProfile("no_ckpt_batch16_frames10k", 16, 10_000, 8, False),
+    BatchProfile("batch8_frames6k", 8, 6_000, 8, True),
+    BatchProfile("batch12_frames8k", 12, 8_000, 8, True),
+    BatchProfile("batch16_frames10k", 16, 10_000, 8, True),
+    BatchProfile("batch20_frames13k", 20, 13_000, 8, True),
+    BatchProfile("batch24_frames16k", 24, 16_000, 8, True),
+    BatchProfile("batch36_frames24k", 36, 24_000, 8, True),
+    BatchProfile("batch48_frames32k", 48, 32_000, 8, True),
 )
 
 
@@ -300,6 +312,13 @@ def build_probe_config(
     )
     if resolved_num_workers <= 0:
         raise ValueError("probe profile num_workers must be positive")
+    resolved_gradient_checkpointing = (
+        profile.gradient_checkpointing
+        if profile.gradient_checkpointing is not None
+        else base_config.get("gradient_checkpointing")
+    )
+    if type(resolved_gradient_checkpointing) is not bool:
+        raise ValueError("probe profile gradient_checkpointing must be boolean")
     config = copy.deepcopy(base_config)
     config.update(
         {
@@ -326,6 +345,7 @@ def build_probe_config(
             "log_every": 1,
             "batch_size": int(profile.batch_size),
             "num_workers": resolved_num_workers,
+            "gradient_checkpointing": resolved_gradient_checkpointing,
             "batch_token_budget": int(profile.frame_budget),
             "length_bucket_frame_budget": int(profile.frame_budget),
             "length_bucket_drop_last": False,
@@ -1011,6 +1031,11 @@ def main() -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     base_config = load_yaml(base_config_path)
+    configured_gradient_checkpointing = base_config.get("gradient_checkpointing")
+    if type(configured_gradient_checkpointing) is not bool:
+        raise ValueError(
+            "Stage211 batch-profile base config requires boolean gradient_checkpointing."
+        )
     configured_num_workers = int(base_config.get("num_workers", 0) or 0)
     if configured_num_workers <= 0:
         raise ValueError("Stage211 batch-profile base config requires positive num_workers.")
@@ -1029,6 +1054,11 @@ def main() -> int:
                     configured_num_workers
                     if profile.num_workers is None
                     else int(profile.num_workers)
+                ),
+                gradient_checkpointing=(
+                    configured_gradient_checkpointing
+                    if profile.gradient_checkpointing is None
+                    else profile.gradient_checkpointing
                 ),
             )
             for profile in args.profile
@@ -1095,6 +1125,8 @@ def main() -> int:
         parser.error("--baseline-profile must name one of the requested profiles")
     if any(profile.num_workers is None or int(profile.num_workers) <= 0 for profile in profiles):
         parser.error("every profile must resolve to a positive num_workers")
+    if any(type(profile.gradient_checkpointing) is not bool for profile in profiles):
+        parser.error("every profile must resolve to boolean gradient_checkpointing")
     manifest_path = (
         Path(str(base_config.get("webdataset_bucket_manifest_path") or "")).expanduser().resolve()
     )

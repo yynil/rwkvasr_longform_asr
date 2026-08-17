@@ -70,6 +70,7 @@ def test_supplemental_profile_admission_routing_is_fail_closed() -> None:
                 "batch_size": 36,
                 "frame_budget": 24_000,
                 "num_workers": 8,
+                "gradient_checkpointing": False,
             }
         },
     }
@@ -85,6 +86,7 @@ def test_supplemental_profile_admission_routing_is_fail_closed() -> None:
                 "batch_size": 12,
                 "frame_budget": 8_000,
                 "num_workers": 8,
+                "gradient_checkpointing": False,
             }
         },
     }
@@ -96,6 +98,19 @@ def test_supplemental_profile_admission_routing_is_fail_closed() -> None:
                 "batch_size": 36,
                 "frame_budget": 24_000,
                 "num_workers": 2,
+                "gradient_checkpointing": False,
+            }
+        },
+    }
+    wrong_retained_checkpointing = {
+        **retained_baseline,
+        "selected_profile_row": {
+            "profile": {
+                "name": "baseline",
+                "batch_size": 36,
+                "frame_budget": 24_000,
+                "num_workers": 8,
+                "gradient_checkpointing": True,
             }
         },
     }
@@ -106,6 +121,8 @@ def test_supplemental_profile_admission_routing_is_fail_closed() -> None:
         handoff._supplemental_profile_requires_admission(wrong_retained_baseline)
     with pytest.raises(ValueError, match="differs from the formal default"):
         handoff._supplemental_profile_requires_admission(wrong_retained_workers)
+    with pytest.raises(ValueError, match="differs from the formal default"):
+        handoff._supplemental_profile_requires_admission(wrong_retained_checkpointing)
 
 
 def test_boundary_preflight_keeps_all_three_default_profiles(tmp_path: Path) -> None:
@@ -159,9 +176,7 @@ def test_long_receipt_binds_exact_hard_to_long_chain(tmp_path: Path) -> None:
 
     hard_steps = handoff.STAGE211_AUDIO_CURRICULUM["hard"]["steps"]
     long_steps = handoff.STAGE211_AUDIO_CURRICULUM["long"]["steps"]
-    assert command[command.index("--init-checkpoint") + 1].endswith(
-        f"hard/step-{hard_steps}.pt"
-    )
+    assert command[command.index("--init-checkpoint") + 1].endswith(f"hard/step-{hard_steps}.pt")
     assert command[command.index("--completion-checkpoint") + 1].endswith(
         f"long/step-{long_steps}.pt"
     )

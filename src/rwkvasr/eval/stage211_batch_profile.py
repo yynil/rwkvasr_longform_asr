@@ -21,8 +21,8 @@ from rwkvasr.eval.stage211_gate import (
 )
 
 
-STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 5
-STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 2
+STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 6
+STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 3
 STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION = 1
 STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION = 1
 STAGE211_BATCH_PROFILE_PHASES = ("mixer", "block", "logits")
@@ -282,6 +282,7 @@ def _validate_profile_config(
     batch_size = profile.get("batch_size")
     frame_budget = profile.get("frame_budget")
     num_workers = profile.get("num_workers")
+    gradient_checkpointing = profile.get("gradient_checkpointing")
     if (
         not isinstance(name, str)
         or not name
@@ -294,6 +295,7 @@ def _validate_profile_config(
         or not isinstance(num_workers, int)
         or isinstance(num_workers, bool)
         or num_workers <= 0
+        or type(gradient_checkpointing) is not bool
     ):
         raise ValueError("Stage211 batch preflight profile values are invalid.")
     config_path = _validate_bound_file(
@@ -303,7 +305,11 @@ def _validate_profile_config(
         label=f"Stage211 batch preflight {name} config",
     )
     config = load_yaml(config_path)
-    validate_stage211_phase_train_config(config, phase=phase)
+    validate_stage211_phase_train_config(
+        config,
+        phase=phase,
+        expected_gradient_checkpointing=gradient_checkpointing,
+    )
     world_size = int(report["world_size"])
     warmup_steps = int(report["warmup_steps"])
     measure_steps = int(report["measure_steps"])
@@ -312,6 +318,7 @@ def _validate_profile_config(
         "max_steps": warmup_steps + measure_steps,
         "batch_size": batch_size,
         "num_workers": num_workers,
+        "gradient_checkpointing": gradient_checkpointing,
         "batch_token_budget": frame_budget,
         "length_bucket_frame_budget": frame_budget,
         "length_bucket_drop_last": False,
@@ -740,6 +747,7 @@ def validate_stage211_batch_profile_preflight(
             "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
             "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
             "num_workers": int(base_config.get("num_workers", 0) or 0),
+            "gradient_checkpointing": bool(base_config.get("gradient_checkpointing")),
         }
     ]
     if phase in {"block", "logits"}:
@@ -749,6 +757,7 @@ def validate_stage211_batch_profile_preflight(
                 "batch_size": STAGE211_STACKED_SAFE_BATCH_SIZE,
                 "frame_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
                 "num_workers": int(base_config.get("num_workers", 0) or 0),
+                "gradient_checkpointing": bool(base_config.get("gradient_checkpointing")),
             }
         )
     if baseline_profile not in supported_baselines:
@@ -1117,11 +1126,15 @@ def validate_stage211_batch_profile_admission(
     worker_count_changed = int(profile["num_workers"]) != int(
         base_config.get("num_workers", 0) or 0
     )
+    checkpointing_changed = profile["gradient_checkpointing"] is not base_config.get(
+        "gradient_checkpointing"
+    )
     profile_is_noop = (
         int(profile["batch_size"]) == int(base_config.get("batch_size", 0) or 0)
         and int(profile["frame_budget"])
         == int(base_config.get("length_bucket_frame_budget", 0) or 0)
         and not worker_count_changed
+        and not checkpointing_changed
     )
     if profile_is_noop:
         raise ValueError(

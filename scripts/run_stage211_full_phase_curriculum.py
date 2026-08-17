@@ -459,6 +459,7 @@ def _automatic_profile_requires_admission(measured: dict[str, Any]) -> bool:
             int(profile["frame_budget"])
             != int(base_config.get("length_bucket_frame_budget", 0) or 0),
             int(profile["num_workers"]) != int(base_config.get("num_workers", 0) or 0),
+            profile["gradient_checkpointing"] is not base_config.get("gradient_checkpointing"),
         )
     )
 
@@ -989,6 +990,7 @@ def _load_reusable_receipt(
     batch_size = STAGE211_FULL_DATA_BATCH_SIZE
     frame_budget = STAGE211_FULL_DATA_FRAME_BUDGET
     num_workers = 8
+    gradient_checkpointing = phase != "mixer"
     steps_per_epoch = int(expected["steps_per_epoch"])
     tail_padding_samples_per_epoch = int(expected["tail_padding_samples_per_epoch"])
     schema_version = 1
@@ -1005,6 +1007,9 @@ def _load_reusable_receipt(
         batch_size = int(profile["batch_size"])
         frame_budget = int(profile["frame_budget"])
         num_workers = int(profile["num_workers"])
+        gradient_checkpointing = profile["gradient_checkpointing"]
+        if type(gradient_checkpointing) is not bool:
+            raise ValueError("Stage211 admitted gradient_checkpointing must be boolean.")
         steps_per_epoch = int(coverage["steps_per_epoch"])
         tail_padding_samples_per_epoch = int(coverage["tail_padding_samples_per_epoch"])
         schema_version = 2
@@ -1042,6 +1047,7 @@ def _load_reusable_receipt(
     }
     if batch_profile_admission is not None:
         expected_fields["num_workers"] = num_workers
+        expected_fields["gradient_checkpointing"] = gradient_checkpointing
     if any(receipt.get(key) != value for key, value in expected_fields.items()):
         raise ValueError(
             f"Stage211 {phase}/{difficulty} reusable curriculum receipt does not match "
@@ -1070,6 +1076,7 @@ def _load_reusable_receipt(
             "batch_profile_admission_path": batch_profile_admission["receipt_path"],
             "batch_profile_admission_sha256": batch_profile_admission["receipt_sha256"],
             "batch_profile_name": batch_profile_admission["selected_profile"]["name"],
+            "gradient_checkpointing": gradient_checkpointing,
         }
         if any(receipt.get(key) != value for key, value in admission_fields.items()):
             raise ValueError(
@@ -1081,6 +1088,7 @@ def _load_reusable_receipt(
             "batch_profile_admission_path",
             "batch_profile_admission_sha256",
             "batch_profile_name",
+            "gradient_checkpointing",
         )
     ):
         raise ValueError(
