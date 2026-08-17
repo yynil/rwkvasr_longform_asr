@@ -14,6 +14,12 @@ SOCIAL_REBASED_ROOT="${SOCIAL_REBASED_ROOT:-${HOME}/rwkvasr_data/stage211_social
 PUBLIC_CLEAN_ROOT="${PUBLIC_CLEAN_ROOT:-${HOME}/rwkvasr_eval/stage211_public_clean_v2}"
 PUBLIC_OVERLAP_RECEIPT="${PUBLIC_OVERLAP_RECEIPT:-${HOME}/rwkvasr_data/stage211_full_curriculum/public_train_overlap_v2/receipt.json}"
 PUBLIC_METRIC_ROOT="${PUBLIC_METRIC_ROOT:-${HOME}/rwkvasr_eval/stage211_public_metric_unicode_v2}"
+PUBLIC_MANIFEST_DIR="${PUBLIC_MANIFEST_DIR:-${REPO_ROOT}/artifacts/eval_benchmarks/manifests}"
+NANO_EVAL_ROOT="${NANO_EVAL_ROOT:-${HOME}/rwkvasr_eval/stage211_public_full/nano_2512}"
+CALIBRATION_EVAL_ROOT="${CALIBRATION_EVAL_ROOT:-${HOME}/rwkvasr_eval/stage211_calibration_selected_full}"
+INITIALIZATION_RECEIPT="${INITIALIZATION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_initialization/nano_initialization_receipt.json}"
+NANO_CHECKPOINT="${NANO_CHECKPOINT:-${HOME}/models/Fun-ASR-Nano-2512-modelscope/model.pt}"
+NANO_BASELINE_RECEIPT="${NANO_BASELINE_RECEIPT:-${NANO_EVAL_ROOT}/provenance_receipt.json}"
 COMBINED_ROOT="${COMBINED_ROOT:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v3}"
 RETENTION_OUTPUT_ROOT="${RETENTION_OUTPUT_ROOT:-${HOME}/rwkvasr_data/stage211_full_curriculum}"
 USB_COVERAGE_RECEIPT="${USB_COVERAGE_RECEIPT:-${HOME}/rwkvasr_data/stage211_usb_top_level_coverage_v1/coverage_receipt.json}"
@@ -51,11 +57,31 @@ env CUDA_VISIBLE_DEVICES='' nice -n 10 ionice -c 2 -n 7 uv run python \
 
 env CUDA_VISIBLE_DEVICES='' uv run python scripts/install_stage211_clean_public_eval.py \
   --clean-root "${PUBLIC_CLEAN_ROOT}" \
+  --manifest-dir "${PUBLIC_MANIFEST_DIR}" \
+  --nano-root "${NANO_EVAL_ROOT}" \
+  --calibration-root "${CALIBRATION_EVAL_ROOT}" \
   --overlap-receipt "${PUBLIC_OVERLAP_RECEIPT}"
 
 env CUDA_VISIBLE_DEVICES='' uv run python scripts/install_stage211_unicode_metric_correction.py \
   --output-root "${PUBLIC_METRIC_ROOT}" \
-  --prior-install-receipt "${PUBLIC_CLEAN_ROOT}/canonical_install_receipt.json"
+  --prior-install-receipt "${PUBLIC_CLEAN_ROOT}/canonical_install_receipt.json" \
+  --nano-root "${NANO_EVAL_ROOT}" \
+  --calibration-root "${CALIBRATION_EVAL_ROOT}" \
+  --manifest-dir "${PUBLIC_MANIFEST_DIR}" \
+  --initialization-receipt "${INITIALIZATION_RECEIPT}" \
+  --nano-checkpoint "${NANO_CHECKPOINT}"
+
+env CUDA_VISIBLE_DEVICES='' uv run python scripts/install_stage211_unicode_metric_correction.py \
+  --validate-only \
+  --output-root "${PUBLIC_METRIC_ROOT}" \
+  --correction-receipt "${PUBLIC_METRIC_ROOT}/correction_receipt.json" \
+  --prior-install-receipt "${PUBLIC_CLEAN_ROOT}/canonical_install_receipt.json" \
+  --nano-root "${NANO_EVAL_ROOT}" \
+  --calibration-root "${CALIBRATION_EVAL_ROOT}" \
+  --manifest-dir "${PUBLIC_MANIFEST_DIR}" \
+  --initialization-receipt "${INITIALIZATION_RECEIPT}" \
+  --nano-checkpoint "${NANO_CHECKPOINT}" \
+  --nano-baseline-receipt "${NANO_BASELINE_RECEIPT}"
 
 env CUDA_VISIBLE_DEVICES='' uv run python \
   scripts/build_stage211_combined_supplemental_inventory.py \

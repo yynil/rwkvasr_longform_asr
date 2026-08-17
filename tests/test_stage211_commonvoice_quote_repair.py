@@ -16,9 +16,49 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 quote_repair = importlib.import_module("scripts.prepare_stage211_commonvoice_quote_repair")
 clean_install = importlib.import_module("scripts.install_stage211_clean_public_eval")
-unicode_correction = importlib.import_module(
-    "scripts.install_stage211_unicode_metric_correction"
-)
+unicode_correction = importlib.import_module("scripts.install_stage211_unicode_metric_correction")
+
+
+def test_quote_repair_handoff_validates_corrected_public_before_supplemental_publish() -> None:
+    source = (REPO_ROOT / "scripts" / "build_stage211_quote_repair_handoff.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert source.count("scripts/install_stage211_unicode_metric_correction.py") == 2
+    clean_index = source.index("scripts/install_stage211_clean_public_eval.py")
+    unicode_install_index = source.index("scripts/install_stage211_unicode_metric_correction.py")
+    validation_index = source.index("  --validate-only \\\n")
+    combined_index = source.index("scripts/build_stage211_combined_supplemental_inventory.py")
+    assert clean_index < unicode_install_index < validation_index < combined_index
+    clean_command = source[clean_index:unicode_install_index]
+    for binding in (
+        '--clean-root "${PUBLIC_CLEAN_ROOT}"',
+        '--manifest-dir "${PUBLIC_MANIFEST_DIR}"',
+        '--nano-root "${NANO_EVAL_ROOT}"',
+        '--calibration-root "${CALIBRATION_EVAL_ROOT}"',
+        '--overlap-receipt "${PUBLIC_OVERLAP_RECEIPT}"',
+    ):
+        assert binding in clean_command
+    for variable in (
+        "PUBLIC_MANIFEST_DIR",
+        "NANO_EVAL_ROOT",
+        "CALIBRATION_EVAL_ROOT",
+        "INITIALIZATION_RECEIPT",
+        "NANO_CHECKPOINT",
+        "NANO_BASELINE_RECEIPT",
+    ):
+        assert f"${{{variable}}}" in source
+    for argument in (
+        "--correction-receipt",
+        "--prior-install-receipt",
+        "--nano-root",
+        "--calibration-root",
+        "--manifest-dir",
+        "--initialization-receipt",
+        "--nano-checkpoint",
+        "--nano-baseline-receipt",
+    ):
+        assert argument in source[validation_index:combined_index]
 
 
 def test_quote_repair_merges_restored_predictions_in_manifest_order() -> None:
@@ -202,8 +242,7 @@ def test_corrected_public_readiness_replays_complete_chain(
         "calibration_reuse_receipt_sha256": sha256_file(calibration_reuse_receipt),
         "initialization_receipt_sha256": sha256_file(initialization_receipt),
         "installed_files": [
-            {"label": label, "path": str(path)}
-            for label, path in expected_installed_paths.items()
+            {"label": label, "path": str(path)} for label, path in expected_installed_paths.items()
         ],
     }
     monkeypatch.setattr(
@@ -289,9 +328,7 @@ def _canonical_install_fixture(
     derivation_path = clean_root / "derivation_receipt.json"
     derivation_path.parent.mkdir(parents=True)
     derivation = {
-        "total_samples": sum(
-            int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
-        )
+        "total_samples": sum(int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values())
     }
     derivation_path.write_text(json.dumps(derivation) + "\n", encoding="utf-8")
 
@@ -309,9 +346,7 @@ def _canonical_install_fixture(
         archived.parent.mkdir(parents=True, exist_ok=True)
         archived.write_text(f"archived-{index}\n", encoding="utf-8")
         archive_sha256 = sha256_file(archived)
-        installed_files.append(
-            {"path": str(canonical.resolve()), "sha256": sha256_file(canonical)}
-        )
+        installed_files.append({"path": str(canonical.resolve()), "sha256": sha256_file(canonical)})
         archived_files.append(
             {
                 "archive_path": str(archived.resolve()),
