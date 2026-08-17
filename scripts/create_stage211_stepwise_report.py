@@ -511,6 +511,7 @@ def _requested_alignment_views(
     initial_calibration_result = {
         "stage": "calibration",
         "role": "initial_baseline",
+        "normalization": "ctc",
         "checkpoint_path": calibration_record["checkpoint_path"],
         "checkpoint_sha256": calibration_record["checkpoint_sha256"],
         "source_report_path": calibration_record["source_report_path"],
@@ -524,6 +525,9 @@ def _requested_alignment_views(
     }
 
     requested_alignment_results = []
+    previous_stage = "calibration"
+    previous_english_wer = calibration_english_wer
+    previous_chinese_cer = calibration_chinese_cer
     for requested_stage in REQUESTED_ALIGNMENT_STAGE_ORDER:
         internal_stage = REQUESTED_TO_INTERNAL_STAGE[requested_stage]
         record = stage_records_by_name[internal_stage]
@@ -541,19 +545,30 @@ def _requested_alignment_views(
                 "internal_stage": internal_stage,
                 "label": record["label"],
                 "objective": REQUESTED_STAGE_OBJECTIVES[requested_stage],
+                "normalization": "ctc",
+                "previous_stage": previous_stage,
                 "checkpoint_path": record["checkpoint_path"],
                 "checkpoint_sha256": record["checkpoint_sha256"],
                 "source_report_path": record["source_report_path"],
                 "source_report_sha256": record["source_report_sha256"],
                 "gate_passed": record["gate_passed"],
                 "english_wer": english_wer,
+                "previous_english_wer": previous_english_wer,
+                "english_wer_delta_from_previous": english_wer - previous_english_wer,
                 "nano_english_wer": nano_english_wer,
                 "english_wer_gap_to_nano": english_wer - nano_english_wer,
+                "english_wer_gap_reduction_from_previous": previous_english_wer - english_wer,
                 "chinese_cer": chinese_cer,
+                "previous_chinese_cer": previous_chinese_cer,
+                "chinese_cer_delta_from_previous": chinese_cer - previous_chinese_cer,
                 "nano_chinese_cer": nano_chinese_cer,
                 "chinese_cer_gap_to_nano": chinese_cer - nano_chinese_cer,
+                "chinese_cer_gap_reduction_from_previous": previous_chinese_cer - chinese_cer,
             }
         )
+        previous_stage = requested_stage
+        previous_english_wer = english_wer
+        previous_chinese_cer = chinese_cer
 
     requested_language_metric_summaries = []
     for summary in language_metric_summaries:
@@ -1899,6 +1914,7 @@ def build_stepwise_report(
         "requested_alignment_stage_order": list(REQUESTED_ALIGNMENT_STAGE_ORDER),
         "requested_to_internal_stage": dict(REQUESTED_TO_INTERNAL_STAGE),
         "all_requested_alignment_metrics_complete": True,
+        "public_metric_normalization": "ctc",
         "initial_calibration_result": initial_calibration_result,
         "requested_alignment_results": requested_alignment_results,
         "requested_alignment_language_metric_summaries": (
@@ -2010,6 +2026,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"unknown tokens: `{int(report['ctc_label_proof']['ctc_unk_tokens'])}`, "
         "non-pronunciation logits suppressed: `true`",
         "",
+        "Public WER/CER normalization: `ctc`.",
+        "",
         "## Requested Alignment Results",
         "",
         "| Stage | Internal phase | Objective | English WER | Nano WER | WER gap | "
@@ -2026,6 +2044,26 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{float(result['nano_chinese_cer']) * 100.0:.3f}% | "
             f"{float(result['chinese_cer_gap_to_nano']) * 100.0:+.3f} pt | "
             f"`{str(result['gate_passed']).lower()}` |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Incremental Stage Impact",
+            "",
+            "Negative error-rate delta and positive Nano-gap reduction indicate improvement.",
+            "",
+            "| Stage | Previous stage | English WER delta | English Nano-gap reduction | "
+            "Chinese CER delta | Chinese Nano-gap reduction |",
+            "|---|---|---:|---:|---:|---:|",
+        )
+    )
+    for result in report["requested_alignment_results"]:
+        lines.append(
+            f"| `{result['stage']}` | `{result['previous_stage']}` | "
+            f"{float(result['english_wer_delta_from_previous']) * 100.0:+.3f} pt | "
+            f"{float(result['english_wer_gap_reduction_from_previous']) * 100.0:+.3f} pt | "
+            f"{float(result['chinese_cer_delta_from_previous']) * 100.0:+.3f} pt | "
+            f"{float(result['chinese_cer_gap_reduction_from_previous']) * 100.0:+.3f} pt |"
         )
     lines.extend(
         (

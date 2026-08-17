@@ -2288,7 +2288,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "sft": "sft",
     }
     assert report["all_requested_alignment_metrics_complete"] is True
+    assert report["public_metric_normalization"] == "ctc"
     assert report["initial_calibration_result"]["role"] == "initial_baseline"
+    assert report["initial_calibration_result"]["normalization"] == "ctc"
     assert report["initial_calibration_result"]["checkpoint_sha256"] == sha256_file(
         checkpoints["calibration"]
     )
@@ -2436,11 +2438,27 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
         "logits": 0.1,
         "sft": 0.0,
     }
+    expected_previous_stages = {
+        "rwkv_layer": "calibration",
+        "block": "rwkv_layer",
+        "logits": "block",
+        "sft": "logits",
+    }
     for stage, expected_gap in expected_nano_gaps.items():
+        assert requested_results[stage]["normalization"] == "ctc"
+        assert requested_results[stage]["previous_stage"] == expected_previous_stages[stage]
         assert requested_results[stage]["nano_english_wer"] == pytest.approx(0.1)
         assert requested_results[stage]["english_wer_gap_to_nano"] == pytest.approx(expected_gap)
+        assert requested_results[stage]["english_wer_delta_from_previous"] == pytest.approx(-0.1)
+        assert requested_results[stage][
+            "english_wer_gap_reduction_from_previous"
+        ] == pytest.approx(0.1)
         assert requested_results[stage]["nano_chinese_cer"] == pytest.approx(0.1)
         assert requested_results[stage]["chinese_cer_gap_to_nano"] == pytest.approx(expected_gap)
+        assert requested_results[stage]["chinese_cer_delta_from_previous"] == pytest.approx(-0.1)
+        assert requested_results[stage][
+            "chinese_cer_gap_reduction_from_previous"
+        ] == pytest.approx(0.1)
     assert len(report["requested_alignment_dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert all(
         list(row["stages"]) == report["requested_alignment_stage_order"]
@@ -2539,6 +2557,9 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     )
     assert "## Requested Alignment Results" in output_markdown.read_text(encoding="utf-8")
     assert "WER gap" in output_markdown.read_text(encoding="utf-8")
+    assert "Public WER/CER normalization: `ctc`" in output_markdown.read_text(encoding="utf-8")
+    assert "## Incremental Stage Impact" in output_markdown.read_text(encoding="utf-8")
+    assert "English Nano-gap reduction" in output_markdown.read_text(encoding="utf-8")
     assert "+30.000 pt" in output_markdown.read_text(encoding="utf-8")
     assert "Language Macro Metrics" in output_markdown.read_text(encoding="utf-8")
     assert "unweighted_dataset_macro" in output_markdown.read_text(encoding="utf-8")
