@@ -1,8 +1,10 @@
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+import rwkvasr.training.deepspeed_loop as deepspeed_loop
 
 from rwkvasr.modules import (
     RWKVCTCModel,
@@ -14,17 +16,21 @@ from rwkvasr.modules import (
 )
 from rwkvasr.training.deepspeed_loop import (
     _CTC_FULL_EVAL_WIDTH,
+    DeepSpeedTrainConfig,
     _ctc_teacher_blank_frame_bce,
     _ctc_teacher_blank_loss,
     _ctc_teacher_decoder_hidden_loss,
     _ctc_teacher_full_loss,
+    _ctc_teacher_full_objective_losses,
     _ctc_teacher_hidden_loss,
     _ctc_teacher_nonblank_hard_loss,
     _ctc_teacher_nonblank_window_loss,
     _ctc_teacher_nonblank_window_topk_loss,
     _ctc_teacher_sequence_presence_loss,
     _ctc_teacher_sequence_window_loss,
+    _ctc_teacher_shared_full_alignment_enabled,
     _finalize_ctc_full_eval_metrics,
+    _online_ctc_teacher_distillation_loss,
     _project_ctc_teacher_full_log_probs,
 )
 
@@ -454,6 +460,280 @@ def test_ctc_teacher_full_loss_supports_device_resident_targets(
     loss.backward()
     assert student_logits.grad is not None
     assert torch.isfinite(student_logits.grad).all()
+
+
+@pytest.mark.parametrize("time_map", ["nearest", "linear"])
+def test_ctc_teacher_shared_full_alignment_matches_separate_losses_and_gradients(
+    monkeypatch: pytest.MonkeyPatch,
+    time_map: str,
+) -> None:
+    torch.manual_seed(417)
+    teacher_cache: dict[str, dict[str, object]] = {}
+    for index, (utt_id, teacher_time) in enumerate((("utt-a", 5), ("utt-b", 4))):
+        teacher_logits = torch.randn(teacher_time, 7)
+        teacher_logits[:, 6] -= 0.75
+        teacher_logits[index::2, index + 1] += 3.0
+        teacher_cache[utt_id] = {
+            "full_log_probs": F.log_softmax(teacher_logits, dim=-1).to(torch.float16),
+            "project_blank_id": 6,
+            "teacher_blank_id": 6,
+            "project_ignored_token_ids": [5],
+        }
+    utt_ids = ["utt-a", "utt-b", "utt-missing"]
+    lengths = torch.tensor([3, 4, 2])
+    initial_logits = torch.randn(3, 4, 7)
+
+    separate_logits = initial_logits.clone().requires_grad_(True)
+    separate_accumulator = torch.zeros(_CTC_FULL_EVAL_WIDTH, dtype=torch.float64)
+    separate_results = {
+        "full": _ctc_teacher_full_loss(
+            separate_logits,
+            lengths,
+            utt_ids,
+            teacher_cache,
+            blank_id=6,
+            time_map=time_map,
+            frame_filter="all",
+            frame_filter_neighbor_radius=0,
+            frame_filter_min_nonblank_prob=0.05,
+            missing_policy="skip",
+            temperature=0.7,
+            nonblank_frame_weight=2.5,
+            frame_weight_mode="posterior_nonblank",
+            eval_accumulator=separate_accumulator,
+        ),
+        "conditional_nonblank": _ctc_teacher_full_loss(
+            separate_logits,
+            lengths,
+            utt_ids,
+            teacher_cache,
+            blank_id=6,
+            time_map=time_map,
+            frame_filter="all",
+            frame_filter_neighbor_radius=0,
+            frame_filter_min_nonblank_prob=0.05,
+            missing_policy="skip",
+            temperature=0.7,
+            loss_mode="conditional_nonblank",
+        ),
+        "conditional_nonblank_hard": _ctc_teacher_full_loss(
+            separate_logits,
+            lengths,
+            utt_ids,
+            teacher_cache,
+            blank_id=6,
+            time_map=time_map,
+            frame_filter="all",
+            frame_filter_neighbor_radius=0,
+            frame_filter_min_nonblank_prob=0.05,
+            missing_policy="skip",
+            temperature=1.0,
+            loss_mode="conditional_nonblank_hard",
+        ),
+    }
+    separate_total = (
+        separate_results["full"][0]
+        + 0.75 * separate_results["conditional_nonblank"][0]
+        + 0.125 * separate_results["conditional_nonblank_hard"][0]
+    )
+    separate_total.backward()
+    assert separate_logits.grad is not None
+    separate_gradient = separate_logits.grad.detach().clone()
+
+    projection_calls = 0
+    original_project = deepspeed_loop._project_ctc_teacher_full_log_probs
+
+    def counted_project(*args: object, **kwargs: object) -> torch.Tensor:
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_project(*args, **kwargs)
+
+    monkeypatch.setattr(
+        deepspeed_loop,
+        "_project_ctc_teacher_full_log_probs",
+        counted_project,
+    )
+    shared_logits = initial_logits.clone().requires_grad_(True)
+    shared_accumulator = torch.zeros(_CTC_FULL_EVAL_WIDTH, dtype=torch.float64)
+    shared_results, shared_active = _ctc_teacher_full_objective_losses(
+        shared_logits,
+        lengths,
+        utt_ids,
+        teacher_cache,
+        blank_id=6,
+        time_map=time_map,
+        full_frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.05,
+        missing_policy="skip",
+        full_temperature=0.7,
+        full_nonblank_frame_weight=2.5,
+        full_frame_weight_mode="posterior_nonblank",
+        full_weight=1.0,
+        conditional_nonblank_weight=0.75,
+        conditional_nonblank_hard_weight=0.125,
+        full_eval_accumulator=shared_accumulator,
+    )
+
+    assert shared_active is True
+    assert projection_calls == 2
+    for name in separate_results:
+        separate_loss, separate_matched, separate_missing = separate_results[name]
+        shared_loss, shared_matched, shared_missing = shared_results[name]
+        assert torch.equal(shared_loss, separate_loss)
+        assert (shared_matched, shared_missing) == (separate_matched, separate_missing) == (2, 1)
+    assert torch.equal(shared_accumulator, separate_accumulator)
+
+    shared_total = (
+        shared_results["full"][0]
+        + 0.75 * shared_results["conditional_nonblank"][0]
+        + 0.125 * shared_results["conditional_nonblank_hard"][0]
+    )
+    shared_total.backward()
+    assert shared_logits.grad is not None
+    assert torch.equal(shared_total, separate_total)
+    assert torch.equal(shared_logits.grad, separate_gradient)
+
+
+def test_ctc_teacher_shared_full_alignment_falls_back_for_single_or_filtered_objectives() -> None:
+    teacher_probs = torch.tensor(
+        [
+            [0.05, 0.70, 0.05, 0.05, 0.05, 0.10],
+            [0.05, 0.05, 0.60, 0.05, 0.05, 0.20],
+        ]
+    )
+    topk_log_probs, topk_ids = teacher_probs.log().topk(2, dim=-1)
+    teacher_cache = {
+        "utt-a": {
+            "full_log_probs": teacher_probs.log(),
+            "topk_token_ids": topk_ids,
+            "topk_log_probs": topk_log_probs,
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+    student_logits = torch.randn(1, 2, 6, requires_grad=True)
+
+    single_results, single_shared = _ctc_teacher_full_objective_losses(
+        student_logits,
+        torch.tensor([2]),
+        ["utt-a"],
+        teacher_cache,
+        blank_id=5,
+        time_map="nearest",
+        full_frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        full_temperature=1.0,
+        full_nonblank_frame_weight=1.0,
+        full_frame_weight_mode="hard_top1",
+        full_weight=1.0,
+        conditional_nonblank_weight=0.0,
+        conditional_nonblank_hard_weight=0.0,
+    )
+    filtered_results, filtered_shared = _ctc_teacher_full_objective_losses(
+        student_logits,
+        torch.tensor([2]),
+        ["utt-a"],
+        teacher_cache,
+        blank_id=5,
+        time_map="nearest",
+        full_frame_filter="nonblank",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        full_temperature=1.0,
+        full_nonblank_frame_weight=1.0,
+        full_frame_weight_mode="hard_top1",
+        full_weight=1.0,
+        conditional_nonblank_weight=1.0,
+        conditional_nonblank_hard_weight=0.0,
+    )
+
+    assert single_shared is False
+    assert set(single_results) == {"full"}
+    assert filtered_shared is False
+    assert set(filtered_results) == {"full", "conditional_nonblank"}
+    assert all(torch.isfinite(result[0]) for result in filtered_results.values())
+    assert not _ctc_teacher_shared_full_alignment_enabled(
+        full_weight=1.0,
+        conditional_nonblank_weight=0.0,
+        conditional_nonblank_hard_weight=0.0,
+        full_frame_filter="all",
+    )
+    assert not _ctc_teacher_shared_full_alignment_enabled(
+        full_weight=1.0,
+        conditional_nonblank_weight=1.0,
+        conditional_nonblank_hard_weight=0.0,
+        full_frame_filter="nonblank",
+    )
+
+
+def test_online_ctc_teacher_distillation_uses_shared_full_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    teacher_probs = torch.tensor(
+        [
+            [0.05, 0.70, 0.05, 0.05, 0.05, 0.10],
+            [0.05, 0.05, 0.60, 0.05, 0.05, 0.20],
+        ]
+    )
+    teacher_cache = {
+        "utt-a": {
+            "full_log_probs": teacher_probs.log().to(torch.float16),
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+    student_logits = torch.randn(1, 2, 6, requires_grad=True)
+    base_loss = student_logits.float().sum() * 0.0
+    config = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        blank_id=5,
+        ctc_teacher_online_full_loss_weight=1.0,
+        ctc_teacher_online_conditional_nonblank_loss_weight=0.75,
+        ctc_teacher_online_conditional_nonblank_hard_loss_weight=0.125,
+        ctc_teacher_online_full_temperature=0.7,
+        ctc_teacher_online_full_frame_filter="all",
+        ctc_teacher_online_full_nonblank_weight=2.0,
+        ctc_teacher_online_full_frame_weight_mode="posterior_nonblank",
+        ctc_teacher_online_project_ignored_token_ids=(4,),
+        ctc_teacher_topk_missing_policy="error",
+    )
+    projection_calls = 0
+    original_project = deepspeed_loop._project_ctc_teacher_full_log_probs
+
+    def counted_project(*args: object, **kwargs: object) -> torch.Tensor:
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_project(*args, **kwargs)
+
+    monkeypatch.setattr(
+        deepspeed_loop,
+        "_project_ctc_teacher_full_log_probs",
+        counted_project,
+    )
+    total = _online_ctc_teacher_distillation_loss(
+        config=config,
+        losses={
+            "loss": base_loss,
+            "logits": student_logits,
+            "logit_lengths": torch.tensor([2]),
+        },
+        batch=SimpleNamespace(utt_ids=["utt-a"]),
+        ctc_teacher_online_records=teacher_cache,
+    )
+
+    assert projection_calls == 1
+    assert torch.isfinite(total)
+    total.backward()
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
+    assert torch.count_nonzero(student_logits.grad).item() > 0
 
 
 def test_ctc_teacher_full_eval_metrics_expose_blank_peak_and_collapsed_sequence_gap() -> None:

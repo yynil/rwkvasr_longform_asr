@@ -2435,73 +2435,41 @@ def _online_ctc_teacher_distillation_loss(
         total = total + loss_value * mass_weight
 
     full_weight = float(config.ctc_teacher_online_full_loss_weight)
-    if full_weight > 0.0:
-        student_logits, student_lengths = student_logits_and_lengths()
-        loss_value, _, _ = _ctc_teacher_full_loss(
-            student_logits,
-            student_lengths,
-            batch.utt_ids,
-            ctc_teacher_online_records,
-            blank_id=int(config.blank_id),
-            time_map=config.ctc_teacher_topk_time_map,
-            frame_filter=ctc_teacher_online_full_frame_filter,
-            frame_filter_neighbor_radius=int(config.ctc_teacher_frame_filter_neighbor_radius),
-            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
-            missing_policy=config.ctc_teacher_topk_missing_policy,
-            temperature=float(config.ctc_teacher_online_full_temperature),
-            nonblank_frame_weight=float(config.ctc_teacher_online_full_nonblank_weight),
-            frame_weight_mode=str(config.ctc_teacher_online_full_frame_weight_mode),
-            eval_accumulator=full_eval_accumulator,
-        )
-        total = total + loss_value * full_weight
-
     conditional_nonblank_weight = float(
         config.ctc_teacher_online_conditional_nonblank_loss_weight
     )
-    if conditional_nonblank_weight > 0.0:
-        student_logits, student_lengths = student_logits_and_lengths()
-        loss_value, _, _ = _ctc_teacher_full_loss(
-            student_logits,
-            student_lengths,
-            batch.utt_ids,
-            ctc_teacher_online_records,
-            blank_id=int(config.blank_id),
-            time_map=config.ctc_teacher_topk_time_map,
-            frame_filter="all",
-            frame_filter_neighbor_radius=0,
-            frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
-            missing_policy=config.ctc_teacher_topk_missing_policy,
-            temperature=float(config.ctc_teacher_online_full_temperature),
-            loss_mode="conditional_nonblank",
-            eval_accumulator=(full_eval_accumulator if full_weight <= 0.0 else None),
-        )
-        total = total + loss_value * conditional_nonblank_weight
-
     conditional_nonblank_hard_weight = float(
         config.ctc_teacher_online_conditional_nonblank_hard_loss_weight
     )
-    if conditional_nonblank_hard_weight > 0.0:
+    full_objective_weights = {
+        "full": full_weight,
+        "conditional_nonblank": conditional_nonblank_weight,
+        "conditional_nonblank_hard": conditional_nonblank_hard_weight,
+    }
+    if any(weight > 0.0 for weight in full_objective_weights.values()):
         student_logits, student_lengths = student_logits_and_lengths()
-        loss_value, _, _ = _ctc_teacher_full_loss(
+        objective_results, _ = _ctc_teacher_full_objective_losses(
             student_logits,
             student_lengths,
             batch.utt_ids,
             ctc_teacher_online_records,
             blank_id=int(config.blank_id),
             time_map=config.ctc_teacher_topk_time_map,
-            frame_filter="all",
-            frame_filter_neighbor_radius=0,
+            full_frame_filter=ctc_teacher_online_full_frame_filter,
+            frame_filter_neighbor_radius=int(config.ctc_teacher_frame_filter_neighbor_radius),
             frame_filter_min_nonblank_prob=float(config.ctc_teacher_frame_filter_min_nonblank_prob),
             missing_policy=config.ctc_teacher_topk_missing_policy,
-            temperature=1.0,
-            loss_mode="conditional_nonblank_hard",
-            eval_accumulator=(
-                full_eval_accumulator
-                if full_weight <= 0.0 and conditional_nonblank_weight <= 0.0
-                else None
-            ),
+            full_temperature=float(config.ctc_teacher_online_full_temperature),
+            full_nonblank_frame_weight=float(config.ctc_teacher_online_full_nonblank_weight),
+            full_frame_weight_mode=str(config.ctc_teacher_online_full_frame_weight_mode),
+            full_weight=full_weight,
+            conditional_nonblank_weight=conditional_nonblank_weight,
+            conditional_nonblank_hard_weight=conditional_nonblank_hard_weight,
+            full_eval_accumulator=full_eval_accumulator,
         )
-        total = total + loss_value * conditional_nonblank_hard_weight
+        for name, weight in full_objective_weights.items():
+            if weight > 0.0:
+                total = total + objective_results[name][0] * weight
 
     encoder_weight = float(config.ctc_teacher_online_encoder_loss_weight)
     if encoder_weight > 0.0:
@@ -4864,7 +4832,16 @@ def _ctc_teacher_time_index_select(value: torch.Tensor, indices: torch.Tensor) -
     )
 
 
-def _ctc_teacher_full_loss(
+@dataclass(frozen=True)
+class _CTCTeacherFullLossObjective:
+    loss_mode: str
+    temperature: float
+    nonblank_frame_weight: float = 1.0
+    frame_weight_mode: str = "hard_top1"
+    eval_accumulator: torch.Tensor | None = None
+
+
+def _ctc_teacher_full_losses(
     student_logits: torch.Tensor,
     student_lengths: torch.Tensor | None,
     utt_ids: tuple[str, ...] | list[str] | None,
@@ -4876,40 +4853,54 @@ def _ctc_teacher_full_loss(
     frame_filter_neighbor_radius: int,
     frame_filter_min_nonblank_prob: float,
     missing_policy: str,
-    temperature: float,
-    nonblank_frame_weight: float = 1.0,
-    frame_weight_mode: str = "hard_top1",
-    loss_mode: str = "full",
-    eval_accumulator: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, int, int]:
+    objectives: dict[str, _CTCTeacherFullLossObjective],
+) -> dict[str, tuple[torch.Tensor, int, int]]:
     if utt_ids is None:
         raise RuntimeError("CTC teacher full-logits distillation requires batch.utt_ids.")
     if time_map not in {"nearest", "linear"}:
         raise ValueError(f"Unsupported ctc_teacher_topk_time_map={time_map!r}; expected nearest or linear.")
     if missing_policy not in {"skip", "error"}:
         raise ValueError(f"Unsupported ctc_teacher_topk_missing_policy={missing_policy!r}; expected skip or error.")
-    loss_mode = str(loss_mode).strip().lower()
-    if loss_mode not in {"full", "conditional_nonblank", "conditional_nonblank_hard"}:
-        raise ValueError(
-            "CTC teacher full loss_mode must be 'full', 'conditional_nonblank', or "
-            "'conditional_nonblank_hard', "
-            f"got {loss_mode!r}."
-        )
-    if not math.isfinite(float(nonblank_frame_weight)) or float(nonblank_frame_weight) <= 0.0:
-        raise ValueError(
-            "ctc_teacher_online_full_nonblank_weight must be finite and > 0, "
-            f"got {nonblank_frame_weight!r}."
-        )
-    frame_weight_mode = str(frame_weight_mode).strip().lower()
-    if frame_weight_mode not in {"hard_top1", "posterior_nonblank"}:
-        raise ValueError(
-            "ctc_teacher_online_full_frame_weight_mode must be 'hard_top1' or "
-            f"'posterior_nonblank', got {frame_weight_mode!r}."
+    if not objectives:
+        raise ValueError("CTC teacher full-logits distillation requires at least one objective.")
+    normalized_objectives: dict[str, _CTCTeacherFullLossObjective] = {}
+    for name, objective in objectives.items():
+        loss_mode = str(objective.loss_mode).strip().lower()
+        if loss_mode not in {"full", "conditional_nonblank", "conditional_nonblank_hard"}:
+            raise ValueError(
+                "CTC teacher full loss_mode must be 'full', 'conditional_nonblank', or "
+                "'conditional_nonblank_hard', "
+                f"got {loss_mode!r}."
+            )
+        nonblank_frame_weight = float(objective.nonblank_frame_weight)
+        if not math.isfinite(nonblank_frame_weight) or nonblank_frame_weight <= 0.0:
+            raise ValueError(
+                "ctc_teacher_online_full_nonblank_weight must be finite and > 0, "
+                f"got {objective.nonblank_frame_weight!r}."
+            )
+        frame_weight_mode = str(objective.frame_weight_mode).strip().lower()
+        if frame_weight_mode not in {"hard_top1", "posterior_nonblank"}:
+            raise ValueError(
+                "ctc_teacher_online_full_frame_weight_mode must be 'hard_top1' or "
+                f"'posterior_nonblank', got {frame_weight_mode!r}."
+            )
+        normalized_objectives[name] = _CTCTeacherFullLossObjective(
+            loss_mode=loss_mode,
+            temperature=float(objective.temperature),
+            nonblank_frame_weight=nonblank_frame_weight,
+            frame_weight_mode=frame_weight_mode,
+            eval_accumulator=objective.eval_accumulator,
         )
 
     batch_size = min(int(student_logits.size(0)), len(utt_ids))
-    total = student_logits.new_zeros((), dtype=torch.float32)
-    denom = student_logits.new_zeros((), dtype=torch.float32)
+    totals = {
+        name: student_logits.new_zeros((), dtype=torch.float32)
+        for name in normalized_objectives
+    }
+    denoms = {
+        name: student_logits.new_zeros((), dtype=torch.float32)
+        for name in normalized_objectives
+    }
     matched = 0
     missing = 0
     max_student_time = int(student_logits.size(1))
@@ -4931,8 +4922,9 @@ def _ctc_teacher_full_loss(
         record = teacher_cache.get(utt_id)
         if record is None:
             missing += 1
-            if eval_accumulator is not None:
-                eval_accumulator[_CTC_FULL_EVAL_MISSING_UTTERANCES] += 1.0
+            for objective in normalized_objectives.values():
+                if objective.eval_accumulator is not None:
+                    objective.eval_accumulator[_CTC_FULL_EVAL_MISSING_UTTERANCES] += 1.0
             if missing_policy == "error":
                 raise KeyError(f"Missing CTC teacher full record for utt_id={utt_id!r}")
             continue
@@ -4940,8 +4932,9 @@ def _ctc_teacher_full_loss(
         teacher_full_log_probs = _ctc_teacher_full_log_probs_from_record(record)
         if teacher_full_log_probs is None:
             missing += 1
-            if eval_accumulator is not None:
-                eval_accumulator[_CTC_FULL_EVAL_MISSING_UTTERANCES] += 1.0
+            for objective in normalized_objectives.values():
+                if objective.eval_accumulator is not None:
+                    objective.eval_accumulator[_CTC_FULL_EVAL_MISSING_UTTERANCES] += 1.0
             if missing_policy == "error":
                 raise ValueError(f"CTC teacher full record has no full_log_probs for utt_id={utt_id!r}")
             continue
@@ -4973,8 +4966,9 @@ def _ctc_teacher_full_loss(
             )
             if raw_ids is None or raw_log_probs is None:
                 missing += 1
-                if eval_accumulator is not None:
-                    eval_accumulator[_CTC_FULL_EVAL_MISSING_UTTERANCES] += 1.0
+                for objective in normalized_objectives.values():
+                    if objective.eval_accumulator is not None:
+                        objective.eval_accumulator[_CTC_FULL_EVAL_MISSING_UTTERANCES] += 1.0
                 if missing_policy == "error":
                     raise ValueError(
                         f"CTC teacher full record needs top-k ids/log_probs for frame filtering: utt_id={utt_id!r}"
@@ -5073,97 +5067,259 @@ def _ctc_teacher_full_loss(
             else:
                 selected_mask = None
         eval_selected_mask = selected_mask
-        if loss_mode in {"conditional_nonblank", "conditional_nonblank_hard"}:
-            teacher_top1 = selected_log_probs.argmax(dim=-1)
-            conditional_mask = teacher_top1.ne(int(project_blank_id))
-            for ignored_id in ignored_ids:
-                conditional_mask = conditional_mask & teacher_top1.ne(int(ignored_id))
-            if float(frame_filter_min_nonblank_prob) > 0.0:
-                teacher_top1_probs = selected_log_probs.gather(
-                    dim=-1,
-                    index=teacher_top1.unsqueeze(-1),
-                ).squeeze(-1).exp()
-                conditional_mask = conditional_mask & teacher_top1_probs.ge(
-                    float(frame_filter_min_nonblank_prob)
+        loss_teacher_log_probs = _match_teacher_full_vocab(
+            selected_log_probs,
+            vocab_size=int(student_slice.size(-1)),
+        ).to(device=student_slice.device, dtype=torch.float32)
+        teacher_top1: torch.Tensor | None = None
+        for name, objective in normalized_objectives.items():
+            loss_mode = objective.loss_mode
+            objective_mask = selected_mask
+            if loss_mode in {"conditional_nonblank", "conditional_nonblank_hard"}:
+                if teacher_top1 is None:
+                    teacher_top1 = selected_log_probs.argmax(dim=-1)
+                conditional_mask = teacher_top1.ne(int(project_blank_id))
+                for ignored_id in ignored_ids:
+                    conditional_mask = conditional_mask & teacher_top1.ne(int(ignored_id))
+                if float(frame_filter_min_nonblank_prob) > 0.0:
+                    teacher_top1_probs = selected_log_probs.gather(
+                        dim=-1,
+                        index=teacher_top1.unsqueeze(-1),
+                    ).squeeze(-1).exp()
+                    conditional_mask = conditional_mask & teacher_top1_probs.ge(
+                        float(frame_filter_min_nonblank_prob)
+                    )
+                objective_mask = (
+                    conditional_mask
+                    if objective_mask is None
+                    else objective_mask.to(device=conditional_mask.device) & conditional_mask
                 )
-            selected_mask = (
-                conditional_mask
-                if selected_mask is None
-                else selected_mask.to(device=conditional_mask.device) & conditional_mask
-            )
-            if loss_mode == "conditional_nonblank":
-                frame_loss = _ctc_teacher_conditional_nonblank_frame_kl(
+                if loss_mode == "conditional_nonblank":
+                    frame_loss = _ctc_teacher_conditional_nonblank_frame_kl(
+                        student_slice,
+                        loss_teacher_log_probs,
+                        blank_id=project_blank_id,
+                        ignored_token_ids=ignored_ids,
+                        temperature=objective.temperature,
+                    )
+                else:
+                    frame_loss = _ctc_teacher_conditional_nonblank_hard_frame_ce(
+                        student_slice,
+                        loss_teacher_log_probs,
+                        blank_id=project_blank_id,
+                        ignored_token_ids=ignored_ids,
+                    )
+            else:
+                frame_loss = _ctc_teacher_full_frame_kl(
                     student_slice,
-                    selected_log_probs,
+                    loss_teacher_log_probs,
+                    temperature=objective.temperature,
+                )
+            frame_weights = torch.ones_like(frame_loss)
+            if loss_mode == "full" and objective.nonblank_frame_weight != 1.0:
+                if objective.frame_weight_mode == "hard_top1":
+                    if teacher_top1 is None:
+                        teacher_top1 = selected_log_probs.argmax(dim=-1)
+                    nonblank_mask = teacher_top1.ne(int(project_blank_id))
+                    for ignored_id in ignored_ids:
+                        nonblank_mask = nonblank_mask & teacher_top1.ne(int(ignored_id))
+                    frame_weights = torch.where(
+                        nonblank_mask.to(device=frame_loss.device),
+                        frame_weights.new_full((), objective.nonblank_frame_weight),
+                        frame_weights,
+                    )
+                else:
+                    teacher_probs = selected_log_probs.exp()
+                    nonblank_probability = 1.0 - teacher_probs[:, int(project_blank_id)]
+                    for ignored_id in ignored_ids:
+                        if 0 <= int(ignored_id) < int(teacher_probs.size(-1)):
+                            nonblank_probability = nonblank_probability - teacher_probs[
+                                :, int(ignored_id)
+                            ]
+                    nonblank_probability = nonblank_probability.clamp(min=0.0, max=1.0)
+                    frame_weights = frame_weights + nonblank_probability.to(
+                        device=frame_loss.device,
+                        dtype=frame_loss.dtype,
+                    ) * (objective.nonblank_frame_weight - 1.0)
+            if objective.eval_accumulator is not None:
+                eval_frame_loss = (
+                    frame_loss
+                    if loss_mode == "full"
+                    else _ctc_teacher_full_frame_kl(
+                        student_slice,
+                        loss_teacher_log_probs,
+                        temperature=objective.temperature,
+                    )
+                )
+                _accumulate_ctc_full_eval_metrics(
+                    objective.eval_accumulator,
+                    student_logits=student_slice,
+                    teacher_log_probs=selected_log_probs,
+                    frame_kl=eval_frame_loss,
+                    selected_mask=eval_selected_mask,
                     blank_id=project_blank_id,
                     ignored_token_ids=ignored_ids,
-                    temperature=float(temperature),
+                    frame_delta=student_time - teacher_time,
                 )
-            else:
-                frame_loss = _ctc_teacher_conditional_nonblank_hard_frame_ce(
-                    student_slice,
-                    selected_log_probs,
-                    blank_id=project_blank_id,
-                    ignored_token_ids=ignored_ids,
-                )
-        else:
-            frame_loss = _ctc_teacher_full_frame_kl(
-                student_slice,
-                selected_log_probs,
-                temperature=float(temperature),
-            )
-        frame_weights = torch.ones_like(frame_loss)
-        if loss_mode == "full" and float(nonblank_frame_weight) != 1.0:
-            if frame_weight_mode == "hard_top1":
-                teacher_top1 = selected_log_probs.argmax(dim=-1)
-                nonblank_mask = teacher_top1.ne(int(project_blank_id))
-                for ignored_id in ignored_ids:
-                    nonblank_mask = nonblank_mask & teacher_top1.ne(int(ignored_id))
-                frame_weights = torch.where(
-                    nonblank_mask.to(device=frame_loss.device),
-                    frame_weights.new_full((), float(nonblank_frame_weight)),
-                    frame_weights,
-                )
-            else:
-                teacher_probs = selected_log_probs.exp()
-                nonblank_probability = 1.0 - teacher_probs[:, int(project_blank_id)]
-                for ignored_id in ignored_ids:
-                    if 0 <= int(ignored_id) < int(teacher_probs.size(-1)):
-                        nonblank_probability = nonblank_probability - teacher_probs[:, int(ignored_id)]
-                nonblank_probability = nonblank_probability.clamp(min=0.0, max=1.0)
-                frame_weights = frame_weights + nonblank_probability.to(
-                    device=frame_loss.device,
-                    dtype=frame_loss.dtype,
-                ) * (float(nonblank_frame_weight) - 1.0)
-        if eval_accumulator is not None:
-            eval_frame_loss = (
-                frame_loss
-                if loss_mode == "full"
-                else _ctc_teacher_full_frame_kl(
-                    student_slice,
-                    selected_log_probs,
-                    temperature=float(temperature),
-                )
-            )
-            _accumulate_ctc_full_eval_metrics(
-                eval_accumulator,
-                student_logits=student_slice,
-                teacher_log_probs=selected_log_probs,
-                frame_kl=eval_frame_loss,
-                selected_mask=eval_selected_mask,
-                blank_id=project_blank_id,
-                ignored_token_ids=ignored_ids,
-                frame_delta=student_time - teacher_time,
-            )
-        if selected_mask is not None:
-            if not bool(selected_mask.any().item()):
-                continue
-            frame_loss = frame_loss[selected_mask]
-            frame_weights = frame_weights[selected_mask]
-        total = total + (frame_loss * frame_weights).sum()
-        denom = denom + frame_weights.sum()
+            if objective_mask is not None:
+                if not bool(objective_mask.any().item()):
+                    continue
+                frame_loss = frame_loss[objective_mask]
+                frame_weights = frame_weights[objective_mask]
+            totals[name] = totals[name] + (frame_loss * frame_weights).sum()
+            denoms[name] = denoms[name] + frame_weights.sum()
 
-    return total / denom.clamp_min(1.0), matched, missing
+    return {
+        name: (totals[name] / denoms[name].clamp_min(1.0), matched, missing)
+        for name in normalized_objectives
+    }
+
+
+def _ctc_teacher_full_loss(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    time_map: str,
+    frame_filter: str,
+    frame_filter_neighbor_radius: int,
+    frame_filter_min_nonblank_prob: float,
+    missing_policy: str,
+    temperature: float,
+    nonblank_frame_weight: float = 1.0,
+    frame_weight_mode: str = "hard_top1",
+    loss_mode: str = "full",
+    eval_accumulator: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int, int]:
+    return _ctc_teacher_full_losses(
+        student_logits,
+        student_lengths,
+        utt_ids,
+        teacher_cache,
+        blank_id=blank_id,
+        time_map=time_map,
+        frame_filter=frame_filter,
+        frame_filter_neighbor_radius=frame_filter_neighbor_radius,
+        frame_filter_min_nonblank_prob=frame_filter_min_nonblank_prob,
+        missing_policy=missing_policy,
+        objectives={
+            "single": _CTCTeacherFullLossObjective(
+                loss_mode=loss_mode,
+                temperature=temperature,
+                nonblank_frame_weight=nonblank_frame_weight,
+                frame_weight_mode=frame_weight_mode,
+                eval_accumulator=eval_accumulator,
+            )
+        },
+    )["single"]
+
+
+def _ctc_teacher_shared_full_alignment_enabled(
+    *,
+    full_weight: float,
+    conditional_nonblank_weight: float,
+    conditional_nonblank_hard_weight: float,
+    full_frame_filter: str,
+) -> bool:
+    active_objectives = sum(
+        float(weight) > 0.0
+        for weight in (
+            full_weight,
+            conditional_nonblank_weight,
+            conditional_nonblank_hard_weight,
+        )
+    )
+    return active_objectives >= 2 and str(full_frame_filter or "all") == "all"
+
+
+def _ctc_teacher_full_objective_losses(
+    student_logits: torch.Tensor,
+    student_lengths: torch.Tensor | None,
+    utt_ids: tuple[str, ...] | list[str] | None,
+    teacher_cache: dict[str, dict[str, Any]],
+    *,
+    blank_id: int,
+    time_map: str,
+    full_frame_filter: str,
+    frame_filter_neighbor_radius: int,
+    frame_filter_min_nonblank_prob: float,
+    missing_policy: str,
+    full_temperature: float,
+    full_nonblank_frame_weight: float,
+    full_frame_weight_mode: str,
+    full_weight: float,
+    conditional_nonblank_weight: float,
+    conditional_nonblank_hard_weight: float,
+    full_eval_accumulator: torch.Tensor | None = None,
+) -> tuple[dict[str, tuple[torch.Tensor, int, int]], bool]:
+    objective_weights = {
+        "full": float(full_weight),
+        "conditional_nonblank": float(conditional_nonblank_weight),
+        "conditional_nonblank_hard": float(conditional_nonblank_hard_weight),
+    }
+    active_names = [name for name, weight in objective_weights.items() if weight > 0.0]
+    shared_alignment = _ctc_teacher_shared_full_alignment_enabled(
+        full_weight=full_weight,
+        conditional_nonblank_weight=conditional_nonblank_weight,
+        conditional_nonblank_hard_weight=conditional_nonblank_hard_weight,
+        full_frame_filter=full_frame_filter,
+    )
+    if shared_alignment:
+        objectives = {
+            name: _CTCTeacherFullLossObjective(
+                loss_mode=name,
+                temperature=(1.0 if name == "conditional_nonblank_hard" else full_temperature),
+                nonblank_frame_weight=(
+                    full_nonblank_frame_weight if name == "full" else 1.0
+                ),
+                frame_weight_mode=(full_frame_weight_mode if name == "full" else "hard_top1"),
+                eval_accumulator=(
+                    full_eval_accumulator if name == active_names[0] else None
+                ),
+            )
+            for name in active_names
+        }
+        return (
+            _ctc_teacher_full_losses(
+                student_logits,
+                student_lengths,
+                utt_ids,
+                teacher_cache,
+                blank_id=blank_id,
+                time_map=time_map,
+                frame_filter="all",
+                frame_filter_neighbor_radius=frame_filter_neighbor_radius,
+                frame_filter_min_nonblank_prob=frame_filter_min_nonblank_prob,
+                missing_policy=missing_policy,
+                objectives=objectives,
+            ),
+            True,
+        )
+
+    results: dict[str, tuple[torch.Tensor, int, int]] = {}
+    for name in active_names:
+        results[name] = _ctc_teacher_full_loss(
+            student_logits,
+            student_lengths,
+            utt_ids,
+            teacher_cache,
+            blank_id=blank_id,
+            time_map=time_map,
+            frame_filter=(full_frame_filter if name == "full" else "all"),
+            frame_filter_neighbor_radius=(
+                frame_filter_neighbor_radius if name == "full" else 0
+            ),
+            frame_filter_min_nonblank_prob=frame_filter_min_nonblank_prob,
+            missing_policy=missing_policy,
+            temperature=(1.0 if name == "conditional_nonblank_hard" else full_temperature),
+            nonblank_frame_weight=(full_nonblank_frame_weight if name == "full" else 1.0),
+            frame_weight_mode=(full_frame_weight_mode if name == "full" else "hard_top1"),
+            loss_mode=name,
+            eval_accumulator=(full_eval_accumulator if name == active_names[0] else None),
+        )
+    return results, False
 
 
 def _ctc_teacher_hidden_loss(
@@ -6345,6 +6501,16 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         if config.ctc_teacher_online_full_frame_filter is None
         else str(config.ctc_teacher_online_full_frame_filter)
     )
+    ctc_teacher_online_shared_full_alignment_active = (
+        _ctc_teacher_shared_full_alignment_enabled(
+            full_weight=ctc_teacher_online_full_weight,
+            conditional_nonblank_weight=ctc_teacher_online_conditional_nonblank_weight,
+            conditional_nonblank_hard_weight=(
+                ctc_teacher_online_conditional_nonblank_hard_weight
+            ),
+            full_frame_filter=ctc_teacher_online_full_frame_filter,
+        )
+    )
     ctc_teacher_online_encoder_weight = float(config.ctc_teacher_online_encoder_loss_weight)
     ctc_teacher_online_decoder_hidden_weight = float(
         config.ctc_teacher_online_decoder_hidden_loss_weight
@@ -6771,6 +6937,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"full_temperature={ctc_teacher_online_full_temperature:g} "
             f"full_nonblank_weight={ctc_teacher_online_full_nonblank_weight:g} "
             f"full_frame_weight_mode={ctc_teacher_online_full_frame_weight_mode} "
+            f"shared_full_alignment={ctc_teacher_online_shared_full_alignment_active} "
             f"frame_balance_mode={ctc_teacher_online_frame_balance_mode} "
             f"blank_frame_balance_mode={ctc_teacher_online_blank_frame_balance_mode} "
             f"hidden_frame_balance_mode={ctc_teacher_online_hidden_frame_balance_mode} "
@@ -7587,105 +7754,103 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                     )
                     ctc_teacher_online_mass_loss_value = float(ctc_teacher_online_mass_loss.detach().item())
                     loss = loss + ctc_teacher_online_mass_loss * ctc_teacher_online_mass_weight
-                if ctc_teacher_online_full_weight > 0.0:
-                    student_logits = losses.get("logits")
-                    if not isinstance(student_logits, torch.Tensor):
-                        raise RuntimeError("joint_losses did not return logits tensor for online CTC teacher full distillation.")
-                    student_lengths = losses.get("logit_lengths")
-                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
-                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
-                    (
-                        ctc_teacher_online_full_loss,
-                        ctc_teacher_online_full_matched,
-                        ctc_teacher_online_full_missing,
-                    ) = _ctc_teacher_full_loss(
-                        student_logits,
-                        student_lengths,
-                        batch.utt_ids,
-                        ctc_teacher_online_records,
-                        blank_id=int(config.blank_id),
-                        time_map=config.ctc_teacher_topk_time_map,
-                        frame_filter=ctc_teacher_online_full_frame_filter,
-                        frame_filter_neighbor_radius=ctc_teacher_frame_filter_neighbor_radius,
-                        frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
-                        missing_policy=config.ctc_teacher_topk_missing_policy,
-                        temperature=ctc_teacher_online_full_temperature,
-                        nonblank_frame_weight=ctc_teacher_online_full_nonblank_weight,
-                        frame_weight_mode=str(config.ctc_teacher_online_full_frame_weight_mode),
-                    )
-                    ctc_teacher_online_full_loss_value = float(ctc_teacher_online_full_loss.detach().item())
-                    loss = loss + ctc_teacher_online_full_loss * ctc_teacher_online_full_weight
-                if ctc_teacher_online_conditional_nonblank_weight > 0.0:
+                full_objective_weights = {
+                    "full": ctc_teacher_online_full_weight,
+                    "conditional_nonblank": ctc_teacher_online_conditional_nonblank_weight,
+                    "conditional_nonblank_hard": (
+                        ctc_teacher_online_conditional_nonblank_hard_weight
+                    ),
+                }
+                if any(weight > 0.0 for weight in full_objective_weights.values()):
                     student_logits = losses.get("logits")
                     if not isinstance(student_logits, torch.Tensor):
                         raise RuntimeError(
-                            "joint_losses did not return logits tensor for online conditional nonblank CTC distillation."
+                            "joint_losses did not return logits tensor for online full-logits "
+                            "CTC distillation."
                         )
                     student_lengths = losses.get("logit_lengths")
                     if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
                         raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
-                    (
-                        ctc_teacher_online_conditional_nonblank_loss,
-                        ctc_teacher_online_conditional_nonblank_matched,
-                        ctc_teacher_online_conditional_nonblank_missing,
-                    ) = _ctc_teacher_full_loss(
-                        student_logits,
-                        student_lengths,
-                        batch.utt_ids,
-                        ctc_teacher_online_records,
-                        blank_id=int(config.blank_id),
-                        time_map=config.ctc_teacher_topk_time_map,
-                        frame_filter="all",
-                        frame_filter_neighbor_radius=0,
-                        frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
-                        missing_policy=config.ctc_teacher_topk_missing_policy,
-                        temperature=ctc_teacher_online_full_temperature,
-                        loss_mode="conditional_nonblank",
-                    )
-                    ctc_teacher_online_conditional_nonblank_loss_value = float(
-                        ctc_teacher_online_conditional_nonblank_loss.detach().item()
-                    )
-                    loss = (
-                        loss
-                        + ctc_teacher_online_conditional_nonblank_loss
-                        * ctc_teacher_online_conditional_nonblank_weight
-                    )
-                if ctc_teacher_online_conditional_nonblank_hard_weight > 0.0:
-                    student_logits = losses.get("logits")
-                    if not isinstance(student_logits, torch.Tensor):
-                        raise RuntimeError(
-                            "joint_losses did not return logits tensor for online conditional "
-                            "nonblank hard CTC distillation."
+                    full_objective_results, shared_full_alignment = (
+                        _ctc_teacher_full_objective_losses(
+                            student_logits,
+                            student_lengths,
+                            batch.utt_ids,
+                            ctc_teacher_online_records,
+                            blank_id=int(config.blank_id),
+                            time_map=config.ctc_teacher_topk_time_map,
+                            full_frame_filter=ctc_teacher_online_full_frame_filter,
+                            frame_filter_neighbor_radius=(
+                                ctc_teacher_frame_filter_neighbor_radius
+                            ),
+                            frame_filter_min_nonblank_prob=(
+                                ctc_teacher_frame_filter_min_nonblank_prob
+                            ),
+                            missing_policy=config.ctc_teacher_topk_missing_policy,
+                            full_temperature=ctc_teacher_online_full_temperature,
+                            full_nonblank_frame_weight=(
+                                ctc_teacher_online_full_nonblank_weight
+                            ),
+                            full_frame_weight_mode=(
+                                ctc_teacher_online_full_frame_weight_mode
+                            ),
+                            full_weight=ctc_teacher_online_full_weight,
+                            conditional_nonblank_weight=(
+                                ctc_teacher_online_conditional_nonblank_weight
+                            ),
+                            conditional_nonblank_hard_weight=(
+                                ctc_teacher_online_conditional_nonblank_hard_weight
+                            ),
                         )
-                    student_lengths = losses.get("logit_lengths")
-                    if student_lengths is not None and not isinstance(student_lengths, torch.Tensor):
-                        raise RuntimeError("joint_losses returned non-tensor logit_lengths.")
-                    (
-                        ctc_teacher_online_conditional_nonblank_hard_loss,
-                        ctc_teacher_online_conditional_nonblank_hard_matched,
-                        ctc_teacher_online_conditional_nonblank_hard_missing,
-                    ) = _ctc_teacher_full_loss(
-                        student_logits,
-                        student_lengths,
-                        batch.utt_ids,
-                        ctc_teacher_online_records,
-                        blank_id=int(config.blank_id),
-                        time_map=config.ctc_teacher_topk_time_map,
-                        frame_filter="all",
-                        frame_filter_neighbor_radius=0,
-                        frame_filter_min_nonblank_prob=ctc_teacher_frame_filter_min_nonblank_prob,
-                        missing_policy=config.ctc_teacher_topk_missing_policy,
-                        temperature=1.0,
-                        loss_mode="conditional_nonblank_hard",
                     )
-                    ctc_teacher_online_conditional_nonblank_hard_loss_value = float(
-                        ctc_teacher_online_conditional_nonblank_hard_loss.detach().item()
-                    )
-                    loss = (
-                        loss
-                        + ctc_teacher_online_conditional_nonblank_hard_loss
-                        * ctc_teacher_online_conditional_nonblank_hard_weight
-                    )
+                    if (
+                        shared_full_alignment
+                        != ctc_teacher_online_shared_full_alignment_active
+                    ):
+                        raise RuntimeError(
+                            "CTC teacher shared full-alignment runtime activation changed."
+                        )
+                    if ctc_teacher_online_full_weight > 0.0:
+                        (
+                            ctc_teacher_online_full_loss,
+                            ctc_teacher_online_full_matched,
+                            ctc_teacher_online_full_missing,
+                        ) = full_objective_results["full"]
+                        ctc_teacher_online_full_loss_value = float(
+                            ctc_teacher_online_full_loss.detach().item()
+                        )
+                        loss = (
+                            loss
+                            + ctc_teacher_online_full_loss * ctc_teacher_online_full_weight
+                        )
+                    if ctc_teacher_online_conditional_nonblank_weight > 0.0:
+                        (
+                            ctc_teacher_online_conditional_nonblank_loss,
+                            ctc_teacher_online_conditional_nonblank_matched,
+                            ctc_teacher_online_conditional_nonblank_missing,
+                        ) = full_objective_results["conditional_nonblank"]
+                        ctc_teacher_online_conditional_nonblank_loss_value = float(
+                            ctc_teacher_online_conditional_nonblank_loss.detach().item()
+                        )
+                        loss = (
+                            loss
+                            + ctc_teacher_online_conditional_nonblank_loss
+                            * ctc_teacher_online_conditional_nonblank_weight
+                        )
+                    if ctc_teacher_online_conditional_nonblank_hard_weight > 0.0:
+                        (
+                            ctc_teacher_online_conditional_nonblank_hard_loss,
+                            ctc_teacher_online_conditional_nonblank_hard_matched,
+                            ctc_teacher_online_conditional_nonblank_hard_missing,
+                        ) = full_objective_results["conditional_nonblank_hard"]
+                        ctc_teacher_online_conditional_nonblank_hard_loss_value = float(
+                            ctc_teacher_online_conditional_nonblank_hard_loss.detach().item()
+                        )
+                        loss = (
+                            loss
+                            + ctc_teacher_online_conditional_nonblank_hard_loss
+                            * ctc_teacher_online_conditional_nonblank_hard_weight
+                        )
                 if ctc_teacher_online_encoder_weight > 0.0:
                     student_encoded = losses.get("ctc_encoded", losses.get("encoded"))
                     if not isinstance(student_encoded, torch.Tensor):
@@ -8144,6 +8309,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         f"online_mass_match={ctc_teacher_online_mass_matched}/{batch_stats.batch_size} "
                         f"online_mass_missing={ctc_teacher_online_mass_missing} "
                         f"online_ctc_full={ctc_teacher_online_full_loss_value:.4f} "
+                        f"online_shared_full_alignment={int(ctc_teacher_online_shared_full_alignment_active)} "
                         f"online_full_match={ctc_teacher_online_full_matched}/{batch_stats.batch_size} "
                         f"online_full_missing={ctc_teacher_online_full_missing} "
                         f"online_ctc_conditional_nonblank={ctc_teacher_online_conditional_nonblank_loss_value:.4f} "
@@ -8234,6 +8400,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             "train/ctc_teacher_online_mass_matched": ctc_teacher_online_mass_matched,
                             "train/ctc_teacher_online_mass_missing": ctc_teacher_online_mass_missing,
                             "train/ctc_teacher_online_full_loss": ctc_teacher_online_full_loss_value,
+                            "train/ctc_teacher_online_shared_full_alignment_active": int(
+                                ctc_teacher_online_shared_full_alignment_active
+                            ),
                             "train/ctc_teacher_online_full_matched": ctc_teacher_online_full_matched,
                             "train/ctc_teacher_online_full_missing": ctc_teacher_online_full_missing,
                             "train/ctc_teacher_online_conditional_nonblank_loss": (
