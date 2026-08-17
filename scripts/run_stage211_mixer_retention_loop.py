@@ -190,6 +190,9 @@ def _correction_command(
         str(args.config_dir),
         "--master-port",
         str(args.master_port),
+        "--auto-batch-profile",
+        "--batch-profile-master-port",
+        str(args.master_port + 100),
     ]
 
 

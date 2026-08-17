@@ -492,6 +492,11 @@ def _profile_admission_command(
     phase: str,
     report_path: Path,
     admission_path: Path,
+    admitted_by: str = "stage211-auto-segment-boundary",
+    reason: str = (
+        "phase/checkpoint/manifest-specific four-GPU profile passed memory, "
+        "objective-match, quality-equivalence, and wall-time gates"
+    ),
 ) -> list[str]:
     return [
         str(PYTHON),
@@ -501,12 +506,9 @@ def _profile_admission_command(
         "--phase",
         phase,
         "--admitted-by",
-        "stage211-auto-segment-boundary",
+        admitted_by,
         "--reason",
-        (
-            "phase/checkpoint/manifest-specific four-GPU profile passed memory, "
-            "objective-match, quality-equivalence, and wall-time gates"
-        ),
+        reason,
         "--admit-recommended-profile",
         "--output",
         str(admission_path),
@@ -522,29 +524,23 @@ def _automatic_profile_requires_admission(measured: dict[str, Any]) -> bool:
     return measured["selection_decision"] != "keep_baseline" or not selected_is_legacy
 
 
-def _ensure_automatic_batch_profile(
+def _ensure_measured_batch_profile(
     *,
     phase: str,
-    difficulty: str,
+    scope: str,
     phase_root: Path,
-    config_root: Path,
+    base_config: Path,
     manifest_path: Path,
     init_checkpoint: Path,
-    expected_legacy_steps: int,
-    template_command: list[str],
     master_port: int,
-) -> Path | None:
-    _run_command(template_command, dry_run=False)
-    base_config = _find_generated_base_config(
-        config_root=config_root,
-        phase=phase,
-        difficulty=difficulty,
-        expected_steps=expected_legacy_steps,
-        init_checkpoint=init_checkpoint,
-        manifest_path=manifest_path,
-    )
+    admitted_by: str = "stage211-auto-segment-boundary",
+    reason: str = (
+        "phase/checkpoint/manifest-specific four-GPU profile passed memory, "
+        "objective-match, quality-equivalence, and wall-time gates"
+    ),
+) -> tuple[dict[str, Any], Path | None]:
     init_sha256 = sha256_file(init_checkpoint)
-    preflight_root = phase_root / "batch_profile_preflight" / f"{difficulty}-{init_sha256[:16]}"
+    preflight_root = phase_root / "batch_profile_preflight" / f"{scope}-{init_sha256[:16]}"
     report_path = preflight_root / "batch_throughput_preflight.json"
     if report_path.is_file():
         measured = validate_stage211_batch_profile_preflight(
@@ -575,23 +571,26 @@ def _ensure_automatic_batch_profile(
     if (
         Path(str(measured["init_checkpoint_path"])).resolve() != init_checkpoint.resolve()
         or Path(str(measured["bucket_manifest_path"])).resolve() != manifest_path.resolve()
+        or Path(str(measured["base_config_path"])).resolve() != base_config.resolve()
     ):
         raise ValueError("Stage211 automatic batch preflight binds different segment inputs.")
     if not _automatic_profile_requires_admission(measured):
         print(
             "[stage211-full-phase] automatic batch preflight retained legacy profile "
-            f"phase={phase} difficulty={difficulty} report={report_path}",
+            f"phase={phase} scope={scope} report={report_path}",
             flush=True,
         )
-        return None
+        return measured, None
     admission_path = (
-        phase_root / "batch_profile_preflight" / f"{difficulty}-{init_sha256[:16]}-admission.json"
+        phase_root / "batch_profile_preflight" / f"{scope}-{init_sha256[:16]}-admission.json"
     )
     _run_command(
         _profile_admission_command(
             phase=phase,
             report_path=report_path,
             admission_path=admission_path,
+            admitted_by=admitted_by,
+            reason=reason,
         ),
         dry_run=False,
     )
@@ -603,10 +602,43 @@ def _ensure_automatic_batch_profile(
     )
     print(
         "[stage211-full-phase] automatic batch profile admitted "
-        f"phase={phase} difficulty={difficulty} "
+        f"phase={phase} scope={scope} "
         f"profile={admission['selected_profile']['name']} "
         f"selection={measured['selection_decision']} admission={admission_path}",
         flush=True,
+    )
+    return measured, admission_path
+
+
+def _ensure_automatic_batch_profile(
+    *,
+    phase: str,
+    difficulty: str,
+    phase_root: Path,
+    config_root: Path,
+    manifest_path: Path,
+    init_checkpoint: Path,
+    expected_legacy_steps: int,
+    template_command: list[str],
+    master_port: int,
+) -> Path | None:
+    _run_command(template_command, dry_run=False)
+    base_config = _find_generated_base_config(
+        config_root=config_root,
+        phase=phase,
+        difficulty=difficulty,
+        expected_steps=expected_legacy_steps,
+        init_checkpoint=init_checkpoint,
+        manifest_path=manifest_path,
+    )
+    _, admission_path = _ensure_measured_batch_profile(
+        phase=phase,
+        scope=difficulty,
+        phase_root=phase_root,
+        base_config=base_config,
+        manifest_path=manifest_path,
+        init_checkpoint=init_checkpoint,
+        master_port=master_port,
     )
     return admission_path
 

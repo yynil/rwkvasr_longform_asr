@@ -15,6 +15,11 @@ import pytest
 import torch
 
 from rwkvasr.config import load_yaml, save_yaml
+from rwkvasr.data.webdataset_bucketed import (
+    estimate_bucket_manifest_steps,
+    estimate_bucket_manifest_tail_padding_samples,
+    load_webdataset_bucket_manifest,
+)
 from rwkvasr.eval.stage211_gate import (
     STAGE211_ALLOWED_OPERATOR_KEY_MARKERS,
     STAGE211_AUDIO_CURRICULUM,
@@ -74,6 +79,9 @@ stage211_supplemental_profile_receipt = importlib.import_module(
     "scripts.create_stage211_supplemental_profile_receipt"
 )
 stage211_gate_module = importlib.import_module("rwkvasr.eval.stage211_gate")
+stage211_batch_profile_test = importlib.import_module(
+    "tests.test_stage211_batch_profile_admission"
+)
 
 
 def _stage211_smoke_runtime_fields(phase: str) -> str:
@@ -5533,6 +5541,144 @@ def _rewrite_phase_alignment(
     gate_report.write_text(json.dumps(phase_gate) + "\n", encoding="utf-8")
 
 
+def _write_retention_correction_batch_profile(
+    root: Path,
+    *,
+    init_checkpoint: Path,
+    manifest: Path,
+    eval_part: Path,
+) -> tuple[dict[str, object], Path]:
+    profile_root = root / "batch-profile"
+    profile_root.mkdir()
+    benchmark = profile_root / "benchmark.py"
+    benchmark.write_text("# benchmark\n", encoding="utf-8")
+    base_config = profile_root / "base.yaml"
+    save_yaml(
+        base_config,
+        {
+            **stage211_phase_train_config_contract("mixer"),
+            "webdataset_bucket_manifest_path": str(manifest.resolve()),
+        },
+    )
+    loaded_manifest = load_webdataset_bucket_manifest(manifest)
+    steps_per_epoch = estimate_bucket_manifest_steps(
+        loaded_manifest,
+        split="train",
+        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+        drop_last=False,
+    )
+    tail_padding = estimate_bucket_manifest_tail_padding_samples(
+        loaded_manifest,
+        split="train",
+        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+    )
+    baseline = stage211_batch_profile_test._profile_row(
+        profile_root,
+        name="baseline",
+        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+        steps_per_epoch=steps_per_epoch,
+        projected_seconds=3.0,
+        loss=0.10,
+        cosine=0.970,
+        phase="mixer",
+        init_checkpoint=init_checkpoint.resolve(),
+        manifest=manifest.resolve(),
+        eval_part=eval_part.resolve(),
+    )
+    baseline["coverage"]["tail_padding_samples_per_epoch"] = tail_padding
+    candidate = stage211_batch_profile_test._profile_row(
+        profile_root,
+        name="batch48_frames42k",
+        batch_size=48,
+        frame_budget=42_000,
+        steps_per_epoch=steps_per_epoch,
+        projected_seconds=6.0,
+        loss=0.10,
+        cosine=0.970,
+        phase="mixer",
+        init_checkpoint=init_checkpoint.resolve(),
+        manifest=manifest.resolve(),
+        eval_part=eval_part.resolve(),
+    )
+    candidate["coverage"]["tail_padding_samples_per_epoch"] = (
+        estimate_bucket_manifest_tail_padding_samples(
+            loaded_manifest,
+            split="train",
+            batch_size=48,
+            world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+            frame_budget=42_000,
+        )
+    )
+    comparison = {
+        "profile": "batch48_frames42k",
+        "projected_full_coverage_seconds": 6.0,
+        "improvement_ratio": -1.0,
+        "mean_loss": 0.10,
+        "loss_regression_ratio": 0.0,
+        "mean_cosine": 0.970,
+        "cosine_regression": 0.0,
+        "fixed_eval_provenance_match": True,
+        "quality_pass": True,
+        "admissible": False,
+    }
+    report = {
+        "schema_version": stage211_batch_profile_test.STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
+        "pipeline": "stage211",
+        "artifact": "batch_throughput_preflight",
+        "phase": "mixer",
+        "complete": True,
+        "formal_admission": False,
+        "dry_run": False,
+        "git_commit": "a" * 40,
+        "git_worktree_clean": True,
+        "git_worktree_changes": [],
+        "script_path": str(benchmark.resolve()),
+        "script_sha256": sha256_file(benchmark),
+        "base_config_path": str(base_config.resolve()),
+        "base_config_sha256": sha256_file(base_config),
+        "init_checkpoint_path": str(init_checkpoint.resolve()),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint),
+        "bucket_manifest_path": str(manifest.resolve()),
+        "bucket_manifest_sha256": sha256_file(manifest),
+        "warmup_steps": 20,
+        "measure_steps": 100,
+        "formal_epochs": STAGE211_FULL_DATA_EPOCHS,
+        "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+        "gpu_indices": [0, 1, 2, 3],
+        "max_peak_memory_gib": 22.0,
+        "min_improvement_ratio": 0.10,
+        "max_loss_regression_ratio": 0.05,
+        "max_cosine_regression": 0.005,
+        "profiles": [baseline, candidate],
+        "selection": {
+            "decision": "keep_baseline",
+            "baseline_profile": "baseline",
+            "recommended_profile": "baseline",
+            "recommended_improvement_ratio": 0.0,
+            "min_improvement_ratio": 0.10,
+            "baseline_mean_loss": 0.10,
+            "baseline_mean_cosine": 0.970,
+            "max_loss_regression_ratio": 0.05,
+            "max_cosine_regression": 0.005,
+            "comparisons": [comparison],
+            "formal_admission": False,
+        },
+    }
+    report_path = profile_root / "batch_throughput_preflight.json"
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    validated = stage211_batch_profile_test.validate_stage211_batch_profile_preflight(
+        report_path,
+        phase="mixer",
+        require_candidate=False,
+    )
+    return validated, report_path
+
+
 def _write_retention_correction(
     tmp_path: Path,
     *,
@@ -5556,6 +5702,9 @@ def _write_retention_correction(
             {
                 "version": 1,
                 "root": "/",
+                "source_length_index_path": str(replay_part.resolve()),
+                "bucket_width": 100,
+                "entries_per_part": 256,
                 "splits": {
                     "train": {
                         "num_samples": 8,
@@ -5663,6 +5812,16 @@ def _write_retention_correction(
         json.dumps(layer_focus_payload) + "\n",
         encoding="utf-8",
     )
+    batch_profile, batch_profile_path = _write_retention_correction_batch_profile(
+        replay_root,
+        init_checkpoint=init_checkpoint,
+        manifest=replay_manifest,
+        eval_part=Path(str(prior_eval_provenance["parts"][0]["path"])),
+    )
+    selected_profile = batch_profile["selected_profile_row"]["profile"]
+    selected_coverage = batch_profile["selected_profile_row"]["coverage"]
+    steps_per_epoch = int(selected_coverage["steps_per_epoch"])
+    tail_padding = int(selected_coverage["tail_padding_samples_per_epoch"])
 
     smoke_checkpoint = replay_root / "smoke-step-2.pt"
     smoke_log = replay_root / "smoke.log"
@@ -5690,6 +5849,13 @@ def _write_retention_correction(
                 "layer_focus_sha256": sha256_file(layer_focus),
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+                "batch_profile_preflight_path": str(batch_profile_path.resolve()),
+                "batch_profile_preflight_sha256": sha256_file(batch_profile_path),
+                "batch_profile_admission_path": None,
+                "batch_profile_admission_sha256": None,
+                "batch_profile_name": selected_profile["name"],
+                "batch_size": int(selected_profile["batch_size"]),
+                "frame_budget": int(selected_profile["frame_budget"]),
                 "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
                 "smoke_checkpoint_sha256": sha256_file(smoke_checkpoint),
                 "smoke_log_path": str(smoke_log.resolve()),
@@ -5712,10 +5878,10 @@ def _write_retention_correction(
     config.update(
         {
             "lr": STAGE211_RETENTION_CORRECTION_LR,
-            "max_steps": 1,
-            "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
-            "batch_token_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
-            "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "max_steps": steps_per_epoch,
+            "batch_size": int(selected_profile["batch_size"]),
+            "batch_token_budget": int(selected_profile["frame_budget"]),
+            "length_bucket_frame_budget": int(selected_profile["frame_budget"]),
             "length_bucket_drop_last": False,
             "skip_oversized_samples": False,
             "webdataset_skip_decode_errors": False,
@@ -5729,6 +5895,17 @@ def _write_retention_correction(
             "stage211_post_coverage_admission_gate_path": str(failed_gate.resolve()),
             "stage211_post_coverage_layer_focus_path": str(layer_focus.resolve()),
             "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
+            "stage211_post_coverage_batch_profile_preflight_path": str(
+                batch_profile_path.resolve()
+            ),
+            "stage211_post_coverage_batch_profile_preflight_sha256": sha256_file(
+                batch_profile_path
+            ),
+            "stage211_post_coverage_batch_profile_admission_path": None,
+            "stage211_post_coverage_batch_profile_admission_sha256": None,
+            "stage211_post_coverage_batch_profile_name": selected_profile["name"],
+            "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
+            "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
             "stage211_post_coverage_original_coverage_unchanged": True,
             "stage211_post_coverage_smoke_marker_path": str(smoke_marker.resolve()),
             "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
@@ -5737,6 +5914,16 @@ def _write_retention_correction(
             "step_eval_split": "eval",
             "step_eval_shuffle": False,
             "step_eval_feature_seed": 0,
+            "stage211_batch_profile_admission_path": None,
+            "stage211_batch_profile_admission_sha256": None,
+            "stage211_batch_profile_name": None,
+            "deepspeed": {
+                "gradient_accumulation_steps": 1,
+                "train_micro_batch_size_per_gpu": int(selected_profile["batch_size"]),
+                "train_batch_size": (
+                    int(selected_profile["batch_size"]) * STAGE211_FULL_DATA_WORLD_SIZE
+                ),
+            },
         }
     )
     save_yaml(train_config, config)
@@ -5744,13 +5931,40 @@ def _write_retention_correction(
     provenance.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "pipeline": "stage211",
                 "artifact": "retention_correction_run",
                 "phase": "mixer",
                 "round": 1,
+                "run_dir": str(run_dir.resolve()),
+                "replay_receipt_path": str(replay_receipt.resolve()),
+                "replay_receipt_sha256": sha256_file(replay_receipt),
+                "replay_manifest_path": str(replay_manifest.resolve()),
+                "replay_manifest_sha256": sha256_file(replay_manifest),
+                "admission_gate_path": str(failed_gate.resolve()),
+                "admission_gate_sha256": sha256_file(failed_gate),
+                "init_checkpoint_path": str(init_checkpoint.resolve()),
+                "init_checkpoint_sha256": sha256_file(init_checkpoint),
+                "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
+                "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+                "smoke_marker_path": str(smoke_marker.resolve()),
+                "smoke_marker_sha256": sha256_file(smoke_marker),
                 "layer_focus_path": str(layer_focus.resolve()),
                 "layer_focus_sha256": sha256_file(layer_focus),
+                "batch_profile_preflight_path": str(batch_profile_path.resolve()),
+                "batch_profile_preflight_sha256": sha256_file(batch_profile_path),
+                "batch_profile_admission_path": None,
+                "batch_profile_admission_sha256": None,
+                "batch_profile_name": selected_profile["name"],
+                "batch_size": int(selected_profile["batch_size"]),
+                "frame_budget": int(selected_profile["frame_budget"]),
+                "correction_extension_decision_path": None,
+                "correction_extension_decision_sha256": None,
+                "epochs": STAGE211_RETENTION_CORRECTION_EPOCHS,
+                "steps_per_epoch": steps_per_epoch,
+                "learning_rate": STAGE211_RETENTION_CORRECTION_LR,
+                "trainable_boundary": "mixer_only",
+                "early_stopping": False,
             }
         )
         + "\n",
@@ -5759,7 +5973,7 @@ def _write_retention_correction(
     epoch_checkpoint = run_dir / "epoch-1.pt"
     epoch_checkpoint.write_bytes(b"epoch-1")
     correction = {
-        "schema_version": 1,
+        "schema_version": 2,
         "pipeline": "stage211",
         "artifact": "post_coverage_correction",
         "phase": "mixer",
@@ -5767,9 +5981,9 @@ def _write_retention_correction(
         "complete": True,
         "epochs": STAGE211_RETENTION_CORRECTION_EPOCHS,
         "learning_rate": STAGE211_RETENTION_CORRECTION_LR,
-        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "batch_size": int(selected_profile["batch_size"]),
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
-        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "frame_budget": int(selected_profile["frame_budget"]),
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
@@ -5777,11 +5991,11 @@ def _write_retention_correction(
         "row_exposures": 8,
         "hours": 0.01,
         "hour_exposures": 0.01,
-        "steps_per_epoch": 1,
-        "steps": 1,
-        "tail_padding_samples_per_epoch": 4,
-        "tail_padding_sample_exposures": 4,
-        "executed_sample_exposures": 12,
+        "steps_per_epoch": steps_per_epoch,
+        "steps": steps_per_epoch,
+        "tail_padding_samples_per_epoch": tail_padding,
+        "tail_padding_sample_exposures": tail_padding,
+        "executed_sample_exposures": 8 + tail_padding,
         "run_dir": str(run_dir.resolve()),
         "provenance_path": str(provenance.resolve()),
         "provenance_sha256": sha256_file(provenance),
@@ -5811,6 +6025,11 @@ def _write_retention_correction(
         "admission_gate_sha256": sha256_file(failed_gate),
         "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+        "batch_profile_preflight_path": str(batch_profile_path.resolve()),
+        "batch_profile_preflight_sha256": sha256_file(batch_profile_path),
+        "batch_profile_admission_path": None,
+        "batch_profile_admission_sha256": None,
+        "batch_profile_name": selected_profile["name"],
         "init_checkpoint_path": str(init_checkpoint.resolve()),
         "init_checkpoint_sha256": sha256_file(init_checkpoint),
         "completion_checkpoint_path": str(completion_checkpoint.resolve()),
@@ -5821,14 +6040,14 @@ def _write_retention_correction(
             "artifact": "runtime_epoch_coverage",
             "complete": True,
             "epochs": 1,
-            "steps_per_epoch": 1,
-            "total_steps": 1,
+            "steps_per_epoch": steps_per_epoch,
+            "total_steps": steps_per_epoch,
             "records": [
                 {
                     "epoch": 1,
-                    "step": 1,
+                    "step": steps_per_epoch,
                     "epoch_batch_offset": 0,
-                    "completed_epoch_batch_count": 1,
+                    "completed_epoch_batch_count": steps_per_epoch,
                     "checkpoint_path": str(epoch_checkpoint.resolve()),
                     "checkpoint_sha256": sha256_file(epoch_checkpoint),
                 }

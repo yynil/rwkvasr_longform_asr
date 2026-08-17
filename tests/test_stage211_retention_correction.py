@@ -19,6 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 correction = importlib.import_module("scripts.create_stage211_retention_correction_receipt")
 correction_runner = importlib.import_module("scripts.run_stage211_retention_correction")
+batch_profile_validation = importlib.import_module("rwkvasr.eval.stage211_batch_profile")
+stage211_gate = importlib.import_module("rwkvasr.eval.stage211_gate")
 
 
 def _write_manifest(root: Path) -> Path:
@@ -91,6 +93,53 @@ def test_logits_correction_retains_direct_full_distribution_objective() -> None:
     assert contract["ctc_teacher_online_nonblank_window_loss_weight"] == 0.0
 
 
+def test_logits_correction_safe_baseline_still_requires_formal_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_checkpoint = tmp_path / "init.pt"
+    manifest = tmp_path / "manifest.json"
+    preflight_path = tmp_path / "preflight.json"
+    init_checkpoint.write_bytes(b"init")
+    manifest.write_text("{}\n", encoding="utf-8")
+    preflight_path.write_text("{}\n", encoding="utf-8")
+    selected_profile = {
+        "name": "baseline",
+        "batch_size": 12,
+        "frame_budget": 8_000,
+    }
+    preflight = {
+        "report_path": str(preflight_path.resolve()),
+        "report_sha256": correction.sha256_file(preflight_path),
+        "init_checkpoint_path": str(init_checkpoint.resolve()),
+        "bucket_manifest_path": str(manifest.resolve()),
+        "selection_decision": "keep_baseline",
+        "selected_profile_name": "baseline",
+        "selected_profile_row": {"profile": selected_profile},
+    }
+    monkeypatch.setattr(
+        batch_profile_validation,
+        "validate_stage211_batch_profile_preflight",
+        lambda *args, **kwargs: preflight,
+    )
+
+    with pytest.raises(ValueError, match="lacks batch-profile admission"):
+        stage211_gate._validate_stage211_correction_batch_profile(
+            {
+                "batch_profile_preflight_path": str(preflight_path.resolve()),
+                "batch_profile_preflight_sha256": correction.sha256_file(preflight_path),
+                "batch_profile_admission_path": None,
+                "batch_profile_admission_sha256": None,
+                "batch_profile_name": "baseline",
+                "batch_size": 12,
+                "frame_budget": 8_000,
+            },
+            phase="logits",
+            manifest_path=manifest.resolve(),
+            init_checkpoint=init_checkpoint.resolve(),
+        )
+
+
 def test_retention_correction_smoke_marker_binds_round_inputs(
     tmp_path: Path,
 ) -> None:
@@ -122,6 +171,14 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
         encoding="utf-8",
     )
     marker_path = tmp_path / "smoke-passed.json"
+    batch_profile = {
+        "report_path": str(replay_receipt.resolve()),
+        "report_sha256": correction.sha256_file(replay_receipt),
+        "selected_profile_name": "baseline",
+        "selected_profile_row": {
+            "profile": {"name": "baseline", "batch_size": 36, "frame_budget": 24_000}
+        },
+    }
     marker_path.write_text(
         json.dumps(
             {
@@ -149,6 +206,13 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
                 "layer_focus_sha256": correction.sha256_file(layer_focus),
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
+                "batch_profile_preflight_path": batch_profile["report_path"],
+                "batch_profile_preflight_sha256": batch_profile["report_sha256"],
+                "batch_profile_admission_path": None,
+                "batch_profile_admission_sha256": None,
+                "batch_profile_name": "baseline",
+                "batch_size": 36,
+                "frame_budget": 24_000,
             }
         )
         + "\n",
@@ -164,6 +228,8 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
         admission_gate=admission_gate,
         layer_focus=layer_focus,
         nano_checkpoint=nano_checkpoint,
+        batch_profile_preflight=batch_profile,
+        batch_profile_admission=None,
     )
     assert marker["correction_round"] == 1
 
@@ -178,6 +244,8 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
             admission_gate=admission_gate,
             layer_focus=layer_focus,
             nano_checkpoint=nano_checkpoint,
+            batch_profile_preflight=batch_profile,
+            batch_profile_admission=None,
         )
 
     admission_gate.write_bytes(b"gate")
@@ -194,6 +262,8 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
             admission_gate=admission_gate,
             layer_focus=layer_focus,
             nano_checkpoint=nano_checkpoint,
+            batch_profile_preflight=batch_profile,
+            batch_profile_admission=None,
         )
 
 
@@ -210,6 +280,19 @@ def test_retention_correction_resume_requires_smoke_marker(
             admission_gate=tmp_path / "gate.json",
             layer_focus=tmp_path / "focus.json",
             layer_focus_payload={"boundary_layer_ids": []},
+            batch_profile_preflight={
+                "report_path": str(tmp_path / "profile.json"),
+                "report_sha256": "a" * 64,
+                "selected_profile_name": "baseline",
+                "selected_profile_row": {
+                    "profile": {
+                        "name": "baseline",
+                        "batch_size": 36,
+                        "frame_budget": 24_000,
+                    }
+                },
+            },
+            batch_profile_admission=None,
             init_checkpoint=tmp_path / "init.pt",
             nano_checkpoint=tmp_path / "nano.pt",
             audio_data_audit={},
@@ -259,6 +342,57 @@ def test_create_stage211_retention_correction_receipt(
     nano_dir.mkdir()
     nano_checkpoint = nano_dir / "model.pt"
     nano_checkpoint.write_bytes(b"nano")
+    batch_size = 12 if phase == "logits" else 36
+    frame_budget = 8_000 if phase == "logits" else 24_000
+    profile_report = tmp_path / "batch-profile.json"
+    profile_report.write_text("{}\n", encoding="utf-8")
+    loaded_manifest = correction.load_webdataset_bucket_manifest(manifest)
+    profile_steps = correction.estimate_bucket_manifest_steps(
+        loaded_manifest,
+        split="train",
+        batch_size=batch_size,
+        world_size=4,
+        frame_budget=frame_budget,
+        drop_last=False,
+    )
+    profile_tail = correction.estimate_bucket_manifest_tail_padding_samples(
+        loaded_manifest,
+        split="train",
+        batch_size=batch_size,
+        world_size=4,
+        frame_budget=frame_budget,
+    )
+    selected_profile = {
+        "name": "baseline",
+        "batch_size": batch_size,
+        "frame_budget": frame_budget,
+    }
+    batch_profile_preflight = {
+        "report_path": str(profile_report.resolve()),
+        "report_sha256": correction.sha256_file(profile_report),
+        "init_checkpoint_path": str(init_checkpoint.resolve()),
+        "bucket_manifest_path": str(manifest.resolve()),
+        "selection_decision": "keep_baseline",
+        "selected_profile_name": "baseline",
+        "selected_profile_row": {
+            "profile": selected_profile,
+            "coverage": {
+                "steps_per_epoch": profile_steps,
+                "tail_padding_samples_per_epoch": profile_tail,
+            },
+        },
+    }
+    profile_admission_path = tmp_path / "batch-profile-admission.json"
+    profile_admission_path.write_text("{}\n", encoding="utf-8")
+    batch_profile_admission = (
+        {
+            "receipt_path": str(profile_admission_path.resolve()),
+            "receipt_sha256": correction.sha256_file(profile_admission_path),
+            "selected_profile": selected_profile,
+        }
+        if phase == "logits"
+        else None
+    )
     smoke_checkpoint = tmp_path / "smoke-step-2.pt"
     smoke_log = tmp_path / "smoke.log"
     smoke_checkpoint.write_bytes(b"smoke-checkpoint")
@@ -285,6 +419,21 @@ def test_create_stage211_retention_correction_receipt(
                 "layer_focus_sha256": correction.sha256_file(layer_focus),
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
+                "batch_profile_preflight_path": batch_profile_preflight["report_path"],
+                "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
+                "batch_profile_admission_path": (
+                    batch_profile_admission["receipt_path"]
+                    if batch_profile_admission is not None
+                    else None
+                ),
+                "batch_profile_admission_sha256": (
+                    batch_profile_admission["receipt_sha256"]
+                    if batch_profile_admission is not None
+                    else None
+                ),
+                "batch_profile_name": "baseline",
+                "batch_size": batch_size,
+                "frame_budget": frame_budget,
                 "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
                 "smoke_checkpoint_sha256": correction.sha256_file(smoke_checkpoint),
                 "smoke_log_path": str(smoke_log.resolve()),
@@ -302,9 +451,9 @@ def test_create_stage211_retention_correction_receipt(
         {
             "lr": correction_lr,
             "max_steps": 1,
-            "batch_size": 36,
-            "batch_token_budget": 24_000,
-            "length_bucket_frame_budget": 24_000,
+            "batch_size": batch_size,
+            "batch_token_budget": frame_budget,
+            "length_bucket_frame_budget": frame_budget,
             "length_bucket_drop_last": False,
             "skip_oversized_samples": False,
             "webdataset_skip_decode_errors": False,
@@ -318,14 +467,52 @@ def test_create_stage211_retention_correction_receipt(
             "stage211_post_coverage_admission_gate_path": str(admission_gate.resolve()),
             "stage211_post_coverage_layer_focus_path": str(layer_focus.resolve()),
             "stage211_post_coverage_layer_focus_sha256": correction.sha256_file(layer_focus),
+            "stage211_post_coverage_batch_profile_preflight_path": batch_profile_preflight[
+                "report_path"
+            ],
+            "stage211_post_coverage_batch_profile_preflight_sha256": batch_profile_preflight[
+                "report_sha256"
+            ],
+            "stage211_post_coverage_batch_profile_admission_path": (
+                batch_profile_admission["receipt_path"]
+                if batch_profile_admission is not None
+                else None
+            ),
+            "stage211_post_coverage_batch_profile_admission_sha256": (
+                batch_profile_admission["receipt_sha256"]
+                if batch_profile_admission is not None
+                else None
+            ),
+            "stage211_post_coverage_batch_profile_name": "baseline",
+            "stage211_post_coverage_batch_size": batch_size,
+            "stage211_post_coverage_frame_budget": frame_budget,
             "stage211_post_coverage_original_coverage_unchanged": True,
             "stage211_post_coverage_smoke_marker_path": str(smoke_marker.resolve()),
             "stage211_post_coverage_smoke_marker_sha256": correction.sha256_file(smoke_marker),
         }
     )
+    if batch_profile_admission is not None:
+        config.update(
+            {
+                "stage211_batch_profile_admission_path": batch_profile_admission["receipt_path"],
+                "stage211_batch_profile_admission_sha256": batch_profile_admission[
+                    "receipt_sha256"
+                ],
+                "stage211_batch_profile_name": "baseline",
+            }
+        )
+    deepspeed = dict(config.get("deepspeed") or {})
+    deepspeed.update(
+        {
+            "gradient_accumulation_steps": 1,
+            "train_micro_batch_size_per_gpu": batch_size,
+            "train_batch_size": batch_size * 4,
+        }
+    )
+    config["deepspeed"] = deepspeed
     save_yaml(run_dir / "train_config.yaml", config)
     provenance = {
-        "schema_version": 1,
+        "schema_version": 2,
         "pipeline": "stage211",
         "artifact": "retention_correction_run",
         "phase": phase,
@@ -337,6 +524,21 @@ def test_create_stage211_retention_correction_receipt(
         "admission_gate_sha256": correction.sha256_file(admission_gate),
         "layer_focus_path": str(layer_focus.resolve()),
         "layer_focus_sha256": correction.sha256_file(layer_focus),
+        "batch_profile_preflight_path": batch_profile_preflight["report_path"],
+        "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
+        "batch_profile_admission_path": (
+            batch_profile_admission["receipt_path"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_admission_sha256": (
+            batch_profile_admission["receipt_sha256"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_name": "baseline",
+        "batch_size": batch_size,
+        "frame_budget": frame_budget,
         "init_checkpoint_path": str(init_checkpoint.resolve()),
         "init_checkpoint_sha256": correction.sha256_file(init_checkpoint),
         "replay_manifest_path": str(manifest.resolve()),
@@ -386,6 +588,16 @@ def test_create_stage211_retention_correction_receipt(
     )
     monkeypatch.setattr(
         correction,
+        "validate_stage211_batch_profile_preflight",
+        lambda *args, **kwargs: batch_profile_preflight,
+    )
+    monkeypatch.setattr(
+        correction,
+        "validate_stage211_batch_profile_admission",
+        lambda *args, **kwargs: batch_profile_admission,
+    )
+    monkeypatch.setattr(
+        correction,
         "audit_stage211_runtime_epoch_coverage",
         lambda **kwargs: {"complete": True, "epochs": kwargs["epochs"]},
     )
@@ -407,10 +619,14 @@ def test_create_stage211_retention_correction_receipt(
 
     assert receipt["artifact"] == "post_coverage_correction"
     assert receipt["round"] == 1
+    assert receipt["schema_version"] == 2
     assert receipt["rows"] == 8
     assert receipt["steps"] == 1
     assert receipt["phase"] == phase
     assert receipt["learning_rate"] == correction_lr
+    assert receipt["batch_size"] == batch_size
+    assert receipt["frame_budget"] == frame_budget
+    assert receipt["batch_profile_preflight_sha256"] == batch_profile_preflight["report_sha256"]
     assert receipt["nano_teacher_checkpoint_sha256"] == nano_sha256
     assert receipt["smoke_marker_sha256"] == correction.sha256_file(smoke_marker)
     assert receipt["layer_focus_sha256"] == correction.sha256_file(layer_focus)

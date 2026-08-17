@@ -192,6 +192,10 @@ def test_phase_correction_commands_preserve_phase_objective(
 
     assert finalizer[finalizer.index("--phase") + 1] == phase
     assert correction[correction.index("--phase") + 1] == phase
+    assert "--auto-batch-profile" in correction
+    assert correction[correction.index("--batch-profile-master-port") + 1] == str(
+        args.master_port + 100
+    )
     assert "--post-coverage-correction-receipt" in finalizer
     if phase == "block":
         assert "--baseline-public-comparison-report" in finalizer

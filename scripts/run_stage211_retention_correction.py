@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from rwkvasr.config import save_yaml
+from rwkvasr.config import load_yaml, save_yaml
 from rwkvasr.data import (
     estimate_bucket_manifest_steps,
     estimate_bucket_manifest_tail_padding_samples,
@@ -26,6 +26,9 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_correction_layer_focus,
     validate_stage211_correction_extension_decision,
     validate_stage211_phase_gate_report,
+)
+from rwkvasr.eval.stage211_batch_profile import (
+    validate_stage211_batch_profile_admission,
 )
 
 try:
@@ -48,6 +51,7 @@ try:
     )
     from scripts.run_stage211_full_phase_curriculum import (
         _audit_smoke as _audit_full_profile_smoke,
+        _ensure_measured_batch_profile,
     )
     from scripts.run_stage211_full_phase_curriculum import (
         _validate_smoke_marker as _validate_full_profile_smoke_marker,
@@ -77,6 +81,7 @@ except ModuleNotFoundError as error:
     )
     from run_stage211_full_phase_curriculum import (
         _audit_smoke as _audit_full_profile_smoke,
+        _ensure_measured_batch_profile,
     )
     from run_stage211_full_phase_curriculum import (
         _validate_smoke_marker as _validate_full_profile_smoke_marker,
@@ -231,12 +236,14 @@ def _provenance_payload(
     nano_checkpoint: Path,
     smoke_marker: Path,
     layer_focus: Path,
+    batch_profile_preflight: dict[str, Any],
+    batch_profile_admission: dict[str, Any] | None,
     extension_decision: Path | None,
     steps_per_epoch: int,
     phase: str = "mixer",
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "pipeline": "stage211",
         "artifact": "retention_correction_run",
         "phase": phase,
@@ -256,6 +263,25 @@ def _provenance_payload(
         "smoke_marker_sha256": sha256_file(smoke_marker),
         "layer_focus_path": str(layer_focus),
         "layer_focus_sha256": sha256_file(layer_focus),
+        "batch_profile_preflight_path": batch_profile_preflight["report_path"],
+        "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
+        "batch_profile_admission_path": (
+            batch_profile_admission["receipt_path"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_admission_sha256": (
+            batch_profile_admission["receipt_sha256"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_name": batch_profile_preflight["selected_profile_name"],
+        "batch_size": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]
+        ),
+        "frame_budget": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
+        ),
         "correction_extension_decision_path": (
             str(extension_decision) if extension_decision is not None else None
         ),
@@ -276,8 +302,11 @@ def _correction_config_metadata(
     replay_receipt: Path,
     admission_gate: Path,
     layer_focus: Path,
+    batch_profile_preflight: dict[str, Any],
+    batch_profile_admission: dict[str, Any] | None,
     phase: str = "mixer",
 ) -> dict[str, Any]:
+    selected_profile = batch_profile_preflight["selected_profile_row"]["profile"]
     return {
         "stage211_post_coverage_correction_phase": phase,
         "stage211_post_coverage_correction_round": round_index,
@@ -285,6 +314,25 @@ def _correction_config_metadata(
         "stage211_post_coverage_admission_gate_path": str(admission_gate),
         "stage211_post_coverage_layer_focus_path": str(layer_focus),
         "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
+        "stage211_post_coverage_batch_profile_preflight_path": batch_profile_preflight[
+            "report_path"
+        ],
+        "stage211_post_coverage_batch_profile_preflight_sha256": batch_profile_preflight[
+            "report_sha256"
+        ],
+        "stage211_post_coverage_batch_profile_admission_path": (
+            batch_profile_admission["receipt_path"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_post_coverage_batch_profile_admission_sha256": (
+            batch_profile_admission["receipt_sha256"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_post_coverage_batch_profile_name": selected_profile["name"],
+        "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
+        "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
         "stage211_post_coverage_original_coverage_unchanged": True,
     }
 
@@ -299,6 +347,8 @@ def _validate_correction_smoke_marker(
     admission_gate: Path,
     layer_focus: Path,
     nano_checkpoint: Path,
+    batch_profile_preflight: dict[str, Any],
+    batch_profile_admission: dict[str, Any] | None,
     phase: str = "mixer",
 ) -> dict[str, Any]:
     raw_marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -325,6 +375,25 @@ def _validate_correction_smoke_marker(
         "layer_focus_sha256": sha256_file(layer_focus),
         "nano_teacher_checkpoint_path": str(nano_checkpoint),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+        "batch_profile_preflight_path": batch_profile_preflight["report_path"],
+        "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
+        "batch_profile_admission_path": (
+            batch_profile_admission["receipt_path"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_admission_sha256": (
+            batch_profile_admission["receipt_sha256"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_name": batch_profile_preflight["selected_profile_name"],
+        "batch_size": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]
+        ),
+        "frame_budget": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
+        ),
     }
     if any(marker.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 correction smoke marker binding mismatch.")
@@ -351,6 +420,8 @@ def _run_correction_smoke(
     admission_gate: Path,
     layer_focus: Path,
     layer_focus_payload: dict[str, Any],
+    batch_profile_preflight: dict[str, Any],
+    batch_profile_admission: dict[str, Any] | None,
     init_checkpoint: Path,
     nano_checkpoint: Path,
     audio_data_audit: dict[str, Any],
@@ -372,6 +443,8 @@ def _run_correction_smoke(
             admission_gate=admission_gate,
             layer_focus=layer_focus,
             nano_checkpoint=nano_checkpoint,
+            batch_profile_preflight=batch_profile_preflight,
+            batch_profile_admission=batch_profile_admission,
             phase=phase,
         )
         return marker_path
@@ -399,6 +472,7 @@ def _run_correction_smoke(
         full_data_profile=True,
         post_coverage_correction=True,
         correction_layer_boundary_ids=layer_focus_payload["boundary_layer_ids"],
+        batch_profile_admission=batch_profile_admission,
     )
     config.update(
         _correction_config_metadata(
@@ -406,6 +480,8 @@ def _run_correction_smoke(
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
             layer_focus=layer_focus,
+            batch_profile_preflight=batch_profile_preflight,
+            batch_profile_admission=batch_profile_admission,
             phase=phase,
         )
     )
@@ -444,6 +520,25 @@ def _run_correction_smoke(
             "layer_focus_sha256": sha256_file(layer_focus),
             "nano_teacher_checkpoint_path": str(nano_checkpoint),
             "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+            "batch_profile_preflight_path": batch_profile_preflight["report_path"],
+            "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
+            "batch_profile_admission_path": (
+                batch_profile_admission["receipt_path"]
+                if batch_profile_admission is not None
+                else None
+            ),
+            "batch_profile_admission_sha256": (
+                batch_profile_admission["receipt_sha256"]
+                if batch_profile_admission is not None
+                else None
+            ),
+            "batch_profile_name": batch_profile_preflight["selected_profile_name"],
+            "batch_size": int(
+                batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]
+            ),
+            "frame_budget": int(
+                batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
+            ),
         }
     )
     _write_immutable_json(marker_path, marker)
@@ -456,6 +551,8 @@ def _run_correction_smoke(
         admission_gate=admission_gate,
         layer_focus=layer_focus,
         nano_checkpoint=nano_checkpoint,
+        batch_profile_preflight=batch_profile_preflight,
+        batch_profile_admission=batch_profile_admission,
         phase=phase,
     )
     return marker_path
@@ -504,21 +601,6 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         label=f"{phase_name} correction round {round_index}",
     )
     manifest = load_webdataset_bucket_manifest(replay_manifest)
-    steps_per_epoch = estimate_bucket_manifest_steps(
-        manifest,
-        split="train",
-        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
-        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
-        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
-        drop_last=False,
-    )
-    tail_padding = estimate_bucket_manifest_tail_padding_samples(
-        manifest,
-        split="train",
-        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
-        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
-        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
-    )
     run_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
@@ -554,6 +636,128 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             flush=True,
         )
     phase_config = replace(PHASES[phase_name], lr=correction_lr)
+    config_dir = (
+        args.config_dir.expanduser().resolve() / phase_name / f"correction_round_{round_index:02d}"
+    )
+    config_dir.mkdir(parents=True, exist_ok=True)
+    legacy_steps_per_epoch = estimate_bucket_manifest_steps(
+        manifest,
+        split="train",
+        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
+        drop_last=False,
+    )
+    profile_segment = _correction_segment(
+        round_index=round_index,
+        steps_per_epoch=legacy_steps_per_epoch,
+        phase=phase_name,
+    )
+    profile_config = _stage211_config(
+        phase=phase_config,
+        segment=profile_segment,
+        output_dir=run_dir,
+        init_checkpoint=init_checkpoint,
+        bucket_manifest=replay_manifest,
+        resume=False,
+        smoke=False,
+        nano_checkpoint=nano_checkpoint,
+        audio_data_audit=audio_data_audit,
+        full_data_profile=True,
+        post_coverage_correction=True,
+        correction_layer_boundary_ids=layer_focus["boundary_layer_ids"],
+    )
+    profile_config_path = config_dir / "batch_profile_base.yaml"
+    if profile_config_path.is_file():
+        if load_yaml(profile_config_path) != profile_config:
+            raise ValueError(
+                f"Stage211 correction batch-profile base config changed: {profile_config_path}"
+            )
+    else:
+        save_yaml(profile_config_path, profile_config)
+
+    if args.dry_run:
+        selected_profile = {
+            "name": "baseline",
+            "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+            "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        }
+        batch_profile_preflight = {
+            "report_path": str(profile_config_path),
+            "report_sha256": sha256_file(profile_config_path),
+            "selection_decision": "dry_run_baseline",
+            "selected_profile_name": "baseline",
+            "selected_profile_row": {"profile": selected_profile},
+        }
+        batch_profile_admission = None
+    else:
+        if not bool(getattr(args, "auto_batch_profile", False)):
+            raise ValueError(
+                "Stage211 production correction requires --auto-batch-profile before formal steps."
+            )
+        profile_scope = f"correction_round_{round_index:02d}"
+        expected_report = (
+            run_dir.parent
+            / "batch_profile_preflight"
+            / f"{profile_scope}-{sha256_file(init_checkpoint)[:16]}"
+            / "batch_throughput_preflight.json"
+        )
+        if latest_step > 0 and not expected_report.is_file():
+            raise ValueError(
+                "Stage211 correction formal progress lacks its checkpoint-bound batch profile."
+            )
+        batch_profile_preflight, batch_profile_admission_path = (
+            _ensure_measured_batch_profile(
+                phase=phase_name,
+                scope=profile_scope,
+                phase_root=run_dir.parent,
+                base_config=profile_config_path,
+                manifest_path=replay_manifest,
+                init_checkpoint=init_checkpoint,
+                master_port=int(args.batch_profile_master_port),
+                admitted_by="stage211-auto-correction-boundary",
+                reason=(
+                    "correction phase/checkpoint/retention-manifest-specific four-GPU profile "
+                    "passed memory, objective-match, fixed-eval, and projected-time gates"
+                ),
+            )
+        )
+        batch_profile_admission = (
+            validate_stage211_batch_profile_admission(
+                batch_profile_admission_path,
+                phase=phase_name,
+                expected_init_checkpoint=init_checkpoint,
+                expected_bucket_manifest=replay_manifest,
+            )
+            if batch_profile_admission_path is not None
+            else None
+        )
+        selected_profile = batch_profile_preflight["selected_profile_row"]["profile"]
+
+    runtime_batch_size = int(selected_profile["batch_size"])
+    runtime_frame_budget = int(selected_profile["frame_budget"])
+    steps_per_epoch = estimate_bucket_manifest_steps(
+        manifest,
+        split="train",
+        batch_size=runtime_batch_size,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=runtime_frame_budget,
+        drop_last=False,
+    )
+    tail_padding = estimate_bucket_manifest_tail_padding_samples(
+        manifest,
+        split="train",
+        batch_size=runtime_batch_size,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=runtime_frame_budget,
+    )
+    selected_coverage = batch_profile_preflight["selected_profile_row"].get("coverage")
+    if not args.dry_run and (
+        not isinstance(selected_coverage, dict)
+        or int(selected_coverage.get("steps_per_epoch", -1)) != steps_per_epoch
+        or int(selected_coverage.get("tail_padding_samples_per_epoch", -1)) != tail_padding
+    ):
+        raise ValueError("Stage211 correction selected batch-profile coverage changed.")
     segment = _correction_segment(
         round_index=round_index,
         steps_per_epoch=steps_per_epoch,
@@ -572,6 +776,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         full_data_profile=True,
         post_coverage_correction=True,
         correction_layer_boundary_ids=layer_focus["boundary_layer_ids"],
+        batch_profile_admission=batch_profile_admission,
     )
     config.update(
         _correction_config_metadata(
@@ -579,13 +784,11 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
             layer_focus=layer_focus_path,
+            batch_profile_preflight=batch_profile_preflight,
+            batch_profile_admission=batch_profile_admission,
             phase=phase_name,
         )
     )
-    config_dir = (
-        args.config_dir.expanduser().resolve() / phase_name / f"correction_round_{round_index:02d}"
-    )
-    config_dir.mkdir(parents=True, exist_ok=True)
     smoke_marker_path = _run_correction_smoke(
         round_index=round_index,
         run_dir=run_dir,
@@ -595,6 +798,8 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         admission_gate=admission_gate,
         layer_focus=layer_focus_path,
         layer_focus_payload=layer_focus,
+        batch_profile_preflight=batch_profile_preflight,
+        batch_profile_admission=batch_profile_admission,
         init_checkpoint=init_checkpoint,
         nano_checkpoint=nano_checkpoint,
         audio_data_audit=audio_data_audit,
@@ -626,6 +831,8 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             nano_checkpoint=nano_checkpoint,
             smoke_marker=smoke_marker_path,
             layer_focus=layer_focus_path,
+            batch_profile_preflight=batch_profile_preflight,
+            batch_profile_admission=batch_profile_admission,
             extension_decision=extension_decision,
             steps_per_epoch=steps_per_epoch,
             phase=phase_name,
@@ -643,6 +850,8 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         "stage211_post_coverage_correction "
         f"phase={phase_name} round={round_index} rows={replay['validated_unique_keys']} "
         f"steps={steps_per_epoch} tail_padding={tail_padding} "
+        f"profile={selected_profile['name']} batch={runtime_batch_size} "
+        f"frame_budget={runtime_frame_budget} "
         f"focus_layers={','.join(str(value) for value in layer_focus['boundary_layer_ids']) or '-'} "
         f"latest_step={latest_step} run_dir={run_dir}",
         flush=True,
@@ -705,6 +914,12 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--config-dir", type=Path, default=DEFAULT_CONFIG_DIR)
     parser.add_argument("--master-port", type=int, default=29641)
+    parser.add_argument(
+        "--auto-batch-profile",
+        action="store_true",
+        help="Measure and admit the fastest safe phase/checkpoint-specific correction profile.",
+    )
+    parser.add_argument("--batch-profile-master-port", type=int, default=29751)
     parser.add_argument("--max-peak-reserved-gib", type=float, default=22.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-nano-weight-audit", action="store_true")
@@ -713,6 +928,8 @@ def main() -> int:
         parser.error("--skip-nano-weight-audit is allowed only with --dry-run")
     if args.max_peak_reserved_gib <= 0:
         parser.error("--max-peak-reserved-gib must be positive")
+    if args.batch_profile_master_port <= 0:
+        parser.error("--batch-profile-master-port must be positive")
     run_correction(args)
     return 0
 

@@ -12,6 +12,23 @@ sys.path.insert(0, str(REPO_ROOT))
 runner = importlib.import_module("scripts.run_stage211_retention_correction")
 
 
+def _batch_profile(tmp_path: Path, *, batch_size: int = 36, frame_budget: int = 24_000):
+    report = tmp_path / "batch-profile.json"
+    report.write_bytes(b"batch-profile")
+    return {
+        "report_path": str(report.resolve()),
+        "report_sha256": runner.sha256_file(report),
+        "selected_profile_name": "selected",
+        "selected_profile_row": {
+            "profile": {
+                "name": "selected",
+                "batch_size": batch_size,
+                "frame_budget": frame_budget,
+            }
+        },
+    }
+
+
 def test_stage211_correction_segment_is_one_complete_low_lr_round() -> None:
     segment = runner._correction_segment(round_index=2, steps_per_epoch=1234)
 
@@ -109,6 +126,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     ):
         path.write_bytes(path.name.encode())
     run_dir = tmp_path / "run"
+    batch_profile = _batch_profile(tmp_path)
 
     provenance = runner._provenance_payload(
         round_index=1,
@@ -120,11 +138,14 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
         nano_checkpoint=nano_checkpoint,
         smoke_marker=smoke_marker,
         layer_focus=layer_focus,
+        batch_profile_preflight=batch_profile,
+        batch_profile_admission=None,
         extension_decision=None,
         steps_per_epoch=99,
     )
 
     assert provenance["artifact"] == "retention_correction_run"
+    assert provenance["schema_version"] == 2
     assert provenance["round"] == 1
     assert provenance["steps_per_epoch"] == 99
     assert provenance["learning_rate"] == runner.CORRECTION_LR
@@ -133,6 +154,9 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     assert len(provenance["admission_gate_sha256"]) == 64
     assert provenance["smoke_marker_sha256"] == runner.sha256_file(smoke_marker)
     assert provenance["layer_focus_sha256"] == runner.sha256_file(layer_focus)
+    assert provenance["batch_profile_preflight_sha256"] == batch_profile["report_sha256"]
+    assert provenance["batch_size"] == 36
+    assert provenance["frame_budget"] == 24_000
     assert provenance["correction_extension_decision_path"] is None
     assert provenance["correction_extension_decision_sha256"] is None
 
@@ -160,6 +184,7 @@ def test_stage211_downstream_correction_provenance_records_phase_objective_with_
     }
     for path in inputs.values():
         path.write_bytes(path.name.encode())
+    batch_profile = _batch_profile(tmp_path)
 
     provenance = runner._provenance_payload(
         round_index=2,
@@ -171,6 +196,8 @@ def test_stage211_downstream_correction_provenance_records_phase_objective_with_
         nano_checkpoint=inputs["model.pt"],
         smoke_marker=inputs["smoke.json"],
         layer_focus=inputs["focus.json"],
+        batch_profile_preflight=batch_profile,
+        batch_profile_admission=None,
         extension_decision=None,
         steps_per_epoch=321,
         phase=phase,

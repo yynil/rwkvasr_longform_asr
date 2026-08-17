@@ -31,6 +31,10 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_phase_gate_report,
 )
 from rwkvasr.eval.stage211_runtime import audit_stage211_runtime_epoch_coverage
+from rwkvasr.eval.stage211_batch_profile import (
+    validate_stage211_batch_profile_admission,
+    validate_stage211_batch_profile_preflight,
+)
 
 try:
     from scripts.create_stage211_curriculum_receipt import (
@@ -80,6 +84,8 @@ def _validate_correction_smoke_marker(
     layer_focus: Path,
     init_checkpoint: Path,
     nano_checkpoint: Path,
+    batch_profile_preflight: dict[str, Any],
+    batch_profile_admission: dict[str, Any] | None,
     phase: str = "mixer",
 ) -> dict[str, Any]:
     marker = _load_json(marker_path, label="Stage211 correction smoke marker")
@@ -102,6 +108,25 @@ def _validate_correction_smoke_marker(
         "layer_focus_sha256": sha256_file(layer_focus),
         "nano_teacher_checkpoint_path": str(nano_checkpoint),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
+        "batch_profile_preflight_path": batch_profile_preflight["report_path"],
+        "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
+        "batch_profile_admission_path": (
+            batch_profile_admission["receipt_path"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_admission_sha256": (
+            batch_profile_admission["receipt_sha256"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_name": batch_profile_preflight["selected_profile_name"],
+        "batch_size": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]
+        ),
+        "frame_budget": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
+        ),
     }
     if any(marker.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 correction smoke marker contract mismatch.")
@@ -137,6 +162,8 @@ def _validate_correction_train_config(
     layer_focus_payload: dict[str, Any],
     init_checkpoint: Path,
     smoke_marker: Path,
+    batch_profile_preflight: dict[str, Any],
+    batch_profile_admission: dict[str, Any] | None,
     phase: str = "mixer",
 ) -> None:
     configured_phase = config.get("stage211_post_coverage_correction_phase", "mixer")
@@ -156,11 +183,12 @@ def _validate_correction_train_config(
                 f"Stage211 correction train config {key} mismatch: "
                 f"actual={actual!r} expected={expected!r}"
             )
+    selected_profile = batch_profile_preflight["selected_profile_row"]["profile"]
     expected_fields = {
         "max_steps": steps_per_epoch,
-        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
-        "batch_token_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
-        "length_bucket_frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "batch_size": int(selected_profile["batch_size"]),
+        "batch_token_budget": int(selected_profile["frame_budget"]),
+        "length_bucket_frame_budget": int(selected_profile["frame_budget"]),
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
@@ -176,6 +204,25 @@ def _validate_correction_train_config(
         "stage211_post_coverage_admission_gate_path": str(admission_gate),
         "stage211_post_coverage_layer_focus_path": str(layer_focus),
         "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
+        "stage211_post_coverage_batch_profile_preflight_path": batch_profile_preflight[
+            "report_path"
+        ],
+        "stage211_post_coverage_batch_profile_preflight_sha256": batch_profile_preflight[
+            "report_sha256"
+        ],
+        "stage211_post_coverage_batch_profile_admission_path": (
+            batch_profile_admission["receipt_path"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_post_coverage_batch_profile_admission_sha256": (
+            batch_profile_admission["receipt_sha256"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_post_coverage_batch_profile_name": selected_profile["name"],
+        "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
+        "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
         "stage211_post_coverage_original_coverage_unchanged": True,
         "stage211_post_coverage_smoke_marker_path": str(smoke_marker),
         "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
@@ -186,6 +233,43 @@ def _validate_correction_train_config(
                 f"Stage211 correction train config {key} mismatch: "
                 f"actual={config.get(key)!r} expected={expected!r}"
             )
+    deepspeed = config.get("deepspeed")
+    gradient_accumulation = (
+        int(deepspeed.get("gradient_accumulation_steps", 1))
+        if isinstance(deepspeed, dict)
+        else -1
+    )
+    if not isinstance(deepspeed, dict) or any(
+        (
+            int(deepspeed.get("train_micro_batch_size_per_gpu", -1))
+            != int(selected_profile["batch_size"]),
+            int(deepspeed.get("train_batch_size", -1))
+            != int(selected_profile["batch_size"])
+            * STAGE211_FULL_DATA_WORLD_SIZE
+            * gradient_accumulation,
+        )
+    ):
+        raise ValueError("Stage211 correction train config DeepSpeed batch profile mismatch.")
+    expected_admission_fields = {
+        "stage211_batch_profile_admission_path": (
+            batch_profile_admission["receipt_path"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_batch_profile_admission_sha256": (
+            batch_profile_admission["receipt_sha256"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_batch_profile_name": (
+            batch_profile_admission["selected_profile"]["name"]
+            if batch_profile_admission is not None
+            else None
+        ),
+    }
+    for key, expected in expected_admission_fields.items():
+        if config.get(key) != expected:
+            raise ValueError(f"Stage211 correction train config {key} mismatch.")
     init_path = config.get("init_checkpoint_path")
     resume_from = config.get("resume_from")
     if not (
@@ -251,28 +335,6 @@ def build_receipt(
     eval_rows = sum(bucket.num_samples for bucket in manifest.splits.get("eval", ()))
     if rows != int(replay.get("validated_unique_keys", -1)) or eval_rows != 256:
         raise ValueError("Stage211 correction replay manifest coverage mismatch.")
-    steps_per_epoch = estimate_bucket_manifest_steps(
-        manifest,
-        split="train",
-        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
-        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
-        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
-        drop_last=False,
-    )
-    tail_padding_samples = estimate_bucket_manifest_tail_padding_samples(
-        manifest,
-        split="train",
-        batch_size=STAGE211_FULL_DATA_BATCH_SIZE,
-        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
-        frame_budget=STAGE211_FULL_DATA_FRAME_BUDGET,
-    )
-    if _checkpoint_step(completion_checkpoint_path) != steps_per_epoch:
-        raise ValueError(
-            "Stage211 correction completion checkpoint step mismatch: "
-            f"actual={_checkpoint_step(completion_checkpoint_path)} "
-            f"expected={steps_per_epoch}"
-        )
-
     admission_gate = validate_stage211_phase_gate_report(
         admission_gate_path,
         expected_phase=phase,
@@ -324,8 +386,81 @@ def build_receipt(
         admission_gate_path=admission_gate_path,
         admission_gate=admission_gate,
     )
+    batch_profile_preflight_path = Path(
+        str(provenance.get("batch_profile_preflight_path") or "")
+    ).resolve()
+    batch_profile_preflight = validate_stage211_batch_profile_preflight(
+        batch_profile_preflight_path,
+        phase=phase,
+        require_candidate=False,
+    )
+    if (
+        batch_profile_preflight["report_sha256"]
+        != provenance.get("batch_profile_preflight_sha256")
+        or Path(str(batch_profile_preflight["init_checkpoint_path"])).resolve()
+        != init_checkpoint_path
+        or Path(str(batch_profile_preflight["bucket_manifest_path"])).resolve()
+        != replay_manifest
+    ):
+        raise ValueError("Stage211 correction batch-profile preflight binding mismatch.")
+    admission_path_value = provenance.get("batch_profile_admission_path")
+    admission_sha256_value = provenance.get("batch_profile_admission_sha256")
+    if admission_path_value is None and admission_sha256_value is None:
+        batch_profile_admission = None
+        selected_profile = batch_profile_preflight["selected_profile_row"]["profile"]
+        if (
+            batch_profile_preflight["selection_decision"] != "keep_baseline"
+            or phase == "logits"
+            or int(selected_profile["batch_size"]) != STAGE211_FULL_DATA_BATCH_SIZE
+            or int(selected_profile["frame_budget"]) != STAGE211_FULL_DATA_FRAME_BUDGET
+        ):
+            raise ValueError("Stage211 correction lacks its required batch-profile admission.")
+    elif isinstance(admission_path_value, str) and isinstance(admission_sha256_value, str):
+        batch_profile_admission = validate_stage211_batch_profile_admission(
+            Path(admission_path_value),
+            phase=phase,
+            expected_init_checkpoint=init_checkpoint_path,
+            expected_bucket_manifest=replay_manifest,
+        )
+        if batch_profile_admission["receipt_sha256"] != admission_sha256_value:
+            raise ValueError("Stage211 correction batch-profile admission changed.")
+        selected_profile = batch_profile_admission["selected_profile"]
+        if selected_profile != batch_profile_preflight["selected_profile_row"]["profile"]:
+            raise ValueError("Stage211 correction batch-profile selection mismatch.")
+    else:
+        raise ValueError("Stage211 correction batch-profile admission binding is incomplete.")
+    batch_size = int(selected_profile["batch_size"])
+    frame_budget = int(selected_profile["frame_budget"])
+    steps_per_epoch = estimate_bucket_manifest_steps(
+        manifest,
+        split="train",
+        batch_size=batch_size,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=frame_budget,
+        drop_last=False,
+    )
+    tail_padding_samples = estimate_bucket_manifest_tail_padding_samples(
+        manifest,
+        split="train",
+        batch_size=batch_size,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=frame_budget,
+    )
+    selected_coverage = batch_profile_preflight["selected_profile_row"]["coverage"]
+    if (
+        int(selected_coverage.get("steps_per_epoch", -1)) != steps_per_epoch
+        or int(selected_coverage.get("tail_padding_samples_per_epoch", -1))
+        != tail_padding_samples
+    ):
+        raise ValueError("Stage211 correction batch-profile coverage changed.")
+    if _checkpoint_step(completion_checkpoint_path) != steps_per_epoch:
+        raise ValueError(
+            "Stage211 correction completion checkpoint step mismatch: "
+            f"actual={_checkpoint_step(completion_checkpoint_path)} "
+            f"expected={steps_per_epoch}"
+        )
     expected_provenance = {
-        "schema_version": 1,
+        "schema_version": 2,
         "pipeline": "stage211",
         "artifact": "retention_correction_run",
         "phase": phase,
@@ -348,6 +483,21 @@ def build_receipt(
         "smoke_marker_sha256": sha256_file(smoke_marker_path),
         "layer_focus_path": str(layer_focus_path),
         "layer_focus_sha256": sha256_file(layer_focus_path),
+        "batch_profile_preflight_path": batch_profile_preflight["report_path"],
+        "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
+        "batch_profile_admission_path": (
+            batch_profile_admission["receipt_path"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_admission_sha256": (
+            batch_profile_admission["receipt_sha256"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_name": selected_profile["name"],
+        "batch_size": batch_size,
+        "frame_budget": frame_budget,
         "correction_extension_decision_path": (
             str(extension_decision_path) if extension_decision_path is not None else None
         ),
@@ -373,6 +523,8 @@ def build_receipt(
         layer_focus_payload=layer_focus,
         init_checkpoint=init_checkpoint_path,
         smoke_marker=smoke_marker_path,
+        batch_profile_preflight=batch_profile_preflight,
+        batch_profile_admission=batch_profile_admission,
         phase=phase,
     )
     nano_teacher_checkpoint = resolve_stage211_nano_teacher_checkpoint(train_config)
@@ -393,6 +545,8 @@ def build_receipt(
         layer_focus=layer_focus_path,
         init_checkpoint=init_checkpoint_path,
         nano_checkpoint=nano_teacher_checkpoint,
+        batch_profile_preflight=batch_profile_preflight,
+        batch_profile_admission=batch_profile_admission,
         phase=phase,
     )
 
@@ -406,7 +560,7 @@ def build_receipt(
         completion_checkpoint_path=completion_checkpoint_path,
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "pipeline": "stage211",
         "artifact": "post_coverage_correction",
         "phase": phase,
@@ -414,9 +568,22 @@ def build_receipt(
         "complete": True,
         "epochs": CORRECTION_EPOCHS,
         "learning_rate": correction_lr,
-        "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
+        "batch_size": batch_size,
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
-        "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+        "frame_budget": frame_budget,
+        "batch_profile_preflight_path": batch_profile_preflight["report_path"],
+        "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
+        "batch_profile_admission_path": (
+            batch_profile_admission["receipt_path"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_admission_sha256": (
+            batch_profile_admission["receipt_sha256"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "batch_profile_name": selected_profile["name"],
         "length_bucket_drop_last": False,
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
