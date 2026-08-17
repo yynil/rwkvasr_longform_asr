@@ -12,6 +12,7 @@ MONITOR_LOG="${MONITOR_LOG:-${OUTPUT_ROOT}/monitor_hourly.log}"
 BASE_PUBLIC_OVERLAP_ROOT="${BASE_PUBLIC_OVERLAP_ROOT:-${HOME}/rwkvasr_data/stage211_base_public_pcm_overlap_v1}"
 SUPPLEMENTAL_PROGRESS_REPORTER="${SUPPLEMENTAL_PROGRESS_REPORTER:-${REPO_ROOT}/scripts/report_stage211_base_public_pcm_progress.py}"
 SOCIAL_PCM_INVENTORY="${SOCIAL_PCM_INVENTORY:-${HOME}/rwkvasr_data/stage211_social_vad_materialized_v1/materialized_inventory.json}"
+SOCIAL_PCM_SOURCE_OUTPUT_ROOT="${SOCIAL_PCM_SOURCE_OUTPUT_ROOT:-${HOME}/rwkvasr_data/stage211_social_vad_filtered_v1}"
 SOCIAL_PCM_OUTPUT_ROOT="${SOCIAL_PCM_OUTPUT_ROOT:-${HOME}/rwkvasr_data/stage211_social_vad_filtered_v2}"
 SOCIAL_PCM_PROGRESS_REPORTER="${SOCIAL_PCM_PROGRESS_REPORTER:-${REPO_ROOT}/scripts/report_stage211_social_pcm_progress.py}"
 SFT_LABELED_ROOT="${SFT_LABELED_ROOT:-${HOME}/rwkvasr_data/stage211_sft_full_labeled_v2}"
@@ -245,16 +246,24 @@ stage211_current_attempt_errors() {
 }
 
 stage211_emit_social_pcm_progress() {
+  local output_root="${1:-${SOCIAL_PCM_OUTPUT_ROOT}}"
   if [[ -x "${MONITOR_PYTHON}" && -f "${SOCIAL_PCM_PROGRESS_REPORTER}" && \
     -s "${SOCIAL_PCM_INVENTORY}" ]]; then
     nice -n 10 "${MONITOR_PYTHON}" "${SOCIAL_PCM_PROGRESS_REPORTER}" \
       --materialized-inventory "${SOCIAL_PCM_INVENTORY}" \
-      --output-root "${SOCIAL_PCM_OUTPUT_ROOT}" 2>&1 || true
+      --output-root "${output_root}" 2>&1 || true
   else
     printf 'unavailable inventory=%s output_root=%s reporter=%s python=%s\n' \
-      "${SOCIAL_PCM_INVENTORY}" "${SOCIAL_PCM_OUTPUT_ROOT}" \
+      "${SOCIAL_PCM_INVENTORY}" "${output_root}" \
       "${SOCIAL_PCM_PROGRESS_REPORTER}" "${MONITOR_PYTHON}"
   fi
+}
+
+stage211_emit_social_pcm_readiness() {
+  printf '%s\n' '-- social source exact PCM fingerprints --'
+  stage211_emit_social_pcm_progress "${SOCIAL_PCM_SOURCE_OUTPUT_ROOT}"
+  printf '%s\n' '-- social corrected-public v2 rebase --'
+  stage211_emit_social_pcm_progress "${SOCIAL_PCM_OUTPUT_ROOT}"
 }
 
 stage211_emit_artifact_status() {
@@ -380,8 +389,7 @@ stage211_emit_snapshot() {
     printf 'unavailable root=%s reporter=%s python=%s\n' \
       "${BASE_PUBLIC_OVERLAP_ROOT}" "${SUPPLEMENTAL_PROGRESS_REPORTER}" "${MONITOR_PYTHON}"
   fi
-  printf '%s\n' '-- social exact PCM prefilter --'
-  stage211_emit_social_pcm_progress
+  stage211_emit_social_pcm_readiness
   printf '%s\n' '-- supplemental handoff readiness --'
   stage211_emit_supplemental_readiness
   printf '%s\n' '-- full labeled SFT readiness --'
