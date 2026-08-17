@@ -1396,8 +1396,12 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
 
     main_body = script[script.index("main() {") :]
     readiness_offset = main_body.index("wait_for_supplemental_training_data")
+    public_readiness_offset = main_body.index("validate_corrected_public_readiness")
     case_offset = main_body.index('case "${START_STAGE}"')
-    assert readiness_offset < case_offset
+    assert readiness_offset < public_readiness_offset < case_offset
+    assert "--validate-only" in script
+    assert '--correction-receipt "${PUBLIC_METRIC_CORRECTION_RECEIPT}"' in script
+    assert '--nano-baseline-receipt "${NANO_BASELINE_RECEIPT}"' in script
     full_branch = main_body[main_body.index("full)") : main_body.index("post_mixer)")]
     assert readiness_offset < main_body.index("build_fixed_manifests")
     assert all(

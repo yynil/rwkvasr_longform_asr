@@ -33,6 +33,7 @@ SFT_CORRECTION_EVAL_ROOT="${SFT_CORRECTION_EVAL_ROOT:-${PHASE_GATE_ROOT}/sft_cor
 SFT_CORRECTED_FINAL_ROOT="${SFT_CORRECTED_FINAL_ROOT:-${PHASE_GATE_ROOT}/sft_corrected}"
 PUBLIC_OVERLAP_RECEIPT="${PUBLIC_OVERLAP_RECEIPT:-${METADATA_ROOT}/public_train_overlap_v2/receipt.json}"
 PUBLIC_METRIC_CORRECTION_RECEIPT="${PUBLIC_METRIC_CORRECTION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_public_metric_unicode_v2/correction_receipt.json}"
+PUBLIC_CLEAN_INSTALL_RECEIPT="${PUBLIC_CLEAN_INSTALL_RECEIPT:-${HOME}/rwkvasr_eval/stage211_public_clean_v2/canonical_install_receipt.json}"
 REUSE_COMPLETED_CALIBRATION_EVAL="${REUSE_COMPLETED_CALIBRATION_EVAL:-0}"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${CALIBRATION_EVAL_DIR}/public/reuse_receipt.json}"
 START_STAGE="${START_STAGE:-full}"
@@ -210,6 +211,21 @@ ensure_initialization_receipt() {
     --calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --output "${INITIALIZATION_RECEIPT}"
+}
+
+validate_corrected_public_readiness() {
+  log "deep-validating corrected 52,436-row public evaluation chain"
+  uv run python "${REPO_ROOT}/scripts/install_stage211_unicode_metric_correction.py" \
+    --validate-only \
+    --output-root "$(dirname "${PUBLIC_METRIC_CORRECTION_RECEIPT}")" \
+    --correction-receipt "${PUBLIC_METRIC_CORRECTION_RECEIPT}" \
+    --prior-install-receipt "${PUBLIC_CLEAN_INSTALL_RECEIPT}" \
+    --nano-root "${NANO_EVAL_DIR}" \
+    --calibration-root "${CALIBRATION_EVAL_DIR}" \
+    --manifest-dir "${PUBLIC_MANIFEST_DIR}" \
+    --initialization-receipt "${INITIALIZATION_RECEIPT}" \
+    --nano-checkpoint "${NANO_CHECKPOINT}" \
+    --nano-baseline-receipt "${NANO_BASELINE_RECEIPT}"
 }
 
 run_full_mixer_phase() {
@@ -442,6 +458,7 @@ run_labeled_sft_phase() {
 main() {
   cd "${REPO_ROOT}"
   wait_for_supplemental_training_data
+  validate_corrected_public_readiness
   case "${START_STAGE}" in
     full)
       wait_for_session "${METADATA_SESSION}" "metadata copy"

@@ -176,6 +176,135 @@ def validate_completed_correction(
     return receipt
 
 
+def validate_corrected_public_readiness(
+    *,
+    output_root: Path,
+    correction_receipt: Path | None = None,
+    prior_install_receipt: Path,
+    nano_root: Path,
+    calibration_root: Path,
+    manifest_dir: Path,
+    initialization_receipt: Path,
+    nano_checkpoint: Path,
+    nano_baseline_receipt: Path = DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
+) -> dict[str, Any]:
+    output_root = output_root.expanduser().resolve()
+    correction_receipt_path = (
+        correction_receipt.expanduser().resolve()
+        if correction_receipt is not None
+        else output_root / "correction_receipt.json"
+    )
+    prior_install_receipt = prior_install_receipt.expanduser().resolve()
+    nano_root = nano_root.expanduser().resolve()
+    calibration_root = calibration_root.expanduser().resolve()
+    manifest_dir = manifest_dir.expanduser().resolve()
+    initialization_receipt = initialization_receipt.expanduser().resolve()
+    nano_checkpoint = nano_checkpoint.expanduser().resolve()
+    nano_baseline_receipt = nano_baseline_receipt.expanduser().resolve()
+    calibration_public = calibration_root / "public"
+    calibration_reuse_receipt = calibration_public / "reuse_receipt.json"
+
+    prior_install = _validate_prior_install(prior_install_receipt)
+    correction = validate_completed_correction(
+        correction_receipt_path,
+        tokenizer_source=DEFAULT_TOKENIZER_SOURCE,
+        expected_calibration_reuse_receipt=calibration_reuse_receipt,
+        expected_initialization_receipt=initialization_receipt,
+    )
+    if correction is None:
+        raise ValueError(
+            f"Stage211 Unicode metric-correction receipt is missing: {correction_receipt_path}"
+        )
+    expected_installed_paths = _affected_paths(
+        nano_root=nano_root,
+        calibration_root=calibration_root,
+        initialization_receipt=initialization_receipt,
+    )
+    installed_records = correction.get("installed_files")
+    if not isinstance(installed_records, list):
+        raise ValueError("Stage211 Unicode correction lacks installed-file evidence.")
+    installed_paths = {
+        str(record.get("label") or ""): Path(str(record.get("path") or "")).resolve()
+        for record in installed_records
+        if isinstance(record, dict)
+    }
+    if installed_paths != {
+        label: path.resolve() for label, path in expected_installed_paths.items()
+    }:
+        raise ValueError("Stage211 Unicode correction binds another canonical artifact set.")
+    if (
+        Path(str(correction.get("prior_clean_install_receipt_path") or "")).resolve()
+        != prior_install_receipt
+        or correction.get("prior_clean_install_receipt_sha256")
+        != sha256_file(prior_install_receipt)
+        or correction.get("prior_clean_install_artifact") != prior_install["artifact"]
+    ):
+        raise ValueError("Stage211 Unicode correction binds another clean canonical install.")
+
+    existing_reuse = _load_json(
+        calibration_reuse_receipt,
+        label="Stage211 corrected calibration reuse receipt",
+    )
+    public_overlap = existing_reuse.get("public_overlap")
+    if not isinstance(public_overlap, dict):
+        raise ValueError("Stage211 corrected calibration reuse lacks public-overlap evidence.")
+    public_overlap_receipt = Path(str(public_overlap.get("receipt_path") or "")).resolve()
+    rebuilt_reuse = build_reuse_receipt(
+        selection_report_path=calibration_root / "checkpoint_selection.json",
+        comparison_report_path=calibration_public / "nano_comparison.json",
+        metrics_path=calibration_public / "metrics.json",
+        manifest_dir=manifest_dir,
+        public_overlap_receipt_path=public_overlap_receipt,
+    )
+    if existing_reuse != rebuilt_reuse:
+        raise ValueError(
+            "Stage211 corrected calibration reuse receipt does not match source replay."
+        )
+    benchmark = validate_stage211_public_benchmark(rebuilt_reuse["public_benchmark"])
+    expected_total = sum(int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values())
+    actual_total = sum(int(row["sample_count"]) for row in benchmark["results"])
+    if actual_total != expected_total:
+        raise ValueError(
+            f"Stage211 corrected public benchmark total mismatch: {actual_total}/{expected_total}."
+        )
+
+    nano_provenance = validate_stage211_nano_public_baseline_receipt(
+        nano_baseline_receipt,
+        public_benchmark=benchmark,
+    )
+    nano_checkpoint_sha256 = sha256_file(nano_checkpoint)
+    if (
+        Path(str(nano_provenance.get("nano_checkpoint_path") or "")).resolve() != nano_checkpoint
+        or nano_provenance.get("nano_checkpoint_sha256") != nano_checkpoint_sha256
+        or Path(str(correction.get("nano_checkpoint_path") or "")).resolve() != nano_checkpoint
+        or correction.get("nano_checkpoint_sha256") != nano_checkpoint_sha256
+    ):
+        raise ValueError("Stage211 corrected public chain binds another Nano checkpoint.")
+
+    initialization = validate_stage211_initialization_receipt(
+        initialization_receipt,
+        expected_calibration_checkpoint=Path(rebuilt_reuse["checkpoint_path"]),
+        expected_nano_checkpoint_sha256=nano_checkpoint_sha256,
+    )
+    if Path(
+        str(initialization.get("calibration_reuse_receipt_path") or "")
+    ).resolve() != calibration_reuse_receipt or initialization.get(
+        "calibration_reuse_receipt_sha256"
+    ) != sha256_file(calibration_reuse_receipt):
+        raise ValueError(
+            "Stage211 corrected initialization does not bind the replayed calibration receipt."
+        )
+    return {
+        "correction": correction,
+        "prior_install": prior_install,
+        "calibration_reuse": rebuilt_reuse,
+        "nano_provenance": nano_provenance,
+        "initialization": initialization,
+        "correction_receipt_path": str(correction_receipt_path),
+        "public_sample_count": actual_total,
+    }
+
+
 def _validate_prior_install(path: Path) -> dict[str, Any]:
     path = path.expanduser().resolve()
     receipt = _load_json(path, label="Stage211 prior clean canonical-install receipt")
@@ -548,11 +677,48 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_STAGE211_INITIALIZATION_RECEIPT,
     )
     parser.add_argument("--nano-checkpoint", type=Path, default=DEFAULT_NANO_CHECKPOINT)
+    parser.add_argument(
+        "--correction-receipt",
+        type=Path,
+        default=None,
+        help="Exact correction receipt to validate; defaults below output-root.",
+    )
+    parser.add_argument(
+        "--nano-baseline-receipt",
+        type=Path,
+        default=DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Deeply replay the corrected public chain without writing any artifact.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.validate_only:
+        readiness = validate_corrected_public_readiness(
+            output_root=args.output_root,
+            correction_receipt=args.correction_receipt,
+            prior_install_receipt=args.prior_install_receipt,
+            nano_root=args.nano_root,
+            calibration_root=args.calibration_root,
+            manifest_dir=args.manifest_dir,
+            initialization_receipt=args.initialization_receipt,
+            nano_checkpoint=args.nano_checkpoint,
+            nano_baseline_receipt=args.nano_baseline_receipt,
+        )
+        print(
+            "[stage211-public-readiness] "
+            f"samples={readiness['public_sample_count']} "
+            f"correction={readiness['correction_receipt_path']} "
+            f"reuse_sha256={readiness['correction']['calibration_reuse_receipt_sha256']} "
+            f"initialization_sha256={readiness['correction']['initialization_receipt_sha256']}",
+            flush=True,
+        )
+        return 0
     receipt = install_correction(
         output_root=args.output_root,
         prior_install_receipt=args.prior_install_receipt,

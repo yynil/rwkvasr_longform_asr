@@ -145,6 +145,136 @@ def test_unicode_correction_prior_install_requires_v2_overlap(
         unicode_correction._validate_prior_install(receipt)
 
 
+def test_corrected_public_readiness_replays_complete_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "metric"
+    correction_receipt = output_root / "custom-correction.json"
+    correction_receipt.parent.mkdir(parents=True)
+    correction_receipt.write_text("{}\n", encoding="utf-8")
+    prior_install_receipt = tmp_path / "canonical-install.json"
+    prior_install_receipt.write_text("{}\n", encoding="utf-8")
+    nano_root = tmp_path / "nano"
+    calibration_root = tmp_path / "calibration"
+    calibration_public = calibration_root / "public"
+    calibration_public.mkdir(parents=True)
+    manifest_dir = tmp_path / "manifests"
+    manifest_dir.mkdir()
+    initialization_receipt = tmp_path / "initialization.json"
+    initialization_receipt.write_text("{}\n", encoding="utf-8")
+    nano_checkpoint = tmp_path / "nano.pt"
+    nano_checkpoint.write_bytes(b"nano")
+    nano_baseline_receipt = nano_root / "provenance_receipt.json"
+    nano_baseline_receipt.parent.mkdir(parents=True)
+    nano_baseline_receipt.write_text("{}\n", encoding="utf-8")
+    public_overlap_receipt = tmp_path / "public-overlap.json"
+    public_overlap_receipt.write_text("{}\n", encoding="utf-8")
+
+    benchmark = {
+        "results": [
+            {"dataset": dataset, "sample_count": int(expected["samples"])}
+            for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items()
+        ]
+    }
+    rebuilt_reuse = {
+        "checkpoint_path": str(tmp_path / "calibration.pt"),
+        "public_overlap": {"receipt_path": str(public_overlap_receipt)},
+        "public_benchmark": benchmark,
+    }
+    calibration_reuse_receipt = calibration_public / "reuse_receipt.json"
+    calibration_reuse_receipt.write_text(
+        json.dumps(rebuilt_reuse, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    nano_sha256 = sha256_file(nano_checkpoint)
+    expected_installed_paths = unicode_correction._affected_paths(
+        nano_root=nano_root,
+        calibration_root=calibration_root,
+        initialization_receipt=initialization_receipt,
+    )
+    correction = {
+        "prior_clean_install_receipt_path": str(prior_install_receipt),
+        "prior_clean_install_receipt_sha256": sha256_file(prior_install_receipt),
+        "prior_clean_install_artifact": "stage211_clean_public_canonical_install",
+        "nano_checkpoint_path": str(nano_checkpoint),
+        "nano_checkpoint_sha256": nano_sha256,
+        "calibration_reuse_receipt_sha256": sha256_file(calibration_reuse_receipt),
+        "initialization_receipt_sha256": sha256_file(initialization_receipt),
+        "installed_files": [
+            {"label": label, "path": str(path)}
+            for label, path in expected_installed_paths.items()
+        ],
+    }
+    monkeypatch.setattr(
+        unicode_correction,
+        "_validate_prior_install",
+        lambda path: {
+            "artifact": "stage211_clean_public_canonical_install",
+            "complete": True,
+        },
+    )
+    monkeypatch.setattr(
+        unicode_correction,
+        "validate_completed_correction",
+        lambda *args, **kwargs: correction,
+    )
+    monkeypatch.setattr(
+        unicode_correction,
+        "build_reuse_receipt",
+        lambda **kwargs: rebuilt_reuse,
+    )
+    monkeypatch.setattr(
+        unicode_correction,
+        "validate_stage211_public_benchmark",
+        lambda payload: payload,
+    )
+    monkeypatch.setattr(
+        unicode_correction,
+        "validate_stage211_nano_public_baseline_receipt",
+        lambda *args, **kwargs: {
+            "nano_checkpoint_path": str(nano_checkpoint),
+            "nano_checkpoint_sha256": nano_sha256,
+        },
+    )
+    monkeypatch.setattr(
+        unicode_correction,
+        "validate_stage211_initialization_receipt",
+        lambda *args, **kwargs: {
+            "calibration_reuse_receipt_path": str(calibration_reuse_receipt),
+            "calibration_reuse_receipt_sha256": sha256_file(calibration_reuse_receipt),
+        },
+    )
+    immutable_inputs = (
+        correction_receipt,
+        prior_install_receipt,
+        calibration_reuse_receipt,
+        initialization_receipt,
+        nano_checkpoint,
+        nano_baseline_receipt,
+        public_overlap_receipt,
+    )
+    before = {path: path.read_bytes() for path in immutable_inputs}
+
+    readiness = unicode_correction.validate_corrected_public_readiness(
+        output_root=output_root,
+        correction_receipt=correction_receipt,
+        prior_install_receipt=prior_install_receipt,
+        nano_root=nano_root,
+        calibration_root=calibration_root,
+        manifest_dir=manifest_dir,
+        initialization_receipt=initialization_receipt,
+        nano_checkpoint=nano_checkpoint,
+        nano_baseline_receipt=nano_baseline_receipt,
+    )
+
+    assert readiness["correction_receipt_path"] == str(correction_receipt)
+    assert readiness["public_sample_count"] == sum(
+        int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values()
+    )
+    assert {path: path.read_bytes() for path in immutable_inputs} == before
+
+
 def _canonical_install_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
