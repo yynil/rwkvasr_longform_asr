@@ -21,6 +21,7 @@ from rwkvasr.eval.stage211_gate import (
     stage211_phase_train_config_contract,
 )
 from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     build_stage211_student_public_prediction_receipt,
     build_stage211_sft_public_progress,
     replay_stage211_public_comparison,
@@ -966,6 +967,7 @@ def test_stage211_sft_public_evidence_replays_baseline_candidate_and_progress(
             "version": 1,
             "decode": "greedy_ctc",
             "normalization": "ctc",
+            "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             "gate": {
                 "max_relative_ratio": 1.20,
                 "max_absolute_gap_points": 3.0,
@@ -1088,6 +1090,7 @@ def _bound_public_benchmark(
     return {
         "decode": "greedy_ctc",
         "normalization": "ctc",
+        "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
         "all_datasets_complete": True,
         "all_datasets_pass": True,
         "results": results,
@@ -1117,6 +1120,7 @@ def _write_nano_baseline_receipt(
                     "language": result["language"],
                     "normalization": "ctc",
                     "decode": "greedy_ctc",
+                    "strip_language_confirmation": (STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION),
                     "requested_limit": None,
                     "sample_count": result["sample_count"],
                 }
@@ -1890,6 +1894,7 @@ def _write_stepwise_inputs(
                 "artifact": "unicode_wer_metric_correction",
                 "complete": True,
                 "tokenizer_contract": "unicode_alnum_words_basic_cjk_chars_v1",
+                "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
                 "tokenizer_source_path": str(metric_tokenizer_source.resolve()),
                 "tokenizer_source_sha256": sha256_file(metric_tokenizer_source),
                 "calibration_reuse_receipt_path": str(calibration_receipt.resolve()),
@@ -2255,6 +2260,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     )
     assert report["ctc_label_proof"]["teacher_projection_support_matches_student"] is True
     assert report["public_metric_definition_chain_passed"] is True
+    assert report["public_metric_strip_language_confirmation"] is False
     assert report["public_metric_correction_receipt_sha256"] == sha256_file(
         reports["metric_correction"]
     )

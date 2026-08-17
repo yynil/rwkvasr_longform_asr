@@ -104,7 +104,7 @@ def test_compare_dataset_normalizes_non_pronounced_chinese_units(
         rows=[
             (
                 "zh-1",
-                "这是中文文字。说话人2：你好【音乐】世界",
+                "说话人2：你好【音乐】世界",
                 "说话人2：你好【噪声】世界",
             )
         ],

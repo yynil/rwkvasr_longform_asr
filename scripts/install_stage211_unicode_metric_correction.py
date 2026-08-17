@@ -26,6 +26,9 @@ from rwkvasr.eval.stage211_initialization import (
     DEFAULT_STAGE211_INITIALIZATION_RECEIPT,
     validate_stage211_initialization_receipt,
 )
+from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
+)
 from rwkvasr.eval.text_metrics import (
     _normalize_text_for_error_tokens,
     normalize_asr_text_for_metrics,
@@ -125,14 +128,15 @@ def validate_completed_correction(
         "artifact": "unicode_wer_metric_correction",
         "complete": True,
         "tokenizer_contract": "unicode_alnum_words_basic_cjk_chars_v1",
+        "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 Unicode metric correction receipt contract mismatch.")
-    if (
-        Path(str(receipt.get("tokenizer_source_path") or "")).resolve()
-        != tokenizer_source.resolve()
-        or receipt.get("tokenizer_source_sha256") != sha256_file(tokenizer_source)
-    ):
+    if Path(
+        str(receipt.get("tokenizer_source_path") or "")
+    ).resolve() != tokenizer_source.resolve() or receipt.get(
+        "tokenizer_source_sha256"
+    ) != sha256_file(tokenizer_source):
         raise ValueError("Stage211 Unicode metric tokenizer source changed.")
     installed = receipt.get("installed_files")
     if not isinstance(installed, list) or not installed:
@@ -165,10 +169,7 @@ def validate_completed_correction(
             raise ValueError(f"Stage211 Unicode metric correction lacks {label}.")
         bound_path = Path(str(receipt.get(f"{stem}_path") or "")).resolve()
         bound_sha256 = str(receipt.get(f"{stem}_sha256") or "")
-        if (
-            bound_path != Path(str(record["path"])).resolve()
-            or bound_sha256 != record["sha256"]
-        ):
+        if bound_path != Path(str(record["path"])).resolve() or bound_sha256 != record["sha256"]:
             raise ValueError(f"Stage211 Unicode metric {label} binding mismatch.")
         if expected_path is not None and bound_path != expected_path.expanduser().resolve():
             raise ValueError(f"Stage211 Unicode metric correction binds another {label}.")
@@ -184,8 +185,7 @@ def _validate_prior_install(path: Path) -> dict[str, Any]:
         or receipt.get("complete") is not True
         or Path(str(receipt.get("overlap_receipt_path") or "")).resolve()
         != DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT.expanduser().resolve()
-        or receipt.get("overlap_receipt_sha256")
-        != STAGE211_PUBLIC_OVERLAP_RECEIPT_SHA256
+        or receipt.get("overlap_receipt_sha256") != STAGE211_PUBLIC_OVERLAP_RECEIPT_SHA256
     ):
         raise ValueError("Stage211 prior clean canonical-install receipt is invalid.")
 
@@ -281,10 +281,9 @@ def _unicode_reference_audit(prediction_path: Path) -> list[dict[str, Any]]:
                 record.get("ref_text"),
                 language="en",
                 normalization="ctc",
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
-            legacy_tokens = LEGACY_WER_PATTERN.findall(
-                _normalize_text_for_error_tokens(reference)
-            )
+            legacy_tokens = LEGACY_WER_PATTERN.findall(_normalize_text_for_error_tokens(reference))
             corrected_tokens = tokenize_for_wer(reference)
             if legacy_tokens != corrected_tokens:
                 affected.append(
@@ -306,9 +305,7 @@ def _metric_row(metrics: dict[str, Any], dataset: str) -> dict[str, Any]:
     matches = [
         row
         for row in rows
-        if isinstance(row, dict)
-        and row.get("dataset") == dataset
-        and row.get("branch") == "ctc"
+        if isinstance(row, dict) and row.get("dataset") == dataset and row.get("branch") == "ctc"
     ]
     if len(matches) != 1:
         raise ValueError(f"Stage211 metrics lacks one CTC row for {dataset}.")
@@ -327,9 +324,7 @@ def _generate_derived_metrics(
         "calibration_metrics_json": temporary_root / "calibration" / "metrics.json",
         "calibration_metrics_markdown": temporary_root / "calibration" / "metrics.md",
         "calibration_comparison_json": temporary_root / "calibration" / "nano_comparison.json",
-        "calibration_comparison_markdown": temporary_root
-        / "calibration"
-        / "nano_comparison.md",
+        "calibration_comparison_markdown": temporary_root / "calibration" / "nano_comparison.md",
     }
     summarize = REPO_ROOT / "scripts" / "summarize_asr_eval_results.py"
     for prediction_dir, json_key, markdown_key in (
@@ -453,9 +448,7 @@ def install_correction(
             _atomic_write(paths["initialization_receipt"], _render_json(initialization))
             validate_stage211_initialization_receipt(
                 paths["initialization_receipt"],
-                expected_calibration_checkpoint=Path(
-                    initialization["calibration_checkpoint_path"]
-                ),
+                expected_calibration_checkpoint=Path(initialization["calibration_checkpoint_path"]),
                 expected_nano_checkpoint_sha256=initialization["nano_checkpoint_sha256"],
             )
 
@@ -471,12 +464,8 @@ def install_correction(
                 paths["calibration_comparison_json"],
                 label="Stage211 corrected calibration comparison",
             )
-            old_by_dataset = {
-                str(row["dataset"]): row for row in old_comparison["results"]
-            }
-            new_by_dataset = {
-                str(row["dataset"]): row for row in new_comparison["results"]
-            }
+            old_by_dataset = {str(row["dataset"]): row for row in old_comparison["results"]}
+            new_by_dataset = {str(row["dataset"]): row for row in new_comparison["results"]}
             cv_dataset = "commonvoice_en_test"
             affected = _unicode_reference_audit(
                 calibration_root / "public" / "predictions" / f"{cv_dataset}.ctc.jsonl"
@@ -492,6 +481,7 @@ def install_correction(
                 "artifact": "unicode_wer_metric_correction",
                 "complete": True,
                 "tokenizer_contract": "unicode_alnum_words_basic_cjk_chars_v1",
+                "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
                 "tokenizer_source_path": str(tokenizer_source.resolve()),
                 "tokenizer_source_sha256": sha256_file(tokenizer_source),
                 "prior_clean_install_receipt_path": str(prior_install_receipt.resolve()),
@@ -505,16 +495,10 @@ def install_correction(
                 "after_commonvoice": new_by_dataset[cv_dataset],
                 "nano_checkpoint_path": nano_provenance["nano_checkpoint_path"],
                 "nano_checkpoint_sha256": nano_provenance["nano_checkpoint_sha256"],
-                "calibration_reuse_receipt_path": str(
-                    paths["calibration_reuse_receipt"].resolve()
-                ),
-                "calibration_reuse_receipt_sha256": sha256_file(
-                    paths["calibration_reuse_receipt"]
-                ),
+                "calibration_reuse_receipt_path": str(paths["calibration_reuse_receipt"].resolve()),
+                "calibration_reuse_receipt_sha256": sha256_file(paths["calibration_reuse_receipt"]),
                 "initialization_receipt_path": str(paths["initialization_receipt"].resolve()),
-                "initialization_receipt_sha256": sha256_file(
-                    paths["initialization_receipt"]
-                ),
+                "initialization_receipt_sha256": sha256_file(paths["initialization_receipt"]),
                 "archive_files": archive_records,
                 "installed_files": installed_files,
                 "corrected_nano_commonvoice_metrics": _metric_row(
@@ -530,10 +514,13 @@ def install_correction(
                 ),
             }
             _atomic_write(receipt_path, _render_json(receipt))
-            return validate_completed_correction(
-                receipt_path,
-                tokenizer_source=tokenizer_source,
-            ) or receipt
+            return (
+                validate_completed_correction(
+                    receipt_path,
+                    tokenizer_source=tokenizer_source,
+                )
+                or receipt
+            )
         except BaseException:
             receipt_path.unlink(missing_ok=True)
             _restore_archives(archive_records)

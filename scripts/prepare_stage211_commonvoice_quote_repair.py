@@ -11,6 +11,9 @@ from rwkvasr.data.manifest import build_text_tokenizer
 from rwkvasr.data.text_normalization import normalize_asr_text
 from rwkvasr.eval import compute_text_error_stats
 from rwkvasr.eval.stage211_gate import STAGE211_PUBLIC_BENCHMARKS, sha256_file
+from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
+)
 from rwkvasr.eval.stage211_public_overlap import validate_stage211_public_overlap_receipt
 
 
@@ -22,9 +25,7 @@ DEFAULT_OVERLAP_RECEIPT = (
     / "public_train_overlap_v2"
     / "receipt.json"
 )
-DEFAULT_LEGACY_ARCHIVE = (
-    Path.home() / "rwkvasr_eval" / "stage211_public_contaminated_archive_v1"
-)
+DEFAULT_LEGACY_ARCHIVE = Path.home() / "rwkvasr_eval" / "stage211_public_contaminated_archive_v1"
 DEFAULT_ACTIVE_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
 DEFAULT_ACTIVE_NANO_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
 DEFAULT_ACTIVE_CALIBRATION_PUBLIC = (
@@ -36,9 +37,7 @@ DEFAULT_RESTORED_INFERENCE_ROOT = (
 DEFAULT_OUTPUT_ROOT = (
     Path.home() / "rwkvasr_eval" / "stage211_public_quote_repair_v2" / "parent_exact"
 )
-DEFAULT_TOKENIZER_MODEL = (
-    REPO_ROOT / "assets" / "fun-asr-nano-2512" / "multilingual.tiktoken"
-)
+DEFAULT_TOKENIZER_MODEL = REPO_ROOT / "assets" / "fun-asr-nano-2512" / "multilingual.tiktoken"
 EXPECTED_FULL_ROWS = 16_401
 EXPECTED_CLEAN_ROWS = 14_927
 EXPECTED_LEGACY_ROWS = 16_396
@@ -310,19 +309,15 @@ def prepare_bundle(
     legacy_calibration = legacy_archive / "calibration" / "commonvoice_en_test.ctc.jsonl"
     restored_nano = restored_inference_root / "nano" / "commonvoice_en_test.ctc.jsonl"
     restored_nano_report = restored_inference_root / "nano" / "commonvoice_en_test.json"
-    restored_calibration = (
-        restored_inference_root / "calibration" / "commonvoice_en_test.ctc.jsonl"
-    )
+    restored_calibration = restored_inference_root / "calibration" / "commonvoice_en_test.ctc.jsonl"
     restored_nano_rows = _load_jsonl(restored_nano, label="restored Nano predictions")
     restored_calibration_rows = _load_jsonl(
         restored_calibration,
         label="restored calibration predictions",
     )
-    if (
-        {str(row["utt_id"]) for row in restored_nano_rows} != EXPECTED_RESTORED_IDS
-        or {str(row["utt_id"]) for row in restored_calibration_rows}
-        != EXPECTED_RESTORED_IDS
-    ):
+    if {str(row["utt_id"]) for row in restored_nano_rows} != EXPECTED_RESTORED_IDS or {
+        str(row["utt_id"]) for row in restored_calibration_rows
+    } != EXPECTED_RESTORED_IDS:
         raise ValueError("Stage211 restored inference does not cover the exact five IDs.")
     nano_report = _load_json(restored_nano_report, label="restored Nano report")
     if int(nano_report.get("sample_count", -1)) != len(EXPECTED_RESTORED_IDS):
@@ -359,7 +354,12 @@ def prepare_bundle(
         legacy_archive / "nano" / "commonvoice_en_test.report.json",
         label="legacy Nano Common Voice report",
     )
-    metrics = compute_text_error_stats(parent_nano, language="en", normalization="ctc")
+    metrics = compute_text_error_stats(
+        parent_nano,
+        language="en",
+        normalization="ctc",
+        strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
+    )
     report.update(
         {
             "manifest_path": str(parent_manifest.resolve()),
@@ -373,6 +373,7 @@ def prepare_bundle(
             "predictions_path": str(parent_nano.resolve()),
             "requested_limit": None,
             "sample_count": EXPECTED_FULL_ROWS,
+            "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             "quote_repair": {
                 "overlap_receipt_path": str(overlap_receipt),
                 "overlap_receipt_sha256": sha256_file(overlap_receipt),
@@ -422,9 +423,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--overlap-receipt", type=Path, default=DEFAULT_OVERLAP_RECEIPT)
     parser.add_argument("--legacy-archive", type=Path, default=DEFAULT_LEGACY_ARCHIVE)
-    parser.add_argument(
-        "--active-manifest-dir", type=Path, default=DEFAULT_ACTIVE_MANIFEST_DIR
-    )
+    parser.add_argument("--active-manifest-dir", type=Path, default=DEFAULT_ACTIVE_MANIFEST_DIR)
     parser.add_argument("--active-nano-root", type=Path, default=DEFAULT_ACTIVE_NANO_ROOT)
     parser.add_argument(
         "--active-calibration-public",

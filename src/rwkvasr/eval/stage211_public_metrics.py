@@ -21,6 +21,7 @@ from rwkvasr.eval.text_metrics import (
 STAGE211_PUBLIC_MAX_RELATIVE_RATIO = 1.20
 STAGE211_PUBLIC_MAX_ABSOLUTE_GAP_POINTS = 3.0
 STAGE211_PUBLIC_MAX_PROGRESS_REGRESSION = 0.03
+STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION = False
 STAGE211_STUDENT_BLANK_ID = 60_515
 STAGE211_STUDENT_TOKENIZER_VOCAB_SIZE = 60_515
 STAGE211_STUDENT_CTC_VOCAB_SIZE = 60_516
@@ -83,7 +84,9 @@ def build_stage211_student_ctc_execution_provenance(
         label="student CTC execution tokenizer config",
     )
     if model_config_path != (checkpoint_path.parent / "model_config.yaml").resolve():
-        raise ValueError("Stage211 student CTC execution must use the checkpoint-local model config.")
+        raise ValueError(
+            "Stage211 student CTC execution must use the checkpoint-local model config."
+        )
     if tokenizer_config_path != (checkpoint_path.parent / "tokenizer_config.yaml").resolve():
         raise ValueError(
             "Stage211 student CTC execution must use the checkpoint-local tokenizer config."
@@ -230,6 +233,7 @@ def _jsonl_references(
                 reference,
                 language=language,
                 normalization="ctc",
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
     if not references:
         raise ValueError(f"Stage211 public JSONL is empty: {path}")
@@ -270,11 +274,13 @@ def _jsonl_predictions(
                 str(row["ref_text"]),
                 language=language,
                 normalization="ctc",
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
             prediction = normalize_asr_text_for_metrics(
                 str(row["pred_text"]),
                 language=language,
                 normalization="ctc",
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
             records[utt_id] = (reference, prediction)
     if not records:
@@ -331,8 +337,7 @@ def _jsonl_student_ctc_predictions(
                     task=tokenizer_config.get("tokenizer_task"),
                 )
                 suppressed_token_ids = {
-                    int(token_id)
-                    for token_id in model_config.get("ctc_suppressed_token_ids", ())
+                    int(token_id) for token_id in model_config.get("ctc_suppressed_token_ids", ())
                 }
 
             if (
@@ -350,8 +355,14 @@ def _jsonl_student_ctc_predictions(
             if (
                 not isinstance(pred_token_ids, list)
                 or not isinstance(ref_token_ids, list)
-                or any(isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in pred_token_ids)
-                or any(isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in ref_token_ids)
+                or any(
+                    isinstance(token_id, bool) or not isinstance(token_id, int)
+                    for token_id in pred_token_ids
+                )
+                or any(
+                    isinstance(token_id, bool) or not isinstance(token_id, int)
+                    for token_id in ref_token_ids
+                )
             ):
                 raise ValueError(
                     f"Stage211 student row has invalid token IDs at {path}:{line_number}"
@@ -415,11 +426,13 @@ def _jsonl_student_ctc_predictions(
                 str(row["ref_text"]),
                 language=language,
                 normalization="ctc",
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
             prediction = normalize_asr_text_for_metrics(
                 str(row["pred_text"]),
                 language=language,
                 normalization="ctc",
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
             records[utt_id] = (reference, prediction)
     if not records or execution_provenance is None:
@@ -478,8 +491,7 @@ def build_stage211_student_public_prediction_receipt(
         ):
             raise ValueError(f"Stage211 {dataset} student public receipt coverage mismatch.")
         if any(
-            predictions[utt_id][0] != reference
-            for utt_id, reference in manifest_references.items()
+            predictions[utt_id][0] != reference for utt_id, reference in manifest_references.items()
         ):
             raise ValueError(
                 f"Stage211 {dataset} student public receipt normalized references mismatch."
@@ -513,6 +525,7 @@ def build_stage211_student_public_prediction_receipt(
         "decode": "greedy_ctc",
         "mode": "bi",
         "normalization": "ctc",
+        "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": _sha256_file(checkpoint_path),
         "student_ctc_execution_provenance": shared_execution_provenance,
@@ -549,6 +562,8 @@ def validate_stage211_student_public_prediction_receipt(
         or payload.get("decode") != "greedy_ctc"
         or payload.get("mode") != "bi"
         or payload.get("normalization") != "ctc"
+        or payload.get("strip_language_confirmation")
+        is not STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION
         or payload.get("all_rows_ctc_only_greedy") is not True
         or payload.get("all_rows_checkpoint_bound") is not True
         or payload.get("all_token_ids_within_student_tokenizer") is not True
@@ -571,9 +586,7 @@ def validate_stage211_student_public_prediction_receipt(
         benchmarks=benchmarks,
     )
     if payload != rebuilt:
-        raise ValueError(
-            "Stage211 student public prediction receipt does not match current files."
-        )
+        raise ValueError("Stage211 student public prediction receipt does not match current files.")
     return payload
 
 
@@ -759,8 +772,16 @@ def replay_stage211_public_comparison(
     expected_checkpoint: Path | None = None,
     require_student_prediction_receipt: bool = False,
 ) -> dict[str, Any]:
-    if report.get("decode") != "greedy_ctc" or report.get("normalization") != "ctc":
-        raise ValueError("Stage211 public comparison must use greedy CTC and CTC normalization.")
+    if (
+        report.get("decode") != "greedy_ctc"
+        or report.get("normalization") != "ctc"
+        or report.get("strip_language_confirmation")
+        is not STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION
+    ):
+        raise ValueError(
+            "Stage211 public comparison must use greedy CTC, CTC normalization, "
+            "and no AR language-prefix stripping."
+        )
     gate = report.get("gate")
     if (
         not isinstance(gate, dict)
@@ -814,9 +835,9 @@ def replay_stage211_public_comparison(
             raise ValueError("Stage211 student public prediction receipt SHA-256 mismatch.")
         receipt_checkpoint = expected_checkpoint
         if receipt_checkpoint is None:
-            receipt_checkpoint = Path(
-                str(report.get("student_checkpoint_path") or "")
-            ).expanduser().resolve()
+            receipt_checkpoint = (
+                Path(str(report.get("student_checkpoint_path") or "")).expanduser().resolve()
+            )
         validate_stage211_student_public_prediction_receipt(
             receipt_path,
             expected_checkpoint=receipt_checkpoint,
@@ -1099,9 +1120,9 @@ def build_stage211_sft_correction_public_progress(
         baseline_macro = sum(float(row["baseline_error_rate"]) for row in language_rows) / len(
             language_rows
         )
-        candidate_macro = sum(
-            float(row["candidate_error_rate"]) for row in language_rows
-        ) / len(language_rows)
+        candidate_macro = sum(float(row["candidate_error_rate"]) for row in language_rows) / len(
+            language_rows
+        )
         improved_datasets = sum(bool(row["improved"]) for row in language_rows)
         macro_improved = candidate_macro < baseline_macro - tolerance
         language_summaries[language] = {

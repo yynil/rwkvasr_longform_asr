@@ -13,6 +13,9 @@ from rwkvasr.eval import (
     tokenize_for_wer,
 )
 from rwkvasr.eval.stage211_gate import STAGE211_PUBLIC_BENCHMARKS, sha256_file
+from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
+)
 from rwkvasr.eval.stage211_public_overlap import validate_stage211_public_overlap_receipt
 
 
@@ -84,7 +87,12 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _compact_metrics(path: Path, *, language: str) -> dict[str, float | int]:
-    metrics = compute_text_error_stats(path, language=language, normalization="ctc")
+    metrics = compute_text_error_stats(
+        path,
+        language=language,
+        normalization="ctc",
+        strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
+    )
     return {
         "avg_cer": float(metrics["avg_cer"]),
         "avg_wer": float(metrics["avg_wer"]),
@@ -109,11 +117,13 @@ def _nano_diagnostics(
             str(row.get("pred_text") or ""),
             language=language,
             normalization="ctc",
+            strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
         )
         normalized_ref = normalize_asr_text_for_metrics(
             str(row.get("ref_text") or ""),
             language=language,
             normalization="ctc",
+            strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
         )
         debug = row.get("debug")
         if not isinstance(debug, dict):
@@ -263,6 +273,7 @@ def derive_clean_public_eval(
                 "predictions_path": str(derived_nano_prediction.resolve()),
                 "rtf": None,
                 "sample_count": len(manifest_rows),
+                "strip_language_confirmation": (STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION),
             }
         )
         _write_json(derived_nano_report, derived_report)

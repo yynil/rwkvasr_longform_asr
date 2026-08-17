@@ -16,6 +16,7 @@ from rwkvasr.data import (
     ctc_suppressed_token_ids_for_tokenizer,
 )
 from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     build_stage211_public_progress,
     replay_stage211_public_comparison,
 )
@@ -4718,6 +4719,13 @@ def validate_stage211_public_benchmark(
         raise ValueError("Stage211 public benchmark must use direct greedy CTC.")
     if public_benchmark.get("normalization") != "ctc":
         raise ValueError("Stage211 public benchmark must use ctc normalization.")
+    if (
+        public_benchmark.get("strip_language_confirmation")
+        is not STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION
+    ):
+        raise ValueError(
+            "Stage211 direct-CTC public benchmark must not strip AR language prefixes."
+        )
     if public_benchmark.get("all_datasets_complete") is not True:
         raise ValueError("Stage211 public benchmark is not complete.")
 

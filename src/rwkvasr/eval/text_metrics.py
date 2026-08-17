@@ -60,7 +60,12 @@ def normalize_asr_text_for_metrics(
         text = strip_asr_language_confirmation_prefix(text)
     if normalization == "none":
         return text.strip()
-    return normalize_asr_text(text, language=language, mode=normalization).strip()
+    return normalize_asr_text(
+        text,
+        language=language,
+        mode=normalization,
+        strip_language_confirmation=strip_language_confirmation,
+    ).strip()
 
 
 def _is_ignored_metric_char(ch: str) -> bool:
@@ -406,7 +411,9 @@ def compare_prediction_text_sets(
             unchanged += 1
         base_pred = baseline_preds.get(utt_id, ("", ""))[0]
         cand_pred = candidate_preds.get(utt_id, ("", ""))[0]
-        if _normalize_text_for_error_tokens(base_pred) != _normalize_text_for_error_tokens(cand_pred):
+        if _normalize_text_for_error_tokens(base_pred) != _normalize_text_for_error_tokens(
+            cand_pred
+        ):
             changed_prediction += 1
 
     baseline_avg_wer = baseline_stats.get("avg_wer")
@@ -418,17 +425,11 @@ def compare_prediction_text_sets(
     compare_cand = candidate_avg_wer if metric == "wer" else candidate_avg_cer
     if isinstance(compare_base, float) and isinstance(compare_cand, float):
         if compare_cand < compare_base - 0.01:
-            verdict = (
-                f"{candidate_label} improved preview ASR-content normalized {metric.upper()} vs {baseline_label}"
-            )
+            verdict = f"{candidate_label} improved preview ASR-content normalized {metric.upper()} vs {baseline_label}"
         elif compare_cand > compare_base + 0.01:
-            verdict = (
-                f"{baseline_label} remained better than {candidate_label} on preview ASR-content normalized {metric.upper()}"
-            )
+            verdict = f"{baseline_label} remained better than {candidate_label} on preview ASR-content normalized {metric.upper()}"
         else:
-            verdict = (
-                f"{baseline_label} and {candidate_label} were roughly neutral on preview ASR-content normalized {metric.upper()}"
-            )
+            verdict = f"{baseline_label} and {candidate_label} were roughly neutral on preview ASR-content normalized {metric.upper()}"
     return {
         "baseline_avg_wer": baseline_avg_wer,
         "candidate_avg_wer": candidate_avg_wer,

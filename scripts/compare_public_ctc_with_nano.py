@@ -15,6 +15,7 @@ from rwkvasr.eval import (
     normalize_asr_text_for_metrics,
 )
 from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     validate_stage211_student_public_prediction_receipt,
 )
 
@@ -86,6 +87,7 @@ def _load_references(
                 str(ref_text),
                 language=language,
                 normalization=normalization,
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
     if not references:
         raise ValueError(f"No prediction rows found: {path}")
@@ -144,11 +146,13 @@ def compare_dataset(
         nano_path,
         language=language,
         normalization=normalization,
+        strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     )
     student_stats = compute_text_error_stats(
         student_path,
         language=language,
         normalization=normalization,
+        strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     )
     metric_key = f"avg_{metric}"
     nano_rate = float(nano_stats[metric_key])
@@ -163,18 +167,21 @@ def compare_dataset(
         language=language,
         normalization=normalization,
         metric=metric,
+        strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     )
     nano_decomposition = compute_text_error_decomposition(
         nano_path,
         language=language,
         normalization=normalization,
         metric=metric,
+        strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     )
     student_decomposition = compute_text_error_decomposition(
         student_path,
         language=language,
         normalization=normalization,
         metric=metric,
+        strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     )
     absolute_gate_pass = absolute_gap_points <= max_absolute_gap_points
     relative_gate_pass = relative_ratio <= max_relative_ratio
@@ -263,6 +270,7 @@ def build_report(
         },
         "decode": "greedy_ctc",
         "normalization": normalization,
+        "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
         "gate": {
             "max_relative_ratio": max_relative_ratio,
             "max_absolute_gap_points": max_absolute_gap_points,
@@ -279,9 +287,7 @@ def build_report(
         report["student_checkpoint_sha256"] = _sha256_file(student_checkpoint)
     if student_prediction_receipt is not None:
         if student_checkpoint is None:
-            raise ValueError(
-                "--student-prediction-receipt requires --student-checkpoint."
-            )
+            raise ValueError("--student-prediction-receipt requires --student-checkpoint.")
         student_prediction_receipt = student_prediction_receipt.expanduser().resolve()
         receipt_payload = json.loads(student_prediction_receipt.read_text(encoding="utf-8"))
         if not isinstance(receipt_payload, dict):
@@ -304,8 +310,7 @@ def build_report(
                 for dataset in DATASETS
             },
             expected_prediction_paths={
-                dataset: student_prediction_dir / f"{dataset}.ctc.jsonl"
-                for dataset in DATASETS
+                dataset: student_prediction_dir / f"{dataset}.ctc.jsonl" for dataset in DATASETS
             },
             benchmarks={
                 dataset: {
@@ -317,9 +322,7 @@ def build_report(
             },
         )
         report["student_prediction_receipt_path"] = str(student_prediction_receipt)
-        report["student_prediction_receipt_sha256"] = _sha256_file(
-            student_prediction_receipt
-        )
+        report["student_prediction_receipt_sha256"] = _sha256_file(student_prediction_receipt)
     return report
 
 

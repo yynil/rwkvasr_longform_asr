@@ -17,6 +17,9 @@ from rwkvasr.eval.text_metrics import (
     tokenize_for_cer,
     tokenize_for_wer,
 )
+from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
+)
 from rwkvasr.training.funasr_online_teacher import (
     FunASRNanoCTCTopKOnlineTeacher,
     FunASROnlineCTCTeacherConfig,
@@ -158,18 +161,22 @@ def evaluate_funasr_nano_ctc_manifest(
             if record is None:
                 raise RuntimeError(f"FunASR-Nano returned no CTC record for utt_id={utt_id!r}")
 
-            token_ids = [int(value) for value in torch.as_tensor(record["argmax_token_ids"]).tolist()]
+            token_ids = [
+                int(value) for value in torch.as_tensor(record["argmax_token_ids"]).tolist()
+            ]
             pred_text = str(decode(token_ids))
             ref_text = str(row.get("text") if row.get("text") is not None else row.get("ref_text"))
             normalized_pred = normalize_asr_text_for_metrics(
                 pred_text,
                 language=config.language,
                 normalization=config.normalization,
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
             normalized_ref = normalize_asr_text_for_metrics(
                 ref_text,
                 language=config.language,
                 normalization=config.normalization,
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
             if config.language == "en":
                 pred_units = tokenize_for_wer(normalized_pred)
@@ -236,6 +243,7 @@ def evaluate_funasr_nano_ctc_manifest(
             predictions_path,
             language=config.language,
             normalization=config.normalization,
+            strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
         )
     )
     report: dict[str, Any] = {
@@ -248,6 +256,7 @@ def evaluate_funasr_nano_ctc_manifest(
         "predictions_path": str(predictions_path),
         "language": config.language,
         "normalization": config.normalization,
+        "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
         "decode": "greedy_ctc",
         "device": config.device,
         "requested_limit": config.limit,
@@ -279,6 +288,7 @@ def evaluate_funasr_nano_ctc_manifest(
             language=config.language,
             normalization=config.normalization,
             metric=metric,
+            strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
         )
         comparison.update(
             {

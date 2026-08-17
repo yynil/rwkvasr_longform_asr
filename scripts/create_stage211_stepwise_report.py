@@ -25,7 +25,10 @@ from rwkvasr.eval.stage211_initialization import (
     DEFAULT_STAGE211_INITIALIZATION_RECEIPT,
     validate_stage211_initialization_receipt,
 )
-from rwkvasr.eval.stage211_public_metrics import replay_stage211_sft_public_evidence
+from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
+    replay_stage211_sft_public_evidence,
+)
 from rwkvasr.eval.stage211_supplemental import STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
 
 try:
@@ -1909,6 +1912,7 @@ def build_stepwise_report(
         "ctc_label_proof": ctc_label_proof,
         "sft_correction_evidence": sft_correction_coverage,
         "public_metric_definition_chain_passed": True,
+        "public_metric_strip_language_confirmation": (STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION),
         "public_metric_correction_receipt_path": str(public_metric_correction_receipt_path),
         "public_metric_correction_receipt_sha256": sha256_file(
             public_metric_correction_receipt_path
@@ -1976,7 +1980,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "Public metric definition proof: "
         f"`{report['public_metric_correction_receipt_sha256']}` "
         f"(`{report['public_metric_tokenizer_contract']}`, tokenizer "
-        f"`{report['public_metric_tokenizer_source_sha256']}`)",
+        f"`{report['public_metric_tokenizer_source_sha256']}`, AR language-prefix "
+        "stripping: `false`)",
         "",
         f"Supplemental inventory: `{report['supplemental_inventory_sha256']}`",
         "",

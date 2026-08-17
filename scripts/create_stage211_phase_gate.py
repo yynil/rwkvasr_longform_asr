@@ -30,6 +30,7 @@ from rwkvasr.eval.stage211_gate import (
 )
 from rwkvasr.eval.stage211_supplemental import STAGE211_SUPPLEMENTAL_DIFFICULTY
 from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     build_stage211_public_progress,
     replay_stage211_public_comparison,
 )
@@ -125,6 +126,7 @@ def _jsonl_records(
                 reference,
                 language=language,
                 normalization="ctc",
+                strip_language_confirmation=STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
             )
     return records
 
