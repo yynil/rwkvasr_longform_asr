@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import shlex
 import subprocess
@@ -24,8 +23,15 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
+    STAGE211_SMOKE_RUNTIME_LOSS_FIELDS,
+    STAGE211_SMOKE_RUNTIME_MATCH_FIELDS,
+    STAGE211_SMOKE_RUNTIME_PRIMARY_LOSS_FIELD,
+    STAGE211_STACKED_SAFE_BATCH_SIZE,
+    STAGE211_STACKED_SAFE_FRAME_BUDGET,
     build_stage211_full_data_coverage,
+    build_stage211_smoke_runtime_objective_evidence,
     sha256_file,
+    stage211_smoke_step_two_lines,
     validate_stage211_full_data_coverage,
     validate_stage211_loaded_manifest_receipt,
 )
@@ -100,46 +106,9 @@ BAD_SMOKE_PATTERNS = (
     re.compile(r"\bdropped_tail(?:_samples)?=[1-9][0-9]*\b"),
     re.compile(r"\bskipped_samples=[1-9][0-9]*\b"),
 )
-SMOKE_RUNTIME_MATCH_FIELDS = {
-    "block": (
-        "online_encoder_match",
-        "online_decoder_hidden_match",
-        "online_layer_match",
-    ),
-    "logits": (
-        "online_blank_match",
-        "online_full_match",
-        "online_conditional_nonblank_match",
-        "online_conditional_nonblank_hard_match",
-        "online_encoder_match",
-        "online_decoder_hidden_match",
-        "online_layer_match",
-    ),
-}
-SMOKE_RUNTIME_LOSS_FIELDS = {
-    "block": (
-        "online_layer_mixer",
-        "online_layer_ffn",
-        "online_layer_block",
-        "online_ctc_encoder",
-        "online_ctc_decoder_hidden",
-    ),
-    "logits": (
-        "online_ctc_blank",
-        "online_ctc_full",
-        "online_ctc_conditional_nonblank",
-        "online_ctc_conditional_nonblank_hard",
-        "online_ctc_encoder",
-        "online_ctc_decoder_hidden",
-        "online_layer_mixer",
-        "online_layer_ffn",
-        "online_layer_block",
-    ),
-}
-SMOKE_RUNTIME_PRIMARY_LOSS_FIELD = {
-    "block": "online_layer_block",
-    "logits": "online_ctc_full",
-}
+SMOKE_RUNTIME_MATCH_FIELDS = STAGE211_SMOKE_RUNTIME_MATCH_FIELDS
+SMOKE_RUNTIME_LOSS_FIELDS = STAGE211_SMOKE_RUNTIME_LOSS_FIELDS
+SMOKE_RUNTIME_PRIMARY_LOSS_FIELD = STAGE211_SMOKE_RUNTIME_PRIMARY_LOSS_FIELD
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -169,47 +138,10 @@ def _checkpoint_step(path: Path) -> int:
 
 
 def _smoke_runtime_objective_evidence(*, phase: str, step_two_line: str) -> dict[str, Any]:
-    if phase not in SMOKE_RUNTIME_MATCH_FIELDS:
-        raise ValueError(f"Stage211 {phase} has no strict runtime-objective smoke contract.")
-    match_fields: dict[str, dict[str, int]] = {}
-    for field in SMOKE_RUNTIME_MATCH_FIELDS[phase]:
-        match = re.search(rf"\b{re.escape(field)}=([0-9]+)/([0-9]+)\b", step_two_line)
-        if match is None:
-            raise ValueError(f"Stage211 {phase} smoke lacks step-2 {field} evidence.")
-        matched, total = (int(value) for value in match.groups())
-        if total <= 0 or matched != total:
-            raise ValueError(
-                f"Stage211 {phase} smoke has incomplete step-2 {field}: {matched}/{total}"
-            )
-        match_fields[field] = {"matched": matched, "total": total}
-
-    loss_fields: dict[str, float] = {}
-    for field in SMOKE_RUNTIME_LOSS_FIELDS[phase]:
-        match = re.search(rf"\b{re.escape(field)}=([^ ]+)", step_two_line)
-        if match is None:
-            raise ValueError(f"Stage211 {phase} smoke lacks step-2 {field} telemetry.")
-        try:
-            value = float(match.group(1))
-        except ValueError as error:
-            raise ValueError(
-                f"Stage211 {phase} smoke has non-numeric step-2 {field} telemetry."
-            ) from error
-        if not math.isfinite(value) or value < 0.0:
-            raise ValueError(
-                f"Stage211 {phase} smoke has invalid step-2 {field} telemetry: {value}"
-            )
-        loss_fields[field] = value
-
-    primary_field = SMOKE_RUNTIME_PRIMARY_LOSS_FIELD[phase]
-    if loss_fields[primary_field] <= 0.0:
-        raise ValueError(f"Stage211 {phase} smoke primary step-2 {primary_field} must be positive.")
-    return {
-        "schema_version": 1,
-        "step": 2,
-        "required_match_fields": match_fields,
-        "active_loss_fields": loss_fields,
-        "primary_loss_field": primary_field,
-    }
+    return build_stage211_smoke_runtime_objective_evidence(
+        phase=phase,
+        step_two_line=step_two_line,
+    )
 
 
 def _formal_phase_training_started(phase_root: Path) -> bool:
@@ -516,9 +448,19 @@ def _profile_admission_command(
 
 
 def _automatic_profile_requires_admission(measured: dict[str, Any]) -> bool:
-    if str(measured.get("phase") or "") == "logits":
-        return True
-    return measured["selection_decision"] != "keep_baseline"
+    selected = measured.get("selected_profile_row")
+    if not isinstance(selected, dict) or not isinstance(selected.get("profile"), dict):
+        raise ValueError("Stage211 automatic batch profile lacks its selected profile.")
+    base_config = load_yaml(Path(str(measured["base_config_path"])))
+    profile = selected["profile"]
+    return any(
+        (
+            int(profile["batch_size"]) != int(base_config.get("batch_size", 0) or 0),
+            int(profile["frame_budget"])
+            != int(base_config.get("length_bucket_frame_budget", 0) or 0),
+            int(profile["num_workers"]) != int(base_config.get("num_workers", 0) or 0),
+        )
+    )
 
 
 def _ensure_measured_batch_profile(
@@ -717,12 +659,42 @@ def _audit_smoke(
         raise ValueError(f"Stage211 {phase} smoke did not produce step-2.pt.")
     if not log_path.is_file() or log_path.stat().st_size <= 0:
         raise ValueError(f"Stage211 {phase} smoke log is missing: {log_path}")
+    smoke_config_path = smoke_run_dir / "train_config.yaml"
+    smoke_runtime_profile: dict[str, Any] | None = None
+    if phase in {"block", "logits"}:
+        if not smoke_config_path.is_file() or smoke_config_path.stat().st_size <= 0:
+            raise ValueError(f"Stage211 {phase} smoke config is missing: {smoke_config_path}")
+        smoke_config = load_yaml(smoke_config_path)
+        deepspeed = smoke_config.get("deepspeed")
+        if not isinstance(deepspeed, dict):
+            raise ValueError(f"Stage211 {phase} smoke lacks its DeepSpeed config.")
+        expected_train_batch = STAGE211_STACKED_SAFE_BATCH_SIZE * STAGE211_FULL_DATA_WORLD_SIZE
+        if any(
+            (
+                int(smoke_config.get("batch_size", 0) or 0) != STAGE211_STACKED_SAFE_BATCH_SIZE,
+                int(smoke_config.get("batch_token_budget", 0) or 0)
+                != STAGE211_STACKED_SAFE_FRAME_BUDGET,
+                int(smoke_config.get("length_bucket_frame_budget", 0) or 0)
+                != STAGE211_STACKED_SAFE_FRAME_BUDGET,
+                int(deepspeed.get("train_micro_batch_size_per_gpu", 0) or 0)
+                != STAGE211_STACKED_SAFE_BATCH_SIZE,
+                int(deepspeed.get("train_batch_size", 0) or 0) != expected_train_batch,
+            )
+        ):
+            raise ValueError(f"Stage211 {phase} smoke did not use the memory-safe stacked profile.")
+        smoke_runtime_profile = {
+            "batch_size": STAGE211_STACKED_SAFE_BATCH_SIZE,
+            "frame_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
+            "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+            "train_batch_size": expected_train_batch,
+        }
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
     attempt_marker = "[rwkvasr] Distributed init complete."
     latest_attempt_start = log_text.rfind(attempt_marker)
     if latest_attempt_start >= 0:
         log_text = log_text[latest_attempt_start:]
-    if "[deepspeed-train] step=2" not in log_text:
+    step_two_lines = stage211_smoke_step_two_lines(log_text)
+    if not step_two_lines:
         raise ValueError(f"Stage211 {phase} smoke did not execute two training steps.")
     for pattern in BAD_SMOKE_PATTERNS:
         match = pattern.search(log_text)
@@ -732,11 +704,6 @@ def _audit_smoke(
             )
     runtime_objective_evidence: dict[str, Any] | None = None
     if phase in SMOKE_RUNTIME_MATCH_FIELDS:
-        step_two_lines = [
-            line
-            for line in log_text.splitlines()
-            if re.search(r"\[deepspeed-train\] step=2\b", line) is not None
-        ]
         runtime_objective_evidence = _smoke_runtime_objective_evidence(
             phase=phase,
             step_two_line=step_two_lines[-1],
@@ -771,6 +738,14 @@ def _audit_smoke(
     }
     if runtime_objective_evidence is not None:
         report["runtime_objective_evidence"] = runtime_objective_evidence
+    if smoke_runtime_profile is not None:
+        report.update(
+            {
+                "smoke_config_path": str(smoke_config_path.resolve()),
+                "smoke_config_sha256": sha256_file(smoke_config_path),
+                "smoke_runtime_profile": smoke_runtime_profile,
+            }
+        )
     return report
 
 

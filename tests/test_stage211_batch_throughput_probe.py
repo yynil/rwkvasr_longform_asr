@@ -28,17 +28,28 @@ def test_default_profiles_cover_baseline_and_seven_larger_candidates() -> None:
     )
 
 
-def test_logits_default_profiles_start_from_memory_safe_baseline() -> None:
+def test_stacked_default_profiles_start_from_memory_safe_baseline() -> None:
+    assert probe.default_profiles_for_phase("block") == (
+        probe.BatchProfile("baseline", 4, 4_000),
+        probe.BatchProfile("batch8_frames6k", 8, 6_000),
+        probe.BatchProfile("batch12_frames8k", 12, 8_000),
+        probe.BatchProfile("batch16_frames10k", 16, 10_000),
+        probe.BatchProfile("batch24_frames16k", 24, 16_000),
+        probe.BatchProfile("batch36_frames24k", 36, 24_000),
+        probe.BatchProfile("batch48_frames32k", 48, 32_000),
+        probe.BatchProfile("batch64_frames42k", 64, 42_000),
+    )
     assert probe.default_profiles_for_phase("logits") == (
-        probe.BatchProfile("baseline", 12, 8_000),
+        probe.BatchProfile("baseline", 4, 4_000),
+        probe.BatchProfile("batch8_frames6k", 8, 6_000),
+        probe.BatchProfile("batch12_frames8k", 12, 8_000),
         probe.BatchProfile("batch16_frames10k", 16, 10_000),
         probe.BatchProfile("batch20_frames13k", 20, 13_000),
         probe.BatchProfile("batch24_frames16k", 24, 16_000),
         probe.BatchProfile("batch36_frames24k", 36, 24_000),
-        *probe.DEFAULT_PROFILES[1:],
+        probe.BatchProfile("batch48_frames32k", 48, 32_000),
     )
     assert probe.default_profiles_for_phase("mixer") is probe.DEFAULT_PROFILES
-    assert probe.default_profiles_for_phase("block") is probe.DEFAULT_PROFILES
 
 
 def test_probe_artifact_cleanup_removes_only_generated_run_dir(tmp_path: Path) -> None:

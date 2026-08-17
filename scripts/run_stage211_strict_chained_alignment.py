@@ -26,6 +26,8 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_WORLD_SIZE,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
+    STAGE211_STACKED_SAFE_BATCH_SIZE,
+    STAGE211_STACKED_SAFE_FRAME_BUDGET,
     stage211_phase_train_config_contract,
     stage211_post_coverage_correction_lr,
     stage211_post_coverage_train_config_contract,
@@ -525,9 +527,7 @@ def _validate_curriculum_receipt(
         raise ValueError("Stage211 easy curriculum does not accept a predecessor receipt.")
     schema_version = receipt.get("schema_version")
     if schema_version not in (1, 2):
-        raise ValueError(
-            f"Stage211 curriculum receipt schema mismatch: actual={schema_version!r}"
-        )
+        raise ValueError(f"Stage211 curriculum receipt schema mismatch: actual={schema_version!r}")
     expected_fields = {
         "pipeline": "stage211",
         "artifact": "curriculum_coverage",
@@ -562,13 +562,9 @@ def _validate_curriculum_receipt(
     if receipt.get("completion_checkpoint_sha256") != _sha256_file(checkpoint_path):
         raise ValueError("Stage211 curriculum receipt checkpoint SHA-256 mismatch.")
     if schema_version == 1:
-        steps_per_epoch = int(
-            STAGE211_AUDIO_CURRICULUM[expected_difficulty]["steps_per_epoch"]
-        )
+        steps_per_epoch = int(STAGE211_AUDIO_CURRICULUM[expected_difficulty]["steps_per_epoch"])
     else:
-        admission_path = Path(
-            str(receipt.get("batch_profile_admission_path") or "")
-        ).resolve()
+        admission_path = Path(str(receipt.get("batch_profile_admission_path") or "")).resolve()
         admission = validate_stage211_batch_profile_admission(
             admission_path,
             phase=phase,
@@ -585,9 +581,7 @@ def _validate_curriculum_receipt(
             "num_workers": int(profile["num_workers"]),
             "steps_per_epoch": int(coverage["steps_per_epoch"]),
             "steps": int(coverage["full_coverage_steps"]),
-            "tail_padding_samples_per_epoch": int(
-                coverage["tail_padding_samples_per_epoch"]
-            ),
+            "tail_padding_samples_per_epoch": int(coverage["tail_padding_samples_per_epoch"]),
         }
         if any(receipt.get(key) != value for key, value in schema2_fields.items()):
             raise ValueError("Stage211 admitted curriculum receipt profile changed.")
@@ -1302,13 +1296,17 @@ def _config(
         }
     )
     if correction_layer_rotation_offset is not None:
-        config["ctc_teacher_online_layer_rotation_offset"] = int(
-            correction_layer_rotation_offset
-        )
+        config["ctc_teacher_online_layer_rotation_offset"] = int(correction_layer_rotation_offset)
     if full_data_profile:
         selected_profile = (
             batch_profile_admission["selected_profile"]
             if batch_profile_admission is not None
+            else {
+                "batch_size": STAGE211_STACKED_SAFE_BATCH_SIZE,
+                "frame_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
+                "num_workers": int(config.get("num_workers", 8)),
+            }
+            if smoke and phase.name in {"block", "logits"}
             else {
                 "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
                 "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
@@ -1342,9 +1340,7 @@ def _config(
         deepspeed_config.update(
             {
                 "train_micro_batch_size_per_gpu": runtime_batch_size,
-                "train_batch_size": (
-                    runtime_batch_size * TRAIN_WORLD_SIZE * gradient_accumulation
-                ),
+                "train_batch_size": (runtime_batch_size * TRAIN_WORLD_SIZE * gradient_accumulation),
             }
         )
         config["deepspeed"] = deepspeed_config
@@ -1357,9 +1353,9 @@ def _config(
                     "stage211_batch_profile_admission_sha256": batch_profile_admission[
                         "receipt_sha256"
                     ],
-                    "stage211_batch_profile_name": batch_profile_admission[
-                        "selected_profile"
-                    ]["name"],
+                    "stage211_batch_profile_name": batch_profile_admission["selected_profile"][
+                        "name"
+                    ],
                     "stage211_batch_profile_num_workers": runtime_num_workers,
                 }
             )
@@ -1414,9 +1410,7 @@ def _config(
             )
         if phase.name in {"mixer", "block", "logits"}:
             if correction_layer_boundary_ids is None:
-                raise ValueError(
-                    "Stage211 correction requires explicit gate-derived layer focus."
-                )
+                raise ValueError("Stage211 correction requires explicit gate-derived layer focus.")
             if correction_layer_rotation_offset is None:
                 raise ValueError(
                     "Stage211 correction requires an explicit cross-round layer rotation offset."
@@ -1590,19 +1584,13 @@ def _record_or_validate_provenance(
         payload["webdataset_skip_decode_errors"] = False
         if batch_profile_admission is not None:
             payload["batch_profile_admission_path"] = batch_profile_admission["receipt_path"]
-            payload["batch_profile_admission_sha256"] = batch_profile_admission[
-                "receipt_sha256"
-            ]
+            payload["batch_profile_admission_sha256"] = batch_profile_admission["receipt_sha256"]
             payload["batch_profile_name"] = batch_profile_admission["selected_profile"]["name"]
-            payload["batch_size"] = int(
-                batch_profile_admission["selected_profile"]["batch_size"]
-            )
+            payload["batch_size"] = int(batch_profile_admission["selected_profile"]["batch_size"])
             payload["frame_budget"] = int(
                 batch_profile_admission["selected_profile"]["frame_budget"]
             )
-            payload["num_workers"] = int(
-                batch_profile_admission["selected_profile"]["num_workers"]
-            )
+            payload["num_workers"] = int(batch_profile_admission["selected_profile"]["num_workers"])
     if phase.requires_labels:
         payload["length_bucket_drop_last"] = False
         payload["skip_oversized_samples"] = False
@@ -1652,18 +1640,10 @@ def _validate_resume_provenance(
         expected["skip_oversized_samples"] = False
         expected["webdataset_skip_decode_errors"] = False
         if batch_profile_admission is not None:
-            expected["batch_profile_admission_path"] = batch_profile_admission[
-                "receipt_path"
-            ]
-            expected["batch_profile_admission_sha256"] = batch_profile_admission[
-                "receipt_sha256"
-            ]
-            expected["batch_profile_name"] = batch_profile_admission["selected_profile"][
-                "name"
-            ]
-            expected["batch_size"] = int(
-                batch_profile_admission["selected_profile"]["batch_size"]
-            )
+            expected["batch_profile_admission_path"] = batch_profile_admission["receipt_path"]
+            expected["batch_profile_admission_sha256"] = batch_profile_admission["receipt_sha256"]
+            expected["batch_profile_name"] = batch_profile_admission["selected_profile"]["name"]
+            expected["batch_size"] = int(batch_profile_admission["selected_profile"]["batch_size"])
             expected["frame_budget"] = int(
                 batch_profile_admission["selected_profile"]["frame_budget"]
             )
@@ -1778,12 +1758,8 @@ def main() -> int:
         difficulty = str(args.difficulty or "easy")
         if args.full_data_profile and args.difficulty is None:
             parser.error("--full-data-profile requires an explicit --difficulty")
-    if args.batch_profile_admission is not None and (
-        not args.full_data_profile or args.smoke
-    ):
-        parser.error(
-            "--batch-profile-admission requires a non-smoke --full-data-profile run"
-        )
+    if args.batch_profile_admission is not None and (not args.full_data_profile or args.smoke):
+        parser.error("--batch-profile-admission requires a non-smoke --full-data-profile run")
     is_supplemental = difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY
     if is_supplemental and args.supplemental_inventory is None:
         parser.error(
@@ -1806,6 +1782,9 @@ def main() -> int:
     runtime_batch_size = STAGE211_FULL_DATA_BATCH_SIZE
     runtime_frame_budget = STAGE211_FULL_DATA_FRAME_BUDGET
     runtime_num_workers = 8
+    if args.smoke and phase.name in {"block", "logits"}:
+        runtime_batch_size = STAGE211_STACKED_SAFE_BATCH_SIZE
+        runtime_frame_budget = STAGE211_STACKED_SAFE_FRAME_BUDGET
     if args.batch_profile_admission is not None:
         batch_profile_admission = validate_stage211_batch_profile_admission(
             args.batch_profile_admission,
@@ -1814,12 +1793,8 @@ def main() -> int:
             expected_bucket_manifest=bucket_manifest,
         )
         runtime_batch_size = int(batch_profile_admission["selected_profile"]["batch_size"])
-        runtime_frame_budget = int(
-            batch_profile_admission["selected_profile"]["frame_budget"]
-        )
-        runtime_num_workers = int(
-            batch_profile_admission["selected_profile"]["num_workers"]
-        )
+        runtime_frame_budget = int(batch_profile_admission["selected_profile"]["frame_budget"])
+        runtime_num_workers = int(batch_profile_admission["selected_profile"]["num_workers"])
 
     labeled_data_audit: dict[str, Any] | None = None
     audio_data_audit: dict[str, Any] | None = None
@@ -1888,12 +1863,8 @@ def main() -> int:
         manifest = load_webdataset_bucket_manifest(bucket_manifest)
         expected_coverage = STAGE211_AUDIO_CURRICULUM[difficulty]
         actual_rows = int(audio_data_audit["split_samples"].get("train", 0))
-        audit_batch_size = (
-            runtime_batch_size if args.full_data_profile else TRAIN_BATCH_SIZE
-        )
-        audit_frame_budget = (
-            runtime_frame_budget if args.full_data_profile else TRAIN_FRAME_BUDGET
-        )
+        audit_batch_size = runtime_batch_size if args.full_data_profile else TRAIN_BATCH_SIZE
+        audit_frame_budget = runtime_frame_budget if args.full_data_profile else TRAIN_FRAME_BUDGET
         actual_steps_per_epoch = estimate_bucket_manifest_steps(
             manifest,
             split="train",
@@ -1902,12 +1873,16 @@ def main() -> int:
             frame_budget=audit_frame_budget,
             drop_last=not args.full_data_profile,
         )
-        expected_steps_per_epoch = int(
-            batch_profile_admission["selected_coverage"]["steps_per_epoch"]
-            if batch_profile_admission is not None
-            else expected_coverage["steps_per_epoch"]
-            if args.full_data_profile
-            else LEGACY_CURRICULUM_STEPS[difficulty]
+        expected_steps_per_epoch = (
+            actual_steps_per_epoch
+            if args.smoke
+            else int(
+                batch_profile_admission["selected_coverage"]["steps_per_epoch"]
+                if batch_profile_admission is not None
+                else expected_coverage["steps_per_epoch"]
+                if args.full_data_profile
+                else LEGACY_CURRICULUM_STEPS[difficulty]
+            )
         )
         if (
             actual_rows != int(expected_coverage["rows"])
@@ -1926,12 +1901,14 @@ def main() -> int:
                 world_size=TRAIN_WORLD_SIZE,
                 frame_budget=audit_frame_budget,
             )
-            expected_tail_padding = int(
-                batch_profile_admission["selected_coverage"][
-                    "tail_padding_samples_per_epoch"
-                ]
-                if batch_profile_admission is not None
-                else expected_coverage["tail_padding_samples_per_epoch"]
+            expected_tail_padding = (
+                actual_tail_padding
+                if args.smoke
+                else int(
+                    batch_profile_admission["selected_coverage"]["tail_padding_samples_per_epoch"]
+                    if batch_profile_admission is not None
+                    else expected_coverage["tail_padding_samples_per_epoch"]
+                )
             )
             if actual_tail_padding != expected_tail_padding:
                 raise ValueError(

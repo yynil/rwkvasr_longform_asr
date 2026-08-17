@@ -34,6 +34,8 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
     STAGE211_RETENTION_CORRECTION_EPOCHS,
     STAGE211_RETENTION_CORRECTION_LR,
+    STAGE211_STACKED_SAFE_BATCH_SIZE,
+    STAGE211_STACKED_SAFE_FRAME_BUDGET,
     build_stage211_correction_round_promotion_gate,
     build_stage211_correction_layer_focus,
     build_stage211_full_data_coverage,
@@ -79,9 +81,7 @@ stage211_supplemental_profile_receipt = importlib.import_module(
     "scripts.create_stage211_supplemental_profile_receipt"
 )
 stage211_gate_module = importlib.import_module("rwkvasr.eval.stage211_gate")
-stage211_batch_profile_test = importlib.import_module(
-    "tests.test_stage211_batch_profile_admission"
-)
+stage211_batch_profile_test = importlib.import_module("tests.test_stage211_batch_profile_admission")
 
 
 def _stage211_smoke_runtime_fields(phase: str) -> str:
@@ -92,6 +92,26 @@ def _stage211_smoke_runtime_fields(phase: str) -> str:
         f"{field}=0.1250" for field in stage211_full_phase.SMOKE_RUNTIME_LOSS_FIELDS[phase]
     )
     return f"{matches} {losses}"
+
+
+def _write_stacked_smoke_config(path: Path, *, phase: str) -> Path:
+    config = stage211_phase_train_config_contract(phase)
+    config.update(
+        {
+            "batch_size": STAGE211_STACKED_SAFE_BATCH_SIZE,
+            "batch_token_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
+            "length_bucket_frame_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
+            "deepspeed": {
+                "train_micro_batch_size_per_gpu": STAGE211_STACKED_SAFE_BATCH_SIZE,
+                "gradient_accumulation_steps": 1,
+                "train_batch_size": (
+                    STAGE211_STACKED_SAFE_BATCH_SIZE * STAGE211_FULL_DATA_WORLD_SIZE
+                ),
+            },
+        }
+    )
+    save_yaml(path, config)
+    return path.resolve()
 
 
 @pytest.fixture(autouse=True)
@@ -176,6 +196,7 @@ def test_stage211_full_phase_smoke_marker_rebuilds_source_evidence(
     torch.save({"step": 0}, init_checkpoint)
     torch.save({"step": 2}, smoke_run_dir / "step-2.pt")
     easy_manifest.write_text("{}\n", encoding="utf-8")
+    _write_stacked_smoke_config(smoke_run_dir / "train_config.yaml", phase="block")
     (log_dir / "block_smoke_2steps.log").write_text(
         "[rwkvasr] Distributed init complete.\n"
         "[deepspeed-train] step=1 loss=0.8 peak_reserved=5.50GiB\n"
@@ -2500,6 +2521,19 @@ def test_stage211_full_phase_smoke_audit_rejects_teacher_misses(
             max_peak_reserved_gib=22.0,
         )
 
+    log_path.write_text(
+        valid_log.replace("step=2", "step=20"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="did not execute two training steps"):
+        stage211_full_phase._audit_smoke(
+            phase=phase,
+            smoke_run_dir=smoke_run_dir,
+            init_checkpoint=init_checkpoint,
+            easy_manifest=easy_manifest,
+            max_peak_reserved_gib=22.0,
+        )
+
 
 def test_stage211_logits_smoke_requires_complete_full_logit_match(
     tmp_path: Path,
@@ -2513,6 +2547,7 @@ def test_stage211_logits_smoke_requires_complete_full_logit_match(
     log_dir = smoke_run_dir / "logs"
     log_dir.mkdir(parents=True)
     torch.save({"step": 2}, smoke_run_dir / "step-2.pt")
+    _write_stacked_smoke_config(smoke_run_dir / "train_config.yaml", phase=phase)
     log_path = log_dir / "logits_smoke_2steps.log"
 
     def audit(match_field: str) -> dict[str, object]:
@@ -2699,6 +2734,35 @@ def _config_for_phase(
         smoke=smoke,
         labeled_webdataset_root=labeled_root if phase.requires_labels else None,
         labeled_length_index=labeled_length_index if phase.requires_labels else None,
+    )
+
+
+@pytest.mark.parametrize("phase_name", ("block", "logits"))
+def test_stage211_stacked_full_profile_smoke_uses_safe_capacity(
+    tmp_path: Path,
+    phase_name: str,
+) -> None:
+    phase = stage211.PHASES[phase_name]
+    segment = stage211._segments(phase=phase, smoke=True)[0]
+    config = stage211._config(
+        phase=phase,
+        segment=segment,
+        output_dir=tmp_path / phase_name,
+        init_checkpoint=tmp_path / "selected.pt",
+        bucket_manifest=tmp_path / "manifest.json",
+        resume=False,
+        smoke=True,
+        full_data_profile=True,
+    )
+
+    assert config["batch_size"] == STAGE211_STACKED_SAFE_BATCH_SIZE
+    assert config["batch_token_budget"] == STAGE211_STACKED_SAFE_FRAME_BUDGET
+    assert config["length_bucket_frame_budget"] == STAGE211_STACKED_SAFE_FRAME_BUDGET
+    assert config["deepspeed"]["train_micro_batch_size_per_gpu"] == (
+        STAGE211_STACKED_SAFE_BATCH_SIZE
+    )
+    assert config["deepspeed"]["train_batch_size"] == (
+        STAGE211_STACKED_SAFE_BATCH_SIZE * STAGE211_FULL_DATA_WORLD_SIZE
     )
 
 
@@ -5117,36 +5181,63 @@ def _write_valid_phase_gate(
     smoke_checkpoint = smoke_dir / "step-2.pt"
     smoke_log = smoke_log_dir / f"{phase}_smoke_2steps.log"
     torch.save({"step": 2}, smoke_checkpoint)
-    logits_full_match = " online_full_match=8/8 online_full_missing=0" if phase == "logits" else ""
+    smoke_config = None
+    smoke_runtime_fields = ""
+    if phase in {"block", "logits"}:
+        smoke_config = _write_stacked_smoke_config(
+            smoke_dir / "train_config.yaml",
+            phase=phase,
+        )
+        smoke_runtime_fields = f" {_stage211_smoke_runtime_fields(phase)}"
     smoke_log.write_text(
         "[rwkvasr] Distributed init complete.\n"
         "[deepspeed-train] step=1 loss=0.8 peak_reserved=5.50GiB\n"
-        f"[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB{logits_full_match}\n",
+        f"[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB{smoke_runtime_fields}\n",
         encoding="utf-8",
     )
     easy_manifest = Path(str(segments[0]["bucket_manifest_path"])).resolve()
     smoke_marker = tmp_path / f"{phase}-full-profile-smoke-passed.json"
-    smoke_marker.write_text(
-        json.dumps(
+    smoke_marker_payload = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "full_profile_smoke",
+        "phase": phase,
+        "complete": True,
+        "init_checkpoint_path": str(phase_init_checkpoint.resolve()),
+        "init_checkpoint_sha256": sha256_file(phase_init_checkpoint),
+        "easy_manifest_path": str(easy_manifest),
+        "easy_manifest_sha256": sha256_file(easy_manifest),
+        "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
+        "smoke_checkpoint_sha256": sha256_file(smoke_checkpoint),
+        "smoke_log_path": str(smoke_log.resolve()),
+        "smoke_log_sha256": sha256_file(smoke_log),
+        "peak_reserved_gib": 6.0,
+        "max_peak_reserved_gib": 22.0,
+    }
+    if smoke_config is not None:
+        runtime_objective_evidence = stage211_full_phase._smoke_runtime_objective_evidence(
+            phase=phase,
+            step_two_line=(
+                f"[deepspeed-train] step=2 loss=0.7 peak_reserved=6.00GiB{smoke_runtime_fields}"
+            ),
+        )
+        smoke_marker_payload.update(
             {
-                "schema_version": 1,
-                "pipeline": "stage211",
-                "artifact": "full_profile_smoke",
-                "phase": phase,
-                "complete": True,
-                "init_checkpoint_path": str(phase_init_checkpoint.resolve()),
-                "init_checkpoint_sha256": sha256_file(phase_init_checkpoint),
-                "easy_manifest_path": str(easy_manifest),
-                "easy_manifest_sha256": sha256_file(easy_manifest),
-                "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
-                "smoke_checkpoint_sha256": sha256_file(smoke_checkpoint),
-                "smoke_log_path": str(smoke_log.resolve()),
-                "smoke_log_sha256": sha256_file(smoke_log),
-                "peak_reserved_gib": 6.0,
-                "max_peak_reserved_gib": 22.0,
+                "smoke_config_path": str(smoke_config),
+                "smoke_config_sha256": sha256_file(smoke_config),
+                "runtime_objective_evidence": runtime_objective_evidence,
+                "smoke_runtime_profile": {
+                    "batch_size": STAGE211_STACKED_SAFE_BATCH_SIZE,
+                    "frame_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
+                    "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+                    "train_batch_size": (
+                        STAGE211_STACKED_SAFE_BATCH_SIZE * STAGE211_FULL_DATA_WORLD_SIZE
+                    ),
+                },
             }
         )
-        + "\n",
+    smoke_marker.write_text(
+        json.dumps(smoke_marker_payload) + "\n",
         encoding="utf-8",
     )
 
@@ -6828,6 +6919,54 @@ def test_stage211_phase_gate_rejects_mutated_preflight_smoke_log(
         validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="mixer",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_block_phase_gate_rejects_unsafe_smoke_capacity(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "block-complete.pt"
+    checkpoint.write_bytes(b"block-complete")
+    gate_report = _write_valid_phase_gate(tmp_path, phase="block", checkpoint=checkpoint)
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    marker_path = Path(report["preflight_smoke"]["marker_path"])
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    smoke_config = Path(marker["smoke_config_path"])
+    config = load_yaml(smoke_config)
+    config["batch_size"] = 36
+    save_yaml(smoke_config, config)
+    marker["smoke_config_sha256"] = sha256_file(smoke_config)
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    report["preflight_smoke"]["marker_sha256"] = sha256_file(marker_path)
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="memory-safe profile"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="block",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_logits_phase_gate_replays_smoke_runtime_objectives(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "logits-complete.pt"
+    checkpoint.write_bytes(b"logits-complete")
+    gate_report = _write_valid_phase_gate(tmp_path, phase="logits", checkpoint=checkpoint)
+    report = json.loads(gate_report.read_text(encoding="utf-8"))
+    marker_path = Path(report["preflight_smoke"]["marker_path"])
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["runtime_objective_evidence"]["active_loss_fields"]["online_ctc_full"] = 0.5
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    report["preflight_smoke"]["marker_sha256"] = sha256_file(marker_path)
+    gate_report.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime-objective evidence changed"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="logits",
             checkpoint_path=checkpoint,
         )
 

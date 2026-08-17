@@ -28,9 +28,7 @@ from rwkvasr.eval.stage211_gate import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
-stage211_full_phase = importlib.import_module(
-    "scripts.run_stage211_full_phase_curriculum"
-)
+stage211_full_phase = importlib.import_module("scripts.run_stage211_full_phase_curriculum")
 
 
 def _write(path: Path, value: str) -> Path:
@@ -100,9 +98,7 @@ def _profile_row(
             }
             for layer_id in range(70)
         }
-        for component in (
-            ("mixer",) if phase == "mixer" else ("mixer", "ffn", "block")
-        )
+        for component in (("mixer",) if phase == "mixer" else ("mixer", "ffn", "block"))
     }
     save_yaml(
         fixed_eval_path,
@@ -160,9 +156,7 @@ def _profile_row(
                 if phase == "logits"
                 else {}
             ),
-            "decoder_hidden_metrics": (
-                {} if phase == "mixer" else {"loss": loss}
-            ),
+            "decoder_hidden_metrics": ({} if phase == "mixer" else {"loss": loss}),
         },
     )
     full_steps = steps_per_epoch * 3
@@ -496,17 +490,21 @@ def test_worker_only_profile_is_measured_admitted_and_tamper_evident(
         validate_stage211_batch_profile_preflight(report_path, phase="mixer")
 
 
-def test_logits_preflight_accepts_safe_and_legacy_baselines(tmp_path: Path) -> None:
+@pytest.mark.parametrize("phase", ("block", "logits"))
+def test_stacked_preflight_accepts_safe_and_legacy_baselines(
+    tmp_path: Path,
+    phase: str,
+) -> None:
     safe_report = _report(
-        tmp_path / "safe",
-        phase="logits",
-        baseline_batch_size=12,
-        baseline_frame_budget=8_000,
+        tmp_path / f"safe-{phase}",
+        phase=phase,
+        baseline_batch_size=4,
+        baseline_frame_budget=4_000,
     )
-    legacy_report = _report(tmp_path / "legacy", phase="logits")
+    legacy_report = _report(tmp_path / f"legacy-{phase}", phase=phase)
 
-    safe = validate_stage211_batch_profile_preflight(safe_report, phase="logits")
-    legacy = validate_stage211_batch_profile_preflight(legacy_report, phase="logits")
+    safe = validate_stage211_batch_profile_preflight(safe_report, phase=phase)
+    legacy = validate_stage211_batch_profile_preflight(legacy_report, phase=phase)
 
     safe_baseline = next(
         row["profile"] for row in safe["profiles"] if row["profile"]["name"] == "baseline"
@@ -514,8 +512,8 @@ def test_logits_preflight_accepts_safe_and_legacy_baselines(tmp_path: Path) -> N
     legacy_baseline = next(
         row["profile"] for row in legacy["profiles"] if row["profile"]["name"] == "baseline"
     )
-    assert safe_baseline["batch_size"] == 12
-    assert safe_baseline["frame_budget"] == 8_000
+    assert safe_baseline["batch_size"] == 4
+    assert safe_baseline["frame_budget"] == 4_000
     assert legacy_baseline["batch_size"] == 36
     assert legacy_baseline["frame_budget"] == 24_000
 
@@ -524,8 +522,8 @@ def test_logits_retained_safe_baseline_can_be_formally_admitted(tmp_path: Path) 
     report_path = _report(
         tmp_path,
         phase="logits",
-        baseline_batch_size=12,
-        baseline_frame_budget=8_000,
+        baseline_batch_size=4,
+        baseline_frame_budget=4_000,
     )
     report = json.loads(report_path.read_text(encoding="utf-8"))
     candidate = report["profiles"][1]
@@ -553,8 +551,8 @@ def test_logits_retained_safe_baseline_can_be_formally_admitted(tmp_path: Path) 
     )
     assert receipt["selected_profile"] == {
         "name": "baseline",
-        "batch_size": 12,
-        "frame_budget": 8_000,
+        "batch_size": 4,
+        "frame_budget": 4_000,
         "num_workers": 8,
     }
     assert receipt["selected_comparison"] is None
@@ -571,15 +569,27 @@ def test_logits_retained_safe_baseline_can_be_formally_admitted(tmp_path: Path) 
     assert validated["selected_comparison"] is None
 
 
-def test_automatic_profile_routes_nonlegacy_retained_baseline_to_admission() -> None:
+def test_automatic_profile_routes_nonlegacy_retained_baseline_to_admission(
+    tmp_path: Path,
+) -> None:
+    base_config = tmp_path / "base.yaml"
+    save_yaml(
+        base_config,
+        {
+            "batch_size": 36,
+            "length_bucket_frame_budget": 24_000,
+            "num_workers": 8,
+        },
+    )
     retained_safe_logits = {
         "phase": "logits",
         "selection_decision": "keep_baseline",
+        "base_config_path": str(base_config),
         "selected_profile_row": {
             "profile": {
                 "name": "baseline",
-                "batch_size": 12,
-                "frame_budget": 8_000,
+                "batch_size": 4,
+                "frame_budget": 4_000,
                 "num_workers": 8,
             }
         },
@@ -591,20 +601,21 @@ def test_automatic_profile_routes_nonlegacy_retained_baseline_to_admission() -> 
     )
     admitted_candidate = copy.deepcopy(retained_legacy)
     admitted_candidate["selection_decision"] = "admit_candidate"
-
-    assert stage211_full_phase._automatic_profile_requires_admission(
-        retained_safe_logits
+    admitted_candidate["selected_profile_row"]["profile"].update(
+        {"batch_size": 48, "frame_budget": 42_000}
     )
+
+    assert stage211_full_phase._automatic_profile_requires_admission(retained_safe_logits)
     assert not stage211_full_phase._automatic_profile_requires_admission(retained_legacy)
     assert stage211_full_phase._automatic_profile_requires_admission(admitted_candidate)
 
 
-def test_mixer_preflight_rejects_logits_safe_baseline(tmp_path: Path) -> None:
+def test_mixer_preflight_rejects_stacked_safe_baseline(tmp_path: Path) -> None:
     report_path = _report(
         tmp_path,
         phase="mixer",
-        baseline_batch_size=12,
-        baseline_frame_budget=8_000,
+        baseline_batch_size=4,
+        baseline_frame_budget=4_000,
     )
 
     with pytest.raises(ValueError, match="baseline is unsupported for this phase"):
@@ -790,9 +801,7 @@ def test_receipt_profile_tamper_is_rejected(tmp_path: Path) -> None:
 
 def test_controller_threads_an_explicit_segment_admission(tmp_path: Path) -> None:
     admission = tmp_path / "admission.json"
-    parsed = stage211_full_phase._parse_batch_profile_admissions(
-        [f"long={admission}"]
-    )
+    parsed = stage211_full_phase._parse_batch_profile_admissions([f"long={admission}"])
     assert parsed == {"long": admission.resolve()}
 
     runner = stage211_full_phase._runner_command(
@@ -902,9 +911,7 @@ def test_schema2_profile_and_mixed_coverage_keep_dynamic_exposures(
         "num_workers": 8,
         "steps_per_epoch": selected["steps_per_epoch"],
         "steps": selected["full_coverage_steps"],
-        "tail_padding_samples_per_epoch": selected[
-            "tail_padding_samples_per_epoch"
-        ],
+        "tail_padding_samples_per_epoch": selected["tail_padding_samples_per_epoch"],
         "init_checkpoint_path": admission["init_checkpoint_path"],
         "bucket_manifest_path": admission["bucket_manifest_path"],
     }

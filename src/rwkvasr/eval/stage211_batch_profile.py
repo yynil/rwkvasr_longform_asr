@@ -14,6 +14,8 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_EPOCHS,
     STAGE211_FULL_DATA_FRAME_BUDGET,
     STAGE211_FULL_DATA_WORLD_SIZE,
+    STAGE211_STACKED_SAFE_BATCH_SIZE,
+    STAGE211_STACKED_SAFE_FRAME_BUDGET,
     sha256_file,
     validate_stage211_phase_train_config,
 )
@@ -182,8 +184,7 @@ def validate_stage211_batch_profile_fixed_eval(
         raw_layers = components.get(component_name)
         if not isinstance(raw_layers, dict) or set(raw_layers) != expected_layers:
             raise ValueError(
-                "Stage211 batch-profile fixed eval lacks exact 70-layer "
-                f"{component_name} coverage."
+                f"Stage211 batch-profile fixed eval lacks exact 70-layer {component_name} coverage."
             )
         validated_layers: dict[str, dict[str, float]] = {}
         for layer_id, raw_metrics in raw_layers.items():
@@ -194,9 +195,7 @@ def validate_stage211_batch_profile_fixed_eval(
                 for name in ("loss", "cosine", "rms_ratio")
             }
             if not all(math.isfinite(value) for value in metrics.values()):
-                raise ValueError(
-                    "Stage211 batch-profile fixed-eval layer metrics are non-finite."
-                )
+                raise ValueError("Stage211 batch-profile fixed-eval layer metrics are non-finite.")
             validated_layers[layer_id] = metrics
         validated_components[component_name] = validated_layers
     if phase in {"block", "logits"}:
@@ -207,22 +206,18 @@ def validate_stage211_batch_profile_fixed_eval(
             else float("nan")
         )
         if not math.isfinite(decoder_loss):
-            raise ValueError(
-                "Stage211 batch-profile fixed eval lacks finite decoder-hidden loss."
-            )
+            raise ValueError("Stage211 batch-profile fixed eval lacks finite decoder-hidden loss.")
     if phase == "logits":
         raw_logits = report.get("logit_metrics")
         if not isinstance(raw_logits, dict):
             raise ValueError("Stage211 batch-profile fixed eval lacks Logits metrics.")
         logits = {
-            name: float(raw_logits.get(name, float("nan")))
-            for name in _FIXED_EVAL_LOGIT_METRICS
+            name: float(raw_logits.get(name, float("nan"))) for name in _FIXED_EVAL_LOGIT_METRICS
         }
         if not all(math.isfinite(value) for value in logits.values()):
             raise ValueError("Stage211 batch-profile fixed-eval Logits metrics are non-finite.")
         if (
-            int(round(logits["matched_utterances"]))
-            != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
+            int(round(logits["matched_utterances"])) != STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
             or logits["missing_utterances"] != 0.0
             or logits["mean_frame_delta"] != 0.0
         ):
@@ -231,9 +226,7 @@ def validate_stage211_batch_profile_fixed_eval(
             )
     primary_component = _FIXED_EVAL_PRIMARY_COMPONENT[phase]
     primary_layers = validated_components[primary_component]
-    mean_cosine = sum(
-        primary_layers[str(layer_id)]["cosine"] for layer_id in range(70)
-    ) / 70.0
+    mean_cosine = sum(primary_layers[str(layer_id)]["cosine"] for layer_id in range(70)) / 70.0
     if not math.isfinite(mean_cosine):
         raise ValueError("Stage211 batch-profile fixed-eval mean cosine is non-finite.")
     return {
@@ -325,9 +318,7 @@ def _validate_profile_config(
         "skip_oversized_samples": False,
         "webdataset_skip_decode_errors": False,
         "init_checkpoint_path": str(Path(report["init_checkpoint_path"]).resolve()),
-        "webdataset_bucket_manifest_path": str(
-            Path(report["bucket_manifest_path"]).resolve()
-        ),
+        "webdataset_bucket_manifest_path": str(Path(report["bucket_manifest_path"]).resolve()),
         "resume_from": None,
         "resume_tag": None,
         "wandb_enabled": False,
@@ -370,13 +361,9 @@ def _validate_profile_config(
         )
     else:
         if fixed_eval_capture.get("report_sha256") is not None:
-            raise ValueError(
-                f"Stage211 batch preflight {name} absent fixed eval has a SHA-256."
-            )
+            raise ValueError(f"Stage211 batch preflight {name} absent fixed eval has a SHA-256.")
         if expected_fixed_eval_path.exists():
-            raise ValueError(
-                f"Stage211 batch preflight {name} fixed-eval capture state is stale."
-            )
+            raise ValueError(f"Stage211 batch preflight {name} fixed-eval capture state is stale.")
     cleanup = row.get("probe_artifact_cleanup")
     expected_cleanup = {
         "schema_version": STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
@@ -396,8 +383,7 @@ def _validate_profile_config(
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"Stage211 batch preflight {name} cleanup count is invalid.")
     if cleanup["existed_before"] is False and any(
-        int(cleanup[key]) != 0
-        for key in ("files_removed", "directories_removed", "bytes_removed")
+        int(cleanup[key]) != 0 for key in ("files_removed", "directories_removed", "bytes_removed")
     ):
         raise ValueError(f"Stage211 batch preflight {name} cleanup counts are inconsistent.")
     if Path(str(cleanup["run_dir"])).exists():
@@ -437,8 +423,10 @@ def _validate_safe_profile(
         raise ValueError(f"Stage211 batch preflight {name} process failed.")
     required_fields = row.get("required_match_fields")
     summary = row.get("summary")
-    if not isinstance(required_fields, list) or not required_fields or not all(
-        isinstance(value, str) and value for value in required_fields
+    if (
+        not isinstance(required_fields, list)
+        or not required_fields
+        or not all(isinstance(value, str) and value for value in required_fields)
     ):
         raise ValueError(f"Stage211 batch preflight {name} objective matches are invalid.")
     if not isinstance(summary, dict):
@@ -609,8 +597,7 @@ def _validate_loader_worker_search(
         if any(search.get(key) != value for key, value in expected.items()):
             raise ValueError("Stage211 balanced loader-worker baseline changed.")
         if any(
-            int(row["profile"]["num_workers"]) != configured_workers
-            for row in by_name.values()
+            int(row["profile"]["num_workers"]) != configured_workers for row in by_name.values()
         ):
             raise ValueError("Stage211 profiles do not use the balanced configured workers.")
         return
@@ -631,9 +618,7 @@ def _validate_loader_worker_search(
     selected_workers = balanced_workers if candidate_selected else configured_workers
     expected = {
         "selection_decision": (
-            "balanced_workers_selected"
-            if candidate_selected
-            else "configured_workers_retained"
+            "balanced_workers_selected" if candidate_selected else "configured_workers_retained"
         ),
         "selected_profile": selected_name,
         "selected_num_workers": selected_workers,
@@ -690,9 +675,10 @@ def validate_stage211_batch_profile_preflight(
         )
     base_config = load_yaml(Path(str(report["base_config_path"])))
     validate_stage211_phase_train_config(base_config, phase=phase)
-    if Path(str(base_config.get("webdataset_bucket_manifest_path") or "")).resolve() != Path(
-        str(report["bucket_manifest_path"])
-    ).resolve():
+    if (
+        Path(str(base_config.get("webdataset_bucket_manifest_path") or "")).resolve()
+        != Path(str(report["bucket_manifest_path"])).resolve()
+    ):
         raise ValueError("Stage211 batch preflight base config uses another manifest.")
     for key in (
         "warmup_steps",
@@ -756,12 +742,12 @@ def validate_stage211_batch_profile_preflight(
             "num_workers": int(base_config.get("num_workers", 0) or 0),
         }
     ]
-    if phase == "logits":
+    if phase in {"block", "logits"}:
         supported_baselines.append(
             {
                 "name": baseline_name,
-                "batch_size": 12,
-                "frame_budget": 8_000,
+                "batch_size": STAGE211_STACKED_SAFE_BATCH_SIZE,
+                "frame_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
                 "num_workers": int(base_config.get("num_workers", 0) or 0),
             }
         )
@@ -777,9 +763,7 @@ def validate_stage211_batch_profile_preflight(
     if not isinstance(comparisons, list):
         raise ValueError("Stage211 batch preflight candidate comparisons are missing.")
     comparison_by_name = {
-        str(row.get("profile") or ""): row
-        for row in comparisons
-        if isinstance(row, dict)
+        str(row.get("profile") or ""): row for row in comparisons if isinstance(row, dict)
     }
     candidate_names = set(by_name).difference((baseline_name,))
     if set(comparison_by_name) != candidate_names or len(comparisons) != len(candidate_names):
@@ -796,9 +780,7 @@ def validate_stage211_batch_profile_preflight(
         )
         summary = candidate_row.get("summary")
         if not isinstance(summary, dict):
-            raise ValueError(
-                f"Stage211 batch preflight {candidate_name} summary is missing."
-            )
+            raise ValueError(f"Stage211 batch preflight {candidate_name} summary is missing.")
         if summary.get("safety_pass") is True:
             _validate_safe_profile(candidate_row, report=report, phase=phase)
         candidate_seconds_value = summary.get("projected_full_coverage_seconds")
@@ -883,10 +865,8 @@ def validate_stage211_batch_profile_preflight(
             label=f"{candidate_name} cosine regression",
         )
         if (
-            comparison_row.get("fixed_eval_provenance_match")
-            is not fixed_eval_provenance_match
-            or
-            comparison_row.get("quality_pass") is not quality_pass
+            comparison_row.get("fixed_eval_provenance_match") is not fixed_eval_provenance_match
+            or comparison_row.get("quality_pass") is not quality_pass
             or comparison_row.get("admissible") is not admissible
         ):
             raise ValueError(
@@ -1047,9 +1027,7 @@ def build_stage211_batch_profile_admission(
         "selected_coverage": dict(selected["coverage"]),
         "selected_summary": dict(selected["summary"]),
         "selected_comparison": (
-            dict(selected_comparison)
-            if isinstance(selected_comparison, dict)
-            else None
+            dict(selected_comparison) if isinstance(selected_comparison, dict) else None
         ),
         "thresholds": {
             "max_peak_memory_gib": report["max_peak_memory_gib"],
@@ -1082,9 +1060,10 @@ def validate_stage211_batch_profile_admission(
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 batch profile admission contract mismatch.")
-    if not str(receipt.get("admitted_by") or "").strip() or not str(
-        receipt.get("reason") or ""
-    ).strip():
+    if (
+        not str(receipt.get("admitted_by") or "").strip()
+        or not str(receipt.get("reason") or "").strip()
+    ):
         raise ValueError("Stage211 batch profile admission lacks explicit review metadata.")
     report_path = _validate_bound_file(
         receipt,
@@ -1121,26 +1100,32 @@ def validate_stage211_batch_profile_admission(
     }
     if any(receipt.get(key) != value for key, value in exact_fields.items()):
         raise ValueError("Stage211 batch profile admission differs from its measured report.")
-    if expected_init_checkpoint is not None and Path(
-        str(receipt["init_checkpoint_path"])
-    ).resolve() != Path(expected_init_checkpoint).expanduser().resolve():
+    if (
+        expected_init_checkpoint is not None
+        and Path(str(receipt["init_checkpoint_path"])).resolve()
+        != Path(expected_init_checkpoint).expanduser().resolve()
+    ):
         raise ValueError("Stage211 batch profile admission uses another initial checkpoint.")
-    if expected_bucket_manifest is not None and Path(
-        str(receipt["bucket_manifest_path"])
-    ).resolve() != Path(expected_bucket_manifest).expanduser().resolve():
+    if (
+        expected_bucket_manifest is not None
+        and Path(str(receipt["bucket_manifest_path"])).resolve()
+        != Path(expected_bucket_manifest).expanduser().resolve()
+    ):
         raise ValueError("Stage211 batch profile admission uses another bucket manifest.")
     profile = receipt["selected_profile"]
     base_config = load_yaml(Path(str(report["base_config_path"])))
     worker_count_changed = int(profile["num_workers"]) != int(
         base_config.get("num_workers", 0) or 0
     )
-    if phase != "logits" and (
-        int(profile["batch_size"]) <= STAGE211_FULL_DATA_BATCH_SIZE
-        and int(profile["frame_budget"]) <= STAGE211_FULL_DATA_FRAME_BUDGET
+    profile_is_noop = (
+        int(profile["batch_size"]) == int(base_config.get("batch_size", 0) or 0)
+        and int(profile["frame_budget"])
+        == int(base_config.get("length_bucket_frame_budget", 0) or 0)
         and not worker_count_changed
-    ):
+    )
+    if profile_is_noop:
         raise ValueError(
-            "Stage211 admitted profile changes neither legacy capacity nor loader workers."
+            "Stage211 admitted profile changes neither configured capacity nor loader workers."
         )
     return {
         **receipt,

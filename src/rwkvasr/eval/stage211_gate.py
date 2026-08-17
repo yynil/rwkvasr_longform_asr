@@ -41,6 +41,48 @@ STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
 STAGE211_FULL_DATA_FRAME_BUDGET = 24_000
+STAGE211_STACKED_SAFE_BATCH_SIZE = 4
+STAGE211_STACKED_SAFE_FRAME_BUDGET = 4_000
+STAGE211_SMOKE_RUNTIME_MATCH_FIELDS = {
+    "block": (
+        "online_encoder_match",
+        "online_decoder_hidden_match",
+        "online_layer_match",
+    ),
+    "logits": (
+        "online_blank_match",
+        "online_full_match",
+        "online_conditional_nonblank_match",
+        "online_conditional_nonblank_hard_match",
+        "online_encoder_match",
+        "online_decoder_hidden_match",
+        "online_layer_match",
+    ),
+}
+STAGE211_SMOKE_RUNTIME_LOSS_FIELDS = {
+    "block": (
+        "online_layer_mixer",
+        "online_layer_ffn",
+        "online_layer_block",
+        "online_ctc_encoder",
+        "online_ctc_decoder_hidden",
+    ),
+    "logits": (
+        "online_ctc_blank",
+        "online_ctc_full",
+        "online_ctc_conditional_nonblank",
+        "online_ctc_conditional_nonblank_hard",
+        "online_ctc_encoder",
+        "online_ctc_decoder_hidden",
+        "online_layer_mixer",
+        "online_layer_ffn",
+        "online_layer_block",
+    ),
+}
+STAGE211_SMOKE_RUNTIME_PRIMARY_LOSS_FIELD = {
+    "block": "online_layer_block",
+    "logits": "online_ctc_full",
+}
 STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS = 3
 STAGE211_RETENTION_CORRECTION_MAX_ROUNDS = 32
 STAGE211_RETENTION_CORRECTION_STALL_PATIENCE = 3
@@ -161,10 +203,7 @@ def stage211_correction_admission_mode(*, gate_passed: Any, round_index: int) ->
     """Derive the correction admission mode from immutable gate state and round order."""
     if gate_passed is False:
         return STAGE211_CORRECTION_ADMISSION_FAILED_GATE
-    if (
-        gate_passed is True
-        and 1 < round_index <= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
-    ):
+    if gate_passed is True and 1 < round_index <= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
         return STAGE211_CORRECTION_ADMISSION_EARLY_PASS
     raise ValueError(
         "Stage211 correction admission requires a failed gate or an early passing gate "
@@ -189,6 +228,62 @@ def stage211_phase_gate_decision(
     if phase == "logits":
         return alignment_gate_passed and all_datasets_pass and trajectory_retention_gate_passed
     raise ValueError(f"Stage211 phase {phase!r} cannot promote.")
+
+
+def build_stage211_smoke_runtime_objective_evidence(
+    *,
+    phase: str,
+    step_two_line: str,
+) -> dict[str, Any]:
+    if phase not in STAGE211_SMOKE_RUNTIME_MATCH_FIELDS:
+        raise ValueError(f"Stage211 {phase} has no strict runtime-objective smoke contract.")
+    match_fields: dict[str, dict[str, int]] = {}
+    for field in STAGE211_SMOKE_RUNTIME_MATCH_FIELDS[phase]:
+        match = re.search(rf"\b{re.escape(field)}=([0-9]+)/([0-9]+)\b", step_two_line)
+        if match is None:
+            raise ValueError(f"Stage211 {phase} smoke lacks step-2 {field} evidence.")
+        matched, total = (int(value) for value in match.groups())
+        if total <= 0 or matched != total:
+            raise ValueError(
+                f"Stage211 {phase} smoke has incomplete step-2 {field}: {matched}/{total}"
+            )
+        match_fields[field] = {"matched": matched, "total": total}
+
+    loss_fields: dict[str, float] = {}
+    for field in STAGE211_SMOKE_RUNTIME_LOSS_FIELDS[phase]:
+        match = re.search(rf"\b{re.escape(field)}=([^ ]+)", step_two_line)
+        if match is None:
+            raise ValueError(f"Stage211 {phase} smoke lacks step-2 {field} telemetry.")
+        try:
+            value = float(match.group(1))
+        except ValueError as error:
+            raise ValueError(
+                f"Stage211 {phase} smoke has non-numeric step-2 {field} telemetry."
+            ) from error
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"Stage211 {phase} smoke has invalid step-2 {field} telemetry: {value}"
+            )
+        loss_fields[field] = value
+
+    primary_field = STAGE211_SMOKE_RUNTIME_PRIMARY_LOSS_FIELD[phase]
+    if loss_fields[primary_field] <= 0.0:
+        raise ValueError(f"Stage211 {phase} smoke primary step-2 {primary_field} must be positive.")
+    return {
+        "schema_version": 1,
+        "step": 2,
+        "required_match_fields": match_fields,
+        "active_loss_fields": loss_fields,
+        "primary_loss_field": primary_field,
+    }
+
+
+def stage211_smoke_step_two_lines(log_text: str) -> list[str]:
+    return [
+        line
+        for line in log_text.splitlines()
+        if re.search(r"\[deepspeed-train\] step=2\b", line) is not None
+    ]
 
 
 def build_stage211_correction_round_promotion_gate(
@@ -546,9 +641,7 @@ def stage211_correction_layer_rotation_offset(
     non_anchor_layers = num_layers - len(layer_ids)
     if non_anchor_layers <= 0:
         raise ValueError("Stage211 correction requires at least one non-anchor layer.")
-    round_stride = math.ceil(
-        non_anchor_layers / STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
-    )
+    round_stride = math.ceil(non_anchor_layers / STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS)
     return ((round_index - 1) * round_stride) % non_anchor_layers
 
 
@@ -1388,6 +1481,40 @@ def validate_stage211_full_profile_smoke_binding(
     }
     if any(marker.get(key) != value for key, value in expected.items()):
         raise ValueError(f"Stage211 {phase} preflight smoke marker contract mismatch.")
+    if phase in {"block", "logits"}:
+        smoke_config_path = _validate_bound_file(
+            marker,
+            path_key="smoke_config_path",
+            sha256_key="smoke_config_sha256",
+            label=f"Stage211 {phase} preflight smoke config",
+        )
+        smoke_config = load_yaml(smoke_config_path)
+        validate_stage211_phase_train_config(smoke_config, phase=phase)
+        deepspeed = smoke_config.get("deepspeed")
+        if not isinstance(deepspeed, dict):
+            raise ValueError(f"Stage211 {phase} preflight smoke lacks DeepSpeed config.")
+        expected_train_batch = STAGE211_STACKED_SAFE_BATCH_SIZE * STAGE211_FULL_DATA_WORLD_SIZE
+        expected_runtime_profile = {
+            "batch_size": STAGE211_STACKED_SAFE_BATCH_SIZE,
+            "frame_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
+            "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+            "train_batch_size": expected_train_batch,
+        }
+        if marker.get("smoke_runtime_profile") != expected_runtime_profile or any(
+            (
+                int(smoke_config.get("batch_size", 0) or 0) != STAGE211_STACKED_SAFE_BATCH_SIZE,
+                int(smoke_config.get("batch_token_budget", 0) or 0)
+                != STAGE211_STACKED_SAFE_FRAME_BUDGET,
+                int(smoke_config.get("length_bucket_frame_budget", 0) or 0)
+                != STAGE211_STACKED_SAFE_FRAME_BUDGET,
+                int(deepspeed.get("train_micro_batch_size_per_gpu", 0) or 0)
+                != STAGE211_STACKED_SAFE_BATCH_SIZE,
+                int(deepspeed.get("train_batch_size", 0) or 0) != expected_train_batch,
+            )
+        ):
+            raise ValueError(
+                f"Stage211 {phase} preflight smoke did not use the memory-safe profile."
+            )
     checkpoint = _validate_bound_file(
         marker,
         path_key="smoke_checkpoint_path",
@@ -1426,10 +1553,18 @@ def validate_stage211_full_profile_smoke_binding(
         re.compile(r"\bdropped_tail(?:_samples)?=[1-9][0-9]*\b"),
         re.compile(r"\bskipped_samples=[1-9][0-9]*\b"),
     )
-    if "[deepspeed-train] step=2" not in log_text or any(
+    step_two_lines = stage211_smoke_step_two_lines(log_text)
+    if not step_two_lines or any(
         pattern.search(log_text) is not None for pattern in rejected_patterns
     ):
         raise ValueError(f"Stage211 {phase} preflight smoke log failed validation.")
+    if phase in STAGE211_SMOKE_RUNTIME_MATCH_FIELDS:
+        rebuilt_runtime_evidence = build_stage211_smoke_runtime_objective_evidence(
+            phase=phase,
+            step_two_line=step_two_lines[-1],
+        )
+        if marker.get("runtime_objective_evidence") != rebuilt_runtime_evidence:
+            raise ValueError(f"Stage211 {phase} smoke runtime-objective evidence changed.")
     peak_values = [
         float(value)
         for value in re.findall(
@@ -4088,9 +4223,7 @@ def _validate_stage211_correction_train_config(
             "report_sha256"
         ],
         "stage211_post_coverage_batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "stage211_post_coverage_batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -4115,9 +4248,7 @@ def _validate_stage211_correction_train_config(
             )
     expected_admission_fields = {
         "stage211_batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "stage211_batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -4219,9 +4350,7 @@ def _validate_stage211_correction_smoke_marker(
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
         "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
         "batch_profile_admission_path": (
-            batch_profile_admission["receipt_path"]
-            if batch_profile_admission is not None
-            else None
+            batch_profile_admission["receipt_path"] if batch_profile_admission is not None else None
         ),
         "batch_profile_admission_sha256": (
             batch_profile_admission["receipt_sha256"]
@@ -4229,9 +4358,7 @@ def _validate_stage211_correction_smoke_marker(
             else None
         ),
         "batch_profile_name": batch_profile_preflight["selected_profile_name"],
-        "batch_size": int(
-            batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]
-        ),
+        "batch_size": int(batch_profile_preflight["selected_profile_row"]["profile"]["batch_size"]),
         "frame_budget": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
         ),
@@ -4309,8 +4436,7 @@ def _validate_stage211_post_coverage_corrections(
         )
         if correction.get("layer_rotation_offset") != expected_layer_rotation_offset:
             raise ValueError(
-                f"Stage211 {phase} correction round {round_index} "
-                "layer rotation offset mismatch."
+                f"Stage211 {phase} correction round {round_index} layer rotation offset mismatch."
             )
         rows = int(correction.get("rows", -1))
         steps_per_epoch = int(correction.get("steps_per_epoch", -1))
@@ -5126,9 +5252,7 @@ def validate_stage211_public_benchmark(
         raise ValueError("Stage211 public benchmark must contain exactly five results.")
     if any(not isinstance(result, dict) for result in results):
         raise ValueError("Stage211 public benchmark results must all be objects.")
-    by_dataset = {
-        str(result.get("dataset")): result for result in results
-    }
+    by_dataset = {str(result.get("dataset")): result for result in results}
     if len(by_dataset) != len(results) or set(by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
         raise ValueError(
             "Stage211 public benchmark datasets must be unique, complete, and expected."
@@ -5185,8 +5309,7 @@ def validate_stage211_public_benchmark(
                 f"Stage211 public benchmark {dataset} lacks boolean threshold decisions."
             )
         expected_absolute_gate_pass = (
-            float(result["absolute_gap_points"])
-            <= STAGE211_PUBLIC_MAX_ABSOLUTE_GAP_POINTS
+            float(result["absolute_gap_points"]) <= STAGE211_PUBLIC_MAX_ABSOLUTE_GAP_POINTS
         )
         expected_relative_gate_pass = (
             float(result["relative_ratio"]) <= STAGE211_PUBLIC_MAX_RELATIVE_RATIO

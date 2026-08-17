@@ -31,6 +31,10 @@ from rwkvasr.eval.stage211_batch_profile import (
     validate_stage211_batch_profile_fixed_eval,
 )
 from rwkvasr.eval.stage211_gate import STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
+from rwkvasr.eval.stage211_gate import (
+    STAGE211_STACKED_SAFE_BATCH_SIZE,
+    STAGE211_STACKED_SAFE_FRAME_BUDGET,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -71,13 +75,35 @@ DEFAULT_PROFILES = (
     BatchProfile("batch160_frames140k", 160, 140_000, 8),
     BatchProfile("batch192_frames168k", 192, 168_000, 8),
 )
+BLOCK_DEFAULT_PROFILES = (
+    BatchProfile(
+        "baseline",
+        STAGE211_STACKED_SAFE_BATCH_SIZE,
+        STAGE211_STACKED_SAFE_FRAME_BUDGET,
+        8,
+    ),
+    BatchProfile("batch8_frames6k", 8, 6_000, 8),
+    BatchProfile("batch12_frames8k", 12, 8_000, 8),
+    BatchProfile("batch16_frames10k", 16, 10_000, 8),
+    BatchProfile("batch24_frames16k", 24, 16_000, 8),
+    BatchProfile("batch36_frames24k", 36, 24_000, 8),
+    BatchProfile("batch48_frames32k", 48, 32_000, 8),
+    BatchProfile("batch64_frames42k", 64, 42_000, 8),
+)
 LOGITS_DEFAULT_PROFILES = (
-    BatchProfile("baseline", 12, 8_000, 8),
+    BatchProfile(
+        "baseline",
+        STAGE211_STACKED_SAFE_BATCH_SIZE,
+        STAGE211_STACKED_SAFE_FRAME_BUDGET,
+        8,
+    ),
+    BatchProfile("batch8_frames6k", 8, 6_000, 8),
+    BatchProfile("batch12_frames8k", 12, 8_000, 8),
     BatchProfile("batch16_frames10k", 16, 10_000, 8),
     BatchProfile("batch20_frames13k", 20, 13_000, 8),
     BatchProfile("batch24_frames16k", 24, 16_000, 8),
     BatchProfile("batch36_frames24k", 36, 24_000, 8),
-    *DEFAULT_PROFILES[1:],
+    BatchProfile("batch48_frames32k", 48, 32_000, 8),
 )
 
 
@@ -88,7 +114,13 @@ def default_profiles_for_phase(
 ) -> tuple[BatchProfile, ...]:
     if num_workers <= 0:
         raise ValueError("num_workers must be positive")
-    profiles = LOGITS_DEFAULT_PROFILES if str(phase) == "logits" else DEFAULT_PROFILES
+    profiles = (
+        BLOCK_DEFAULT_PROFILES
+        if str(phase) == "block"
+        else LOGITS_DEFAULT_PROFILES
+        if str(phase) == "logits"
+        else DEFAULT_PROFILES
+    )
     if int(num_workers) == 8:
         return profiles
     return tuple(replace(profile, num_workers=int(num_workers)) for profile in profiles)
@@ -150,9 +182,7 @@ def parse_profile(value: str) -> BatchProfile:
         name=match.group("name"),
         batch_size=int(match.group("batch")),
         frame_budget=int(match.group("frames")),
-        num_workers=(
-            int(match.group("workers")) if match.group("workers") is not None else None
-        ),
+        num_workers=(int(match.group("workers")) if match.group("workers") is not None else None),
     )
 
 
@@ -1018,9 +1048,7 @@ def main() -> int:
             "selected_num_workers": None,
         }
     else:
-        defaults = list(
-            default_profiles_for_phase(args.phase, num_workers=configured_num_workers)
-        )
+        defaults = list(default_profiles_for_phase(args.phase, num_workers=configured_num_workers))
         baseline = next(
             (profile for profile in defaults if profile.name == args.baseline_profile),
             None,
@@ -1050,7 +1078,9 @@ def main() -> int:
             "baseline_profile": baseline.name,
             "candidate_profile": worker_candidate_name,
             "selection_decision": (
-                "pending" if worker_search_enabled and not args.dry_run else "dry_run_only"
+                "pending"
+                if worker_search_enabled and not args.dry_run
+                else "dry_run_only"
                 if worker_search_enabled
                 else "configured_workers_already_balanced"
             ),
