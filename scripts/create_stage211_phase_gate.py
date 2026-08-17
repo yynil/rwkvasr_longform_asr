@@ -382,36 +382,32 @@ def build_phase_gate(
     )
     public_progress: dict[str, Any] | None = None
     baseline_public_record: dict[str, str] | None = None
-    public_progress_gate_passed = phase == "logits"
-    if phase in {"mixer", "block"}:
-        if baseline_public_comparison_report_path is None:
-            raise ValueError(f"Stage211 {phase} requires a baseline public comparison report.")
-        baseline_public_comparison_report_path = baseline_public_comparison_report_path.resolve()
-        baseline_public_report = _load_json(
-            baseline_public_comparison_report_path,
-            label="Stage211 baseline public comparison report",
-        )
-        if Path(
-            str(baseline_public_report.get("student_checkpoint_path") or "")
-        ).resolve() != phase_init_checkpoint or baseline_public_report.get(
-            "student_checkpoint_sha256"
-        ) != sha256_file(phase_init_checkpoint):
-            raise ValueError(
-                "Stage211 baseline public report does not bind the phase initialization."
-            )
-        baseline_benchmark = _enrich_public_benchmark(
-            baseline_public_report,
-            manifest_dir=manifest_dir.resolve(),
-        )
-        public_progress = _build_public_progress(
-            baseline=baseline_benchmark,
-            candidate=benchmark,
-        )
-        public_progress_gate_passed = bool(public_progress["gate_passed"])
-        baseline_public_record = {
-            "path": str(baseline_public_comparison_report_path),
-            "sha256": sha256_file(baseline_public_comparison_report_path),
-        }
+    if baseline_public_comparison_report_path is None:
+        raise ValueError(f"Stage211 {phase} requires a baseline public comparison report.")
+    baseline_public_comparison_report_path = baseline_public_comparison_report_path.resolve()
+    baseline_public_report = _load_json(
+        baseline_public_comparison_report_path,
+        label="Stage211 baseline public comparison report",
+    )
+    if Path(
+        str(baseline_public_report.get("student_checkpoint_path") or "")
+    ).resolve() != phase_init_checkpoint or baseline_public_report.get(
+        "student_checkpoint_sha256"
+    ) != sha256_file(phase_init_checkpoint):
+        raise ValueError("Stage211 baseline public report does not bind the phase initialization.")
+    baseline_benchmark = _enrich_public_benchmark(
+        baseline_public_report,
+        manifest_dir=manifest_dir.resolve(),
+    )
+    public_progress = _build_public_progress(
+        baseline=baseline_benchmark,
+        candidate=benchmark,
+    )
+    public_progress_gate_passed = bool(public_progress["gate_passed"])
+    baseline_public_record = {
+        "path": str(baseline_public_comparison_report_path),
+        "sha256": sha256_file(baseline_public_comparison_report_path),
+    }
     trajectory_retention = build_stage211_trajectory_retention_gate(
         phase=phase,
         segments=coverage,

@@ -173,8 +173,6 @@ def test_phase_correction_commands_preserve_phase_objective(
 ) -> None:
     args = _args(tmp_path)
     args.phase = phase
-    if phase == "logits":
-        args.baseline_public_comparison_report = None
     receipt = tmp_path / "round1.json"
 
     finalizer = loop._finalizer_command(
@@ -197,10 +195,10 @@ def test_phase_correction_commands_preserve_phase_objective(
         args.master_port + 100
     )
     assert "--post-coverage-correction-receipt" in finalizer
-    if phase == "block":
-        assert "--baseline-public-comparison-report" in finalizer
-    else:
-        assert "--baseline-public-comparison-report" not in finalizer
+    assert "--baseline-public-comparison-report" in finalizer
+    assert finalizer[finalizer.index("--baseline-public-comparison-report") + 1] == str(
+        args.baseline_public_comparison_report
+    )
 
     gate = tmp_path / "gate" / "phase_gate.json"
     checkpoint = tmp_path / f"{phase}.pt"
@@ -219,6 +217,10 @@ def test_phase_correction_commands_preserve_phase_objective(
     assert selection["artifact"] == "phase_gate_selection"
     assert selection["phase"] == phase
     assert selection["checkpoint_sha256"] == loop.sha256_file(checkpoint)
+
+
+def test_correction_loop_requires_explicit_phase_public_baseline() -> None:
+    assert loop.build_parser().get_default("baseline_public_comparison_report") is None
 
 
 def test_retention_loop_requires_three_complete_rounds_before_promotion(

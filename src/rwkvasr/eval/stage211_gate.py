@@ -226,7 +226,12 @@ def stage211_phase_gate_decision(
             and trajectory_retention_gate_passed
         )
     if phase == "logits":
-        return alignment_gate_passed and all_datasets_pass and trajectory_retention_gate_passed
+        return (
+            alignment_gate_passed
+            and public_progress_gate_passed
+            and all_datasets_pass
+            and trajectory_retention_gate_passed
+        )
     raise ValueError(f"Stage211 phase {phase!r} cannot promote.")
 
 
@@ -5502,47 +5507,36 @@ def validate_stage211_phase_gate_report(
         replayed_benchmark,
         label=f"{expected_phase} public WER/CER benchmark",
     )
-    replayed_public_progress_gate_passed = True
-    if expected_phase in {"mixer", "block"}:
-        baseline_public_record = report.get("baseline_public_comparison_report")
-        if not isinstance(baseline_public_record, dict):
-            raise ValueError(
-                f"Stage211 {expected_phase} phase gate lacks its baseline public report."
-            )
-        baseline_public_path = _validate_bound_file(
-            baseline_public_record,
-            path_key="path",
-            sha256_key="sha256",
-            label=f"Stage211 {expected_phase} baseline public comparison report",
-        )
-        baseline_public_source = _load_json_object(
-            baseline_public_path,
-            label=f"Stage211 {expected_phase} baseline public comparison report",
-        )
-        replayed_baseline_benchmark = replay_stage211_public_comparison(
-            baseline_public_source,
-            manifest_paths=manifest_paths,
-            benchmarks=STAGE211_PUBLIC_BENCHMARKS,
-            expected_checkpoint=phase_init_checkpoint,
-        )
-        replayed_public_progress = build_stage211_public_progress(
-            baseline=replayed_baseline_benchmark,
-            candidate=replayed_benchmark,
-            benchmarks=STAGE211_PUBLIC_BENCHMARKS,
-        )
-        _validate_stage211_replayed_value(
-            report.get("public_progress"),
-            replayed_public_progress,
-            label=f"{expected_phase} public progress gate",
-        )
-        replayed_public_progress_gate_passed = bool(replayed_public_progress["gate_passed"])
-    elif (
-        report.get("baseline_public_comparison_report") is not None
-        or report.get("public_progress") is not None
-    ):
-        raise ValueError(
-            "Stage211 logits phase gate unexpectedly contains a baseline progress gate."
-        )
+    baseline_public_record = report.get("baseline_public_comparison_report")
+    if not isinstance(baseline_public_record, dict):
+        raise ValueError(f"Stage211 {expected_phase} phase gate lacks its baseline public report.")
+    baseline_public_path = _validate_bound_file(
+        baseline_public_record,
+        path_key="path",
+        sha256_key="sha256",
+        label=f"Stage211 {expected_phase} baseline public comparison report",
+    )
+    baseline_public_source = _load_json_object(
+        baseline_public_path,
+        label=f"Stage211 {expected_phase} baseline public comparison report",
+    )
+    replayed_baseline_benchmark = replay_stage211_public_comparison(
+        baseline_public_source,
+        manifest_paths=manifest_paths,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        expected_checkpoint=phase_init_checkpoint,
+    )
+    replayed_public_progress = build_stage211_public_progress(
+        baseline=replayed_baseline_benchmark,
+        candidate=replayed_benchmark,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+    )
+    _validate_stage211_replayed_value(
+        report.get("public_progress"),
+        replayed_public_progress,
+        label=f"{expected_phase} public progress gate",
+    )
+    replayed_public_progress_gate_passed = bool(replayed_public_progress["gate_passed"])
     validate_stage211_public_overlap_binding(
         report.get("public_overlap"),
         public_benchmark=benchmark,
@@ -5727,12 +5721,10 @@ def validate_stage211_phase_gate_report(
     expected_gate_passed = expected_metric_gate_passed and bool(
         expected_correction_round_promotion["gate_passed"]
     )
-    if expected_phase in {"mixer", "block"}:
-        if require_passed and not public_progress_gate_passed:
-            raise ValueError(f"Stage211 {expected_phase} public progress gate did not pass.")
-    elif expected_phase == "logits":
-        if require_passed and not datasets_passed:
-            raise ValueError("Stage211 logits phase must pass the every-dataset Nano WER/CER gate.")
+    if require_passed and not public_progress_gate_passed:
+        raise ValueError(f"Stage211 {expected_phase} public progress gate did not pass.")
+    if expected_phase == "logits" and require_passed and not datasets_passed:
+        raise ValueError("Stage211 logits phase must pass the every-dataset Nano WER/CER gate.")
     if gate_passed != expected_gate_passed:
         raise ValueError("Stage211 phase gate decision is inconsistent with its sub-gates.")
     if require_passed and not trajectory_retention_gate_passed:

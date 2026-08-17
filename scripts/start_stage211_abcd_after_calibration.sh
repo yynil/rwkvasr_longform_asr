@@ -342,6 +342,8 @@ run_full_logits_phase() {
 }
 
 run_logits_correction_loop() {
+  local block_gate_dir
+  block_gate_dir="$(jq -er '.gate_dir' "${BLOCK_SELECTION}")"
   uv run python "${REPO_ROOT}/scripts/run_stage211_mixer_retention_loop.py" \
     --phase logits \
     --phase-root "${FULL_OUTPUT_ROOT}/stage211c_logits_full_data_3ep" \
@@ -353,6 +355,7 @@ run_logits_correction_loop() {
     --public-manifest-dir "${PUBLIC_MANIFEST_DIR}" \
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
+    --baseline-public-comparison-report "${block_gate_dir}/nano_comparison.json" \
     --config-dir "${FULL_CONFIG_ROOT}" \
     --selection "${LOGITS_SELECTION}" \
     --master-port "$((MASTER_PORT + 12))" \

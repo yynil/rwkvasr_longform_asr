@@ -1027,6 +1027,7 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
     )
     phase_root = tmp_path / "phase"
     nano_prediction_dir = tmp_path / "nano" / "predictions"
+    baseline_public_report = tmp_path / "block-nano-comparison.json"
     stage211_phase_finalizer.finalize_phase(
         SimpleNamespace(
             phase="logits",
@@ -1037,7 +1038,7 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
             output_dir=tmp_path / "eval",
             devices="0,1,2,3",
             dry_run=True,
-            baseline_public_comparison_report=None,
+            baseline_public_comparison_report=baseline_public_report,
             stratified_hidden_receipt=stratified_receipt,
         )
     )
@@ -1089,6 +1090,9 @@ def test_stage211_logits_finalizer_runs_independent_alignment_gate(
     assert phase_gate_command[phase_gate_command.index("--alignment-report") + 1] == str(
         logits_gate_path
     )
+    assert phase_gate_command[
+        phase_gate_command.index("--baseline-public-comparison-report") + 1
+    ] == str(baseline_public_report.resolve())
 
 
 def test_stage211_mixer_finalizer_runs_stratified_hidden_gate(
@@ -1387,6 +1391,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
         '"${CALIBRATION_EVAL_DIR}/public/nano_comparison.json"' in script
     )
     assert '--baseline-public-comparison-report "${mixer_gate_dir}/nano_comparison.json"' in script
+    assert '--baseline-public-comparison-report "${block_gate_dir}/nano_comparison.json"' in script
     assert '--baseline-public-comparison-report "${logits_gate_dir}/nano_comparison.json"' in script
     assert '--calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}"' in script
     assert "create_stage211_nano_baseline_receipt.py" in script
@@ -2288,6 +2293,16 @@ def test_stage211_logits_requires_every_dataset_nano_proximity() -> None:
             phase="logits",
             alignment_gate_passed=True,
             public_progress_gate_passed=False,
+            trajectory_retention_gate_passed=True,
+            all_datasets_pass=True,
+        )
+        is False
+    )
+    assert (
+        stage211_gate_module.stage211_phase_gate_decision(
+            phase="logits",
+            alignment_gate_passed=True,
+            public_progress_gate_passed=True,
             trajectory_retention_gate_passed=True,
             all_datasets_pass=True,
         )
@@ -5312,15 +5327,11 @@ def _write_valid_phase_gate(
                 "step_eval_cadence": step_eval_cadence,
                 "public_comparison_report_path": str(public_comparison_report.resolve()),
                 "public_comparison_report_sha256": sha256_file(public_comparison_report),
-                "baseline_public_comparison_report": (
-                    {
-                        "path": str(baseline_public_comparison_report.resolve()),
-                        "sha256": sha256_file(baseline_public_comparison_report),
-                    }
-                    if phase in {"mixer", "block"}
-                    else None
-                ),
-                "public_progress": (public_progress if phase in {"mixer", "block"} else None),
+                "baseline_public_comparison_report": {
+                    "path": str(baseline_public_comparison_report.resolve()),
+                    "sha256": sha256_file(baseline_public_comparison_report),
+                },
+                "public_progress": public_progress,
                 "global_dedup_manifest_path": str(GLOBAL_DEDUP_FIXTURE.resolve()),
                 "global_dedup_manifest_sha256": sha256_file(GLOBAL_DEDUP_FIXTURE),
                 "loaded_manifest_receipt_path": str(loaded_manifest_receipt.resolve()),
@@ -6925,14 +6936,16 @@ def test_stage211_phase_gate_rejects_missing_student_prediction_provenance(
         )
 
 
+@pytest.mark.parametrize("phase", ("mixer", "block", "logits"))
 def test_stage211_phase_gate_replays_public_progress_from_baseline(
     tmp_path: Path,
+    phase: str,
 ) -> None:
     checkpoint = tmp_path / "step-final.pt"
     checkpoint.write_bytes(b"checkpoint")
     gate_report = _write_valid_phase_gate(
         tmp_path,
-        phase="mixer",
+        phase=phase,
         checkpoint=checkpoint,
     )
     gate = json.loads(gate_report.read_text(encoding="utf-8"))
@@ -6942,7 +6955,30 @@ def test_stage211_phase_gate_replays_public_progress_from_baseline(
     with pytest.raises(ValueError, match="public progress gate"):
         validate_stage211_phase_gate_report(
             gate_report,
-            expected_phase="mixer",
+            expected_phase=phase,
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_logits_phase_gate_rejects_missing_block_public_baseline(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="logits",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    gate["baseline_public_comparison_report"] = None
+    gate["public_progress"] = None
+    gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lacks its baseline public report"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="logits",
             checkpoint_path=checkpoint,
         )
 

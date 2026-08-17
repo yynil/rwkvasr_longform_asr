@@ -65,13 +65,6 @@ DEFAULT_STRATIFIED_HIDDEN_RECEIPT = (
 DEFAULT_PUBLIC_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
 DEFAULT_NANO_EVAL_DIR = Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
 DEFAULT_NANO_CHECKPOINT = Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
-DEFAULT_BASELINE_PUBLIC_REPORT = (
-    Path.home()
-    / "rwkvasr_eval"
-    / "stage211_calibration_selected_full"
-    / "public"
-    / "nano_comparison.json"
-)
 DEFAULT_SELECTION = Path.home() / "rwkvasr_eval" / "stage211_phase_gates" / "mixer_selected.json"
 PHASE_TARGETS = {"mixer": "block", "block": "logits", "logits": "sft"}
 
@@ -148,15 +141,14 @@ def _finalizer_command(
         "--devices",
         str(args.devices),
     ]
-    if phase in {"mixer", "block"}:
-        if args.baseline_public_comparison_report is None:
-            raise ValueError(f"Stage211 {phase} correction loop requires a public baseline.")
-        command.extend(
-            (
-                "--baseline-public-comparison-report",
-                str(args.baseline_public_comparison_report),
-            )
+    if args.baseline_public_comparison_report is None:
+        raise ValueError(f"Stage211 {phase} correction loop requires a public baseline.")
+    command.extend(
+        (
+            "--baseline-public-comparison-report",
+            str(args.baseline_public_comparison_report),
         )
+    )
     for receipt in correction_receipts:
         command.extend(("--post-coverage-correction-receipt", str(receipt)))
     return command
@@ -557,7 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--baseline-public-comparison-report",
         type=Path,
-        default=DEFAULT_BASELINE_PUBLIC_REPORT,
+        default=None,
     )
     parser.add_argument(
         "--config-dir",
@@ -599,7 +591,8 @@ def main() -> int:
         "selection",
     ):
         value = getattr(args, name)
-        setattr(args, name, value.expanduser().resolve())
+        if value is not None:
+            setattr(args, name, value.expanduser().resolve())
     if args.validate_selection_only:
         if not args.selection.is_file():
             raise ValueError(f"Stage211 selected {_phase(args)} gate is missing: {args.selection}")

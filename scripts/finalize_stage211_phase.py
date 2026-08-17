@@ -772,17 +772,16 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         )
     if alignment_gate_path is not None:
         phase_gate_command.extend(("--alignment-report", str(alignment_gate_path)))
-    if phase in {"mixer", "block"}:
-        if args.baseline_public_comparison_report is None:
-            raise ValueError(
-                f"Stage211 {phase} finalization requires --baseline-public-comparison-report."
-            )
-        phase_gate_command.extend(
-            (
-                "--baseline-public-comparison-report",
-                str(args.baseline_public_comparison_report.expanduser().resolve()),
-            )
+    if args.baseline_public_comparison_report is None:
+        raise ValueError(
+            f"Stage211 {phase} finalization requires --baseline-public-comparison-report."
         )
+    phase_gate_command.extend(
+        (
+            "--baseline-public-comparison-report",
+            str(args.baseline_public_comparison_report.expanduser().resolve()),
+        )
+    )
     _run(phase_gate_command, dry_run=bool(args.dry_run))
 
     promotion_receipt = output_dir / f"{phase}_promotion_receipt.json"
