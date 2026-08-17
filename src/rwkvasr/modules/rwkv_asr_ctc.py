@@ -1484,6 +1484,7 @@ class RWKVCTCModel(nn.Module):
         decoder_prompt_before_audio_lengths: Tensor | None = None,
         direction_mask: DirectionMask | None = None,
         state: RWKVConformerEncoderState | None = None,
+        compute_ctc_logits: bool = True,
     ) -> dict[str, Tensor | Tensor | RWKVConformerEncoderState | None]:
         encoded, encoded_lengths, next_state = self.encoder(
             features,
@@ -1493,12 +1494,19 @@ class RWKVCTCModel(nn.Module):
         )
         ctc_encoded, ctc_encoded_lengths = self.ctc_encoder_features_from_encoded(encoded, encoded_lengths)
         ctc_features, logit_lengths = self.ctc_features_from_ctc_encoded(ctc_encoded, ctc_encoded_lengths)
-        logits = self.apply_ctc_logit_mask(self.ctc_head(ctc_features))
         if logit_lengths is None:
             raise ValueError("CTC training/distillation requires feature lengths.")
         ctc_loss_weight = float(self.config.ctc_loss_weight)
         decoder_loss_weight = float(self.config.decoder_loss_weight)
-        zero_loss = logits.float().sum() * 0.0
+        if not compute_ctc_logits and ctc_loss_weight > 0.0:
+            raise ValueError("compute_ctc_logits=False requires ctc_loss_weight=0.")
+        logits = (
+            self.apply_ctc_logit_mask(self.ctc_head(ctc_features))
+            if compute_ctc_logits
+            else None
+        )
+        zero_source = logits if isinstance(logits, Tensor) else ctc_features
+        zero_loss = zero_source.float().sum() * 0.0
         ctc_loss = (
             self.ctc_loss(logits, logit_lengths, targets, target_lengths)
             if ctc_loss_weight > 0.0

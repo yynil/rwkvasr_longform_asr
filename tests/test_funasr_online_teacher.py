@@ -111,6 +111,11 @@ class _FakeCTC(nn.Module):
         return self.ctc_lo(x).log_softmax(dim=-1)
 
 
+class _TrapCTC(nn.Module):
+    def log_softmax(self, _x: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("CTC head must not run for hidden-only records")
+
+
 class _FakeNanoModel(nn.Module):
     def __init__(self, dim: int, vocab_size: int):
         super().__init__()
@@ -161,6 +166,23 @@ def test_capture_funasr_encoder_hiddens_collects_requested_components() -> None:
             assert captured["layers"][layer_id][component].shape == (2, 5, 6)
             assert not captured["layers"][layer_id][component].requires_grad
     assert torch.equal(captured["layers"][0]["input"], features)
+
+
+def test_capture_funasr_encoder_hiddens_can_omit_unused_layer_inputs() -> None:
+    encoder = _FakeNanoEncoder(dim=6)
+    features = torch.randn(2, 5, 6)
+    lengths = torch.tensor([5, 3], dtype=torch.long)
+
+    with _capture_funasr_encoder_hiddens(
+        encoder,
+        (0, 2),
+        capture_input=False,
+        capture_layer_inputs=False,
+    ) as captured:
+        encoder(features, lengths)
+
+    for layer_id in (0, 2):
+        assert set(captured["layers"][layer_id]) == {"mixer", "ffn", "block"}
 
 
 def test_capture_funasr_encoder_hiddens_matches_native_sanm_component_semantics() -> None:
@@ -258,7 +280,7 @@ def test_feature_records_batches_teacher_forward_and_preserves_student_features(
         include_ctc_outputs=False,
     )
     assert hidden_only["utt-a"]["format"] == "funasr_nano_encoder_hidden_online_v1"
-    assert "num_frames" not in hidden_only["utt-a"]
+    assert hidden_only["utt-a"]["num_frames"] == 5
     assert hidden_only["utt-b"]["encoder_layer_hiddens"]["0"]["input"].shape == (3, 6)
     assert hidden_only["utt-b"]["encoder_layer_hiddens"]["0"]["mixer"].shape == (3, 6)
     assert hidden_only["utt-b"]["encoder_layer_hiddens"]["0"]["mixer"].device.type == "cpu"
@@ -289,16 +311,34 @@ def test_feature_records_batches_teacher_forward_and_preserves_student_features(
     assert full_log_probs.dtype == torch.float16
 
     teacher.model.ctc_decoder = _FakeLayeredCTCDecoder(dim=6)
+    teacher.model.ctc = _TrapCTC()
     teacher.config = replace(
         teacher.config,
         return_ctc_decoder_hiddens=True,
-        keep_layer_hiddens_on_device=False,
+        return_encoder_out=True,
+        return_layer_inputs=False,
+        keep_layer_hiddens_on_device=True,
     )
-    decoder_records = teacher.feature_records(["utt-a", "utt-b"], features, lengths)
+    decoder_records = teacher.feature_records(
+        ["utt-a", "utt-b"],
+        features,
+        lengths,
+        layer_ids=[0],
+        include_ctc_outputs=False,
+    )
     decoder_hiddens = decoder_records["utt-b"]["ctc_decoder_hiddens"]
     assert set(decoder_hiddens) == {"input", "layer_0", "layer_1"}
     assert decoder_hiddens["layer_1"].shape == (3, 6)
     assert decoder_hiddens["layer_1"].dtype == torch.float16
+    assert decoder_hiddens["layer_1"].device == features.device
+    assert set(decoder_records["utt-b"]["encoder_layer_hiddens"]["0"]) == {
+        "mixer",
+        "ffn",
+        "block",
+    }
+    assert decoder_records["utt-b"]["encoder_out"].device == features.device
+    assert decoder_records["utt-b"]["num_frames"] == 3
+    assert "topk_token_ids" not in decoder_records["utt-b"]
 
 
 def test_feature_records_project_ignored_tokens_before_ctc_distribution_outputs() -> None:

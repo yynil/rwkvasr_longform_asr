@@ -1,6 +1,7 @@
 import json
 import inspect
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from rwkvasr.training.deepspeed_loop import (
     _materialize_step_eval_batches,
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
+    _online_teacher_ctc_outputs_required,
     _prune_deepspeed_step_checkpoint_artifacts,
     _prune_periodic_step_checkpoint_artifacts,
     _resolve_ctc_frame_balance_mode,
@@ -35,6 +37,7 @@ from rwkvasr.training.deepspeed_loop import (
     _sample_direction_mask_distributed,
     _select_layer_hidden_ids,
     _step_checkpoint_record_is_retained,
+    _student_ctc_logits_required,
     _teacher_forced_student_layer_hiddens,
     _teacher_layer_capture_ids,
     _validate_exact_batch_coverage,
@@ -99,6 +102,38 @@ def test_online_ctc_teacher_projection_support_is_irrelevant_without_output_loss
         student_suppressed_token_ids=(3, 5, 7),
         teacher_ignored_token_ids=(3,),
     )
+
+
+def test_hidden_only_projection_elision_falls_back_for_ctc_objectives() -> None:
+    hidden_only = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        ctc_loss_weight=0.0,
+        decoder_loss_weight=0.0,
+        ctc_teacher_online_encoder_loss_weight=1.0,
+        ctc_teacher_online_decoder_hidden_loss_weight=1.0,
+        ctc_teacher_online_layer_block_loss_weight=1.0,
+        ctc_teacher_online_hidden_frame_balance_mode="all",
+    )
+    assert _online_teacher_ctc_outputs_required(hidden_only) is False
+    assert _student_ctc_logits_required(hidden_only) is False
+
+    online_logits = replace(hidden_only, ctc_teacher_online_full_loss_weight=1.0)
+    assert _online_teacher_ctc_outputs_required(online_logits) is True
+    assert _student_ctc_logits_required(online_logits) is True
+
+    cached_logits = replace(hidden_only, ctc_teacher_topk_loss_weight=1.0)
+    assert _student_ctc_logits_required(cached_logits) is True
+
+    supervised_ctc = replace(hidden_only, ctc_loss_weight=1.0)
+    assert _student_ctc_logits_required(supervised_ctc) is True
+
+    teacher_top1_balance = replace(
+        hidden_only,
+        ctc_teacher_online_hidden_frame_balance_mode="teacher_top1_balanced",
+    )
+    assert _online_teacher_ctc_outputs_required(teacher_top1_balance) is True
+    assert _student_ctc_logits_required(teacher_top1_balance) is False
 
 
 def test_deepspeed_loop_leaves_gradient_accumulation_to_engine() -> None:

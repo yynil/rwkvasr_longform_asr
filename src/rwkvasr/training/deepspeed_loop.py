@@ -403,6 +403,9 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_use_batch_features: bool = False
     ctc_teacher_online_keep_layer_hiddens_on_device: bool = False
     ctc_teacher_online_keep_full_log_probs_on_device: bool = False
+    ctc_teacher_online_compute_ctc_outputs: bool = True
+    ctc_teacher_online_capture_layer_inputs: bool = True
+    ctc_student_compute_ctc_logits: bool = True
     ctc_teacher_online_layer_mixer_loss_weight: float = 0.0
     ctc_teacher_online_layer_ffn_loss_weight: float = 0.0
     ctc_teacher_online_layer_block_loss_weight: float = 0.0
@@ -1792,6 +1795,72 @@ def _is_layer_hidden_only_objective(config: DeepSpeedTrainConfig) -> bool:
     return layer_enabled and all(float(value) <= 0.0 for value in non_layer_weights)
 
 
+def _student_ctc_logits_required(config: DeepSpeedTrainConfig) -> bool:
+    return any(
+        float(value) > 0.0
+        for value in (
+            config.ctc_loss_weight,
+            config.ctc_logit_anchor_loss_weight,
+            config.ctc_teacher_topk_loss_weight,
+            config.ctc_teacher_topk_blank_loss_weight,
+            config.ctc_teacher_topk_mass_loss_weight,
+            config.ctc_teacher_online_loss_weight,
+            config.ctc_teacher_online_blank_loss_weight,
+            config.ctc_teacher_online_mass_loss_weight,
+            config.ctc_teacher_online_full_loss_weight,
+            config.ctc_teacher_online_conditional_nonblank_loss_weight,
+            config.ctc_teacher_online_conditional_nonblank_hard_loss_weight,
+            config.ctc_teacher_online_sequence_loss_weight,
+            config.ctc_teacher_online_sequence_presence_loss_weight,
+            config.ctc_teacher_online_sequence_window_loss_weight,
+            config.ctc_teacher_online_nonblank_hard_loss_weight,
+            config.ctc_teacher_online_nonblank_margin_loss_weight,
+            config.ctc_teacher_online_nonblank_window_loss_weight,
+            config.ctc_teacher_online_nonblank_window_margin_loss_weight,
+            config.ctc_teacher_online_nonblank_window_topk_loss_weight,
+        )
+    )
+
+
+def _online_teacher_ctc_outputs_required(config: DeepSpeedTrainConfig) -> bool:
+    output_required = any(
+        float(value) > 0.0
+        for value in (
+            config.ctc_teacher_online_loss_weight,
+            config.ctc_teacher_online_blank_loss_weight,
+            config.ctc_teacher_online_mass_loss_weight,
+            config.ctc_teacher_online_full_loss_weight,
+            config.ctc_teacher_online_conditional_nonblank_loss_weight,
+            config.ctc_teacher_online_conditional_nonblank_hard_loss_weight,
+            config.ctc_teacher_online_sequence_loss_weight,
+            config.ctc_teacher_online_sequence_presence_loss_weight,
+            config.ctc_teacher_online_sequence_window_loss_weight,
+            config.ctc_teacher_online_nonblank_hard_loss_weight,
+            config.ctc_teacher_online_nonblank_margin_loss_weight,
+            config.ctc_teacher_online_nonblank_window_loss_weight,
+            config.ctc_teacher_online_nonblank_window_margin_loss_weight,
+            config.ctc_teacher_online_nonblank_window_topk_loss_weight,
+        )
+    )
+    if output_required:
+        return True
+    hidden_enabled = any(
+        float(value) > 0.0
+        for value in (
+            config.ctc_teacher_online_encoder_loss_weight,
+            config.ctc_teacher_online_decoder_hidden_loss_weight,
+            config.ctc_teacher_online_layer_mixer_loss_weight,
+            config.ctc_teacher_online_layer_ffn_loss_weight,
+            config.ctc_teacher_online_layer_block_loss_weight,
+        )
+    )
+    hidden_balance_mode = _resolve_ctc_frame_balance_mode(
+        config.ctc_teacher_online_hidden_frame_balance_mode,
+        config.ctc_teacher_online_frame_balance_mode,
+    )
+    return hidden_enabled and hidden_balance_mode == "teacher_top1_balanced"
+
+
 def _ctc_frame_group_count(frame_balance_mode: str) -> int:
     mode = str(frame_balance_mode or "all").strip().lower()
     if mode == "all":
@@ -2708,13 +2777,8 @@ def _evaluate_epoch_loss(
                     teacher_batch_feature_lengths,
                     audio_rows=batch.ctc_teacher_audio_rows,
                     layer_ids=teacher_layer_ids,
-                    include_ctc_outputs=(
-                        not layer_hidden_only
-                        or _resolve_ctc_frame_balance_mode(
-                            config.ctc_teacher_online_hidden_frame_balance_mode,
-                            config.ctc_teacher_online_frame_balance_mode,
-                        )
-                        == "teacher_top1_balanced"
+                    include_ctc_outputs=bool(
+                        config.ctc_teacher_online_compute_ctc_outputs
                     ),
                 )
             else:
@@ -2783,6 +2847,7 @@ def _evaluate_epoch_loss(
                             decoder_prompt_before_audio=batch.decoder_prompt_before_audio,
                             decoder_prompt_before_audio_lengths=batch.decoder_prompt_before_audio_lengths,
                             direction_mask=mask,
+                            compute_ctc_logits=bool(config.ctc_student_compute_ctc_logits),
                         )
             loss = _online_ctc_teacher_distillation_loss(
                 config=config,
@@ -6567,6 +6632,32 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         ctc_teacher_online_nonblank_window_margin_weight,
         ctc_teacher_online_nonblank_window_topk_weight,
     )
+    teacher_ctc_outputs_required = _online_teacher_ctc_outputs_required(config)
+    teacher_ctc_outputs_active = bool(config.ctc_teacher_online_compute_ctc_outputs)
+    student_ctc_logits_required = _student_ctc_logits_required(config)
+    student_ctc_logits_active = bool(config.ctc_student_compute_ctc_logits)
+    capture_teacher_layer_inputs = bool(
+        config.ctc_teacher_online_capture_layer_inputs
+    )
+    if teacher_ctc_outputs_required and not teacher_ctc_outputs_active:
+        raise ValueError(
+            "ctc_teacher_online_compute_ctc_outputs=False is incompatible with an "
+            "enabled online CTC-output objective or teacher-top1 hidden balancing."
+        )
+    if student_ctc_logits_required and not student_ctc_logits_active:
+        raise ValueError(
+            "ctc_student_compute_ctc_logits=False is incompatible with an enabled "
+            "student CTC-logit objective."
+        )
+    if (
+        ctc_teacher_online_layer_enabled
+        and ctc_teacher_online_layer_input_mode == "teacher_forced"
+        and not capture_teacher_layer_inputs
+    ):
+        raise ValueError(
+            "Teacher-forced layer alignment requires "
+            "ctc_teacher_online_capture_layer_inputs=True."
+        )
     _validate_online_ctc_teacher_projection_support(
         suppress_non_pronunciation_tokens=bool(
             config.ctc_suppress_non_pronunciation_tokens
@@ -6844,6 +6935,14 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
         or ctc_teacher_online_nonblank_window_topk_weight > 0.0
         or ctc_teacher_online_layer_enabled
     ):
+        if (
+            not teacher_ctc_outputs_active
+            and not config.ctc_teacher_online_use_batch_features
+        ):
+            raise ValueError(
+                "ctc_teacher_online_compute_ctc_outputs=False requires "
+                "ctc_teacher_online_use_batch_features=True."
+            )
         if config.ctc_teacher_online_model_path is None:
             raise ValueError("Online CTC teacher distillation requires ctc_teacher_online_model_path.")
         audio_index_path = config.ctc_teacher_online_audio_index_path
@@ -6892,6 +6991,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 ),
                 return_encoder_out=ctc_teacher_online_encoder_weight > 0.0,
                 return_layer_hiddens=ctc_teacher_online_layer_enabled,
+                return_layer_inputs=capture_teacher_layer_inputs,
                 return_ctc_decoder_hiddens=ctc_teacher_online_decoder_hidden_weight > 0.0,
                 keep_layer_hiddens_on_device=bool(
                     config.ctc_teacher_online_keep_layer_hiddens_on_device
@@ -6931,9 +7031,12 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"layer_rotation_offset={int(config.ctc_teacher_online_layer_rotation_offset)} "
             f"layer_frame_tolerance={int(config.ctc_teacher_online_layer_frame_tolerance)} "
             f"layer_input_mode={ctc_teacher_online_layer_input_mode} "
+            f"capture_layer_inputs={capture_teacher_layer_inputs} "
             f"layer_hiddens_on_device={bool(config.ctc_teacher_online_keep_layer_hiddens_on_device)} "
             f"full_log_probs_on_device={bool(config.ctc_teacher_online_keep_full_log_probs_on_device)} "
             f"layer_hidden_only={ctc_teacher_online_layer_only} "
+            f"teacher_ctc_outputs={teacher_ctc_outputs_active} "
+            f"student_ctc_logits={student_ctc_logits_active} "
             f"full_temperature={ctc_teacher_online_full_temperature:g} "
             f"full_nonblank_weight={ctc_teacher_online_full_nonblank_weight:g} "
             f"full_frame_weight_mode={ctc_teacher_online_full_frame_weight_mode} "
@@ -7400,10 +7503,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                 teacher_batch_feature_lengths,
                                 audio_rows=batch.ctc_teacher_audio_rows,
                                 layer_ids=teacher_layer_hidden_ids,
-                                include_ctc_outputs=(
-                                    not ctc_teacher_online_layer_only
-                                    or ctc_teacher_online_hidden_frame_balance_mode
-                                    == "teacher_top1_balanced"
+                                include_ctc_outputs=bool(
+                                    config.ctc_teacher_online_compute_ctc_outputs
                                 ),
                             )
                         else:
@@ -7489,6 +7590,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                                         batch.decoder_prompt_before_audio_lengths
                                     ),
                                     direction_mask=mask,
+                                    compute_ctc_logits=bool(
+                                        config.ctc_student_compute_ctc_logits
+                                    ),
                                 )
                 except torch.OutOfMemoryError:
                     _all_rank_log(
@@ -8310,6 +8414,9 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         f"online_mass_missing={ctc_teacher_online_mass_missing} "
                         f"online_ctc_full={ctc_teacher_online_full_loss_value:.4f} "
                         f"online_shared_full_alignment={int(ctc_teacher_online_shared_full_alignment_active)} "
+                        f"online_teacher_ctc_outputs={int(teacher_ctc_outputs_active)} "
+                        f"online_student_ctc_logits={int(student_ctc_logits_active)} "
+                        f"online_teacher_layer_inputs={int(capture_teacher_layer_inputs)} "
                         f"online_full_match={ctc_teacher_online_full_matched}/{batch_stats.batch_size} "
                         f"online_full_missing={ctc_teacher_online_full_missing} "
                         f"online_ctc_conditional_nonblank={ctc_teacher_online_conditional_nonblank_loss_value:.4f} "
@@ -8402,6 +8509,15 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                             "train/ctc_teacher_online_full_loss": ctc_teacher_online_full_loss_value,
                             "train/ctc_teacher_online_shared_full_alignment_active": int(
                                 ctc_teacher_online_shared_full_alignment_active
+                            ),
+                            "train/ctc_teacher_online_ctc_outputs_active": int(
+                                teacher_ctc_outputs_active
+                            ),
+                            "train/ctc_student_ctc_logits_active": int(
+                                student_ctc_logits_active
+                            ),
+                            "train/ctc_teacher_online_layer_inputs_active": int(
+                                capture_teacher_layer_inputs
                             ),
                             "train/ctc_teacher_online_full_matched": ctc_teacher_online_full_matched,
                             "train/ctc_teacher_online_full_missing": ctc_teacher_online_full_missing,

@@ -2812,6 +2812,10 @@ def test_stage211_freezes_nano_non_attention_path_in_every_phase(
         "sft": 0.05,
     }[phase_name]
     assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(expected_ffn_weight)
+    assert config["ctc_teacher_online_keep_layer_hiddens_on_device"] is True
+    assert config["ctc_teacher_online_compute_ctc_outputs"] is (phase_name in {"logits", "sft"})
+    assert config["ctc_teacher_online_capture_layer_inputs"] is (phase_name == "mixer")
+    assert config["ctc_student_compute_ctc_logits"] is (phase_name in {"logits", "sft"})
     assert config["step_eval_cache_batches"] is True
     assert config["step_eval_feature_seed"] == 0
     if phase_name == "sft":
@@ -2831,6 +2835,40 @@ def test_stage211_phase_config_contract_rejects_cross_phase_objective(
         match="block train config ctc_teacher_online_layer_input_mode mismatch",
     ):
         validate_stage211_phase_train_config(config, phase="block")
+
+
+def test_stage211_legacy_mixer_projection_config_requires_exact_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config_for_phase(tmp_path, "mixer")
+    for key in stage211_gate_module._STAGE211_PROJECTION_ELISION_CONFIG_KEYS:
+        config.pop(key)
+    normalized_sha256 = hashlib.sha256(
+        json.dumps(
+            config,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("ascii")
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="compute_ctc_outputs mismatch"):
+        validate_stage211_phase_train_config(config, phase="mixer")
+
+    monkeypatch.setattr(
+        stage211_gate_module,
+        "_STAGE211_LEGACY_MIXER_CONFIG_SHA256",
+        frozenset({normalized_sha256}),
+    )
+    assert validate_stage211_phase_train_config(config, phase="mixer") == (
+        stage211_phase_train_config_contract("mixer")
+    )
+
+    config["lr"] = 9.0e-6
+    with pytest.raises(ValueError, match="mismatch"):
+        validate_stage211_phase_train_config(config, phase="mixer")
 
 
 def test_stage211_mixer_phase_has_only_teacher_forced_mixer_objective(

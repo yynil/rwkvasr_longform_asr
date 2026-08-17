@@ -192,6 +192,77 @@ def test_ctc_bridge_residual_mlp_is_identity_initialized() -> None:
     assert torch.equal(losses["ctc_encoded_lengths"], lengths)
 
 
+def test_joint_losses_hidden_only_skips_ctc_head_and_preserves_hidden_gradients() -> None:
+    torch.manual_seed(22015)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=8,
+            n_embd=16,
+            dim_att=16,
+            dim_ff=32,
+            num_layers=2,
+            vocab_size=10,
+            blank_id=10,
+            head_size=8,
+            conv_kernel_size=3,
+            dropout=0.0,
+            frontend_type="linear",
+            ctc_bridge_type="residual_mlp",
+            ctc_bridge_hidden_dim=32,
+            ctc_bridge_dropout=0.0,
+            ctc_loss_weight=0.0,
+        )
+    ).eval()
+    features = torch.randn(2, 7, 8)
+    lengths = torch.tensor([7, 5], dtype=torch.long)
+    targets = torch.empty(0, dtype=torch.long)
+    target_lengths = torch.tensor([0, 0], dtype=torch.long)
+    full = model.joint_losses(features, lengths, targets, target_lengths)
+    full_hidden_loss = (
+        full["encoded"].float().square().mean()
+        + full["ctc_encoded"].float().abs().mean()
+    )
+    full_hidden_loss.backward()
+    full_gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    model.zero_grad(set_to_none=True)
+
+    class TrapHead(torch.nn.Module):
+        def forward(self, _features: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("CTC head must not run for hidden-only student forward")
+
+    model.ctc_head = TrapHead()
+    hidden_only = model.joint_losses(
+        features,
+        lengths,
+        targets,
+        target_lengths,
+        compute_ctc_logits=False,
+    )
+
+    assert hidden_only["logits"] is None
+    torch.testing.assert_close(hidden_only["encoded"], full["encoded"])
+    torch.testing.assert_close(hidden_only["ctc_encoded"], full["ctc_encoded"])
+    assert torch.equal(hidden_only["logit_lengths"], full["logit_lengths"])
+    hidden_only_loss = (
+        hidden_only["encoded"].float().square().mean()
+        + hidden_only["ctc_encoded"].float().abs().mean()
+    )
+    torch.testing.assert_close(hidden_only_loss, full_hidden_loss)
+    hidden_only_loss.backward()
+    hidden_only_gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    assert hidden_only_gradients.keys() == full_gradients.keys()
+    for name, gradient in hidden_only_gradients.items():
+        torch.testing.assert_close(gradient, full_gradients[name])
+
+
 def test_ctc_bridge_context_residual_mlp_is_identity_initialized_and_masks_padding() -> None:
     torch.manual_seed(22012)
     model = RWKVCTCModel(

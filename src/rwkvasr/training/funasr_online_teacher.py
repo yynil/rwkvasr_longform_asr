@@ -66,6 +66,7 @@ class FunASROnlineCTCTeacherConfig:
     return_encoder_out: bool = False
     return_encoder_input: bool = False
     return_layer_hiddens: bool = False
+    return_layer_inputs: bool = True
     return_ctc_decoder_hiddens: bool = False
     keep_layer_hiddens_on_device: bool = False
     keep_full_log_probs_on_device: bool = False
@@ -99,6 +100,7 @@ def _capture_funasr_encoder_hiddens(
     layer_ids: tuple[int, ...],
     *,
     capture_input: bool,
+    capture_layer_inputs: bool = True,
 ) -> Iterator[dict[str, Any]]:
     layers = _funasr_encoder_layers(audio_encoder)
     invalid = [layer_id for layer_id in layer_ids if not 0 <= int(layer_id) < len(layers)]
@@ -161,7 +163,8 @@ def _capture_funasr_encoder_hiddens(
         ) -> None:
             target["block"] = _first_tensor(output).detach()
 
-        handles.append(layer.register_forward_pre_hook(capture_layer_input))
+        if capture_layer_inputs:
+            handles.append(layer.register_forward_pre_hook(capture_layer_input))
         handles.append(layer.self_attn.register_forward_hook(capture_mixer))
         handles.append(layer.feed_forward.register_forward_hook(capture_ffn))
         handles.append(layer.register_forward_hook(capture_block))
@@ -528,8 +531,8 @@ class FunASRNanoCTCTopKOnlineTeacher:
             "argmax_token_ids": argmax_token_ids.detach().cpu(),
         }
         if self.config.return_encoder_out:
-            result["encoder_out"] = (
-                encoder_out[sample_idx, :encoder_frame_count, :].detach().cpu().to(dtype=torch.float16)
+            result["encoder_out"] = self._layer_hidden_record_tensor(
+                encoder_out[sample_idx, :encoder_frame_count, :]
             )
             result["encoder_out_lens"] = int(encoder_frame_count)
         if self.config.return_encoder_input:
@@ -549,10 +552,15 @@ class FunASRNanoCTCTopKOnlineTeacher:
         if capture_layer_ids:
             layer_hiddens: dict[str, dict[str, torch.Tensor]] = {}
             captured_layers = hidden_capture.get("layers", {})
+            component_names = (
+                ("input", "mixer", "ffn", "block")
+                if self.config.return_layer_inputs
+                else ("mixer", "ffn", "block")
+            )
             for layer_id in capture_layer_ids:
                 captured_components = captured_layers.get(layer_id, {})
                 missing_components = [
-                    name for name in ("input", "mixer", "ffn", "block")
+                    name for name in component_names
                     if not isinstance(captured_components.get(name), torch.Tensor)
                 ]
                 if missing_components:
@@ -564,7 +572,7 @@ class FunASRNanoCTCTopKOnlineTeacher:
                     name: self._layer_hidden_record_tensor(
                         captured_components[name][sample_idx, :encoder_frame_count, :]
                     )
-                    for name in ("input", "mixer", "ffn", "block")
+                    for name in component_names
                 }
             result["encoder_layer_hiddens"] = layer_hiddens
             result["encoder_layer_ids"] = list(capture_layer_ids)
@@ -634,6 +642,7 @@ class FunASRNanoCTCTopKOnlineTeacher:
                 self.model.audio_encoder,
                 capture_layer_ids,
                 capture_input=bool(self.config.return_encoder_input),
+                capture_layer_inputs=bool(self.config.return_layer_inputs),
             ) as hidden_capture, _capture_funasr_ctc_decoder_hiddens(
                 self.model.ctc_decoder,
                 enabled=bool(self.config.return_ctc_decoder_hiddens),
@@ -687,9 +696,6 @@ class FunASRNanoCTCTopKOnlineTeacher:
         capture_layer_ids = tuple(sorted(set(int(value) for value in (layer_ids or ()))))
         if capture_layer_ids and not self.config.return_layer_hiddens:
             raise ValueError("layer_ids were requested but return_layer_hiddens is disabled.")
-        if self.config.return_ctc_decoder_hiddens and not include_ctc_outputs:
-            raise ValueError("CTC decoder hidden capture requires include_ctc_outputs=True.")
-
         teacher_device = next(self.model.audio_encoder.parameters()).device
         teacher_features = features[:batch_size].detach().to(device=teacher_device, dtype=torch.float32).clone()
         teacher_lengths = feature_lengths[:batch_size].detach().to(device=teacher_device, dtype=torch.long)
@@ -697,17 +703,20 @@ class FunASRNanoCTCTopKOnlineTeacher:
             self.model.audio_encoder,
             capture_layer_ids,
             capture_input=bool(self.config.return_encoder_input),
+            capture_layer_inputs=bool(self.config.return_layer_inputs),
         ) as hidden_capture, _capture_funasr_ctc_decoder_hiddens(
             self.model.ctc_decoder,
             enabled=bool(self.config.return_ctc_decoder_hiddens),
         ) as decoder_hidden_capture:
             with torch.inference_mode():
                 encoder_out, encoder_out_lens = self.model.audio_encoder(teacher_features, teacher_lengths)
-                if include_ctc_outputs:
+                if include_ctc_outputs or self.config.return_ctc_decoder_hiddens:
                     decoder_out, decoder_out_lens = self.model.ctc_decoder(encoder_out, encoder_out_lens)
-                    ctc_logp = self.model.ctc.log_softmax(decoder_out)
                 else:
                     decoder_out_lens = None
+                if include_ctc_outputs:
+                    ctc_logp = self.model.ctc.log_softmax(decoder_out)
+                else:
                     ctc_logp = None
 
         self._prepare_device_layer_hiddens(hidden_capture)
@@ -715,6 +724,11 @@ class FunASRNanoCTCTopKOnlineTeacher:
         encoder_frame_counts = [
             int(value) for value in encoder_out_lens[:batch_size].detach().cpu().tolist()
         ]
+        decoder_frame_counts = (
+            [int(value) for value in decoder_out_lens[:batch_size].detach().cpu().tolist()]
+            if isinstance(decoder_out_lens, torch.Tensor)
+            else encoder_frame_counts
+        )
         records: dict[str, dict[str, Any]] = {}
         for sample_idx in range(batch_size):
             utt_id = str(utt_ids[sample_idx])
@@ -743,12 +757,18 @@ class FunASRNanoCTCTopKOnlineTeacher:
                 continue
 
             encoder_frame_count = encoder_frame_counts[sample_idx]
+            decoder_frame_count = decoder_frame_counts[sample_idx]
             captured_layers = hidden_capture.get("layers", {})
             layer_hiddens: dict[str, dict[str, torch.Tensor]] = {}
+            component_names = (
+                ("input", "mixer", "ffn", "block")
+                if self.config.return_layer_inputs
+                else ("mixer", "ffn", "block")
+            )
             for layer_id in capture_layer_ids:
                 captured_components = captured_layers.get(layer_id, {})
                 missing_components = [
-                    name for name in ("input", "mixer", "ffn", "block")
+                    name for name in component_names
                     if not isinstance(captured_components.get(name), torch.Tensor)
                 ]
                 if missing_components:
@@ -760,7 +780,7 @@ class FunASRNanoCTCTopKOnlineTeacher:
                     name: self._layer_hidden_record_tensor(
                         captured_components[name][sample_idx, :encoder_frame_count, :]
                     )
-                    for name in ("input", "mixer", "ffn", "block")
+                    for name in component_names
                 }
             hidden_record: dict[str, Any] = {
                 "format": "funasr_nano_encoder_hidden_online_v1",
@@ -768,16 +788,14 @@ class FunASRNanoCTCTopKOnlineTeacher:
                 "utt_id": utt_id,
                 "source": source,
                 "language": SOURCE_LANGUAGES.get(source),
+                "num_frames": decoder_frame_count,
                 "encoder_out_lens": encoder_frame_count,
                 "encoder_layer_hiddens": layer_hiddens,
                 "encoder_layer_ids": list(capture_layer_ids),
             }
             if self.config.return_encoder_out:
-                hidden_record["encoder_out"] = (
+                hidden_record["encoder_out"] = self._layer_hidden_record_tensor(
                     encoder_out[sample_idx, :encoder_frame_count, :]
-                    .detach()
-                    .cpu()
-                    .to(dtype=torch.float16)
                 )
             if self.config.return_encoder_input:
                 encoder_input = hidden_capture.get("encoder_input")
@@ -790,6 +808,27 @@ class FunASRNanoCTCTopKOnlineTeacher:
                     .to(dtype=torch.float16)
                 )
                 hidden_record["encoder_input_lens"] = encoder_frame_count
+            if self.config.return_ctc_decoder_hiddens:
+                expected_names = (
+                    "input",
+                    *(f"layer_{index}" for index in range(len(self.model.ctc_decoder.blocks))),
+                )
+                missing_names = [
+                    name
+                    for name in expected_names
+                    if not isinstance(decoder_hidden_capture.get(name), torch.Tensor)
+                ]
+                if missing_names:
+                    raise RuntimeError(
+                        "Nano CTC decoder hidden capture is incomplete for "
+                        f"utt_id={utt_id!r}: missing={missing_names}"
+                    )
+                hidden_record["ctc_decoder_hiddens"] = {
+                    name: self._layer_hidden_record_tensor(
+                        decoder_hidden_capture[name][sample_idx, :decoder_frame_count, :]
+                    )
+                    for name in expected_names
+                }
             records[utt_id] = hidden_record
         return records
 

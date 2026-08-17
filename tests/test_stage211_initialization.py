@@ -267,9 +267,13 @@ def test_initialization_loader_source_accepts_only_recorded_git_evolution() -> N
 
     assert evidence["mode"] == "git_history_non_initialization_ast_equivalent"
     assert evidence["historical_commit"] == "c4fee65421617b29ab70d415e5f3721f0ca64cbe"
-    assert evidence["normalization"] == "strip_ctc_target_validation_v1"
+    assert (
+        evidence["normalization"]
+        == "strip_ctc_target_validation_and_projection_elision_v2"
+    )
     assert evidence["removed_current_methods"] == 1
     assert evidence["removed_current_calls"] == 1
+    assert evidence["normalized_current_projection_elisions"] == 1
     assert len(evidence["normalized_ast_sha256"]) == 64
 
 
@@ -302,10 +306,11 @@ class RWKVCTCModel:
         lambda path, *, expected_sha256: ("a" * 40, historical_source),
     )
 
-    historical_ast, _, _ = _normalized_loader_ast(historical_source)
-    current_ast, methods, calls = _normalized_loader_ast(changed_source)
+    historical_ast, _, _, _ = _normalized_loader_ast(historical_source)
+    current_ast, methods, calls, projection_elisions = _normalized_loader_ast(changed_source)
     assert methods == 1
     assert calls == 1
+    assert projection_elisions == 0
     assert current_ast != historical_ast
     with pytest.raises(ValueError, match="outside the approved"):
         _validate_loader_source_binding(
@@ -341,9 +346,10 @@ class RWKVCTCModel:
         lambda path, *, expected_sha256: ("a" * 40, historical_source),
     )
 
-    _, methods, calls = _normalized_loader_ast(changed_source)
+    _, methods, calls, projection_elisions = _normalized_loader_ast(changed_source)
     assert methods == 1
     assert calls == 0
+    assert projection_elisions == 0
     with pytest.raises(ValueError, match="outside the approved"):
         _validate_loader_source_binding(
             {

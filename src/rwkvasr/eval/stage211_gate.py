@@ -68,6 +68,21 @@ _STAGE211_STUDENT_BLANK_ID = 60_515
 _STAGE211_NANO_BLANK_ID = 60_514
 _STAGE211_ALIGNMENT_LAYER_IDS = tuple(range(70))
 _STAGE211_ALIGNMENT_LAYER_KEYS = {str(index) for index in _STAGE211_ALIGNMENT_LAYER_IDS}
+_STAGE211_PROJECTION_ELISION_CONFIG_KEYS = frozenset(
+    {
+        "ctc_teacher_online_compute_ctc_outputs",
+        "ctc_teacher_online_capture_layer_inputs",
+        "ctc_student_compute_ctc_logits",
+    }
+)
+_STAGE211_LEGACY_MIXER_CONFIG_SHA256 = frozenset(
+    {
+        # Active uninterrupted easy/medium/hard configs generated before projection elision.
+        "53ddc41e6cf4527df84731e9e1ea8bae4813a8d2dbbcc393544cf097bf2e8802",
+        "10ea5953724e76ed65e8ab733f87c964a41defb05cf1aca05ccc07b86b13c365",
+        "da4aa7979010347d285d82d32c397b17db3c09a6d0afdf0ab44911cdda73e15f",
+    }
+)
 _STAGE211_ALIGNMENT_WEAK_BANDS = {
     "10-19": tuple(range(10, 20)),
     "20-29": tuple(range(20, 30)),
@@ -316,6 +331,7 @@ _STAGE211_COMMON_PHASE_TRAIN_CONFIG: dict[str, Any] = {
     "funasr_nano_ctc_init_load_head": False,
     "ctc_teacher_frame_filter": "all",
     "ctc_teacher_online_use_batch_features": True,
+    "ctc_teacher_online_keep_layer_hiddens_on_device": True,
     "ctc_teacher_online_layer_raw_mse_weight": 0.0,
     "ctc_teacher_online_layer_normalized_mse_weight": 1.0,
     "ctc_teacher_online_layer_cosine_weight": 0.25,
@@ -362,6 +378,9 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_layer_boundary_ids": [],
         "ctc_teacher_online_layer_include_boundaries": False,
         "ctc_teacher_online_keep_full_log_probs_on_device": False,
+        "ctc_teacher_online_compute_ctc_outputs": False,
+        "ctc_teacher_online_capture_layer_inputs": True,
+        "ctc_student_compute_ctc_logits": False,
     },
     "block": {
         "lr": 2.0e-6,
@@ -383,6 +402,9 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_layer_boundary_ids": [],
         "ctc_teacher_online_layer_include_boundaries": False,
         "ctc_teacher_online_keep_full_log_probs_on_device": False,
+        "ctc_teacher_online_compute_ctc_outputs": False,
+        "ctc_teacher_online_capture_layer_inputs": False,
+        "ctc_student_compute_ctc_logits": False,
     },
     "logits": {
         "lr": 3.0e-7,
@@ -405,6 +427,9 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_layer_boundary_ids": list(STAGE211_HARD_LAYER_IDS),
         "ctc_teacher_online_layer_include_boundaries": True,
         "ctc_teacher_online_keep_full_log_probs_on_device": True,
+        "ctc_teacher_online_compute_ctc_outputs": True,
+        "ctc_teacher_online_capture_layer_inputs": False,
+        "ctc_student_compute_ctc_logits": True,
     },
     "sft": {
         "lr": 3.0e-7,
@@ -426,6 +451,9 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_layer_boundary_ids": list(STAGE211_HARD_LAYER_IDS),
         "ctc_teacher_online_layer_include_boundaries": True,
         "ctc_teacher_online_keep_full_log_probs_on_device": False,
+        "ctc_teacher_online_compute_ctc_outputs": True,
+        "ctc_teacher_online_capture_layer_inputs": False,
+        "ctc_student_compute_ctc_logits": True,
     },
 }
 
@@ -568,7 +596,23 @@ def validate_stage211_phase_train_config(
     phase: str,
 ) -> dict[str, Any]:
     contract = stage211_phase_train_config_contract(phase)
+    normalized_sha256 = hashlib.sha256(
+        json.dumps(
+            train_config,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("ascii")
+    ).hexdigest()
+    legacy_mixer_projection_config = (
+        phase == "mixer"
+        and _STAGE211_PROJECTION_ELISION_CONFIG_KEYS.isdisjoint(train_config)
+        and normalized_sha256 in _STAGE211_LEGACY_MIXER_CONFIG_SHA256
+    )
     for key, expected in contract.items():
+        if legacy_mixer_projection_config and key in _STAGE211_PROJECTION_ELISION_CONFIG_KEYS:
+            continue
         actual = train_config.get(key)
         if type(actual) is not type(expected) or actual != expected:
             raise ValueError(

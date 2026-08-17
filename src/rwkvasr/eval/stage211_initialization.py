@@ -19,7 +19,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _EVOLVED_LOADER_PATH = (
     _REPO_ROOT / "src" / "rwkvasr" / "modules" / "rwkv_asr_ctc.py"
 ).resolve()
-_EVOLVED_LOADER_NORMALIZATION = "strip_ctc_target_validation_v1"
+_EVOLVED_LOADER_NORMALIZATION = "strip_ctc_target_validation_and_projection_elision_v2"
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -68,10 +68,104 @@ def _is_approved_ctc_target_validation_call(statement: ast.stmt) -> bool:
     )
 
 
-def _normalized_loader_ast(source: bytes) -> tuple[str, int, int]:
+def _ast_shape(node: ast.AST) -> str:
+    return ast.dump(node, annotate_fields=True, include_attributes=False)
+
+
+def _parsed_statements(source: str) -> list[ast.stmt]:
+    return ast.parse(source).body
+
+
+def _normalize_approved_ctc_projection_elision(method: ast.FunctionDef) -> bool:
+    compute_arguments = [
+        index
+        for index, argument in enumerate(method.args.kwonlyargs)
+        if argument.arg == "compute_ctc_logits"
+    ]
+    compute_references = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Name) and node.id == "compute_ctc_logits"
+    ]
+    if not compute_arguments and not compute_references:
+        return False
+    if compute_arguments != [len(method.args.kwonlyargs) - 1] or len(compute_references) != 2:
+        return False
+    argument_index = compute_arguments[0]
+    argument = method.args.kwonlyargs[argument_index]
+    default = method.args.kw_defaults[argument_index]
+    if (
+        not isinstance(argument.annotation, ast.Name)
+        or argument.annotation.id != "bool"
+        or not isinstance(default, ast.Constant)
+        or default.value is not True
+    ):
+        return False
+
+    approved_current = _parsed_statements(
+        """
+if not compute_ctc_logits and ctc_loss_weight > 0.0:
+    raise ValueError("compute_ctc_logits=False requires ctc_loss_weight=0.")
+logits = (
+    self.apply_ctc_logit_mask(self.ctc_head(ctc_features))
+    if compute_ctc_logits
+    else None
+)
+zero_source = logits if isinstance(logits, Tensor) else ctc_features
+zero_loss = zero_source.float().sum() * 0.0
+"""
+    )
+    current_shapes = [_ast_shape(statement) for statement in approved_current]
+    matching_offsets = [
+        index
+        for index in range(len(method.body) - len(current_shapes) + 1)
+        if [
+            _ast_shape(statement)
+            for statement in method.body[index : index + len(current_shapes)]
+        ]
+        == current_shapes
+    ]
+    if len(matching_offsets) != 1:
+        return False
+
+    logit_length_guard = _parsed_statements(
+        """
+if logit_lengths is None:
+    raise ValueError("CTC training/distillation requires feature lengths.")
+"""
+    )[0]
+    guard_offsets = [
+        index
+        for index, statement in enumerate(method.body)
+        if _ast_shape(statement) == _ast_shape(logit_length_guard)
+    ]
+    if len(guard_offsets) != 1 or guard_offsets[0] >= matching_offsets[0]:
+        return False
+
+    historical_logits, historical_zero_loss = _parsed_statements(
+        """
+logits = self.apply_ctc_logit_mask(self.ctc_head(ctc_features))
+zero_loss = logits.float().sum() * 0.0
+"""
+    )
+    offset = matching_offsets[0]
+    method.body[offset : offset + len(current_shapes)] = [historical_zero_loss]
+    guard_offset = next(
+        index
+        for index, statement in enumerate(method.body)
+        if _ast_shape(statement) == _ast_shape(logit_length_guard)
+    )
+    method.body.insert(guard_offset, historical_logits)
+    del method.args.kwonlyargs[argument_index]
+    del method.args.kw_defaults[argument_index]
+    return True
+
+
+def _normalized_loader_ast(source: bytes) -> tuple[str, int, int, int]:
     tree = ast.parse(source.decode("utf-8"))
     removed_methods = 0
     removed_calls = 0
+    normalized_projection_elisions = 0
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef) or node.name != "RWKVCTCModel":
             continue
@@ -91,10 +185,19 @@ def _normalized_loader_ast(source: bytes) -> tuple[str, int, int]:
                         continue
                     filtered.append(statement)
                 item.body = filtered
+            if isinstance(item, ast.FunctionDef) and item.name == "joint_losses":
+                normalized_projection_elisions += int(
+                    _normalize_approved_ctc_projection_elision(item)
+                )
             retained.append(item)
         node.body = retained
     rendered = ast.dump(tree, annotate_fields=True, include_attributes=False)
-    return hashlib.sha256(rendered.encode("utf-8")).hexdigest(), removed_methods, removed_calls
+    return (
+        hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        removed_methods,
+        removed_calls,
+        normalized_projection_elisions,
+    )
 
 
 def _git_historical_source(path: Path, *, expected_sha256: str) -> tuple[str, bytes]:
@@ -160,20 +263,30 @@ def _validate_loader_source_binding(
         path,
         expected_sha256=expected_sha256,
     )
-    historical_ast_sha256, historical_methods, historical_calls = _normalized_loader_ast(
-        historical_source
-    )
-    current_ast_sha256, current_methods, current_calls = _normalized_loader_ast(current_source)
+    (
+        historical_ast_sha256,
+        historical_methods,
+        historical_calls,
+        historical_projection_elisions,
+    ) = _normalized_loader_ast(historical_source)
+    (
+        current_ast_sha256,
+        current_methods,
+        current_calls,
+        current_projection_elisions,
+    ) = _normalized_loader_ast(current_source)
     if (
         historical_methods != 0
         or historical_calls != 0
+        or historical_projection_elisions != 0
         or current_methods != 1
         or current_calls != 1
+        or current_projection_elisions != 1
         or current_ast_sha256 != historical_ast_sha256
     ):
         raise ValueError(
             "Stage211 initialization loader changed outside the approved CTC-target "
-            "validation-only evolution."
+            "validation and hidden-only projection-elision evolution."
         )
     return {
         "path": str(path),
@@ -185,6 +298,7 @@ def _validate_loader_source_binding(
         "normalized_ast_sha256": current_ast_sha256,
         "removed_current_methods": current_methods,
         "removed_current_calls": current_calls,
+        "normalized_current_projection_elisions": current_projection_elisions,
     }
 
 
