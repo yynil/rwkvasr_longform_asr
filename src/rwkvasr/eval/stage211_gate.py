@@ -16,6 +16,8 @@ from rwkvasr.data import (
     ctc_suppressed_token_ids_for_tokenizer,
 )
 from rwkvasr.eval.stage211_public_metrics import (
+    STAGE211_PUBLIC_MAX_ABSOLUTE_GAP_POINTS,
+    STAGE211_PUBLIC_MAX_RELATIVE_RATIO,
     STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
     build_stage211_public_progress,
     replay_stage211_public_comparison,
@@ -4796,14 +4798,19 @@ def validate_stage211_public_benchmark(
         raise ValueError("Stage211 public benchmark is not complete.")
 
     results = public_benchmark.get("results")
-    if not isinstance(results, list):
-        raise ValueError("Stage211 public benchmark results must be a list.")
+    if not isinstance(results, list) or len(results) != len(STAGE211_PUBLIC_BENCHMARKS):
+        raise ValueError("Stage211 public benchmark must contain exactly five results.")
+    if any(not isinstance(result, dict) for result in results):
+        raise ValueError("Stage211 public benchmark results must all be objects.")
     by_dataset = {
-        str(result.get("dataset")): result for result in results if isinstance(result, dict)
+        str(result.get("dataset")): result for result in results
     }
-    if set(by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
-        raise ValueError("Stage211 public benchmark dataset set is incomplete or unexpected.")
+    if len(by_dataset) != len(results) or set(by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
+        raise ValueError(
+            "Stage211 public benchmark datasets must be unique, complete, and expected."
+        )
 
+    replayed_dataset_decisions: list[bool] = []
     for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
         result = by_dataset[dataset]
         if result.get("language") != expected["language"]:
@@ -4843,6 +4850,43 @@ def validate_stage211_public_benchmark(
                 raise ValueError(
                     f"Stage211 public benchmark {dataset}/{metric_name} must be finite."
                 )
+        absolute_gate_pass = result.get("absolute_gate_pass")
+        relative_gate_pass = result.get("relative_gate_pass")
+        dataset_gate_pass = result.get("gate_pass")
+        if not all(
+            isinstance(value, bool)
+            for value in (absolute_gate_pass, relative_gate_pass, dataset_gate_pass)
+        ):
+            raise ValueError(
+                f"Stage211 public benchmark {dataset} lacks boolean threshold decisions."
+            )
+        expected_absolute_gate_pass = (
+            float(result["absolute_gap_points"])
+            <= STAGE211_PUBLIC_MAX_ABSOLUTE_GAP_POINTS
+        )
+        expected_relative_gate_pass = (
+            float(result["relative_ratio"]) <= STAGE211_PUBLIC_MAX_RELATIVE_RATIO
+        )
+        if absolute_gate_pass is not expected_absolute_gate_pass:
+            raise ValueError(
+                f"Stage211 public benchmark {dataset} absolute threshold decision mismatch."
+            )
+        if relative_gate_pass is not expected_relative_gate_pass:
+            raise ValueError(
+                f"Stage211 public benchmark {dataset} relative threshold decision mismatch."
+            )
+        expected_dataset_gate_pass = expected_absolute_gate_pass and expected_relative_gate_pass
+        if dataset_gate_pass is not expected_dataset_gate_pass:
+            raise ValueError(
+                f"Stage211 public benchmark {dataset} combined threshold decision mismatch."
+            )
+        replayed_dataset_decisions.append(expected_dataset_gate_pass)
+
+    all_datasets_pass = public_benchmark.get("all_datasets_pass")
+    if not isinstance(all_datasets_pass, bool):
+        raise ValueError("Stage211 public benchmark lacks a boolean every-dataset decision.")
+    if all_datasets_pass is not all(replayed_dataset_decisions):
+        raise ValueError("Stage211 public benchmark every-dataset decision mismatch.")
     return dict(public_benchmark)
 
 

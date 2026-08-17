@@ -19,6 +19,7 @@ from rwkvasr.eval.stage211_gate import (
     build_stage211_sft_step_eval_cadence,
     sha256_file,
     stage211_phase_train_config_contract,
+    validate_stage211_public_benchmark,
 )
 from rwkvasr.eval.stage211_public_metrics import (
     STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
@@ -1062,6 +1063,11 @@ def _bound_public_benchmark(
         for path in (manifest, nano, student):
             if not path.exists():
                 path.write_text("{}\n", encoding="utf-8")
+        nano_error_rate = 0.1
+        absolute_gap_points = (error_rate - nano_error_rate) * 100.0
+        relative_ratio = error_rate / nano_error_rate
+        absolute_gate_pass = absolute_gap_points <= 3.0
+        relative_gate_pass = relative_ratio <= 1.20
         results.append(
             {
                 "dataset": dataset,
@@ -1071,10 +1077,13 @@ def _bound_public_benchmark(
                 "identical_utt_coverage": True,
                 "normalized_reference_mismatch_count": 0,
                 "metric_source_recomputed": True,
-                "nano_error_rate": 0.1,
+                "nano_error_rate": nano_error_rate,
                 "student_error_rate": error_rate,
-                "absolute_gap_points": (error_rate - 0.1) * 100.0,
-                "relative_ratio": error_rate / 0.1,
+                "absolute_gap_points": absolute_gap_points,
+                "relative_ratio": relative_ratio,
+                "absolute_gate_pass": absolute_gate_pass,
+                "relative_gate_pass": relative_gate_pass,
+                "gate_pass": absolute_gate_pass and relative_gate_pass,
                 "nano_prediction_reference_unit_ratio": 1.0,
                 "student_prediction_reference_unit_ratio": 0.95,
                 "nano_deletion_rate": 0.01,
@@ -1092,9 +1101,73 @@ def _bound_public_benchmark(
         "normalization": "ctc",
         "strip_language_confirmation": STAGE211_PUBLIC_STRIP_LANGUAGE_CONFIRMATION,
         "all_datasets_complete": True,
-        "all_datasets_pass": True,
+        "all_datasets_pass": all(bool(result["gate_pass"]) for result in results),
         "results": results,
     }
+
+
+def test_stage211_public_benchmark_rejects_duplicate_dataset_records(tmp_path: Path) -> None:
+    benchmark = _bound_public_benchmark(tmp_path, stage="duplicate", error_rate=0.1)
+    results = benchmark["results"]
+    assert isinstance(results, list)
+    results[-1] = dict(results[0])
+
+    with pytest.raises(ValueError, match="unique, complete, and expected"):
+        validate_stage211_public_benchmark(benchmark, require_metric_source_recomputed=True)
+
+
+def test_stage211_public_benchmark_rejects_extra_result_record(tmp_path: Path) -> None:
+    benchmark = _bound_public_benchmark(tmp_path, stage="extra", error_rate=0.1)
+    results = benchmark["results"]
+    assert isinstance(results, list)
+    results.append(dict(results[0]))
+
+    with pytest.raises(ValueError, match="exactly five results"):
+        validate_stage211_public_benchmark(benchmark, require_metric_source_recomputed=True)
+
+
+def test_stage211_public_benchmark_rejects_non_object_result(tmp_path: Path) -> None:
+    benchmark = _bound_public_benchmark(tmp_path, stage="non-object", error_rate=0.1)
+    results = benchmark["results"]
+    assert isinstance(results, list)
+    results[-1] = "not-a-result"
+
+    with pytest.raises(ValueError, match="results must all be objects"):
+        validate_stage211_public_benchmark(benchmark, require_metric_source_recomputed=True)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    (
+        ("absolute_gate_pass", "absolute threshold decision mismatch"),
+        ("relative_gate_pass", "relative threshold decision mismatch"),
+        ("gate_pass", "combined threshold decision mismatch"),
+    ),
+)
+def test_stage211_public_benchmark_rejects_inconsistent_dataset_decision(
+    tmp_path: Path,
+    field: str,
+    message: str,
+) -> None:
+    benchmark = _bound_public_benchmark(tmp_path, stage=field, error_rate=0.1)
+    results = benchmark["results"]
+    assert isinstance(results, list)
+    result = results[0]
+    assert isinstance(result, dict)
+    result[field] = False
+
+    with pytest.raises(ValueError, match=message):
+        validate_stage211_public_benchmark(benchmark, require_metric_source_recomputed=True)
+
+
+def test_stage211_public_benchmark_rejects_inconsistent_every_dataset_decision(
+    tmp_path: Path,
+) -> None:
+    benchmark = _bound_public_benchmark(tmp_path, stage="all", error_rate=0.1)
+    benchmark["all_datasets_pass"] = False
+
+    with pytest.raises(ValueError, match="every-dataset decision mismatch"):
+        validate_stage211_public_benchmark(benchmark, require_metric_source_recomputed=True)
 
 
 def _write_nano_baseline_receipt(
@@ -2594,7 +2667,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
     sft["public_benchmark"]["all_datasets_pass"] = False
     reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="every-dataset Nano"):
+    with pytest.raises(ValueError, match="every-dataset"):
         stepwise_report.build_stepwise_report(
             initialization_receipt_path=reports["initialization"],
             calibration_receipt_path=reports["calibration"],
@@ -2604,7 +2677,7 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
             sft_final_report_path=reports["sft"],
             public_metric_correction_receipt_path=reports["metric_correction"],
         )
-    with pytest.raises(ValueError, match="every-dataset Nano"):
+    with pytest.raises(ValueError, match="every-dataset"):
         sft_finalizer._validate_final_report(
             reports["sft"],
             checkpoint=checkpoints["sft"],
