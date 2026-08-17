@@ -155,6 +155,58 @@ def test_boundary_sentinel_stops_only_controller(
     assert signals == [(100, signal.SIGSTOP)]
 
 
+@pytest.mark.parametrize("terminal_state", ("X", "Z"))
+def test_boundary_sentinel_accepts_unreaped_terminal_long_child(
+    tmp_path: Path,
+    terminal_state: str,
+) -> None:
+    proc_root = tmp_path / "proc"
+    _write_process(
+        proc_root,
+        pid=101,
+        command=("python", "run_stage211_strict_chained_alignment.py"),
+        state=terminal_state,
+    )
+
+    sentinel._wait_for_exit(101, poll_seconds=0.01, proc_root=proc_root)
+
+
+def test_boundary_sentinel_waits_until_long_child_becomes_zombie(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc_root = tmp_path / "proc"
+    _write_process(
+        proc_root,
+        pid=101,
+        command=("python", "run_stage211_strict_chained_alignment.py"),
+        state="S",
+    )
+    sleeps: list[float] = []
+
+    def finish_long_child(seconds: float) -> None:
+        sleeps.append(seconds)
+        (proc_root / "101" / "status").write_text(
+            "Name:\tpython\nState:\tZ (zombie)\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(sentinel.time, "sleep", finish_long_child)
+
+    sentinel._wait_for_exit(101, poll_seconds=0.25, proc_root=proc_root)
+
+    assert sleeps == [0.25]
+
+
+def test_boundary_sentinel_rejects_unreadable_live_long_child_state(tmp_path: Path) -> None:
+    proc_root = tmp_path / "proc"
+    process = proc_root / "101"
+    process.mkdir(parents=True)
+
+    with pytest.raises(FileNotFoundError):
+        sentinel._wait_for_exit(101, poll_seconds=0.01, proc_root=proc_root)
+
+
 def test_boundary_sentinel_handoff_command_uses_current_python(tmp_path: Path) -> None:
     command = sentinel._handoff_command(
         controller_pid=100,

@@ -120,6 +120,14 @@ def _process_exists(pid: int, *, proc_root: Path = Path("/proc")) -> bool:
 
 def _wait_for_exit(pid: int, *, poll_seconds: float, proc_root: Path = Path("/proc")) -> None:
     while _process_exists(pid, proc_root=proc_root):
+        try:
+            state = _read_state(pid, proc_root=proc_root)
+        except FileNotFoundError:
+            if _process_exists(pid, proc_root=proc_root):
+                raise
+            return
+        if state in {"X", "Z"}:
+            return
         time.sleep(poll_seconds)
 
 
