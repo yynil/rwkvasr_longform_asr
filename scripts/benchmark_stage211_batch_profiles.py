@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -35,7 +35,8 @@ from rwkvasr.eval.stage211_gate import STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATTERN = re.compile(
-    r"^(?P<name>[A-Za-z0-9_.-]+):(?P<batch>[1-9][0-9]*):(?P<frames>[1-9][0-9]*)$"
+    r"^(?P<name>[A-Za-z0-9_.-]+):(?P<batch>[1-9][0-9]*):"
+    r"(?P<frames>[1-9][0-9]*)(?::(?P<workers>[1-9][0-9]*))?$"
 )
 TRAIN_LINE_MARKER = "[deepspeed-train]"
 STEP_PATTERN = re.compile(r"\bstep=([0-9]+)\b")
@@ -57,30 +58,40 @@ class BatchProfile:
     name: str
     batch_size: int
     frame_budget: int
+    num_workers: int | None = 8
 
 
 DEFAULT_PROFILES = (
-    BatchProfile("baseline", 36, 24_000),
-    BatchProfile("batch48_frames42k", 48, 42_000),
-    BatchProfile("batch64_frames56k", 64, 56_000),
-    BatchProfile("batch80_frames70k", 80, 70_000),
-    BatchProfile("batch96_frames84k", 96, 84_000),
-    BatchProfile("batch128_frames112k", 128, 112_000),
-    BatchProfile("batch160_frames140k", 160, 140_000),
-    BatchProfile("batch192_frames168k", 192, 168_000),
+    BatchProfile("baseline", 36, 24_000, 8),
+    BatchProfile("batch48_frames42k", 48, 42_000, 8),
+    BatchProfile("batch64_frames56k", 64, 56_000, 8),
+    BatchProfile("batch80_frames70k", 80, 70_000, 8),
+    BatchProfile("batch96_frames84k", 96, 84_000, 8),
+    BatchProfile("batch128_frames112k", 128, 112_000, 8),
+    BatchProfile("batch160_frames140k", 160, 140_000, 8),
+    BatchProfile("batch192_frames168k", 192, 168_000, 8),
 )
 LOGITS_DEFAULT_PROFILES = (
-    BatchProfile("baseline", 12, 8_000),
-    BatchProfile("batch16_frames10k", 16, 10_000),
-    BatchProfile("batch20_frames13k", 20, 13_000),
-    BatchProfile("batch24_frames16k", 24, 16_000),
-    BatchProfile("batch36_frames24k", 36, 24_000),
+    BatchProfile("baseline", 12, 8_000, 8),
+    BatchProfile("batch16_frames10k", 16, 10_000, 8),
+    BatchProfile("batch20_frames13k", 20, 13_000, 8),
+    BatchProfile("batch24_frames16k", 24, 16_000, 8),
+    BatchProfile("batch36_frames24k", 36, 24_000, 8),
     *DEFAULT_PROFILES[1:],
 )
 
 
-def default_profiles_for_phase(phase: str) -> tuple[BatchProfile, ...]:
-    return LOGITS_DEFAULT_PROFILES if str(phase) == "logits" else DEFAULT_PROFILES
+def default_profiles_for_phase(
+    phase: str,
+    *,
+    num_workers: int = 8,
+) -> tuple[BatchProfile, ...]:
+    if num_workers <= 0:
+        raise ValueError("num_workers must be positive")
+    profiles = LOGITS_DEFAULT_PROFILES if str(phase) == "logits" else DEFAULT_PROFILES
+    if int(num_workers) == 8:
+        return profiles
+    return tuple(replace(profile, num_workers=int(num_workers)) for profile in profiles)
 
 
 @dataclass(frozen=True)
@@ -132,12 +143,44 @@ def sha256_file(path: Path, *, chunk_size: int = 8 << 20) -> str:
 def parse_profile(value: str) -> BatchProfile:
     match = PROFILE_PATTERN.fullmatch(value)
     if match is None:
-        raise argparse.ArgumentTypeError("profile must use NAME:BATCH_SIZE:FRAME_BUDGET")
+        raise argparse.ArgumentTypeError(
+            "profile must use NAME:BATCH_SIZE:FRAME_BUDGET[:NUM_WORKERS]"
+        )
     return BatchProfile(
         name=match.group("name"),
         batch_size=int(match.group("batch")),
         frame_budget=int(match.group("frames")),
+        num_workers=(
+            int(match.group("workers")) if match.group("workers") is not None else None
+        ),
     )
+
+
+def available_cpu_topology() -> dict[str, int | str]:
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
+    if not affinity:
+        affinity = list(range(max(1, int(os.cpu_count() or 1))))
+    physical: set[tuple[str, str]] = set()
+    for cpu in affinity:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = (topology / "physical_package_id").read_text(encoding="ascii").strip()
+            core = (topology / "core_id").read_text(encoding="ascii").strip()
+        except OSError:
+            physical.clear()
+            break
+        physical.add((package, core))
+    if physical:
+        physical_cores = len(physical)
+        source = "linux_sysfs_affinity"
+    else:
+        physical_cores = len(affinity)
+        source = "logical_affinity_fallback"
+    return {
+        "logical_cpus": len(affinity),
+        "physical_cores": max(1, physical_cores),
+        "topology_source": source,
+    }
 
 
 def required_online_match_fields(config: dict[str, Any]) -> tuple[str, ...]:
@@ -220,6 +263,13 @@ def build_probe_config(
         raise ValueError("probe max_steps must be greater than one")
     if world_size <= 0:
         raise ValueError("world_size must be positive")
+    resolved_num_workers = int(
+        profile.num_workers
+        if profile.num_workers is not None
+        else base_config.get("num_workers", 8)
+    )
+    if resolved_num_workers <= 0:
+        raise ValueError("probe profile num_workers must be positive")
     config = copy.deepcopy(base_config)
     config.update(
         {
@@ -245,6 +295,7 @@ def build_probe_config(
             "wandb_run_name": None,
             "log_every": 1,
             "batch_size": int(profile.batch_size),
+            "num_workers": resolved_num_workers,
             "batch_token_budget": int(profile.frame_budget),
             "length_bucket_frame_budget": int(profile.frame_budget),
             "length_bucket_drop_last": False,
@@ -810,6 +861,46 @@ def select_profile(
     }
 
 
+def select_loader_workers(
+    rows: list[dict[str, Any]],
+    *,
+    baseline_name: str,
+    candidate_name: str,
+    min_improvement_ratio: float,
+    max_loss_regression_ratio: float,
+    max_cosine_regression: float,
+) -> dict[str, Any]:
+    if [str(row["profile"]["name"]) for row in rows] != [
+        baseline_name,
+        candidate_name,
+    ]:
+        raise ValueError("loader-worker calibration rows are incomplete or reordered")
+    selection = select_profile(
+        rows,
+        baseline_name=baseline_name,
+        min_improvement_ratio=min_improvement_ratio,
+        max_loss_regression_ratio=max_loss_regression_ratio,
+        max_cosine_regression=max_cosine_regression,
+    )
+    selected_name = (
+        candidate_name
+        if selection.get("decision") == "candidate_recommended"
+        and selection.get("recommended_profile") == candidate_name
+        else baseline_name
+    )
+    by_name = {str(row["profile"]["name"]): row for row in rows}
+    selected_workers = int(by_name[selected_name]["profile"]["num_workers"])
+    return {
+        "selection_decision": (
+            "balanced_workers_selected"
+            if selected_name == candidate_name
+            else "configured_workers_retained"
+        ),
+        "selected_profile": selected_name,
+        "selected_num_workers": selected_workers,
+    }
+
+
 def _profile_full_coverage(
     config: dict[str, Any],
     profile: BatchProfile,
@@ -867,11 +958,6 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    profiles = args.profile or list(default_profiles_for_phase(args.phase))
-    if len({profile.name for profile in profiles}) != len(profiles):
-        parser.error("profile names must be unique")
-    if args.baseline_profile not in {profile.name for profile in profiles}:
-        parser.error("--baseline-profile must name one of the requested profiles")
     if args.warmup_steps <= 0 or args.measure_steps <= 0:
         parser.error("warmup and measured steps must be positive")
     if args.formal_epochs <= 0 or args.world_size <= 0:
@@ -895,6 +981,90 @@ def main() -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     base_config = load_yaml(base_config_path)
+    configured_num_workers = int(base_config.get("num_workers", 0) or 0)
+    if configured_num_workers <= 0:
+        raise ValueError("Stage211 batch-profile base config requires positive num_workers.")
+    topology = available_cpu_topology()
+    balanced_num_workers = max(
+        1,
+        int(topology["physical_cores"]) // int(args.world_size),
+    )
+    explicit_profiles = bool(args.profile)
+    worker_candidate_name: str | None = None
+    if explicit_profiles:
+        profiles = [
+            replace(
+                profile,
+                num_workers=(
+                    configured_num_workers
+                    if profile.num_workers is None
+                    else int(profile.num_workers)
+                ),
+            )
+            for profile in args.profile
+        ]
+        loader_worker_search: dict[str, Any] = {
+            "schema_version": 1,
+            "mode": "explicit_profiles",
+            **topology,
+            "world_size": int(args.world_size),
+            "configured_num_workers": configured_num_workers,
+            "balanced_num_workers": balanced_num_workers,
+            "enabled": False,
+            "baseline_profile": str(args.baseline_profile),
+            "candidate_profile": None,
+            "selection_decision": "explicit_profiles",
+            "selected_profile": None,
+            "selected_num_workers": None,
+        }
+    else:
+        defaults = list(
+            default_profiles_for_phase(args.phase, num_workers=configured_num_workers)
+        )
+        baseline = next(
+            (profile for profile in defaults if profile.name == args.baseline_profile),
+            None,
+        )
+        if baseline is None:
+            parser.error("--baseline-profile must name one of the default profiles")
+        profiles = [baseline]
+        worker_search_enabled = balanced_num_workers != configured_num_workers
+        if worker_search_enabled:
+            worker_candidate_name = f"{baseline.name}_workers{balanced_num_workers}"
+            profiles.append(
+                replace(
+                    baseline,
+                    name=worker_candidate_name,
+                    num_workers=balanced_num_workers,
+                )
+            )
+        profiles.extend(profile for profile in defaults if profile.name != baseline.name)
+        loader_worker_search = {
+            "schema_version": 1,
+            "mode": "automatic_balanced_candidate",
+            **topology,
+            "world_size": int(args.world_size),
+            "configured_num_workers": configured_num_workers,
+            "balanced_num_workers": balanced_num_workers,
+            "enabled": worker_search_enabled,
+            "baseline_profile": baseline.name,
+            "candidate_profile": worker_candidate_name,
+            "selection_decision": (
+                "pending" if worker_search_enabled and not args.dry_run else "dry_run_only"
+                if worker_search_enabled
+                else "configured_workers_already_balanced"
+            ),
+            "selected_profile": (
+                None if worker_search_enabled and not args.dry_run else baseline.name
+            ),
+            "selected_num_workers": configured_num_workers,
+        }
+    if len({profile.name for profile in profiles}) != len(profiles):
+        parser.error("profile names must be unique")
+    if args.baseline_profile not in {profile.name for profile in profiles}:
+        parser.error("--baseline-profile must name one of the requested profiles")
+    if any(profile.num_workers is None or int(profile.num_workers) <= 0 for profile in profiles):
+        parser.error("every profile must resolve to a positive num_workers")
     manifest_path = (
         Path(str(base_config.get("webdataset_bucket_manifest_path") or "")).expanduser().resolve()
     )
@@ -936,6 +1106,7 @@ def main() -> int:
         "min_improvement_ratio": float(args.min_improvement_ratio),
         "max_loss_regression_ratio": float(args.max_loss_regression_ratio),
         "max_cosine_regression": float(args.max_cosine_regression),
+        "loader_worker_search": loader_worker_search,
         "profiles": [],
     }
     report_path = output_root / "batch_throughput_preflight.json"
@@ -1062,6 +1233,26 @@ def main() -> int:
                 profile_root=profile_root,
             )
         report["profiles"].append(row)
+        if (
+            worker_candidate_name is not None
+            and profile.name == worker_candidate_name
+            and not args.dry_run
+        ):
+            worker_selection = select_loader_workers(
+                report["profiles"],
+                baseline_name=str(args.baseline_profile),
+                candidate_name=worker_candidate_name,
+                min_improvement_ratio=float(args.min_improvement_ratio),
+                max_loss_regression_ratio=float(args.max_loss_regression_ratio),
+                max_cosine_regression=float(args.max_cosine_regression),
+            )
+            selected_num_workers = int(worker_selection["selected_num_workers"])
+            report["loader_worker_search"].update(worker_selection)
+            for pending_index in range(profile_index + 1, len(profiles)):
+                profiles[pending_index] = replace(
+                    profiles[pending_index],
+                    num_workers=selected_num_workers,
+                )
         _atomic_write_json(report_path, report)
 
     if args.dry_run:

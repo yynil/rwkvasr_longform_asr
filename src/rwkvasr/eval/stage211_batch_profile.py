@@ -19,8 +19,8 @@ from rwkvasr.eval.stage211_gate import (
 )
 
 
-STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 4
-STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 1
+STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 5
+STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 2
 STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION = 1
 STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION = 1
 STAGE211_BATCH_PROFILE_PHASES = ("mixer", "block", "logits")
@@ -288,6 +288,7 @@ def _validate_profile_config(
     name = profile.get("name")
     batch_size = profile.get("batch_size")
     frame_budget = profile.get("frame_budget")
+    num_workers = profile.get("num_workers")
     if (
         not isinstance(name, str)
         or not name
@@ -297,6 +298,9 @@ def _validate_profile_config(
         or not isinstance(frame_budget, int)
         or isinstance(frame_budget, bool)
         or frame_budget <= 0
+        or not isinstance(num_workers, int)
+        or isinstance(num_workers, bool)
+        or num_workers <= 0
     ):
         raise ValueError("Stage211 batch preflight profile values are invalid.")
     config_path = _validate_bound_file(
@@ -314,6 +318,7 @@ def _validate_profile_config(
         "stage211_batch_profile_probe_phase": phase,
         "max_steps": warmup_steps + measure_steps,
         "batch_size": batch_size,
+        "num_workers": num_workers,
         "batch_token_budget": frame_budget,
         "length_bucket_frame_budget": frame_budget,
         "length_bucket_drop_last": False,
@@ -533,6 +538,117 @@ def _validate_safe_profile(
     return row
 
 
+def _validate_loader_worker_search(
+    report: dict[str, Any],
+    *,
+    base_config: dict[str, Any],
+    by_name: dict[str, dict[str, Any]],
+    admissible_names: set[str],
+) -> None:
+    search = report.get("loader_worker_search")
+    if not isinstance(search, dict):
+        raise ValueError("Stage211 batch preflight loader-worker search is missing.")
+    world_size = int(report["world_size"])
+    configured_workers = int(base_config.get("num_workers", 0) or 0)
+    physical_cores = search.get("physical_cores")
+    logical_cpus = search.get("logical_cpus")
+    balanced_workers = search.get("balanced_num_workers")
+    common_expected = {
+        "schema_version": 1,
+        "world_size": world_size,
+        "configured_num_workers": configured_workers,
+    }
+    if any(search.get(key) != value for key, value in common_expected.items()):
+        raise ValueError("Stage211 batch preflight loader-worker search contract changed.")
+    if (
+        configured_workers <= 0
+        or not isinstance(physical_cores, int)
+        or isinstance(physical_cores, bool)
+        or physical_cores <= 0
+        or not isinstance(logical_cpus, int)
+        or isinstance(logical_cpus, bool)
+        or logical_cpus <= 0
+        or physical_cores > logical_cpus
+        or not isinstance(balanced_workers, int)
+        or isinstance(balanced_workers, bool)
+        or balanced_workers != max(1, physical_cores // world_size)
+        or search.get("topology_source")
+        not in ("linux_sysfs_affinity", "logical_affinity_fallback")
+    ):
+        raise ValueError("Stage211 batch preflight loader-worker topology is invalid.")
+    mode = search.get("mode")
+    baseline_name = search.get("baseline_profile")
+    if not isinstance(baseline_name, str) or baseline_name not in by_name:
+        raise ValueError("Stage211 batch preflight loader-worker baseline is invalid.")
+    baseline_profile = by_name[baseline_name]["profile"]
+    if int(baseline_profile["num_workers"]) != configured_workers:
+        raise ValueError("Stage211 batch preflight baseline worker count changed.")
+    if mode == "explicit_profiles":
+        expected = {
+            "enabled": False,
+            "candidate_profile": None,
+            "selection_decision": "explicit_profiles",
+            "selected_profile": None,
+            "selected_num_workers": None,
+        }
+        if any(search.get(key) != value for key, value in expected.items()):
+            raise ValueError("Stage211 explicit loader-worker profile contract changed.")
+        return
+    if mode != "automatic_balanced_candidate":
+        raise ValueError("Stage211 batch preflight loader-worker mode is unsupported.")
+    enabled = balanced_workers != configured_workers
+    if search.get("enabled") is not enabled:
+        raise ValueError("Stage211 batch preflight loader-worker enablement changed.")
+    if not enabled:
+        expected = {
+            "candidate_profile": None,
+            "selection_decision": "configured_workers_already_balanced",
+            "selected_profile": baseline_name,
+            "selected_num_workers": configured_workers,
+        }
+        if any(search.get(key) != value for key, value in expected.items()):
+            raise ValueError("Stage211 balanced loader-worker baseline changed.")
+        if any(
+            int(row["profile"]["num_workers"]) != configured_workers
+            for row in by_name.values()
+        ):
+            raise ValueError("Stage211 profiles do not use the balanced configured workers.")
+        return
+    candidate_name = search.get("candidate_profile")
+    if not isinstance(candidate_name, str) or candidate_name not in by_name:
+        raise ValueError("Stage211 loader-worker calibration candidate is missing.")
+    candidate_profile = by_name[candidate_name]["profile"]
+    if any(
+        (
+            int(candidate_profile["batch_size"]) != int(baseline_profile["batch_size"]),
+            int(candidate_profile["frame_budget"]) != int(baseline_profile["frame_budget"]),
+            int(candidate_profile["num_workers"]) != balanced_workers,
+        )
+    ):
+        raise ValueError("Stage211 loader-worker candidate changes more than workers.")
+    candidate_selected = candidate_name in admissible_names
+    selected_name = candidate_name if candidate_selected else baseline_name
+    selected_workers = balanced_workers if candidate_selected else configured_workers
+    expected = {
+        "selection_decision": (
+            "balanced_workers_selected"
+            if candidate_selected
+            else "configured_workers_retained"
+        ),
+        "selected_profile": selected_name,
+        "selected_num_workers": selected_workers,
+    }
+    if any(search.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 loader-worker calibration decision changed.")
+    for name, row in by_name.items():
+        if name in (baseline_name, candidate_name):
+            continue
+        if int(row["profile"]["num_workers"]) != selected_workers:
+            raise ValueError(
+                "Stage211 larger batch profiles do not use the calibrated worker count."
+            )
+
+
 def validate_stage211_batch_profile_preflight(
     report_path: str | Path,
     *,
@@ -637,6 +753,7 @@ def validate_stage211_batch_profile_preflight(
             "name": baseline_name,
             "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
             "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "num_workers": int(base_config.get("num_workers", 0) or 0),
         }
     ]
     if phase == "logits":
@@ -645,6 +762,7 @@ def validate_stage211_batch_profile_preflight(
                 "name": baseline_name,
                 "batch_size": 12,
                 "frame_budget": 8_000,
+                "num_workers": int(base_config.get("num_workers", 0) or 0),
             }
         )
     if baseline_profile not in supported_baselines:
@@ -779,6 +897,12 @@ def validate_stage211_batch_profile_preflight(
             assert improvement is not None
             replayed_admissible.append((candidate_seconds, candidate_name, improvement))
     replayed_admissible.sort()
+    _validate_loader_worker_search(
+        report,
+        base_config=base_config,
+        by_name=by_name,
+        admissible_names={name for _, name, _ in replayed_admissible},
+    )
     for key in (
         "min_improvement_ratio",
         "max_loss_regression_ratio",
@@ -1006,11 +1130,18 @@ def validate_stage211_batch_profile_admission(
     ).resolve() != Path(expected_bucket_manifest).expanduser().resolve():
         raise ValueError("Stage211 batch profile admission uses another bucket manifest.")
     profile = receipt["selected_profile"]
+    base_config = load_yaml(Path(str(report["base_config_path"])))
+    worker_count_changed = int(profile["num_workers"]) != int(
+        base_config.get("num_workers", 0) or 0
+    )
     if phase != "logits" and (
         int(profile["batch_size"]) <= STAGE211_FULL_DATA_BATCH_SIZE
         and int(profile["frame_budget"]) <= STAGE211_FULL_DATA_FRAME_BUDGET
+        and not worker_count_changed
     ):
-        raise ValueError("Stage211 admitted profile is not larger than the legacy profile.")
+        raise ValueError(
+            "Stage211 admitted profile changes neither legacy capacity nor loader workers."
+        )
     return {
         **receipt,
         "receipt_path": str(path),

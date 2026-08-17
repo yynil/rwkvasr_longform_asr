@@ -149,6 +149,7 @@ def build_receipt(
     batch_profile_admission: dict[str, Any] | None = None
     batch_size = STAGE211_FULL_DATA_BATCH_SIZE
     frame_budget = STAGE211_FULL_DATA_FRAME_BUDGET
+    num_workers = 8
     receipt_schema_version = 1
     if batch_profile_admission_path is not None:
         batch_profile_admission = validate_stage211_batch_profile_admission(
@@ -160,6 +161,7 @@ def build_receipt(
         selected_profile = batch_profile_admission["selected_profile"]
         batch_size = int(selected_profile["batch_size"])
         frame_budget = int(selected_profile["frame_budget"])
+        num_workers = int(selected_profile["num_workers"])
         receipt_schema_version = 2
     supplemental_profile: dict[str, Any] | None = None
     if difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY:
@@ -267,6 +269,7 @@ def build_receipt(
         "batch_profile_name",
         "batch_size",
         "frame_budget",
+        "num_workers",
     )
     if batch_profile_admission is not None:
         expected_admission_provenance = {
@@ -275,6 +278,7 @@ def build_receipt(
             "batch_profile_name": batch_profile_admission["selected_profile"]["name"],
             "batch_size": batch_size,
             "frame_budget": frame_budget,
+            "num_workers": num_workers,
         }
         if any(
             provenance.get(key) != value
@@ -294,6 +298,7 @@ def build_receipt(
     expected_train_config = {
         "max_steps": expected_steps,
         "batch_size": batch_size,
+        "num_workers": num_workers,
         "batch_token_budget": frame_budget,
         "length_bucket_frame_budget": frame_budget,
         "length_bucket_drop_last": False,
@@ -320,6 +325,7 @@ def build_receipt(
             "stage211_batch_profile_name": batch_profile_admission["selected_profile"][
                 "name"
             ],
+            "stage211_batch_profile_num_workers": num_workers,
         }
         for key, value in expected_admission_config.items():
             if train_config.get(key) != value:
@@ -333,6 +339,7 @@ def build_receipt(
             "stage211_batch_profile_admission_path",
             "stage211_batch_profile_admission_sha256",
             "stage211_batch_profile_name",
+            "stage211_batch_profile_num_workers",
         )
     ):
         raise ValueError(
@@ -411,6 +418,7 @@ def build_receipt(
             "receipt_sha256"
         ]
         receipt["batch_profile_name"] = batch_profile_admission["selected_profile"]["name"]
+        receipt["num_workers"] = num_workers
     return receipt
 
 

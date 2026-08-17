@@ -127,6 +127,9 @@ def _validate_correction_smoke_marker(
         "frame_budget": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
         ),
+        "num_workers": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
+        ),
     }
     if any(marker.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 correction smoke marker contract mismatch.")
@@ -187,6 +190,7 @@ def _validate_correction_train_config(
     expected_fields = {
         "max_steps": steps_per_epoch,
         "batch_size": int(selected_profile["batch_size"]),
+        "num_workers": int(selected_profile["num_workers"]),
         "batch_token_budget": int(selected_profile["frame_budget"]),
         "length_bucket_frame_budget": int(selected_profile["frame_budget"]),
         "length_bucket_drop_last": False,
@@ -223,6 +227,7 @@ def _validate_correction_train_config(
         "stage211_post_coverage_batch_profile_name": selected_profile["name"],
         "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
         "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
+        "stage211_post_coverage_num_workers": int(selected_profile["num_workers"]),
         "stage211_post_coverage_original_coverage_unchanged": True,
         "stage211_post_coverage_smoke_marker_path": str(smoke_marker),
         "stage211_post_coverage_smoke_marker_sha256": sha256_file(smoke_marker),
@@ -498,6 +503,7 @@ def build_receipt(
         "batch_profile_name": selected_profile["name"],
         "batch_size": batch_size,
         "frame_budget": frame_budget,
+        "num_workers": int(selected_profile["num_workers"]),
         "correction_extension_decision_path": (
             str(extension_decision_path) if extension_decision_path is not None else None
         ),
@@ -571,6 +577,7 @@ def build_receipt(
         "batch_size": batch_size,
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
         "frame_budget": frame_budget,
+        "num_workers": int(selected_profile["num_workers"]),
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
         "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
         "batch_profile_admission_path": (

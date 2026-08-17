@@ -282,6 +282,9 @@ def _provenance_payload(
         "frame_budget": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
         ),
+        "num_workers": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
+        ),
         "correction_extension_decision_path": (
             str(extension_decision) if extension_decision is not None else None
         ),
@@ -333,6 +336,7 @@ def _correction_config_metadata(
         "stage211_post_coverage_batch_profile_name": selected_profile["name"],
         "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
         "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
+        "stage211_post_coverage_num_workers": int(selected_profile["num_workers"]),
         "stage211_post_coverage_original_coverage_unchanged": True,
     }
 
@@ -393,6 +397,9 @@ def _validate_correction_smoke_marker(
         ),
         "frame_budget": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
+        ),
+        "num_workers": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
         ),
     }
     if any(marker.get(key) != value for key, value in expected.items()):
@@ -539,6 +546,9 @@ def _run_correction_smoke(
             "frame_budget": int(
                 batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
             ),
+            "num_workers": int(
+                batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
+            ),
         }
     )
     _write_immutable_json(marker_path, marker)
@@ -681,6 +691,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             "name": "baseline",
             "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
             "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+            "num_workers": 8,
         }
         batch_profile_preflight = {
             "report_path": str(profile_config_path),
@@ -736,6 +747,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
 
     runtime_batch_size = int(selected_profile["batch_size"])
     runtime_frame_budget = int(selected_profile["frame_budget"])
+    runtime_num_workers = int(selected_profile["num_workers"])
     steps_per_epoch = estimate_bucket_manifest_steps(
         manifest,
         split="train",
@@ -851,7 +863,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         f"phase={phase_name} round={round_index} rows={replay['validated_unique_keys']} "
         f"steps={steps_per_epoch} tail_padding={tail_padding} "
         f"profile={selected_profile['name']} batch={runtime_batch_size} "
-        f"frame_budget={runtime_frame_budget} "
+        f"frame_budget={runtime_frame_budget} num_workers={runtime_num_workers} "
         f"focus_layers={','.join(str(value) for value in layer_focus['boundary_layer_ids']) or '-'} "
         f"latest_step={latest_step} run_dir={run_dir}",
         flush=True,

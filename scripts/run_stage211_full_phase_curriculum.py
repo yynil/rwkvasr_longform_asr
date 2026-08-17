@@ -516,12 +516,9 @@ def _profile_admission_command(
 
 
 def _automatic_profile_requires_admission(measured: dict[str, Any]) -> bool:
-    selected_profile = measured["selected_profile_row"]["profile"]
-    selected_is_legacy = (
-        int(selected_profile["batch_size"]) == STAGE211_FULL_DATA_BATCH_SIZE
-        and int(selected_profile["frame_budget"]) == STAGE211_FULL_DATA_FRAME_BUDGET
-    )
-    return measured["selection_decision"] != "keep_baseline" or not selected_is_legacy
+    if str(measured.get("phase") or "") == "logits":
+        return True
+    return measured["selection_decision"] != "keep_baseline"
 
 
 def _ensure_measured_batch_profile(
@@ -1016,6 +1013,7 @@ def _load_reusable_receipt(
     expected = expected_profile or STAGE211_AUDIO_CURRICULUM[difficulty]
     batch_size = STAGE211_FULL_DATA_BATCH_SIZE
     frame_budget = STAGE211_FULL_DATA_FRAME_BUDGET
+    num_workers = 8
     steps_per_epoch = int(expected["steps_per_epoch"])
     tail_padding_samples_per_epoch = int(expected["tail_padding_samples_per_epoch"])
     schema_version = 1
@@ -1031,6 +1029,7 @@ def _load_reusable_receipt(
         coverage = batch_profile_admission["selected_coverage"]
         batch_size = int(profile["batch_size"])
         frame_budget = int(profile["frame_budget"])
+        num_workers = int(profile["num_workers"])
         steps_per_epoch = int(coverage["steps_per_epoch"])
         tail_padding_samples_per_epoch = int(coverage["tail_padding_samples_per_epoch"])
         schema_version = 2
@@ -1066,6 +1065,8 @@ def _load_reusable_receipt(
         "init_checkpoint_path": str(init_checkpoint.resolve()),
         "completion_checkpoint_path": str(completion_checkpoint.resolve()),
     }
+    if batch_profile_admission is not None:
+        expected_fields["num_workers"] = num_workers
     if any(receipt.get(key) != value for key, value in expected_fields.items()):
         raise ValueError(
             f"Stage211 {phase}/{difficulty} reusable curriculum receipt does not match "

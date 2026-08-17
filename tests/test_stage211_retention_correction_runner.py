@@ -24,6 +24,7 @@ def _batch_profile(tmp_path: Path, *, batch_size: int = 36, frame_budget: int = 
                 "name": "selected",
                 "batch_size": batch_size,
                 "frame_budget": frame_budget,
+                "num_workers": 8,
             }
         },
     }
@@ -157,6 +158,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     assert provenance["batch_profile_preflight_sha256"] == batch_profile["report_sha256"]
     assert provenance["batch_size"] == 36
     assert provenance["frame_budget"] == 24_000
+    assert provenance["num_workers"] == 8
     assert provenance["correction_extension_decision_path"] is None
     assert provenance["correction_extension_decision_sha256"] is None
 

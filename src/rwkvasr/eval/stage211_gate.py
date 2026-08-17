@@ -3906,6 +3906,7 @@ def _validate_stage211_correction_batch_profile(
             correction.get("batch_profile_name") != selected_profile["name"],
             int(correction.get("batch_size", -1)) != int(selected_profile["batch_size"]),
             int(correction.get("frame_budget", -1)) != int(selected_profile["frame_budget"]),
+            int(correction.get("num_workers", -1)) != int(selected_profile["num_workers"]),
         )
     ):
         raise ValueError(f"Stage211 {phase} correction batch-profile summary mismatch.")
@@ -3959,6 +3960,7 @@ def _validate_stage211_correction_train_config(
     expected_fields = {
         "max_steps": int(correction["steps_per_epoch"]),
         "batch_size": int(selected_profile["batch_size"]),
+        "num_workers": int(selected_profile["num_workers"]),
         "batch_token_budget": int(selected_profile["frame_budget"]),
         "length_bucket_frame_budget": int(selected_profile["frame_budget"]),
         "length_bucket_drop_last": False,
@@ -3994,6 +3996,7 @@ def _validate_stage211_correction_train_config(
         "stage211_post_coverage_batch_profile_name": selected_profile["name"],
         "stage211_post_coverage_batch_size": int(selected_profile["batch_size"]),
         "stage211_post_coverage_frame_budget": int(selected_profile["frame_budget"]),
+        "stage211_post_coverage_num_workers": int(selected_profile["num_workers"]),
         "stage211_post_coverage_original_coverage_unchanged": True,
         "stage211_post_coverage_smoke_marker_path": str(
             Path(str(correction["smoke_marker_path"])).resolve()
@@ -4019,6 +4022,11 @@ def _validate_stage211_correction_train_config(
         ),
         "stage211_batch_profile_name": (
             batch_profile_admission["selected_profile"]["name"]
+            if batch_profile_admission is not None
+            else None
+        ),
+        "stage211_batch_profile_num_workers": (
+            int(batch_profile_admission["selected_profile"]["num_workers"])
             if batch_profile_admission is not None
             else None
         ),
@@ -4120,6 +4128,9 @@ def _validate_stage211_correction_smoke_marker(
         ),
         "frame_budget": int(
             batch_profile_preflight["selected_profile_row"]["profile"]["frame_budget"]
+        ),
+        "num_workers": int(
+            batch_profile_preflight["selected_profile_row"]["profile"]["num_workers"]
         ),
     }
     if any(marker.get(key) != value for key, value in expected.items()):
@@ -4337,6 +4348,7 @@ def _validate_stage211_post_coverage_corrections(
             "batch_profile_name": selected_profile["name"],
             "batch_size": int(selected_profile["batch_size"]),
             "frame_budget": int(selected_profile["frame_budget"]),
+            "num_workers": int(selected_profile["num_workers"]),
         }
         if any(provenance.get(key) != value for key, value in expected_provenance_focus.items()):
             raise ValueError(
@@ -4526,6 +4538,7 @@ def _validate_stage211_segment_batch_profile(
         "batch_size": int(profile["batch_size"]),
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
         "frame_budget": int(profile["frame_budget"]),
+        "num_workers": int(profile["num_workers"]),
         "steps_per_epoch": int(admitted_coverage["steps_per_epoch"]),
         "steps": int(admitted_coverage["full_coverage_steps"]),
         "tail_padding_samples_per_epoch": int(admitted_coverage["tail_padding_samples_per_epoch"]),

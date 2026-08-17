@@ -53,6 +53,7 @@ def _profile_row(
     init_checkpoint: Path,
     manifest: Path,
     eval_part: Path,
+    num_workers: int = 8,
 ) -> dict[str, object]:
     profile_root = root / name
     config_path = profile_root / "train_config.yaml"
@@ -61,6 +62,7 @@ def _profile_row(
         "stage211_batch_profile_probe_phase": phase,
         "max_steps": 120,
         "batch_size": batch_size,
+        "num_workers": num_workers,
         "batch_token_budget": frame_budget,
         "length_bucket_frame_budget": frame_budget,
         "length_bucket_drop_last": False,
@@ -215,6 +217,7 @@ def _profile_row(
             "name": name,
             "batch_size": batch_size,
             "frame_budget": frame_budget,
+            "num_workers": num_workers,
         },
         "config_path": str(config_path.resolve()),
         "config_sha256": sha256_file(config_path),
@@ -268,6 +271,7 @@ def _report(
         {
             **stage211_phase_train_config_contract(phase),
             "webdataset_bucket_manifest_path": str(manifest),
+            "num_workers": 8,
         },
     )
     baseline = _profile_row(
@@ -338,6 +342,22 @@ def _report(
         "min_improvement_ratio": 0.10,
         "max_loss_regression_ratio": 0.05,
         "max_cosine_regression": 0.005,
+        "loader_worker_search": {
+            "schema_version": 1,
+            "mode": "explicit_profiles",
+            "logical_cpus": 16,
+            "physical_cores": 8,
+            "topology_source": "linux_sysfs_affinity",
+            "world_size": 4,
+            "configured_num_workers": 8,
+            "balanced_num_workers": 2,
+            "enabled": False,
+            "baseline_profile": "baseline",
+            "candidate_profile": None,
+            "selection_decision": "explicit_profiles",
+            "selected_profile": None,
+            "selected_num_workers": None,
+        },
         "profiles": [baseline, candidate],
         "selection": {
             "decision": "candidate_recommended",
@@ -356,6 +376,67 @@ def _report(
     path = tmp_path / "batch_throughput_preflight.json"
     path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def _worker_only_report(tmp_path: Path) -> Path:
+    report_path = _report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    candidate = report["profiles"][1]
+    candidate_name = "baseline_workers2"
+    candidate["profile"].update(
+        {
+            "name": candidate_name,
+            "batch_size": 36,
+            "frame_budget": 24_000,
+            "num_workers": 2,
+        }
+    )
+    config_path = Path(candidate["config_path"])
+    config = load_yaml(config_path)
+    config.update(
+        {
+            "batch_size": 36,
+            "num_workers": 2,
+            "batch_token_budget": 24_000,
+            "length_bucket_frame_budget": 24_000,
+        }
+    )
+    config["deepspeed"].update(
+        {
+            "train_micro_batch_size_per_gpu": 36,
+            "train_batch_size": 144,
+        }
+    )
+    save_yaml(config_path, config)
+    candidate["config_sha256"] = sha256_file(config_path)
+    candidate["coverage"].update(
+        {
+            "steps_per_epoch": 1000,
+            "full_coverage_steps": 3000,
+        }
+    )
+    candidate["summary"]["steps_per_second"] = 3000.0 / 2100.0
+    comparison = report["selection"]["comparisons"][0]
+    comparison["profile"] = candidate_name
+    report["selection"]["recommended_profile"] = candidate_name
+    report["loader_worker_search"] = {
+        "schema_version": 1,
+        "mode": "automatic_balanced_candidate",
+        "logical_cpus": 16,
+        "physical_cores": 8,
+        "topology_source": "linux_sysfs_affinity",
+        "world_size": 4,
+        "configured_num_workers": 8,
+        "balanced_num_workers": 2,
+        "enabled": True,
+        "baseline_profile": "baseline",
+        "candidate_profile": candidate_name,
+        "selection_decision": "balanced_workers_selected",
+        "selected_profile": candidate_name,
+        "selected_num_workers": 2,
+    }
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report_path
 
 
 def test_measured_phase_specific_profile_can_be_admitted(tmp_path: Path) -> None:
@@ -381,7 +462,38 @@ def test_measured_phase_specific_profile_can_be_admitted(tmp_path: Path) -> None
         "name": "batch48_frames42k",
         "batch_size": 48,
         "frame_budget": 42_000,
+        "num_workers": 8,
     }
+
+
+def test_worker_only_profile_is_measured_admitted_and_tamper_evident(
+    tmp_path: Path,
+) -> None:
+    report_path = _worker_only_report(tmp_path)
+    measured = validate_stage211_batch_profile_preflight(report_path, phase="mixer")
+    assert measured["selected_profile_row"]["profile"]["num_workers"] == 2
+
+    receipt = build_stage211_batch_profile_admission(
+        report_path,
+        phase="mixer",
+        admitted_by="test",
+        reason="same-capacity loader worker calibration exceeded ten percent",
+    )
+    receipt_path = tmp_path / "worker-admission.json"
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    validated = validate_stage211_batch_profile_admission(receipt_path, phase="mixer")
+    assert validated["selected_profile"] == {
+        "name": "baseline_workers2",
+        "batch_size": 36,
+        "frame_budget": 24_000,
+        "num_workers": 2,
+    }
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["loader_worker_search"]["selected_num_workers"] = 8
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="calibration decision changed"):
+        validate_stage211_batch_profile_preflight(report_path, phase="mixer")
 
 
 def test_logits_preflight_accepts_safe_and_legacy_baselines(tmp_path: Path) -> None:
@@ -443,6 +555,7 @@ def test_logits_retained_safe_baseline_can_be_formally_admitted(tmp_path: Path) 
         "name": "baseline",
         "batch_size": 12,
         "frame_budget": 8_000,
+        "num_workers": 8,
     }
     assert receipt["selected_comparison"] is None
     receipt_path = tmp_path / "admission.json"
@@ -460,12 +573,19 @@ def test_logits_retained_safe_baseline_can_be_formally_admitted(tmp_path: Path) 
 
 def test_automatic_profile_routes_nonlegacy_retained_baseline_to_admission() -> None:
     retained_safe_logits = {
+        "phase": "logits",
         "selection_decision": "keep_baseline",
         "selected_profile_row": {
-            "profile": {"name": "baseline", "batch_size": 12, "frame_budget": 8_000}
+            "profile": {
+                "name": "baseline",
+                "batch_size": 12,
+                "frame_budget": 8_000,
+                "num_workers": 8,
+            }
         },
     }
     retained_legacy = copy.deepcopy(retained_safe_logits)
+    retained_legacy["phase"] = "mixer"
     retained_legacy["selected_profile_row"]["profile"].update(
         {"batch_size": 36, "frame_budget": 24_000}
     )
@@ -779,6 +899,7 @@ def test_schema2_profile_and_mixed_coverage_keep_dynamic_exposures(
         "batch_size": 48,
         "world_size": 4,
         "frame_budget": 42_000,
+        "num_workers": 8,
         "steps_per_epoch": selected["steps_per_epoch"],
         "steps": selected["full_coverage_steps"],
         "tail_padding_samples_per_epoch": selected[

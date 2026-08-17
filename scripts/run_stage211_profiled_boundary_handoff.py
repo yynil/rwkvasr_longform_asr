@@ -357,7 +357,11 @@ def _supplemental_profile_requires_admission(report: dict[str, object]) -> bool:
     if not isinstance(selected, dict) or not isinstance(selected.get("profile"), dict):
         raise ValueError("Stage211 Supplemental preflight selected profile is invalid.")
     profile = selected["profile"]
-    if int(profile["batch_size"]) != 36 or int(profile["frame_budget"]) != 24_000:
+    if (
+        int(profile["batch_size"]) != 36
+        or int(profile["frame_budget"]) != 24_000
+        or int(profile["num_workers"]) != 8
+    ):
         raise ValueError(
             "Stage211 Supplemental retained baseline differs from the formal default."
         )

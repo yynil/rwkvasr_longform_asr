@@ -107,6 +107,7 @@ def test_logits_correction_safe_baseline_still_requires_formal_admission(
         "name": "baseline",
         "batch_size": 12,
         "frame_budget": 8_000,
+        "num_workers": 8,
     }
     preflight = {
         "report_path": str(preflight_path.resolve()),
@@ -133,6 +134,7 @@ def test_logits_correction_safe_baseline_still_requires_formal_admission(
                 "batch_profile_name": "baseline",
                 "batch_size": 12,
                 "frame_budget": 8_000,
+                "num_workers": 8,
             },
             phase="logits",
             manifest_path=manifest.resolve(),
@@ -176,7 +178,12 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
         "report_sha256": correction.sha256_file(replay_receipt),
         "selected_profile_name": "baseline",
         "selected_profile_row": {
-            "profile": {"name": "baseline", "batch_size": 36, "frame_budget": 24_000}
+            "profile": {
+                "name": "baseline",
+                "batch_size": 36,
+                "frame_budget": 24_000,
+                "num_workers": 8,
+            }
         },
     }
     marker_path.write_text(
@@ -213,6 +220,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
                 "batch_profile_name": "baseline",
                 "batch_size": 36,
                 "frame_budget": 24_000,
+                "num_workers": 8,
             }
         )
         + "\n",
@@ -289,6 +297,7 @@ def test_retention_correction_resume_requires_smoke_marker(
                         "name": "baseline",
                         "batch_size": 36,
                         "frame_budget": 24_000,
+                        "num_workers": 8,
                     }
                 },
             },
@@ -366,6 +375,7 @@ def test_create_stage211_retention_correction_receipt(
         "name": "baseline",
         "batch_size": batch_size,
         "frame_budget": frame_budget,
+        "num_workers": 8,
     }
     batch_profile_preflight = {
         "report_path": str(profile_report.resolve()),
@@ -434,6 +444,7 @@ def test_create_stage211_retention_correction_receipt(
                 "batch_profile_name": "baseline",
                 "batch_size": batch_size,
                 "frame_budget": frame_budget,
+                "num_workers": 8,
                 "smoke_checkpoint_path": str(smoke_checkpoint.resolve()),
                 "smoke_checkpoint_sha256": correction.sha256_file(smoke_checkpoint),
                 "smoke_log_path": str(smoke_log.resolve()),
@@ -452,6 +463,7 @@ def test_create_stage211_retention_correction_receipt(
             "lr": correction_lr,
             "max_steps": 1,
             "batch_size": batch_size,
+            "num_workers": 8,
             "batch_token_budget": frame_budget,
             "length_bucket_frame_budget": frame_budget,
             "length_bucket_drop_last": False,
@@ -486,6 +498,7 @@ def test_create_stage211_retention_correction_receipt(
             "stage211_post_coverage_batch_profile_name": "baseline",
             "stage211_post_coverage_batch_size": batch_size,
             "stage211_post_coverage_frame_budget": frame_budget,
+            "stage211_post_coverage_num_workers": 8,
             "stage211_post_coverage_original_coverage_unchanged": True,
             "stage211_post_coverage_smoke_marker_path": str(smoke_marker.resolve()),
             "stage211_post_coverage_smoke_marker_sha256": correction.sha256_file(smoke_marker),
@@ -499,6 +512,7 @@ def test_create_stage211_retention_correction_receipt(
                     "receipt_sha256"
                 ],
                 "stage211_batch_profile_name": "baseline",
+                "stage211_batch_profile_num_workers": 8,
             }
         )
     deepspeed = dict(config.get("deepspeed") or {})
@@ -539,6 +553,7 @@ def test_create_stage211_retention_correction_receipt(
         "batch_profile_name": "baseline",
         "batch_size": batch_size,
         "frame_budget": frame_budget,
+        "num_workers": 8,
         "init_checkpoint_path": str(init_checkpoint.resolve()),
         "init_checkpoint_sha256": correction.sha256_file(init_checkpoint),
         "replay_manifest_path": str(manifest.resolve()),

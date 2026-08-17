@@ -65,7 +65,12 @@ def test_supplemental_profile_admission_routing_is_fail_closed() -> None:
     retained_baseline = {
         "selection_decision": "keep_baseline",
         "selected_profile_row": {
-            "profile": {"name": "baseline", "batch_size": 36, "frame_budget": 24_000}
+            "profile": {
+                "name": "baseline",
+                "batch_size": 36,
+                "frame_budget": 24_000,
+                "num_workers": 8,
+            }
         },
     }
     admitted_candidate = {
@@ -75,7 +80,23 @@ def test_supplemental_profile_admission_routing_is_fail_closed() -> None:
     wrong_retained_baseline = {
         **retained_baseline,
         "selected_profile_row": {
-            "profile": {"name": "baseline", "batch_size": 12, "frame_budget": 8_000}
+            "profile": {
+                "name": "baseline",
+                "batch_size": 12,
+                "frame_budget": 8_000,
+                "num_workers": 8,
+            }
+        },
+    }
+    wrong_retained_workers = {
+        **retained_baseline,
+        "selected_profile_row": {
+            "profile": {
+                "name": "baseline",
+                "batch_size": 36,
+                "frame_budget": 24_000,
+                "num_workers": 2,
+            }
         },
     }
 
@@ -83,6 +104,8 @@ def test_supplemental_profile_admission_routing_is_fail_closed() -> None:
     assert handoff._supplemental_profile_requires_admission(admitted_candidate)
     with pytest.raises(ValueError, match="differs from the formal default"):
         handoff._supplemental_profile_requires_admission(wrong_retained_baseline)
+    with pytest.raises(ValueError, match="differs from the formal default"):
+        handoff._supplemental_profile_requires_admission(wrong_retained_workers)
 
 
 def test_boundary_preflight_keeps_all_three_default_profiles(tmp_path: Path) -> None:

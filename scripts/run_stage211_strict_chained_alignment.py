@@ -582,6 +582,7 @@ def _validate_curriculum_receipt(
             "batch_profile_name": profile["name"],
             "batch_size": int(profile["batch_size"]),
             "frame_budget": int(profile["frame_budget"]),
+            "num_workers": int(profile["num_workers"]),
             "steps_per_epoch": int(coverage["steps_per_epoch"]),
             "steps": int(coverage["full_coverage_steps"]),
             "tail_padding_samples_per_epoch": int(
@@ -1302,13 +1303,16 @@ def _config(
             else {
                 "batch_size": STAGE211_FULL_DATA_BATCH_SIZE,
                 "frame_budget": STAGE211_FULL_DATA_FRAME_BUDGET,
+                "num_workers": int(config.get("num_workers", 8)),
             }
         )
         runtime_batch_size = int(selected_profile["batch_size"])
         runtime_frame_budget = int(selected_profile["frame_budget"])
+        runtime_num_workers = int(selected_profile["num_workers"])
         config.update(
             {
                 "batch_size": runtime_batch_size,
+                "num_workers": runtime_num_workers,
                 "batch_token_budget": runtime_frame_budget,
                 "length_bucket_drop_last": False,
                 "length_bucket_frame_budget": runtime_frame_budget,
@@ -1347,6 +1351,7 @@ def _config(
                     "stage211_batch_profile_name": batch_profile_admission[
                         "selected_profile"
                     ]["name"],
+                    "stage211_batch_profile_num_workers": runtime_num_workers,
                 }
             )
     if phase.requires_labels:
@@ -1578,6 +1583,9 @@ def _record_or_validate_provenance(
             payload["frame_budget"] = int(
                 batch_profile_admission["selected_profile"]["frame_budget"]
             )
+            payload["num_workers"] = int(
+                batch_profile_admission["selected_profile"]["num_workers"]
+            )
     if phase.requires_labels:
         payload["length_bucket_drop_last"] = False
         payload["skip_oversized_samples"] = False
@@ -1642,6 +1650,9 @@ def _validate_resume_provenance(
             expected["frame_budget"] = int(
                 batch_profile_admission["selected_profile"]["frame_budget"]
             )
+            expected["num_workers"] = int(
+                batch_profile_admission["selected_profile"]["num_workers"]
+            )
     if phase.requires_labels:
         expected["length_bucket_drop_last"] = False
         expected["skip_oversized_samples"] = False
@@ -1658,6 +1669,7 @@ def _validate_resume_provenance(
         "batch_profile_name",
         "batch_size",
         "frame_budget",
+        "num_workers",
     )
     if batch_profile_admission is None and any(
         payload.get(key) is not None for key in admission_keys
@@ -1776,6 +1788,7 @@ def main() -> int:
     batch_profile_admission: dict[str, Any] | None = None
     runtime_batch_size = STAGE211_FULL_DATA_BATCH_SIZE
     runtime_frame_budget = STAGE211_FULL_DATA_FRAME_BUDGET
+    runtime_num_workers = 8
     if args.batch_profile_admission is not None:
         batch_profile_admission = validate_stage211_batch_profile_admission(
             args.batch_profile_admission,
@@ -1786,6 +1799,9 @@ def main() -> int:
         runtime_batch_size = int(batch_profile_admission["selected_profile"]["batch_size"])
         runtime_frame_budget = int(
             batch_profile_admission["selected_profile"]["frame_budget"]
+        )
+        runtime_num_workers = int(
+            batch_profile_admission["selected_profile"]["num_workers"]
         )
 
     labeled_data_audit: dict[str, Any] | None = None
@@ -2048,7 +2064,8 @@ def main() -> int:
                 "batch_profile_admission="
                 f"{batch_profile_admission['receipt_path']} "
                 f"profile={batch_profile_admission['selected_profile']['name']} "
-                f"batch={runtime_batch_size} frame_budget={runtime_frame_budget}",
+                f"batch={runtime_batch_size} frame_budget={runtime_frame_budget} "
+                f"num_workers={runtime_num_workers}",
                 flush=True,
             )
     if labeled_data_audit is not None:

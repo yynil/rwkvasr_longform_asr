@@ -151,10 +151,54 @@ def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> No
     assert config["step_eval_feature_seed"] == 0
     assert config["wandb_enabled"] is False
     assert config["batch_size"] == 48
+    assert config["num_workers"] == 8
     assert config["batch_token_budget"] == 42_000
     assert config["length_bucket_frame_budget"] == 42_000
     assert config["deepspeed"]["train_micro_batch_size_per_gpu"] == 48
     assert config["deepspeed"]["train_batch_size"] == 384
+
+
+def test_loader_worker_selection_requires_measured_ten_percent_gain() -> None:
+    provenance = {"eval": "same"}
+
+    def row(name: str, workers: int, seconds: float) -> dict[str, object]:
+        return {
+            "profile": {
+                "name": name,
+                "batch_size": 36,
+                "frame_budget": 24_000,
+                "num_workers": workers,
+            },
+            "summary": {
+                "safety_pass": True,
+                "projected_full_coverage_seconds": seconds,
+                "mean_loss": 0.1,
+                "mean_cosine": 0.97,
+                "fixed_eval_provenance": provenance,
+            },
+        }
+
+    selected = probe.select_loader_workers(
+        [row("baseline", 8, 1000.0), row("baseline_workers2", 2, 850.0)],
+        baseline_name="baseline",
+        candidate_name="baseline_workers2",
+        min_improvement_ratio=0.10,
+        max_loss_regression_ratio=0.05,
+        max_cosine_regression=0.005,
+    )
+    retained = probe.select_loader_workers(
+        [row("baseline", 8, 1000.0), row("baseline_workers2", 2, 950.0)],
+        baseline_name="baseline",
+        candidate_name="baseline_workers2",
+        min_improvement_ratio=0.10,
+        max_loss_regression_ratio=0.05,
+        max_cosine_regression=0.005,
+    )
+
+    assert selected["selection_decision"] == "balanced_workers_selected"
+    assert selected["selected_num_workers"] == 2
+    assert retained["selection_decision"] == "configured_workers_retained"
+    assert retained["selected_num_workers"] == 8
 
 
 def test_parse_train_telemetry_collects_alignment_safety_fields() -> None:
