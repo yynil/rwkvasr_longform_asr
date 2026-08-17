@@ -2941,6 +2941,7 @@ def test_stage211_mixer_phase_has_only_teacher_forced_mixer_objective(
     config = _config_for_phase(tmp_path, "mixer")
 
     assert config["lr"] == pytest.approx(3.0e-6)
+    assert config["gradient_checkpointing"] is False
     assert config["ctc_teacher_online_layer_input_mode"] == "teacher_forced"
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(1.0)
     assert config["ctc_teacher_online_layer_ffn_loss_weight"] == 0.0
@@ -2960,6 +2961,7 @@ def test_stage211_block_phase_chains_stacked_block_without_logits(
     config = _config_for_phase(tmp_path, "block")
 
     assert config["lr"] == pytest.approx(2.0e-6)
+    assert config["gradient_checkpointing"] is True
     assert config["ctc_teacher_online_layer_input_mode"] == "stacked"
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(0.25)
     assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(0.25)
@@ -2979,6 +2981,7 @@ def test_stage211_logits_phase_enables_outputs_after_hidden_anchors(
     config = _config_for_phase(tmp_path, "logits")
 
     assert config["lr"] == pytest.approx(3.0e-7)
+    assert config["gradient_checkpointing"] is True
     assert config["ctc_teacher_online_layer_input_mode"] == "stacked"
     assert config["ctc_teacher_online_layer_mixer_loss_weight"] == pytest.approx(0.10)
     assert config["ctc_teacher_online_layer_ffn_loss_weight"] == pytest.approx(0.10)
@@ -3002,6 +3005,7 @@ def test_stage211_sft_phase_uses_labels_after_logits_with_low_teacher_anchors(
     suppressed_token_ids = list(stage211.stage211_sft_ctc_suppressed_token_ids())
 
     assert config["lr"] == pytest.approx(3.0e-7)
+    assert config["gradient_checkpointing"] is True
     assert config["allow_missing_targets"] is False
     assert config["ctc_loss_weight"] == pytest.approx(1.0)
     assert config["decoder_loss_weight"] == 0.0

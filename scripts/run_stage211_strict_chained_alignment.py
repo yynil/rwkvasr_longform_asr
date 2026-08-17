@@ -1222,6 +1222,7 @@ def _config(
         {
             "max_steps": target_step,
             "lr": float(phase.lr),
+            "gradient_checkpointing": phase.name != "mixer",
             "weight_decay": 0.0,
             "save_every": save_interval,
             "step_eval_every": eval_interval,

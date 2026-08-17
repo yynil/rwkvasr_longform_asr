@@ -635,6 +635,54 @@ def test_stacked_layer_capture_reconstructs_same_forward_residuals() -> None:
         )
 
 
+def test_stacked_hidden_capture_preserves_loss_and_gradients_with_checkpointing() -> None:
+    torch.manual_seed(2706)
+    config = RWKVCTCModelConfig(
+        input_dim=80,
+        n_embd=64,
+        encoder_output_dim=64,
+        dim_att=64,
+        dim_ff=128,
+        num_layers=3,
+        vocab_size=16,
+        head_size=32,
+        dropout=0.0,
+        frontend_type="sensevoice_rwkv",
+        sensevoice_tp_blocks=1,
+    )
+    reference = RWKVCTCModel(config)
+    checkpointed = RWKVCTCModel(config)
+    checkpointed.load_state_dict(reference.state_dict())
+    features = torch.randn(2, 7, 80)
+    lengths = torch.tensor([7, 4])
+    selected = (0, 2)
+
+    def run(model: RWKVCTCModel, *, enabled: bool) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        model.enable_gradient_checkpointing(enabled)
+        model.train()
+        with _capture_student_sensevoice_layer_hiddens(model, selected) as captured:
+            encoded, _, _ = model.encoder(features, lengths)
+        loss = encoded.float().square().mean()
+        for layer_id in selected:
+            for component in ("mixer", "ffn", "block"):
+                loss = loss + captured[layer_id][component].float().square().mean()
+        loss.backward()
+        gradients = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        }
+        return loss.detach(), gradients
+
+    reference_loss, reference_gradients = run(reference, enabled=False)
+    checkpointed_loss, checkpointed_gradients = run(checkpointed, enabled=True)
+
+    assert torch.equal(reference_loss, checkpointed_loss)
+    assert checkpointed_gradients.keys() == reference_gradients.keys()
+    for name, expected in reference_gradients.items():
+        torch.testing.assert_close(checkpointed_gradients[name], expected, rtol=1e-5, atol=1e-6)
+
+
 def test_layer_hidden_loss_matches_identical_sampled_components() -> None:
     student_hiddens = {
         layer_id: {
@@ -1082,10 +1130,10 @@ def test_train_ctc_model_deepspeed_smoke_single_process(tmp_path: Path) -> None:
 
     result = train_ctc_model_deepspeed(
         DeepSpeedTrainConfig(
-                output_dir=str(out_dir),
-                manifest_path=str(manifest),
-                vocab_size=8,
-                tokenizer_type="synthetic",
+            output_dir=str(out_dir),
+            manifest_path=str(manifest),
+            vocab_size=8,
+            tokenizer_type="synthetic",
             input_dim=80,
             n_embd=128,
             dim_att=128,
@@ -1140,10 +1188,10 @@ def test_train_ctc_model_deepspeed_keeps_top_k_step_checkpoints(tmp_path: Path) 
 
     result = train_ctc_model_deepspeed(
         DeepSpeedTrainConfig(
-                output_dir=str(out_dir),
-                manifest_path=str(manifest),
-                vocab_size=8,
-                tokenizer_type="synthetic",
+            output_dir=str(out_dir),
+            manifest_path=str(manifest),
+            vocab_size=8,
+            tokenizer_type="synthetic",
             input_dim=80,
             n_embd=128,
             dim_att=128,

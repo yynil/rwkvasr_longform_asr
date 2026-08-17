@@ -455,6 +455,7 @@ _STAGE211_COMMON_PHASE_TRAIN_CONFIG: dict[str, Any] = {
 _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
     "mixer": {
         "lr": 3.0e-6,
+        "gradient_checkpointing": False,
         "allow_missing_targets": True,
         "ctc_loss_weight": 0.0,
         "ctc_suppress_non_pronunciation_tokens": False,
@@ -479,6 +480,7 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
     },
     "block": {
         "lr": 2.0e-6,
+        "gradient_checkpointing": True,
         "allow_missing_targets": True,
         "ctc_loss_weight": 0.0,
         "ctc_suppress_non_pronunciation_tokens": False,
@@ -503,6 +505,7 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
     },
     "logits": {
         "lr": 3.0e-7,
+        "gradient_checkpointing": True,
         "allow_missing_targets": True,
         "ctc_loss_weight": 0.0,
         "ctc_suppress_non_pronunciation_tokens": False,
@@ -528,6 +531,7 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
     },
     "sft": {
         "lr": 3.0e-7,
+        "gradient_checkpointing": True,
         "allow_missing_targets": False,
         "ctc_loss_weight": 1.0,
         "ctc_suppress_non_pronunciation_tokens": True,
