@@ -211,6 +211,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
                 "admission_gate_sha256": correction.sha256_file(admission_gate),
                 "layer_focus_path": str(layer_focus.resolve()),
                 "layer_focus_sha256": correction.sha256_file(layer_focus),
+                "layer_rotation_offset": 0,
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
                 "batch_profile_preflight_path": batch_profile["report_path"],
@@ -235,6 +236,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
         replay_manifest=replay_manifest,
         admission_gate=admission_gate,
         layer_focus=layer_focus,
+        layer_rotation_offset=0,
         nano_checkpoint=nano_checkpoint,
         batch_profile_preflight=batch_profile,
         batch_profile_admission=None,
@@ -251,6 +253,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
             layer_focus=layer_focus,
+            layer_rotation_offset=0,
             nano_checkpoint=nano_checkpoint,
             batch_profile_preflight=batch_profile,
             batch_profile_admission=None,
@@ -269,6 +272,7 @@ def test_retention_correction_smoke_marker_binds_round_inputs(
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
             layer_focus=layer_focus,
+            layer_rotation_offset=0,
             nano_checkpoint=nano_checkpoint,
             batch_profile_preflight=batch_profile,
             batch_profile_admission=None,
@@ -288,6 +292,7 @@ def test_retention_correction_resume_requires_smoke_marker(
             admission_gate=tmp_path / "gate.json",
             layer_focus=tmp_path / "focus.json",
             layer_focus_payload={"boundary_layer_ids": []},
+            layer_rotation_offset=0,
             batch_profile_preflight={
                 "report_path": str(tmp_path / "profile.json"),
                 "report_sha256": "a" * 64,
@@ -427,6 +432,7 @@ def test_create_stage211_retention_correction_receipt(
                 "admission_gate_sha256": correction.sha256_file(admission_gate),
                 "layer_focus_path": str(layer_focus.resolve()),
                 "layer_focus_sha256": correction.sha256_file(layer_focus),
+                "layer_rotation_offset": 0,
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": correction.sha256_file(nano_checkpoint),
                 "batch_profile_preflight_path": batch_profile_preflight["report_path"],
@@ -479,6 +485,8 @@ def test_create_stage211_retention_correction_receipt(
             "stage211_post_coverage_admission_gate_path": str(admission_gate.resolve()),
             "stage211_post_coverage_layer_focus_path": str(layer_focus.resolve()),
             "stage211_post_coverage_layer_focus_sha256": correction.sha256_file(layer_focus),
+            "stage211_post_coverage_layer_rotation_offset": 0,
+            "ctc_teacher_online_layer_rotation_offset": 0,
             "stage211_post_coverage_batch_profile_preflight_path": batch_profile_preflight[
                 "report_path"
             ],
@@ -538,6 +546,7 @@ def test_create_stage211_retention_correction_receipt(
         "admission_gate_sha256": correction.sha256_file(admission_gate),
         "layer_focus_path": str(layer_focus.resolve()),
         "layer_focus_sha256": correction.sha256_file(layer_focus),
+        "layer_rotation_offset": 0,
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
         "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
         "batch_profile_admission_path": (
@@ -645,6 +654,7 @@ def test_create_stage211_retention_correction_receipt(
     assert receipt["nano_teacher_checkpoint_sha256"] == nano_sha256
     assert receipt["smoke_marker_sha256"] == correction.sha256_file(smoke_marker)
     assert receipt["layer_focus_sha256"] == correction.sha256_file(layer_focus)
+    assert receipt["layer_rotation_offset"] == 0
     assert receipt["layer_focus_strategy"] == layer_focus_payload["strategy"]
     assert receipt["failed_layer_count"] == 0
     assert (

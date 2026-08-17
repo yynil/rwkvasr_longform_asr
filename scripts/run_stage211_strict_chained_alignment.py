@@ -1210,6 +1210,7 @@ def _config(
     batch_profile_admission: dict[str, Any] | None = None,
     post_coverage_correction: bool = False,
     correction_layer_boundary_ids: tuple[int, ...] | list[int] | None = None,
+    correction_layer_rotation_offset: int | None = None,
 ) -> dict[str, Any]:
     config = _stage210n_config(
         segment=segment,
@@ -1296,6 +1297,10 @@ def _config(
             "wandb_run_name": f"{output_dir.name}_{segment['name']}",
         }
     )
+    if correction_layer_rotation_offset is not None:
+        config["ctc_teacher_online_layer_rotation_offset"] = int(
+            correction_layer_rotation_offset
+        )
     if full_data_profile:
         selected_profile = (
             batch_profile_admission["selected_profile"]
@@ -1408,12 +1413,20 @@ def _config(
                 raise ValueError(
                     "Stage211 correction requires explicit gate-derived layer focus."
                 )
+            if correction_layer_rotation_offset is None:
+                raise ValueError(
+                    "Stage211 correction requires an explicit cross-round layer rotation offset."
+                )
             correction_contract = stage211_post_coverage_train_config_contract(
                 phase.name,
                 boundary_layer_ids=correction_layer_boundary_ids,
+                rotation_offset=correction_layer_rotation_offset,
             )
         else:
-            if correction_layer_boundary_ids is not None:
+            if (
+                correction_layer_boundary_ids is not None
+                or correction_layer_rotation_offset is not None
+            ):
                 raise ValueError("Stage211 SFT correction does not accept hidden-layer focus.")
             correction_contract = stage211_phase_train_config_contract(phase.name)
             correction_contract["lr"] = expected_lr

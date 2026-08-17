@@ -483,10 +483,35 @@ def stage211_post_coverage_correction_lr(phase: str) -> float:
         ) from error
 
 
+def stage211_correction_layer_rotation_offset(
+    *,
+    round_index: int,
+    boundary_layer_ids: tuple[int, ...] | list[int],
+    num_layers: int = len(_STAGE211_ALIGNMENT_LAYER_IDS),
+) -> int:
+    if round_index <= 0:
+        raise ValueError("Stage211 correction round must be positive.")
+    if num_layers <= 0:
+        raise ValueError("Stage211 correction layer count must be positive.")
+    layer_ids = [int(value) for value in boundary_layer_ids]
+    if layer_ids != sorted(set(layer_ids)) or any(
+        layer_id < 0 or layer_id >= num_layers for layer_id in layer_ids
+    ):
+        raise ValueError("Stage211 correction boundary layer IDs are invalid.")
+    non_anchor_layers = num_layers - len(layer_ids)
+    if non_anchor_layers <= 0:
+        raise ValueError("Stage211 correction requires at least one non-anchor layer.")
+    round_stride = math.ceil(
+        non_anchor_layers / STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
+    )
+    return ((round_index - 1) * round_stride) % non_anchor_layers
+
+
 def stage211_post_coverage_train_config_contract(
     phase: str,
     *,
     boundary_layer_ids: tuple[int, ...] | list[int],
+    rotation_offset: int = 0,
 ) -> dict[str, Any]:
     if phase not in _STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS:
         raise ValueError(f"Unsupported Stage211 correction focus phase: {phase!r}")
@@ -495,6 +520,8 @@ def stage211_post_coverage_train_config_contract(
         layer_id not in _STAGE211_ALIGNMENT_LAYER_IDS for layer_id in layer_ids
     ):
         raise ValueError("Stage211 correction boundary layer IDs are invalid.")
+    if rotation_offset < 0:
+        raise ValueError("Stage211 correction layer rotation offset must be non-negative.")
     contract = stage211_phase_train_config_contract(phase)
     contract["lr"] = stage211_post_coverage_correction_lr(phase)
     sample_count = int(contract["ctc_teacher_online_layer_sample_count"])
@@ -514,6 +541,7 @@ def stage211_post_coverage_train_config_contract(
         raise ValueError("Stage211 correction layer focus does not preserve rotating coverage.")
     contract["ctc_teacher_online_layer_boundary_ids"] = layer_ids
     contract["ctc_teacher_online_layer_include_boundaries"] = bool(layer_ids)
+    contract["ctc_teacher_online_layer_rotation_offset"] = int(rotation_offset)
     return contract
 
 
@@ -3945,9 +3973,16 @@ def _validate_stage211_correction_train_config(
         layer_focus_path,
         label=f"Stage211 {phase} correction layer focus",
     )
+    layer_rotation_offset = stage211_correction_layer_rotation_offset(
+        round_index=int(correction["round"]),
+        boundary_layer_ids=layer_focus.get("boundary_layer_ids", []),
+    )
+    if correction.get("layer_rotation_offset") != layer_rotation_offset:
+        raise ValueError(f"Stage211 {phase} correction layer rotation offset mismatch.")
     contract = stage211_post_coverage_train_config_contract(
         phase,
         boundary_layer_ids=layer_focus.get("boundary_layer_ids", []),
+        rotation_offset=layer_rotation_offset,
     )
     for key, expected in contract.items():
         actual = config.get(key)
@@ -3977,6 +4012,7 @@ def _validate_stage211_correction_train_config(
         ),
         "stage211_post_coverage_layer_focus_path": str(layer_focus_path),
         "stage211_post_coverage_layer_focus_sha256": str(correction["layer_focus_sha256"]),
+        "stage211_post_coverage_layer_rotation_offset": layer_rotation_offset,
         "stage211_post_coverage_batch_profile_preflight_path": batch_profile_preflight[
             "report_path"
         ],
@@ -4108,6 +4144,7 @@ def _validate_stage211_correction_smoke_marker(
         "admission_gate_sha256": sha256_file(admission_gate),
         "layer_focus_path": str(Path(str(correction["layer_focus_path"])).resolve()),
         "layer_focus_sha256": str(correction["layer_focus_sha256"]),
+        "layer_rotation_offset": int(correction["layer_rotation_offset"]),
         "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_teacher_checkpoint),
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
@@ -4197,6 +4234,15 @@ def _validate_stage211_post_coverage_corrections(
         }
         if any(correction.get(key) != value for key, value in expected_fields.items()):
             raise ValueError(f"Stage211 {phase} correction round {round_index} contract mismatch.")
+        expected_layer_rotation_offset = stage211_correction_layer_rotation_offset(
+            round_index=round_index,
+            boundary_layer_ids=correction.get("boundary_layer_ids", []),
+        )
+        if correction.get("layer_rotation_offset") != expected_layer_rotation_offset:
+            raise ValueError(
+                f"Stage211 {phase} correction round {round_index} "
+                "layer rotation offset mismatch."
+            )
         rows = int(correction.get("rows", -1))
         steps_per_epoch = int(correction.get("steps_per_epoch", -1))
         tail_padding = int(correction.get("tail_padding_samples_per_epoch", -1))
@@ -4333,6 +4379,7 @@ def _validate_stage211_post_coverage_corrections(
             "round": round_index,
             "layer_focus_path": str(Path(str(correction.get("layer_focus_path") or "")).resolve()),
             "layer_focus_sha256": str(correction.get("layer_focus_sha256") or ""),
+            "layer_rotation_offset": int(correction["layer_rotation_offset"]),
             "batch_profile_preflight_path": batch_profile_preflight["report_path"],
             "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
             "batch_profile_admission_path": (

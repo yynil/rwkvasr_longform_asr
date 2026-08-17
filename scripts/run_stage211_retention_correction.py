@@ -22,6 +22,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
     build_stage211_correction_layer_focus,
     sha256_file,
+    stage211_correction_layer_rotation_offset,
     stage211_post_coverage_correction_lr,
     validate_stage211_correction_layer_focus,
     validate_stage211_correction_extension_decision,
@@ -236,6 +237,7 @@ def _provenance_payload(
     nano_checkpoint: Path,
     smoke_marker: Path,
     layer_focus: Path,
+    layer_rotation_offset: int,
     batch_profile_preflight: dict[str, Any],
     batch_profile_admission: dict[str, Any] | None,
     extension_decision: Path | None,
@@ -263,6 +265,7 @@ def _provenance_payload(
         "smoke_marker_sha256": sha256_file(smoke_marker),
         "layer_focus_path": str(layer_focus),
         "layer_focus_sha256": sha256_file(layer_focus),
+        "layer_rotation_offset": layer_rotation_offset,
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
         "batch_profile_preflight_sha256": batch_profile_preflight["report_sha256"],
         "batch_profile_admission_path": (
@@ -305,6 +308,7 @@ def _correction_config_metadata(
     replay_receipt: Path,
     admission_gate: Path,
     layer_focus: Path,
+    layer_rotation_offset: int,
     batch_profile_preflight: dict[str, Any],
     batch_profile_admission: dict[str, Any] | None,
     phase: str = "mixer",
@@ -317,6 +321,7 @@ def _correction_config_metadata(
         "stage211_post_coverage_admission_gate_path": str(admission_gate),
         "stage211_post_coverage_layer_focus_path": str(layer_focus),
         "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
+        "stage211_post_coverage_layer_rotation_offset": layer_rotation_offset,
         "stage211_post_coverage_batch_profile_preflight_path": batch_profile_preflight[
             "report_path"
         ],
@@ -350,6 +355,7 @@ def _validate_correction_smoke_marker(
     replay_manifest: Path,
     admission_gate: Path,
     layer_focus: Path,
+    layer_rotation_offset: int,
     nano_checkpoint: Path,
     batch_profile_preflight: dict[str, Any],
     batch_profile_admission: dict[str, Any] | None,
@@ -377,6 +383,7 @@ def _validate_correction_smoke_marker(
         "admission_gate_sha256": sha256_file(admission_gate),
         "layer_focus_path": str(layer_focus),
         "layer_focus_sha256": sha256_file(layer_focus),
+        "layer_rotation_offset": layer_rotation_offset,
         "nano_teacher_checkpoint_path": str(nano_checkpoint),
         "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
         "batch_profile_preflight_path": batch_profile_preflight["report_path"],
@@ -427,6 +434,7 @@ def _run_correction_smoke(
     admission_gate: Path,
     layer_focus: Path,
     layer_focus_payload: dict[str, Any],
+    layer_rotation_offset: int,
     batch_profile_preflight: dict[str, Any],
     batch_profile_admission: dict[str, Any] | None,
     init_checkpoint: Path,
@@ -449,6 +457,7 @@ def _run_correction_smoke(
             replay_manifest=replay_manifest,
             admission_gate=admission_gate,
             layer_focus=layer_focus,
+            layer_rotation_offset=layer_rotation_offset,
             nano_checkpoint=nano_checkpoint,
             batch_profile_preflight=batch_profile_preflight,
             batch_profile_admission=batch_profile_admission,
@@ -479,6 +488,7 @@ def _run_correction_smoke(
         full_data_profile=True,
         post_coverage_correction=True,
         correction_layer_boundary_ids=layer_focus_payload["boundary_layer_ids"],
+        correction_layer_rotation_offset=layer_rotation_offset,
         batch_profile_admission=batch_profile_admission,
     )
     config.update(
@@ -487,6 +497,7 @@ def _run_correction_smoke(
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
             layer_focus=layer_focus,
+            layer_rotation_offset=layer_rotation_offset,
             batch_profile_preflight=batch_profile_preflight,
             batch_profile_admission=batch_profile_admission,
             phase=phase,
@@ -525,6 +536,7 @@ def _run_correction_smoke(
             "admission_gate_sha256": sha256_file(admission_gate),
             "layer_focus_path": str(layer_focus),
             "layer_focus_sha256": sha256_file(layer_focus),
+            "layer_rotation_offset": layer_rotation_offset,
             "nano_teacher_checkpoint_path": str(nano_checkpoint),
             "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
             "batch_profile_preflight_path": batch_profile_preflight["report_path"],
@@ -560,6 +572,7 @@ def _run_correction_smoke(
         replay_manifest=replay_manifest,
         admission_gate=admission_gate,
         layer_focus=layer_focus,
+        layer_rotation_offset=layer_rotation_offset,
         nano_checkpoint=nano_checkpoint,
         batch_profile_preflight=batch_profile_preflight,
         batch_profile_admission=batch_profile_admission,
@@ -635,6 +648,10 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         admission_gate_path=admission_gate,
         admission_gate=admitted_gate,
     )
+    layer_rotation_offset = stage211_correction_layer_rotation_offset(
+        round_index=round_index,
+        boundary_layer_ids=layer_focus["boundary_layer_ids"],
+    )
     latest_step = _latest_step(run_dir)
     if latest_step <= 0 and not args.skip_nano_weight_audit:
         audit = _audit_nano_non_attention_exact(
@@ -676,6 +693,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         full_data_profile=True,
         post_coverage_correction=True,
         correction_layer_boundary_ids=layer_focus["boundary_layer_ids"],
+        correction_layer_rotation_offset=layer_rotation_offset,
     )
     profile_config_path = config_dir / "batch_profile_base.yaml"
     if profile_config_path.is_file():
@@ -788,6 +806,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         full_data_profile=True,
         post_coverage_correction=True,
         correction_layer_boundary_ids=layer_focus["boundary_layer_ids"],
+        correction_layer_rotation_offset=layer_rotation_offset,
         batch_profile_admission=batch_profile_admission,
     )
     config.update(
@@ -796,6 +815,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             replay_receipt=replay_receipt,
             admission_gate=admission_gate,
             layer_focus=layer_focus_path,
+            layer_rotation_offset=layer_rotation_offset,
             batch_profile_preflight=batch_profile_preflight,
             batch_profile_admission=batch_profile_admission,
             phase=phase_name,
@@ -810,6 +830,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         admission_gate=admission_gate,
         layer_focus=layer_focus_path,
         layer_focus_payload=layer_focus,
+        layer_rotation_offset=layer_rotation_offset,
         batch_profile_preflight=batch_profile_preflight,
         batch_profile_admission=batch_profile_admission,
         init_checkpoint=init_checkpoint,
@@ -843,6 +864,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
             nano_checkpoint=nano_checkpoint,
             smoke_marker=smoke_marker_path,
             layer_focus=layer_focus_path,
+            layer_rotation_offset=layer_rotation_offset,
             batch_profile_preflight=batch_profile_preflight,
             batch_profile_admission=batch_profile_admission,
             extension_decision=extension_decision,
@@ -865,6 +887,7 @@ def run_correction(args: argparse.Namespace) -> Path | None:
         f"profile={selected_profile['name']} batch={runtime_batch_size} "
         f"frame_budget={runtime_frame_budget} num_workers={runtime_num_workers} "
         f"focus_layers={','.join(str(value) for value in layer_focus['boundary_layer_ids']) or '-'} "
+        f"layer_rotation_offset={layer_rotation_offset} "
         f"latest_step={latest_step} run_dir={run_dir}",
         flush=True,
     )

@@ -5868,6 +5868,7 @@ def _write_retention_correction(
                 "admission_gate_sha256": sha256_file(failed_gate),
                 "layer_focus_path": str(layer_focus.resolve()),
                 "layer_focus_sha256": sha256_file(layer_focus),
+                "layer_rotation_offset": 0,
                 "nano_teacher_checkpoint_path": str(nano_checkpoint.resolve()),
                 "nano_teacher_checkpoint_sha256": sha256_file(nano_checkpoint),
                 "batch_profile_preflight_path": str(batch_profile_path.resolve()),
@@ -5896,6 +5897,7 @@ def _write_retention_correction(
     config = stage211_post_coverage_train_config_contract(
         "mixer",
         boundary_layer_ids=layer_focus_payload["boundary_layer_ids"],
+        rotation_offset=0,
     )
     config.update(
         {
@@ -5918,6 +5920,7 @@ def _write_retention_correction(
             "stage211_post_coverage_admission_gate_path": str(failed_gate.resolve()),
             "stage211_post_coverage_layer_focus_path": str(layer_focus.resolve()),
             "stage211_post_coverage_layer_focus_sha256": sha256_file(layer_focus),
+            "stage211_post_coverage_layer_rotation_offset": 0,
             "stage211_post_coverage_batch_profile_preflight_path": str(
                 batch_profile_path.resolve()
             ),
@@ -5975,6 +5978,7 @@ def _write_retention_correction(
                 "smoke_marker_sha256": sha256_file(smoke_marker),
                 "layer_focus_path": str(layer_focus.resolve()),
                 "layer_focus_sha256": sha256_file(layer_focus),
+                "layer_rotation_offset": 0,
                 "batch_profile_preflight_path": str(batch_profile_path.resolve()),
                 "batch_profile_preflight_sha256": sha256_file(batch_profile_path),
                 "batch_profile_admission_path": None,
@@ -6031,6 +6035,7 @@ def _write_retention_correction(
         "smoke_marker_sha256": sha256_file(smoke_marker),
         "layer_focus_path": str(layer_focus.resolve()),
         "layer_focus_sha256": sha256_file(layer_focus),
+        "layer_rotation_offset": 0,
         "layer_focus_strategy": str(layer_focus_payload["strategy"]),
         "failed_layer_count": int(layer_focus_payload["failed_layer_count"]),
         "dynamic_layer_limit": int(layer_focus_payload["dynamic_layer_limit"]),
@@ -6360,6 +6365,50 @@ def test_stage211_phase_gate_rejects_mutated_correction_focus_summary(
     )
 
     with pytest.raises(ValueError, match="layer-focus summary mismatch"):
+        validate_stage211_phase_gate_report(
+            corrected_gate,
+            expected_phase="mixer",
+            checkpoint_path=corrected_checkpoint,
+            require_passed=False,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_correction_layer_rotation_offset(
+    tmp_path: Path,
+) -> None:
+    original_checkpoint = tmp_path / "long-complete.pt"
+    original_checkpoint.write_bytes(b"long-complete")
+    failed_gate = _write_failed_phase_gate(
+        _write_valid_phase_gate(
+            tmp_path,
+            phase="mixer",
+            checkpoint=original_checkpoint,
+        )
+    )
+    corrected_checkpoint = tmp_path / "retention-complete.pt"
+    corrected_checkpoint.write_bytes(b"retention-complete")
+    correction, _ = _write_retention_correction(
+        tmp_path,
+        failed_gate=failed_gate,
+        completion_checkpoint=corrected_checkpoint,
+    )
+    receipt_path = Path(str(correction["receipt_path"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["layer_rotation_offset"] = 1
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    correction = {
+        **receipt,
+        "receipt_path": str(receipt_path.resolve()),
+        "receipt_sha256": sha256_file(receipt_path),
+    }
+    corrected_gate = _write_corrected_phase_gate(
+        tmp_path,
+        failed_gate=failed_gate,
+        checkpoint=corrected_checkpoint,
+        correction=correction,
+    )
+
+    with pytest.raises(ValueError, match="layer rotation offset mismatch"):
         validate_stage211_phase_gate_report(
             corrected_gate,
             expected_phase="mixer",

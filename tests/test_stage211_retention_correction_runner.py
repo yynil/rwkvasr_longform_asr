@@ -139,6 +139,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
         nano_checkpoint=nano_checkpoint,
         smoke_marker=smoke_marker,
         layer_focus=layer_focus,
+        layer_rotation_offset=0,
         batch_profile_preflight=batch_profile,
         batch_profile_admission=None,
         extension_decision=None,
@@ -155,6 +156,7 @@ def test_stage211_correction_provenance_binds_all_admission_inputs(
     assert len(provenance["admission_gate_sha256"]) == 64
     assert provenance["smoke_marker_sha256"] == runner.sha256_file(smoke_marker)
     assert provenance["layer_focus_sha256"] == runner.sha256_file(layer_focus)
+    assert provenance["layer_rotation_offset"] == 0
     assert provenance["batch_profile_preflight_sha256"] == batch_profile["report_sha256"]
     assert provenance["batch_size"] == 36
     assert provenance["frame_budget"] == 24_000
@@ -198,6 +200,7 @@ def test_stage211_downstream_correction_provenance_records_phase_objective_with_
         nano_checkpoint=inputs["model.pt"],
         smoke_marker=inputs["smoke.json"],
         layer_focus=inputs["focus.json"],
+        layer_rotation_offset=24,
         batch_profile_preflight=batch_profile,
         batch_profile_admission=None,
         extension_decision=None,

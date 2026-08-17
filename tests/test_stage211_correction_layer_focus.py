@@ -9,6 +9,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_HARD_LAYER_IDS,
     build_stage211_correction_layer_focus,
     sha256_file,
+    stage211_correction_layer_rotation_offset,
     stage211_post_coverage_train_config_contract,
     validate_stage211_correction_layer_focus,
 )
@@ -392,4 +393,57 @@ def test_stage211_correction_config_contract_rejects_lost_rotation() -> None:
         stage211_post_coverage_train_config_contract(
             "logits",
             boundary_layer_ids=[0, 11, 12],
+        )
+
+
+@pytest.mark.parametrize(
+    ("boundary_layer_ids", "expected_offsets"),
+    (
+        ([], [0, 24, 48]),
+        ([55, 64, 65, 68, 69], [0, 22, 44]),
+        (list(STAGE211_HARD_LAYER_IDS) + [60, 61, 62], [0, 20, 40]),
+    ),
+)
+def test_stage211_correction_rounds_shift_non_anchor_layer_coverage(
+    boundary_layer_ids: list[int],
+    expected_offsets: list[int],
+) -> None:
+    boundary_layer_ids = sorted(boundary_layer_ids)
+    offsets = [
+        stage211_correction_layer_rotation_offset(
+            round_index=round_index,
+            boundary_layer_ids=boundary_layer_ids,
+        )
+        for round_index in range(1, 4)
+    ]
+
+    assert offsets == expected_offsets
+    selections = [
+        _select_layer_hidden_ids(
+            step=0,
+            num_layers=70,
+            sample_count=12 if len(boundary_layer_ids) > 8 else 8,
+            boundary_ids=boundary_layer_ids,
+            include_boundaries=bool(boundary_layer_ids),
+            rotation_offset=rotation_offset,
+        )
+        for rotation_offset in offsets
+    ]
+    assert all(set(boundary_layer_ids).issubset(selection) for selection in map(set, selections))
+    rotating_selections = [set(selection) - set(boundary_layer_ids) for selection in selections]
+    assert all(
+        first.isdisjoint(second)
+        for index, first in enumerate(rotating_selections)
+        for second in rotating_selections[index + 1 :]
+    )
+
+
+def test_layer_hidden_sampler_rejects_negative_cross_round_offset() -> None:
+    with pytest.raises(ValueError, match="rotation_offset must be non-negative"):
+        _select_layer_hidden_ids(
+            step=0,
+            num_layers=70,
+            sample_count=8,
+            boundary_ids=(),
+            rotation_offset=-1,
         )

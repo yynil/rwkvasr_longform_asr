@@ -414,6 +414,7 @@ class DeepSpeedTrainConfig:
     ctc_teacher_online_layer_sample_count: int = 8
     ctc_teacher_online_layer_boundary_ids: tuple[int, ...] | list[int] = (0, 49, 50, 69)
     ctc_teacher_online_layer_include_boundaries: bool = False
+    ctc_teacher_online_layer_rotation_offset: int = 0
     ctc_teacher_online_layer_frame_tolerance: int = 0
     ctc_teacher_online_layer_input_mode: str = "stacked"
     ctc_decoder_type: str = "none"
@@ -1422,11 +1423,16 @@ def _select_layer_hidden_ids(
     sample_count: int,
     boundary_ids: tuple[int, ...] | list[int],
     include_boundaries: bool = False,
+    rotation_offset: int = 0,
 ) -> tuple[int, ...]:
     if num_layers <= 0:
         raise ValueError(f"num_layers must be positive, got {num_layers}.")
     if sample_count <= 0:
         raise ValueError(f"layer hidden sample_count must be positive, got {sample_count}.")
+    if rotation_offset < 0:
+        raise ValueError(
+            f"layer hidden rotation_offset must be non-negative, got {rotation_offset}."
+        )
     anchors = (
         tuple(sorted({int(value) for value in boundary_ids if 0 <= int(value) < num_layers}))
         if include_boundaries
@@ -1437,7 +1443,7 @@ def _select_layer_hidden_ids(
     extra_count = target_count - len(anchors)
     if extra_count <= 0 or not remaining:
         return anchors[:target_count]
-    cursor = int(step) * max(extra_count, 1) % len(remaining)
+    cursor = (int(step) * max(extra_count, 1) + int(rotation_offset)) % len(remaining)
     extras = tuple(remaining[(cursor + offset) % len(remaining)] for offset in range(extra_count))
     return tuple(sorted((*anchors, *extras)))
 
@@ -6591,6 +6597,8 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                 )
             if int(config.ctc_teacher_online_layer_sample_count) <= 0:
                 raise ValueError("ctc_teacher_online_layer_sample_count must be positive.")
+            if int(config.ctc_teacher_online_layer_rotation_offset) < 0:
+                raise ValueError("ctc_teacher_online_layer_rotation_offset must be non-negative.")
             if int(config.ctc_teacher_online_layer_frame_tolerance) < 0:
                 raise ValueError("ctc_teacher_online_layer_frame_tolerance must be non-negative.")
             if str(config.frontend_type) != "sensevoice_rwkv":
@@ -6754,6 +6762,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
             f"layer_sample_count={int(config.ctc_teacher_online_layer_sample_count)} "
             f"layer_boundaries={tuple(int(value) for value in config.ctc_teacher_online_layer_boundary_ids)} "
             f"layer_include_boundaries={bool(config.ctc_teacher_online_layer_include_boundaries)} "
+            f"layer_rotation_offset={int(config.ctc_teacher_online_layer_rotation_offset)} "
             f"layer_frame_tolerance={int(config.ctc_teacher_online_layer_frame_tolerance)} "
             f"layer_input_mode={ctc_teacher_online_layer_input_mode} "
             f"layer_hiddens_on_device={bool(config.ctc_teacher_online_keep_layer_hiddens_on_device)} "
@@ -7203,6 +7212,7 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
                         include_boundaries=bool(
                             config.ctc_teacher_online_layer_include_boundaries
                         ),
+                        rotation_offset=int(config.ctc_teacher_online_layer_rotation_offset),
                     )
                     if ctc_teacher_online_layer_enabled
                     else ()
