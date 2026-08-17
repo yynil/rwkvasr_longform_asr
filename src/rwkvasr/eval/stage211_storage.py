@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -22,6 +24,7 @@ _PLAN_NAME = "stage211_storage_compaction_plan.json"
 _RECEIPT_NAME = "stage211_storage_compaction_receipt.json"
 _SAFE_TAG = re.compile(r"(?:best|epoch-[1-9][0-9]*|step-[1-9][0-9]*)\Z")
 _PRESERVED_DS_FILES = {"latest", "zero_to_fp32.py"}
+_CORRECTION_POLICY = "export_only_after_completed_correction_v1"
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -53,6 +56,28 @@ def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
             raise ValueError(f"Refusing to overwrite changed Stage211 artifact: {path}")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _yaml_bytes(payload: Mapping[str, Any]) -> bytes:
+    return yaml.safe_dump(dict(payload), sort_keys=False).encode("utf-8")
+
+
+def _replace_yaml(path: Path, payload: Mapping[str, Any]) -> None:
+    encoded = _yaml_bytes(payload)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -409,30 +434,422 @@ def compact_stage211_completed_segment(
     }
 
 
+def _validate_correction_receipt(
+    receipt_path: Path,
+    *,
+    expected_receipt: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], Path]:
+    receipt_path = receipt_path.expanduser().resolve()
+    receipt = _load_json(receipt_path, label="post-coverage correction receipt")
+    if expected_receipt is not None and receipt != dict(expected_receipt):
+        raise ValueError("Stage211 correction compaction receipt binding changed.")
+    if (
+        receipt.get("schema_version") != 2
+        or receipt.get("pipeline") != "stage211"
+        or receipt.get("artifact") != "post_coverage_correction"
+        or receipt.get("phase") not in {"mixer", "block", "logits"}
+        or receipt.get("complete") is not True
+        or int(receipt.get("round", 0)) <= 0
+        or int(receipt.get("epochs", 0)) != 1
+    ):
+        raise ValueError("Stage211 correction compaction requires a completed correction receipt.")
+    run_dir = Path(str(receipt.get("run_dir") or "")).expanduser().resolve()
+    if not run_dir.is_dir() or receipt_path != run_dir / "correction_receipt.json":
+        raise ValueError("Stage211 correction receipt is outside its run directory.")
+    steps = int(receipt.get("steps", 0))
+    hours = float(receipt.get("hours", 0.0))
+    if (
+        steps <= 0
+        or int(receipt.get("steps_per_epoch", 0)) != steps
+        or int(receipt.get("rows", 0)) <= 0
+        or not math.isfinite(hours)
+        or hours <= 0.0
+    ):
+        raise ValueError("Stage211 correction receipt has invalid one-epoch coverage.")
+    validate_stage211_runtime_epoch_coverage(
+        receipt.get("runtime_epoch_coverage"),
+        epochs=1,
+        steps_per_epoch=steps,
+        label="correction storage compaction",
+    )
+    completion_checkpoint = _validate_bound_file(
+        receipt,
+        "completion_checkpoint_path",
+        "completion_checkpoint_sha256",
+    )
+    if completion_checkpoint != run_dir / f"step-{steps}.pt":
+        raise ValueError("Stage211 correction completion checkpoint path is not terminal.")
+    for path_key, sha_key in (
+        ("provenance_path", "provenance_sha256"),
+        ("train_config_path", "train_config_sha256"),
+        ("smoke_marker_path", "smoke_marker_sha256"),
+        ("layer_focus_path", "layer_focus_sha256"),
+    ):
+        _validate_bound_file(receipt, path_key, sha_key)
+    audit = receipt.get("parameter_delta_audit")
+    if (
+        not isinstance(audit, dict)
+        or audit.get("complete") is not True
+        or audit.get("policy") != "stage211_timemixer_and_input_projection_only"
+        or int(audit.get("forbidden_changed_tensors", -1)) != 0
+    ):
+        raise ValueError("Stage211 correction compaction parameter-delta proof is invalid.")
+    return receipt, run_dir
+
+
+def _correction_export_latest_state(
+    *,
+    run_dir: Path,
+    receipt: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    epoch_export = (run_dir / "epoch-1.pt").resolve()
+    if not epoch_export.is_file() or epoch_export.stat().st_size <= 0:
+        raise ValueError("Stage211 correction terminal epoch export is unavailable.")
+    return epoch_export, {
+        "checkpoint_type": "export",
+        "step": int(receipt["steps"]),
+        "epoch": 1,
+        "epoch_batch_offset": 0,
+        "checkpoint_path": str(epoch_export),
+    }
+
+
+def _validate_correction_deepspeed_state(
+    *,
+    run_dir: Path,
+    receipt: Mapping[str, Any],
+) -> tuple[Path, Path, Path, dict[str, Any]]:
+    ds_root = (run_dir / "ds_checkpoints").resolve()
+    if not ds_root.is_dir() or ds_root.is_symlink() or ds_root.parent != run_dir:
+        raise ValueError(f"Stage211 correction DeepSpeed directory is invalid: {ds_root}")
+    unknown_files = sorted(
+        child.name
+        for child in ds_root.iterdir()
+        if child.is_file() and child.name not in _PRESERVED_DS_FILES
+    )
+    if unknown_files:
+        raise ValueError(
+            f"Stage211 correction compaction found unknown DeepSpeed files: {unknown_files}"
+        )
+    for child in ds_root.iterdir():
+        if child.is_symlink():
+            raise ValueError(f"Stage211 correction compaction refuses a symlink: {child}")
+        if child.is_dir():
+            _safe_tag_path(ds_root, child.name)
+    latest_path = (run_dir / "latest_checkpoint.yaml").resolve()
+    _load_yaml(latest_path, label="correction latest checkpoint pointer")
+    epoch_export, export_latest = _correction_export_latest_state(
+        run_dir=run_dir,
+        receipt=receipt,
+    )
+    return ds_root, latest_path, epoch_export, export_latest
+
+
+def _new_correction_plan(
+    *,
+    receipt_path: Path,
+    receipt: Mapping[str, Any],
+    run_dir: Path,
+    ds_root: Path,
+    latest_path: Path,
+    epoch_export: Path,
+    export_latest: Mapping[str, Any],
+) -> dict[str, Any]:
+    latest = _load_yaml(latest_path, label="correction latest checkpoint pointer")
+    expected_latest = {
+        "checkpoint_type": "deepspeed",
+        "step": int(receipt["steps"]),
+        "epoch": 1,
+        "epoch_batch_offset": 0,
+        "checkpoint_path": str(epoch_export),
+        "deepspeed_checkpoint_dir": str(ds_root / "epoch-1"),
+        "resume_tag": "epoch-1",
+    }
+    if any(latest.get(key) != value for key, value in expected_latest.items()):
+        raise ValueError("Stage211 correction compaction refuses a nonterminal latest checkpoint.")
+    latest_tag_path = ds_root / "latest"
+    if (
+        not latest_tag_path.is_file()
+        or latest_tag_path.read_text(encoding="utf-8").strip() != "epoch-1"
+    ):
+        raise ValueError("Stage211 correction DeepSpeed latest tag is not terminal.")
+    remove: list[dict[str, Any]] = []
+    for child in sorted(ds_root.iterdir(), key=lambda path: path.name):
+        if not child.is_dir():
+            continue
+        path = _safe_tag_path(ds_root, child.name)
+        if path.is_symlink():
+            raise ValueError(f"Stage211 correction compaction refuses a symlink: {path}")
+        bytes_total, files_total = _tree_stats(path)
+        remove.append(
+            {
+                "tag": child.name,
+                "path": str(path),
+                "bytes": bytes_total,
+                "files": files_total,
+            }
+        )
+    if "epoch-1" not in {record["tag"] for record in remove}:
+        raise ValueError("Stage211 correction terminal DeepSpeed tag is unavailable.")
+    return {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "completed_correction_storage_compaction_plan",
+        "policy": _CORRECTION_POLICY,
+        "phase": receipt["phase"],
+        "round": int(receipt["round"]),
+        "run_dir": str(run_dir),
+        "correction_receipt_path": str(receipt_path),
+        "correction_receipt_sha256": sha256_file(receipt_path),
+        "ds_checkpoint_root": str(ds_root),
+        "terminal_epoch_export_path": str(epoch_export),
+        "terminal_epoch_export_sha256": sha256_file(epoch_export),
+        "latest_checkpoint_path": str(latest_path),
+        "latest_checkpoint_before_sha256": sha256_file(latest_path),
+        "latest_checkpoint_after": dict(export_latest),
+        "deepspeed_latest_path": str(latest_tag_path),
+        "deepspeed_latest_sha256": sha256_file(latest_tag_path),
+        "remove": remove,
+        "bytes_planned": sum(int(record["bytes"]) for record in remove),
+        "files_planned": sum(int(record["files"]) for record in remove),
+        "complete": False,
+    }
+
+
+def _validate_correction_plan(
+    plan: Mapping[str, Any],
+    *,
+    receipt_path: Path,
+    receipt: Mapping[str, Any],
+    run_dir: Path,
+    ds_root: Path,
+    latest_path: Path,
+    epoch_export: Path,
+    export_latest: Mapping[str, Any],
+    completion_exists: bool,
+) -> list[Path]:
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "completed_correction_storage_compaction_plan",
+        "policy": _CORRECTION_POLICY,
+        "phase": receipt["phase"],
+        "round": int(receipt["round"]),
+        "run_dir": str(run_dir),
+        "correction_receipt_path": str(receipt_path),
+        "correction_receipt_sha256": sha256_file(receipt_path),
+        "ds_checkpoint_root": str(ds_root),
+        "terminal_epoch_export_path": str(epoch_export),
+        "terminal_epoch_export_sha256": sha256_file(epoch_export),
+        "latest_checkpoint_path": str(latest_path),
+        "latest_checkpoint_after": dict(export_latest),
+        "deepspeed_latest_path": str(ds_root / "latest"),
+        "complete": False,
+    }
+    if any(plan.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 correction storage compaction plan binding changed.")
+    latest_bytes = latest_path.read_bytes()
+    latest_after_bytes = _yaml_bytes(export_latest)
+    if (
+        hashlib.sha256(latest_bytes).hexdigest() != plan.get("latest_checkpoint_before_sha256")
+        and latest_bytes != latest_after_bytes
+    ):
+        raise ValueError("Stage211 correction latest checkpoint pointer changed.")
+    latest_tag_path = ds_root / "latest"
+    if latest_tag_path.exists() and sha256_file(latest_tag_path) != plan.get(
+        "deepspeed_latest_sha256"
+    ):
+        raise ValueError("Stage211 correction DeepSpeed latest tag changed.")
+    records = plan.get("remove")
+    if not isinstance(records, list):
+        raise ValueError("Stage211 correction compaction plan lacks removal records.")
+    paths: list[Path] = []
+    tags: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Stage211 correction compaction plan has an invalid record.")
+        tag = str(record.get("tag") or "")
+        path = _safe_tag_path(ds_root, tag)
+        if str(path) != record.get("path"):
+            raise ValueError("Stage211 correction compaction removal path changed.")
+        if int(record.get("bytes", -1)) < 0 or int(record.get("files", -1)) < 0:
+            raise ValueError("Stage211 correction compaction plan has invalid size evidence.")
+        if path.exists():
+            if completion_exists:
+                raise ValueError(f"Stage211 compacted correction checkpoint tag reappeared: {path}")
+            if not path.is_dir() or path.is_symlink():
+                raise ValueError(f"Stage211 correction compaction refuses checkpoint path: {path}")
+            current_bytes, current_files = _tree_stats(path)
+            if current_bytes != int(record["bytes"]) or current_files != int(record["files"]):
+                raise ValueError(
+                    f"Stage211 correction checkpoint state changed after planning: {path}"
+                )
+        tags.append(tag)
+        paths.append(path)
+    if tags != sorted(set(tags)) or "epoch-1" not in tags:
+        raise ValueError("Stage211 correction compaction tags are invalid.")
+    if int(plan.get("bytes_planned", -1)) != sum(int(record["bytes"]) for record in records) or int(
+        plan.get("files_planned", -1)
+    ) != sum(int(record["files"]) for record in records):
+        raise ValueError("Stage211 correction compaction plan totals changed.")
+    current_tags = {child.name for child in ds_root.iterdir() if child.is_dir()}
+    if not current_tags.issubset(set(tags)):
+        raise ValueError("Stage211 correction compaction found an unplanned checkpoint tag.")
+    return paths
+
+
+def _correction_completion_receipt(plan_path: Path, plan: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "completed_correction_storage_compaction",
+        "policy": plan["policy"],
+        "phase": plan["phase"],
+        "round": plan["round"],
+        "run_dir": plan["run_dir"],
+        "correction_receipt_path": plan["correction_receipt_path"],
+        "correction_receipt_sha256": plan["correction_receipt_sha256"],
+        "plan_path": str(plan_path),
+        "plan_sha256": sha256_file(plan_path),
+        "removed_tags": [record["tag"] for record in plan["remove"]],
+        "bytes_planned": plan["bytes_planned"],
+        "files_planned": plan["files_planned"],
+        "latest_checkpoint_path": plan["latest_checkpoint_path"],
+        "latest_checkpoint_sha256": hashlib.sha256(
+            _yaml_bytes(plan["latest_checkpoint_after"])
+        ).hexdigest(),
+        "terminal_epoch_export_path": plan["terminal_epoch_export_path"],
+        "terminal_epoch_export_sha256": plan["terminal_epoch_export_sha256"],
+        "complete": True,
+    }
+
+
+def compact_stage211_completed_correction(
+    *,
+    correction_receipt_path: Path,
+    expected_receipt: Mapping[str, Any] | None = None,
+    execute: bool = True,
+) -> dict[str, Any]:
+    receipt_path = correction_receipt_path.expanduser().resolve()
+    receipt, run_dir = _validate_correction_receipt(
+        receipt_path,
+        expected_receipt=expected_receipt,
+    )
+    ds_root, latest_path, epoch_export, export_latest = _validate_correction_deepspeed_state(
+        run_dir=run_dir,
+        receipt=receipt,
+    )
+    plan_path = run_dir / _PLAN_NAME
+    completion_path = run_dir / _RECEIPT_NAME
+    if plan_path.exists():
+        plan = _load_json(plan_path, label="correction storage compaction plan")
+    else:
+        plan = _new_correction_plan(
+            receipt_path=receipt_path,
+            receipt=receipt,
+            run_dir=run_dir,
+            ds_root=ds_root,
+            latest_path=latest_path,
+            epoch_export=epoch_export,
+            export_latest=export_latest,
+        )
+        _write_immutable_json(plan_path, plan)
+    removal_paths = _validate_correction_plan(
+        plan,
+        receipt_path=receipt_path,
+        receipt=receipt,
+        run_dir=run_dir,
+        ds_root=ds_root,
+        latest_path=latest_path,
+        epoch_export=epoch_export,
+        export_latest=export_latest,
+        completion_exists=completion_path.exists(),
+    )
+    if not execute:
+        return {
+            **plan,
+            "plan_path": str(plan_path.resolve()),
+            "plan_sha256": sha256_file(plan_path),
+        }
+    expected_completion = _correction_completion_receipt(plan_path, plan)
+    if completion_path.exists():
+        existing = _load_json(completion_path, label="correction storage compaction receipt")
+        if existing != expected_completion:
+            raise ValueError("Stage211 correction storage compaction receipt changed.")
+    else:
+        for path in removal_paths:
+            if path.exists():
+                if not path.is_dir() or path.is_symlink():
+                    raise ValueError(
+                        f"Stage211 correction compaction refuses checkpoint path: {path}"
+                    )
+                shutil.rmtree(path)
+        (ds_root / "latest").unlink(missing_ok=True)
+        _replace_yaml(latest_path, export_latest)
+        for path in removal_paths:
+            if path.exists():
+                raise ValueError(
+                    f"Stage211 correction compaction did not remove checkpoint tag: {path}"
+                )
+        _write_immutable_json(completion_path, expected_completion)
+    for path in removal_paths:
+        if path.exists():
+            raise ValueError(f"Stage211 compacted correction checkpoint tag reappeared: {path}")
+    if (ds_root / "latest").exists():
+        raise ValueError("Stage211 compacted correction DeepSpeed latest tag reappeared.")
+    if latest_path.read_bytes() != _yaml_bytes(export_latest):
+        raise ValueError("Stage211 compacted correction latest pointer is not export-only.")
+    return {
+        **expected_completion,
+        "receipt_path": str(completion_path.resolve()),
+        "receipt_sha256": sha256_file(completion_path),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Compact restart-safe DeepSpeed state for a completed Stage211 segment."
+        description=(
+            "Compact restart-safe DeepSpeed state for a completed Stage211 segment or correction."
+        )
     )
-    parser.add_argument("--curriculum-receipt", type=Path, required=True)
+    receipt_group = parser.add_mutually_exclusive_group(required=True)
+    receipt_group.add_argument("--curriculum-receipt", type=Path)
+    receipt_group.add_argument("--correction-receipt", type=Path)
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
-    result = compact_stage211_completed_segment(
-        curriculum_receipt_path=args.curriculum_receipt,
-        execute=not args.plan_only,
-    )
+    if args.correction_receipt is not None:
+        result = compact_stage211_completed_correction(
+            correction_receipt_path=args.correction_receipt,
+            execute=not args.plan_only,
+        )
+    else:
+        result = compact_stage211_completed_segment(
+            curriculum_receipt_path=args.curriculum_receipt,
+            execute=not args.plan_only,
+        )
     if args.plan_only:
+        scope = (
+            f"round={result['round']}"
+            if args.correction_receipt is not None
+            else f"difficulty={result['difficulty']}"
+        )
         print(
             "stage211_storage_compaction_planned "
-            f"phase={result['phase']} difficulty={result['difficulty']} "
+            f"phase={result['phase']} {scope} "
             f"remove_tags={len(result['remove'])} "
             f"bytes_planned={result['bytes_planned']} "
             f"plan_sha256={result['plan_sha256']}",
             flush=True,
         )
         return 0
+    scope = (
+        f"round={result['round']}"
+        if args.correction_receipt is not None
+        else f"difficulty={result['difficulty']}"
+    )
     print(
         "stage211_storage_compaction_complete "
-        f"phase={result['phase']} difficulty={result['difficulty']} "
+        f"phase={result['phase']} {scope} "
         f"removed_tags={len(result['removed_tags'])} "
         f"bytes_planned={result['bytes_planned']} "
         f"receipt_sha256={result['receipt_sha256']}",

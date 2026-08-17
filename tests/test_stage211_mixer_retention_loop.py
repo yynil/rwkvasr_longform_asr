@@ -16,6 +16,15 @@ sys.path.insert(0, str(REPO_ROOT))
 loop = importlib.import_module("scripts.run_stage211_mixer_retention_loop")
 
 
+@pytest.fixture(autouse=True)
+def _stub_correction_storage_compaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        loop,
+        "_ensure_correction_storage_compaction",
+        lambda receipt_path, *, dry_run: None,
+    )
+
+
 def _args(tmp_path: Path) -> argparse.Namespace:
     phase_root = tmp_path / "phase"
     original_gate_dir = tmp_path / "gates" / "mixer"
@@ -293,6 +302,58 @@ def test_retention_loop_requires_three_complete_rounds_before_promotion(
     assert len(finalizer_commands) == 3
     round3_finalizer = finalizer_commands[-1]
     assert round3_finalizer.count("--post-coverage-correction-receipt") == 3
+
+
+def test_retention_loop_compacts_existing_receipt_before_finalizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _args(tmp_path)
+    args.max_rounds = 1
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    original_gate = args.original_gate_dir / "phase_gate.json"
+    original_gate.write_text("{}\n", encoding="utf-8")
+    run_dir = args.correction_run_root / "round_01"
+    run_dir.mkdir(parents=True)
+    receipt = run_dir / "correction_receipt.json"
+    receipt.write_text("{}\n", encoding="utf-8")
+    events: list[tuple[str, Path]] = []
+
+    def fake_compaction(receipt_path: Path, *, dry_run: bool) -> None:
+        assert dry_run is False
+        events.append(("compaction", receipt_path))
+
+    def fake_run(
+        command: list[str],
+        *,
+        dry_run: bool,
+        allow_failure: bool = False,
+    ) -> int:
+        assert dry_run is False
+        assert allow_failure is True
+        assert str(loop.FINALIZER) in command
+        gate_dir = Path(command[command.index("--output-dir") + 1])
+        events.append(("finalizer", gate_dir))
+        gate_dir.mkdir(parents=True)
+        (gate_dir / "phase_gate.json").write_text("{}\n", encoding="utf-8")
+        return 1
+
+    monkeypatch.setattr(loop, "_ensure_correction_storage_compaction", fake_compaction)
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(
+        loop,
+        "_validate_gate",
+        lambda path: {"gate_passed": False, "checkpoint_path": str(checkpoint)},
+    )
+
+    with pytest.raises(ValueError, match="failed after 1 complete correction rounds"):
+        loop.run_retention_loop(args)
+
+    assert events == [
+        ("compaction", receipt),
+        ("finalizer", args.correction_gate_root / "round_01"),
+    ]
 
 
 def test_retention_loop_continues_early_passes_and_promotes_only_after_round_three(

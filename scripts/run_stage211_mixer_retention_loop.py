@@ -17,6 +17,7 @@ from rwkvasr.eval.stage211_gate import (
     validate_stage211_correction_extension_decision,
     validate_stage211_phase_gate_report,
 )
+from rwkvasr.eval.stage211_storage import compact_stage211_completed_correction
 
 try:
     from scripts.run_stage211_strict_chained_alignment import (
@@ -108,6 +109,25 @@ def _run(command: list[str], *, dry_run: bool, allow_failure: bool = False) -> i
             f"{shlex.join(command)}"
         )
     return int(result.returncode)
+
+
+def _ensure_correction_storage_compaction(
+    receipt_path: Path,
+    *,
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        return
+    result = compact_stage211_completed_correction(
+        correction_receipt_path=receipt_path,
+    )
+    print(
+        "[stage211-correction-loop] storage compaction complete "
+        f"receipt={receipt_path} removed_tags={len(result['removed_tags'])} "
+        f"bytes={result['bytes_planned']} "
+        f"compaction_receipt_sha256={result['receipt_sha256']}",
+        flush=True,
+    )
 
 
 def _finalizer_command(
@@ -415,6 +435,10 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
                     ),
                     dry_run=bool(args.dry_run),
                 )
+            _ensure_correction_storage_compaction(
+                receipt,
+                dry_run=bool(args.dry_run),
+            )
             correction_receipts.append(receipt)
             if not gate_path.is_file():
                 code = _run(

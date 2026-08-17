@@ -32,6 +32,7 @@ from rwkvasr.eval.stage211_gate import (
 from rwkvasr.eval.stage211_batch_profile import (
     validate_stage211_batch_profile_admission,
 )
+from rwkvasr.eval.stage211_storage import compact_stage211_completed_correction
 
 try:
     from scripts.create_stage211_retention_correction_receipt import (
@@ -940,9 +941,16 @@ def run_correction(args: argparse.Namespace) -> Path | None:
     )
     receipt_path = run_dir / "correction_receipt.json"
     _write_immutable_json(receipt_path, receipt)
+    compaction = compact_stage211_completed_correction(
+        correction_receipt_path=receipt_path,
+        expected_receipt=receipt,
+    )
     print(
         f"stage211_post_coverage_correction_complete phase={phase_name} round={round_index} "
-        f"checkpoint={completion_checkpoint} receipt={receipt_path}",
+        f"checkpoint={completion_checkpoint} receipt={receipt_path} "
+        f"compacted_tags={len(compaction['removed_tags'])} "
+        f"compacted_bytes={compaction['bytes_planned']} "
+        f"compaction_receipt_sha256={compaction['receipt_sha256']}",
         flush=True,
     )
     return receipt_path
