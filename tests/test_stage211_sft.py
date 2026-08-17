@@ -53,6 +53,7 @@ SFT_SUPPORT_EXPECTED = {
 
 def test_stage211_sft_controller_preserves_virtualenv_python() -> None:
     assert sft_runner.PYTHON == Path(sys.executable)
+    assert sft_correction_loop.PYTHON == Path(sys.executable)
 
 
 def _labeled_paths(tmp_path: Path) -> tuple[Path, Path, Path]:

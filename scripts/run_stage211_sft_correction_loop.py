@@ -36,7 +36,7 @@ except ModuleNotFoundError as error:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path(sys.executable).resolve()
+PYTHON = Path(sys.executable)
 MAX_ROUNDS = 3
 DEFAULT_RUN_ROOT = (
     Path.home() / "rwkvasr_runs" / "stage211_full_alignment" / "stage211d_sft_correction"

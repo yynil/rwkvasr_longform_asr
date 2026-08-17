@@ -15,6 +15,10 @@ sys.path.insert(0, str(REPO_ROOT))
 handoff = importlib.import_module("scripts.run_stage211_profiled_boundary_handoff")
 
 
+def test_profiled_handoff_preserves_virtualenv_python() -> None:
+    assert handoff.PYTHON == Path(sys.executable)
+
+
 def test_profiled_controller_binds_only_fresh_supplemental_admission(
     tmp_path: Path,
 ) -> None:

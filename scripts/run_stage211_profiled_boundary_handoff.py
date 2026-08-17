@@ -22,7 +22,7 @@ from rwkvasr.eval.stage211_supplemental import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path(sys.executable).resolve()
+PYTHON = Path(sys.executable)
 STRICT_RUNNER = REPO_ROOT / "scripts" / "run_stage211_strict_chained_alignment.py"
 RECEIPT_CREATOR = REPO_ROOT / "scripts" / "create_stage211_curriculum_receipt.py"
 PROFILE_RECEIPT_CREATOR = REPO_ROOT / "scripts" / "create_stage211_supplemental_profile_receipt.py"
