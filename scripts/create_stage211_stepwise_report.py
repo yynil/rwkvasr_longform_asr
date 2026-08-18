@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from rwkvasr.eval.stage211_artifact_io import write_immutable_text
 from rwkvasr.eval.stage211_gate import (
     STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
     STAGE211_FULL_DATA_EPOCHS,
@@ -2492,11 +2493,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 
 def _write_immutable(path: Path, text: str, *, label: str) -> None:
-    path = path.expanduser().resolve()
-    if path.is_file() and path.read_text(encoding="utf-8") != text:
-        raise ValueError(f"Refusing to overwrite a different {label}: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    write_immutable_text(path, text, label=label)
 
 
 def create_stepwise_report(

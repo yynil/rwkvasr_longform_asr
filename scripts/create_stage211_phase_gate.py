@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.eval import normalize_asr_text_for_metrics
+from rwkvasr.eval.stage211_artifact_io import write_immutable_text
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
     DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
@@ -541,11 +542,8 @@ def main() -> int:
         public_overlap_receipt_path=args.public_overlap_receipt,
     )
     output_path = args.output.resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     rendered = json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    if output_path.is_file() and output_path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"Refusing to overwrite a different phase gate: {output_path}")
-    output_path.write_text(rendered, encoding="utf-8")
+    write_immutable_text(output_path, rendered, label="phase gate")
     validate_stage211_phase_gate_report(
         output_path,
         expected_phase=str(args.phase),

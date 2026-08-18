@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 from pathlib import Path
 from typing import Any
 
 from rwkvasr.config import load_yaml
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 from rwkvasr.eval.stage211_gate import sha256_file
 
 try:
@@ -606,11 +606,7 @@ def build_gate(
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
-    rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    if path.is_file() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"Refusing to overwrite a different logits gate: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
+    write_immutable_json(path, payload, label="logits gate")
 
 
 def main() -> int:

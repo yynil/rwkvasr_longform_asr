@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
+
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 
 try:
     from scripts.run_stage211_strict_chained_alignment import (
@@ -57,10 +58,7 @@ def main() -> int:
             checkpoint_path=args.checkpoint,
             gate_report_path=args.gate_report,
         )
-        output_path.write_text(
-            json.dumps(receipt, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_immutable_json(output_path, receipt, label="Stage211 promotion receipt")
     print(
         f"promotion_receipt={output_path} "
         f"transition={receipt['source_phase']}->{receipt['target_phase']} "

@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
     DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
@@ -93,11 +94,7 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
-    rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    if path.is_file() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"Refusing to overwrite a different Stage211 artifact: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
+    write_immutable_json(path, payload, label="Stage211 artifact")
 
 
 def _run(command: list[str], *, dry_run: bool, env: dict[str, str] | None = None) -> None:

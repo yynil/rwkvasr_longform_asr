@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
     STAGE211_PUBLIC_BENCHMARKS,
@@ -68,11 +69,7 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
-    rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    if path.is_file() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"Refusing to overwrite a different Stage211 final report: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
+    write_immutable_json(path, payload, label="Stage211 final report")
 
 
 def _resolve_phase_gate(

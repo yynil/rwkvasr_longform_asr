@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.config import load_yaml
+from rwkvasr.eval.stage211_artifact_io import write_immutable_text
 from rwkvasr.eval.stage211_gate import (
     STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT,
     sha256_file,
@@ -738,11 +739,8 @@ def main() -> int:
         stratified_summary_path=args.stratified_summary,
     )
     output_path = args.output.resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     rendered = json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    if output_path.is_file() and output_path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"Refusing to overwrite a different hidden gate: {output_path}")
-    output_path.write_text(rendered, encoding="utf-8")
+    write_immutable_text(output_path, rendered, label="hidden gate")
     print(
         f"hidden_gate={output_path} phase={args.phase} "
         f"gate_passed={str(report['gate_passed']).lower()}",
