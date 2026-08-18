@@ -59,6 +59,16 @@ def write_immutable_json(
     payload: Mapping[str, Any],
     *,
     label: str,
+    allow_nan: bool = True,
 ) -> None:
-    rendered = json.dumps(dict(payload), ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    rendered = (
+        json.dumps(
+            dict(payload),
+            allow_nan=allow_nan,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
     write_immutable_text(path, rendered, label=label)

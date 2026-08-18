@@ -8,6 +8,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
+
 
 ROLES = ("baseline", "candidate")
 LAYER_IDS = tuple(range(70))
@@ -37,20 +39,7 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
 
 
 def _write_immutable(path: Path, payload: dict[str, Any]) -> None:
-    rendered = (
-        json.dumps(
-            payload,
-            allow_nan=False,
-            ensure_ascii=True,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    )
-    if path.is_file() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"Refusing to replace a different summary: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
+    write_immutable_json(path, payload, label="summary", allow_nan=False)
 
 
 def _validate_cell_report(

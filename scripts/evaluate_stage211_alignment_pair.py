@@ -17,6 +17,7 @@ from rwkvasr.cli.eval_online_ctc_distill import (
     _resolve_student_dtype,
 )
 from rwkvasr.config import load_yaml
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 from rwkvasr.eval.stage211_gate import (
     STAGE211_ALIGNMENT_CHECKPOINT_EVAL_ARTIFACT,
     STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
@@ -301,22 +302,12 @@ def _evaluate_checkpoint(
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
-    rendered = (
-        json.dumps(
-            payload,
-            allow_nan=False,
-            ensure_ascii=True,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
+    write_immutable_json(
+        path,
+        payload,
+        label="Stage211 alignment eval",
+        allow_nan=False,
     )
-    if path.is_file() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(
-            f"Refusing to overwrite a different Stage211 alignment eval: {path}"
-        )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
 
 
 def evaluate_pair(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:

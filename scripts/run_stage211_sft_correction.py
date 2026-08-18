@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from rwkvasr.config import load_yaml, save_yaml
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
     resolve_stage211_nano_teacher_checkpoint,
@@ -102,15 +103,7 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
 
 
 def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
-    rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    if path.is_file():
-        if path.read_text(encoding="utf-8") != rendered:
-            raise ValueError(f"Refusing to overwrite a different Stage211D artifact: {path}")
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(rendered, encoding="utf-8")
-    temporary.replace(path)
+    write_immutable_json(path, payload, label="Stage211D artifact")
 
 
 def _current_attempt_log(log_path: Path) -> str:

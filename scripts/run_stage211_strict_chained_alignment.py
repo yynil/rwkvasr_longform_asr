@@ -18,6 +18,7 @@ from rwkvasr.data import (
     estimate_bucket_manifest_tail_padding_samples,
     load_webdataset_bucket_manifest,
 )
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 from rwkvasr.eval.stage211_gate import (
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_FULL_DATA_BATCH_SIZE,
@@ -1613,17 +1614,7 @@ def _record_or_validate_provenance(
         payload["length_bucket_drop_last"] = False
         payload["skip_oversized_samples"] = False
         payload["webdataset_skip_decode_errors"] = False
-    if path.is_file():
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if existing != payload:
-            raise ValueError(f"Stage211 output provenance cannot be changed in place: {path}")
-        return path
-    temporary_path = path.with_suffix(".json.tmp")
-    temporary_path.write_text(
-        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    temporary_path.replace(path)
+    write_immutable_json(path, payload, label="Stage211 output provenance")
     return path
 
 

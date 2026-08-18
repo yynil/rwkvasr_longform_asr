@@ -68,3 +68,15 @@ def test_failed_atomic_publish_leaves_no_partial_final_and_restart_completes(
         label="Stage211 final report",
     )
     assert output.read_bytes() == payload
+
+
+def test_nonfinite_strict_json_is_rejected_before_publication(tmp_path: Path) -> None:
+    output = tmp_path / "alignment.json"
+    with pytest.raises(ValueError, match="Out of range float values"):
+        stage211_artifact_io.write_immutable_json(
+            output,
+            {"loss": float("nan")},
+            label="Stage211 alignment eval",
+            allow_nan=False,
+        )
+    assert not output.exists()

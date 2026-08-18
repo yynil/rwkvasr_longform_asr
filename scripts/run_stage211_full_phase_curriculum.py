@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from rwkvasr.config import load_yaml
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json, write_immutable_text
 from rwkvasr.eval.stage211_batch_profile import (
     validate_stage211_batch_profile_admission,
     validate_stage211_batch_profile_preflight,
@@ -751,11 +752,7 @@ def _audit_smoke(
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
-    rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    if path.is_file() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"Refusing to overwrite a different Stage211 artifact: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
+    write_immutable_json(path, payload, label="Stage211 artifact")
 
 
 def _validate_supplemental_profile_receipt(
@@ -1551,19 +1548,11 @@ def run_phase(args: argparse.Namespace) -> Path | None:
     )
     if args.final_checkpoint_path_output is not None:
         final_checkpoint_path_output = args.final_checkpoint_path_output.expanduser().resolve()
-        final_checkpoint_path_output.parent.mkdir(parents=True, exist_ok=True)
         rendered_checkpoint_path = str(final_checkpoint) + "\n"
-        if (
-            final_checkpoint_path_output.is_file()
-            and final_checkpoint_path_output.read_text(encoding="utf-8") != rendered_checkpoint_path
-        ):
-            raise ValueError(
-                "Refusing to overwrite a different Stage211 final-checkpoint path: "
-                f"{final_checkpoint_path_output}"
-            )
-        final_checkpoint_path_output.write_text(
+        write_immutable_text(
+            final_checkpoint_path_output,
             rendered_checkpoint_path,
-            encoding="utf-8",
+            label="Stage211 final-checkpoint path",
         )
     print(
         f"[stage211-full-phase] curriculum complete phase={phase} "

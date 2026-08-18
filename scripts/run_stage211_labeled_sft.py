@@ -14,6 +14,7 @@ import torch
 import yaml
 
 from rwkvasr.config import load_yaml
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json, write_immutable_text
 from rwkvasr.eval.stage211_gate import (
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
@@ -107,11 +108,7 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
-    rendered = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    if path.is_file() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"Refusing to overwrite a different Stage211D artifact: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
+    write_immutable_json(path, payload, label="Stage211D artifact")
 
 
 def _latest_step(run_dir: Path) -> int:
@@ -841,13 +838,8 @@ def run_sft(args: argparse.Namespace) -> Path | None:
     )
     if args.final_checkpoint_path_output is not None:
         path_output = args.final_checkpoint_path_output.expanduser().resolve()
-        path_output.parent.mkdir(parents=True, exist_ok=True)
         rendered = str(completion_checkpoint.resolve()) + "\n"
-        if path_output.is_file() and path_output.read_text(encoding="utf-8") != rendered:
-            raise ValueError(
-                f"Refusing to overwrite a different Stage211D checkpoint path: {path_output}"
-            )
-        path_output.write_text(rendered, encoding="utf-8")
+        write_immutable_text(path_output, rendered, label="Stage211D checkpoint path")
     print(
         f"[stage211-sft] complete checkpoint={completion_checkpoint} report={completion_path}",
         flush=True,

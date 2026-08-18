@@ -14,6 +14,7 @@ from rwkvasr.data import (
     estimate_bucket_manifest_tail_padding_samples,
     load_webdataset_bucket_manifest,
 )
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 from rwkvasr.eval.stage211_batch_profile import (
     validate_stage211_batch_profile_admission,
 )
@@ -441,11 +442,7 @@ def main() -> int:
         batch_profile_admission_path=args.batch_profile_admission,
     )
     output_path = args.output.resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    rendered = json.dumps(receipt, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    if output_path.is_file() and output_path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"Refusing to overwrite a different coverage receipt: {output_path}")
-    output_path.write_text(rendered, encoding="utf-8")
+    write_immutable_json(output_path, receipt, label="coverage receipt")
     print(
         f"coverage_receipt={output_path} phase={receipt['phase']} "
         f"difficulty={receipt['difficulty']} rows={receipt['rows']} steps={receipt['steps']}",
