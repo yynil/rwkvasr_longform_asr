@@ -145,6 +145,7 @@ def _profile_row(
     config = {
         **stage211_phase_train_config_contract(phase),
         "stage211_batch_profile_probe_phase": phase,
+        "stage211_batch_profile_probe_epoch_batch_offset": 0,
         "max_steps": 120,
         "batch_size": batch_size,
         "num_workers": num_workers,
@@ -302,6 +303,7 @@ def _profile_row(
             "num_workers": num_workers,
             "gradient_checkpointing": gradient_checkpointing,
         },
+        "probe_epoch_batch_offset": 0,
         "config_path": str(config_path.resolve()),
         "config_sha256": sha256_file(config_path),
         "log_path": str(log_path),
@@ -418,6 +420,7 @@ def _report(
         "bucket_manifest_sha256": sha256_file(manifest),
         "warmup_steps": 20,
         "measure_steps": 100,
+        "probe_depth_fraction": 0.0,
         "formal_epochs": 3,
         "world_size": 4,
         "gpu_indices": [0, 1, 2, 3],
@@ -555,6 +558,28 @@ def test_measured_phase_specific_profile_can_be_admitted(tmp_path: Path) -> None
         "num_workers": 8,
         "gradient_checkpointing": False,
     }
+
+
+def test_representative_depth_profile_rejects_offset_tampering(tmp_path: Path) -> None:
+    report_path = _report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["probe_depth_fraction"] = 0.5
+    for row in report["profiles"]:
+        offset = int(row["coverage"]["steps_per_epoch"] * 0.5)
+        row["probe_epoch_batch_offset"] = offset
+        config_path = Path(row["config_path"])
+        config = load_yaml(config_path)
+        config["stage211_batch_profile_probe_epoch_batch_offset"] = offset
+        save_yaml(config_path, config)
+        row["config_sha256"] = sha256_file(config_path)
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    measured = validate_stage211_batch_profile_preflight(report_path, phase="mixer")
+    assert measured["selected_profile_name"] == "batch48_frames42k"
+
+    report["profiles"][0]["probe_epoch_batch_offset"] += 1
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="probe offset changed"):
+        validate_stage211_batch_profile_preflight(report_path, phase="mixer")
 
 
 def test_dominated_capacity_candidate_is_replayed_and_tamper_evident(tmp_path: Path) -> None:

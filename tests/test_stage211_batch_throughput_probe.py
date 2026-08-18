@@ -232,12 +232,24 @@ def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> No
     assert config["batch_token_budget"] == 42_000
     assert config["length_bucket_frame_budget"] == 42_000
     assert config["gradient_checkpointing"] is False
+    assert config["stage211_batch_profile_probe_epoch_batch_offset"] == 0
     assert config["deepspeed"]["train_micro_batch_size_per_gpu"] == 48
     assert config["deepspeed"]["train_batch_size"] == 384
 
     config["stage211_batch_profile_probe_phase"] = "mixer"
     executable = DeepSpeedTrainConfig(**config)
     assert executable.stage211_batch_profile_probe_phase == "mixer"
+
+    midpoint = probe.build_probe_config(
+        base,
+        profile=profile,
+        output_dir=tmp_path / "midpoint-run",
+        init_checkpoint=checkpoint,
+        max_steps=120,
+        world_size=4,
+        epoch_batch_offset=321,
+    )
+    assert midpoint["stage211_batch_profile_probe_epoch_batch_offset"] == 321
 
 
 def test_probe_environment_exposes_active_virtualenv_tools(tmp_path: Path) -> None:

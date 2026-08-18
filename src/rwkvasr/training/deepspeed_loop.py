@@ -487,8 +487,10 @@ class DeepSpeedTrainConfig:
     specaugment_time_width: int = 40
     specaugment_freq_masks: int = 2
     specaugment_freq_width: int = 15
-    # Receipt-bound Stage211 metadata; these fields do not affect training behavior.
+    # Probe-only controls; formal Stage211 configs leave these unset.
     stage211_batch_profile_probe_phase: str | None = None
+    stage211_batch_profile_probe_epoch_batch_offset: int | None = None
+    # Receipt-bound Stage211 metadata; these fields do not affect training behavior.
     stage211_batch_profile_admission_path: str | None = None
     stage211_batch_profile_admission_sha256: str | None = None
     stage211_batch_profile_name: str | None = None
@@ -519,6 +521,45 @@ class DeepSpeedTrainConfig:
     stage211_sft_correction_profile_sha256: str | None = None
     stage211_full_sft_completion_path: str | None = None
     stage211_full_sft_completion_sha256: str | None = None
+
+
+def _stage211_probe_start_state(
+    config: DeepSpeedTrainConfig,
+    *,
+    epoch_steps: int,
+    resume_from: str | None,
+    bucket_manifest_active: bool,
+) -> tuple[int, int]:
+    offset = config.stage211_batch_profile_probe_epoch_batch_offset
+    if offset is None:
+        return 0, 0
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise ValueError(
+            "stage211_batch_profile_probe_epoch_batch_offset must be a "
+            "non-negative integer."
+        )
+    if config.stage211_batch_profile_probe_phase not in {"mixer", "block", "logits"}:
+        raise ValueError(
+            "A Stage211 probe epoch offset requires a supported batch-profile probe phase."
+        )
+    if resume_from is not None:
+        raise ValueError("A Stage211 probe epoch offset cannot be combined with resume_from.")
+    if not bucket_manifest_active:
+        raise ValueError("A Stage211 probe epoch offset requires a bucket manifest.")
+    if any(
+        (
+            config.length_bucket_drop_last,
+            config.skip_oversized_samples,
+            config.webdataset_skip_decode_errors,
+        )
+    ):
+        raise ValueError("A Stage211 probe epoch offset requires exact-coverage loading.")
+    if epoch_steps <= 0 or offset >= epoch_steps:
+        raise ValueError(
+            "Stage211 probe epoch offset exceeds first-epoch coverage: "
+            f"offset={offset} steps={epoch_steps}"
+        )
+    return ((1, offset) if offset > 0 else (0, 0))
 
 
 def _validate_exact_batch_coverage(
@@ -7394,6 +7435,20 @@ def train_ctc_model_deepspeed(config: DeepSpeedTrainConfig) -> dict[str, float |
     best_eval_loss = float("inf")
     best_train_loss = float("inf")
     resume_from, resume_tag = _resolve_deepspeed_resume_source(config)
+    probe_epoch_batch_offset = config.stage211_batch_profile_probe_epoch_batch_offset
+    if probe_epoch_batch_offset is not None:
+        epoch_steps = len(loader)
+        start_epoch, start_epoch_batch_offset = _stage211_probe_start_state(
+            config,
+            epoch_steps=epoch_steps,
+            resume_from=resume_from,
+            bucket_manifest_active=active_bucket_manifest_path is not None,
+        )
+        if probe_epoch_batch_offset > 0:
+            _rank_zero_log(
+                "Stage211 representative-depth probe: "
+                f"epoch=1 epoch_batch_offset={probe_epoch_batch_offset}/{epoch_steps}"
+            )
     if resume_from is not None:
         load_path, client_state = engine.load_checkpoint(resume_from, tag=resume_tag)
         if load_path is None:

@@ -25,7 +25,8 @@ from rwkvasr.eval.stage211_gate import (
 )
 
 
-STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 7
+STAGE211_BATCH_PROFILE_PREFLIGHT_LEGACY_SCHEMA_VERSION = 7
+STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 8
 STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 3
 STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION = 1
 STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION = 1
@@ -491,6 +492,31 @@ def _validate_profile_config(
         "save_deepspeed_sharded_checkpoints": False,
         "output_dir": str((config_path.parent / "run").resolve()),
     }
+    if int(report["schema_version"]) >= STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION:
+        depth_fraction = report.get("probe_depth_fraction")
+        coverage = row.get("coverage")
+        if (
+            not isinstance(depth_fraction, (int, float))
+            or isinstance(depth_fraction, bool)
+            or not math.isfinite(float(depth_fraction))
+            or not 0.0 <= float(depth_fraction) < 1.0
+            or not isinstance(coverage, dict)
+        ):
+            raise ValueError(f"Stage211 batch preflight {name} probe depth is invalid.")
+        steps_per_epoch = coverage.get("steps_per_epoch")
+        if (
+            not isinstance(steps_per_epoch, int)
+            or isinstance(steps_per_epoch, bool)
+            or steps_per_epoch <= 0
+        ):
+            raise ValueError(f"Stage211 batch preflight {name} epoch coverage is invalid.")
+        expected_offset = min(
+            steps_per_epoch - 1,
+            int(math.floor(steps_per_epoch * float(depth_fraction))),
+        )
+        if row.get("probe_epoch_batch_offset") != expected_offset:
+            raise ValueError(f"Stage211 batch preflight {name} probe offset changed.")
+        expected_fields["stage211_batch_profile_probe_epoch_batch_offset"] = expected_offset
     for key, expected in expected_fields.items():
         if config.get(key) != expected:
             raise ValueError(
@@ -803,8 +829,13 @@ def validate_stage211_batch_profile_preflight(
         raise ValueError(f"Unsupported Stage211 batch profile phase: {phase!r}")
     path = Path(report_path).expanduser().resolve()
     report = _load_json_object(path, label="Stage211 batch profile preflight")
+    schema_version = report.get("schema_version")
+    if schema_version not in {
+        STAGE211_BATCH_PROFILE_PREFLIGHT_LEGACY_SCHEMA_VERSION,
+        STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
+    }:
+        raise ValueError("Stage211 batch profile preflight schema is unsupported.")
     expected = {
-        "schema_version": STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "batch_throughput_preflight",
         "phase": phase,
@@ -818,6 +849,15 @@ def validate_stage211_batch_profile_preflight(
     }
     if any(report.get(key) != value for key, value in expected.items()):
         raise ValueError("Stage211 batch profile preflight is not a formal measured report.")
+    if schema_version == STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION:
+        depth_fraction = report.get("probe_depth_fraction")
+        if (
+            not isinstance(depth_fraction, (int, float))
+            or isinstance(depth_fraction, bool)
+            or not math.isfinite(float(depth_fraction))
+            or not 0.0 <= float(depth_fraction) < 1.0
+        ):
+            raise ValueError("Stage211 batch profile preflight depth fraction is invalid.")
     if _GIT_COMMIT_PATTERN.fullmatch(str(report.get("git_commit") or "")) is None:
         raise ValueError("Stage211 batch profile preflight git commit is invalid.")
     _validate_git_bound_source(

@@ -6023,6 +6023,7 @@ def _write_retention_correction_batch_profile(
         "bucket_manifest_sha256": sha256_file(manifest),
         "warmup_steps": 20,
         "measure_steps": 100,
+        "probe_depth_fraction": 0.0,
         "formal_epochs": STAGE211_FULL_DATA_EPOCHS,
         "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
         "gpu_indices": [0, 1, 2, 3],

@@ -306,11 +306,18 @@ def build_probe_config(
     init_checkpoint: Path,
     max_steps: int,
     world_size: int,
+    epoch_batch_offset: int = 0,
 ) -> dict[str, Any]:
     if max_steps <= 1:
         raise ValueError("probe max_steps must be greater than one")
     if world_size <= 0:
         raise ValueError("world_size must be positive")
+    if (
+        not isinstance(epoch_batch_offset, int)
+        or isinstance(epoch_batch_offset, bool)
+        or epoch_batch_offset < 0
+    ):
+        raise ValueError("probe epoch batch offset must be a non-negative integer")
     resolved_num_workers = int(
         profile.num_workers
         if profile.num_workers is not None
@@ -357,6 +364,7 @@ def build_probe_config(
             "length_bucket_drop_last": False,
             "skip_oversized_samples": False,
             "webdataset_skip_decode_errors": False,
+            "stage211_batch_profile_probe_epoch_batch_offset": int(epoch_batch_offset),
         }
     )
     deepspeed = copy.deepcopy(config.get("deepspeed"))
@@ -1042,6 +1050,7 @@ def main() -> int:
     parser.add_argument("--baseline-profile", default="baseline")
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--measure-steps", type=int, default=100)
+    parser.add_argument("--probe-depth-fraction", type=float, default=0.0)
     parser.add_argument("--formal-epochs", type=int, default=3)
     parser.add_argument("--world-size", type=int, default=4)
     parser.add_argument("--master-port", type=int, default=29731)
@@ -1057,6 +1066,8 @@ def main() -> int:
 
     if args.warmup_steps <= 0 or args.measure_steps <= 0:
         parser.error("warmup and measured steps must be positive")
+    if not 0.0 <= args.probe_depth_fraction < 1.0:
+        parser.error("probe depth fraction must be in [0, 1)")
     if args.formal_epochs <= 0 or args.world_size <= 0:
         parser.error("formal epochs and world size must be positive")
     if args.max_peak_memory_gib <= 0.0 or not 0.0 <= args.min_improvement_ratio < 1.0:
@@ -1213,6 +1224,7 @@ def main() -> int:
         "bucket_manifest_sha256": sha256_file(manifest_path),
         "warmup_steps": int(args.warmup_steps),
         "measure_steps": int(args.measure_steps),
+        "probe_depth_fraction": float(args.probe_depth_fraction),
         "formal_epochs": int(args.formal_epochs),
         "world_size": int(args.world_size),
         "max_peak_memory_gib": float(args.max_peak_memory_gib),
@@ -1266,18 +1278,24 @@ def main() -> int:
             raise ValueError(
                 "Stage211 throughput preflight config enables no online teacher match fields."
             )
-        save_yaml(config_path, config)
         coverage = _profile_full_coverage(
             config,
             profile,
             world_size=int(args.world_size),
             formal_epochs=int(args.formal_epochs),
         )
+        probe_epoch_batch_offset = min(
+            int(coverage["steps_per_epoch"]) - 1,
+            int(math.floor(int(coverage["steps_per_epoch"]) * args.probe_depth_fraction)),
+        )
+        config["stage211_batch_profile_probe_epoch_batch_offset"] = probe_epoch_batch_offset
+        save_yaml(config_path, config)
         row: dict[str, Any] = {
             "profile": asdict(profile),
             "config_path": str(config_path.resolve()),
             "config_sha256": sha256_file(config_path),
             "coverage": coverage,
+            "probe_epoch_batch_offset": probe_epoch_batch_offset,
             "required_match_fields": list(required_match_fields),
             "command": _probe_command(
                 config_path,

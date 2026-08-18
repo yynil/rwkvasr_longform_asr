@@ -417,6 +417,8 @@ def _profile_preflight_command(
         "0.05",
         "--max-cosine-regression",
         "0.005",
+        "--probe-depth-fraction",
+        "0.5",
     ]
 
 

@@ -39,6 +39,7 @@ from rwkvasr.training.deepspeed_loop import (
     _select_layer_hidden_ids,
     _step_checkpoint_record_is_retained,
     _student_ctc_logits_required,
+    _stage211_probe_start_state,
     _teacher_forced_student_layer_hiddens,
     _teacher_layer_capture_ids,
     _validate_exact_batch_coverage,
@@ -74,6 +75,66 @@ def test_online_ctc_teacher_device_uses_cuda_zero_for_single_process_debug() -> 
     assert _resolve_ctc_teacher_online_device(None, torch.device("cuda", 2), local_rank=2) == "cuda:2"
     assert _resolve_ctc_teacher_online_device("cuda:1", torch.device("cuda"), local_rank=-1) == "cuda:1"
     assert _resolve_ctc_teacher_online_device(None, torch.device("cpu"), local_rank=-1) == "cpu"
+
+
+def test_stage211_probe_start_state_uses_formal_epoch_one() -> None:
+    config = DeepSpeedTrainConfig(
+        output_dir="probe",
+        deepspeed={},
+        stage211_batch_profile_probe_phase="block",
+        stage211_batch_profile_probe_epoch_batch_offset=50,
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+        webdataset_skip_decode_errors=False,
+    )
+
+    assert _stage211_probe_start_state(
+        config,
+        epoch_steps=100,
+        resume_from=None,
+        bucket_manifest_active=True,
+    ) == (1, 50)
+    assert _stage211_probe_start_state(
+        replace(config, stage211_batch_profile_probe_epoch_batch_offset=0),
+        epoch_steps=100,
+        resume_from=None,
+        bucket_manifest_active=True,
+    ) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("config_changes", "resume_from", "manifest_active", "error"),
+    (
+        ({"stage211_batch_profile_probe_phase": None}, None, True, "supported"),
+        ({}, "/checkpoint", True, "resume_from"),
+        ({}, None, False, "bucket manifest"),
+        ({"length_bucket_drop_last": True}, None, True, "exact-coverage"),
+        ({"stage211_batch_profile_probe_epoch_batch_offset": 100}, None, True, "exceeds"),
+        ({"stage211_batch_profile_probe_epoch_batch_offset": True}, None, True, "non-negative"),
+    ),
+)
+def test_stage211_probe_start_state_rejects_unsafe_offsets(
+    config_changes: dict[str, object],
+    resume_from: str | None,
+    manifest_active: bool,
+    error: str,
+) -> None:
+    config = DeepSpeedTrainConfig(
+        output_dir="probe",
+        deepspeed={},
+        stage211_batch_profile_probe_phase="block",
+        stage211_batch_profile_probe_epoch_batch_offset=50,
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+        webdataset_skip_decode_errors=False,
+    )
+    with pytest.raises(ValueError, match=error):
+        _stage211_probe_start_state(
+            replace(config, **config_changes),
+            epoch_steps=100,
+            resume_from=resume_from,
+            bucket_manifest_active=manifest_active,
+        )
 
 
 def test_online_ctc_teacher_projection_support_matches_pronunciation_mask() -> None:
