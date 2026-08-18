@@ -12,6 +12,8 @@ import pytest
 from rwkvasr.eval.stage211_gate import sha256_file
 from rwkvasr.eval.stage211_sft_public_overlap import (
     EXPECTED_DATASETS,
+    _load_profile_binding,
+    _resolve_labeled_shard,
     build_stage211_sft_public_overlap_audit,
     validate_stage211_sft_public_overlap_receipt,
 )
@@ -286,4 +288,74 @@ def test_sft_public_overlap_audit_rejects_forged_public_match(tmp_path: Path) ->
         validate_stage211_sft_public_overlap_receipt(
             receipt_path,
             require_training_ready=False,
+        )
+
+
+def test_sft_public_overlap_binds_public_clean_rebuild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile, _, _, _ = _fixture(tmp_path, overlap_train=False)
+    root = profile.parent
+    rebuild_path = root / "public_overlap_exclusion_rebuild_receipt.json"
+    _write_json(rebuild_path, {"artifact": "test-placeholder"})
+
+    def validate_rebuild(path: Path) -> dict[str, Any]:
+        assert path == rebuild_path
+        return {
+            "output_root": str(root),
+            "output_profile_path": str(profile),
+            "output_profile_sha256": sha256_file(profile),
+            "source_profile_path": str(profile),
+        }
+
+    monkeypatch.setattr(
+        "rwkvasr.eval.stage211_sft_public_clean."
+        "validate_stage211_sft_public_clean_rebuild_receipt",
+        validate_rebuild,
+    )
+
+    _, binding = _load_profile_binding(profile)
+
+    assert binding["public_clean_rebuild_receipt_path"] == str(rebuild_path)
+    assert binding["public_clean_rebuild_receipt_sha256"] == sha256_file(rebuild_path)
+    assert binding["public_clean_source_webdataset_root"] == str(root)
+
+
+def test_resolve_labeled_shard_accepts_only_bound_external_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "clean"
+    source_root = tmp_path / "source"
+    unrelated_root = tmp_path / "unrelated"
+    for directory in (root, source_root, unrelated_root):
+        directory.mkdir()
+    shard_name = "samples.tar"
+    source_shard = source_root / shard_name
+    source_shard.write_bytes(b"source")
+    unrelated_shard = unrelated_root / shard_name
+    unrelated_shard.write_bytes(b"unrelated")
+    clean_shard = root / shard_name
+    clean_shard.symlink_to(source_shard)
+
+    assert _resolve_labeled_shard(
+        root=root,
+        shard_relative=Path(shard_name),
+        trusted_source_root=source_root,
+        line_number=1,
+    ) == source_shard
+    with pytest.raises(ValueError, match="escapes its labeled root"):
+        _resolve_labeled_shard(
+            root=root,
+            shard_relative=Path(shard_name),
+            trusted_source_root=None,
+            line_number=1,
+        )
+
+    clean_shard.unlink()
+    clean_shard.symlink_to(unrelated_shard)
+    with pytest.raises(ValueError, match="unbound external shard target"):
+        _resolve_labeled_shard(
+            root=root,
+            shard_relative=Path(shard_name),
+            trusted_source_root=source_root,
+            line_number=1,
         )

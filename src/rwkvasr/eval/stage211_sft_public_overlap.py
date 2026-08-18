@@ -126,7 +126,7 @@ def _load_profile_binding(profile_path: Path) -> tuple[dict[str, Any], dict[str,
     required_counts = ("total_samples", "train_samples", "eval_samples", "source_counts")
     if any(key not in expected for key in required_counts):
         raise ValueError("Stage211D labeled profile coverage is incomplete.")
-    return profile, {
+    binding = {
         "bucket_manifest_path": str(bucket_manifest),
         "bucket_manifest_sha256": sha256_file(bucket_manifest),
         "labeled_profile_path": str(profile_path),
@@ -135,6 +135,38 @@ def _load_profile_binding(profile_path: Path) -> tuple[dict[str, Any], dict[str,
         "length_index_path": str(length_index),
         "length_index_sha256": sha256_file(length_index),
     }
+    rebuild_path = root / "public_overlap_exclusion_rebuild_receipt.json"
+    if rebuild_path.is_file():
+        from rwkvasr.eval.stage211_sft_public_clean import (
+            validate_stage211_sft_public_clean_rebuild_receipt,
+        )
+
+        rebuild = validate_stage211_sft_public_clean_rebuild_receipt(rebuild_path)
+        if (
+            Path(str(rebuild.get("output_root") or "")).resolve() != root
+            or Path(str(rebuild.get("output_profile_path") or "")).resolve()
+            != profile_path
+            or rebuild.get("output_profile_sha256") != sha256_file(profile_path)
+        ):
+            raise ValueError("Stage211D public-clean rebuild uses a different labeled profile.")
+        source_profile_path = Path(str(rebuild.get("source_profile_path") or "")).resolve()
+        source_profile = _load_json_object(
+            source_profile_path,
+            label="Stage211D public-clean source profile",
+        )
+        source_root = Path(
+            str(source_profile.get("labeled_webdataset_root") or "")
+        ).resolve()
+        if not source_root.is_dir():
+            raise ValueError("Stage211D public-clean source root is unavailable.")
+        binding.update(
+            {
+                "public_clean_rebuild_receipt_path": str(rebuild_path),
+                "public_clean_rebuild_receipt_sha256": sha256_file(rebuild_path),
+                "public_clean_source_webdataset_root": str(source_root),
+            }
+        )
+    return profile, binding
 
 
 def _load_public_fingerprints(
@@ -284,6 +316,27 @@ def _read_region(handle: BinaryIO, *, offset: int, size: int, path: Path) -> byt
     return payload
 
 
+def _resolve_labeled_shard(
+    *,
+    root: Path,
+    shard_relative: Path,
+    trusted_source_root: Path | None,
+    line_number: int,
+) -> Path:
+    shard_entry = root / shard_relative
+    shard_path = shard_entry.resolve()
+    if shard_path.is_relative_to(root):
+        return shard_path
+    if trusted_source_root is None:
+        raise ValueError(f"Stage211D row {line_number} escapes its labeled root.")
+    trusted_shard = (trusted_source_root / shard_relative).resolve()
+    if shard_path != trusted_shard:
+        raise ValueError(
+            f"Stage211D row {line_number} uses an unbound external shard target."
+        )
+    return shard_path
+
+
 def build_stage211_sft_public_overlap_audit(
     *,
     labeled_profile_path: Path,
@@ -299,6 +352,12 @@ def build_stage211_sft_public_overlap_audit(
     root = Path(labeled_binding["labeled_webdataset_root"])
     length_index = Path(labeled_binding["length_index_path"])
     profile_expected = dict(profile["expected"])
+    trusted_source_root_value = labeled_binding.get("public_clean_source_webdataset_root")
+    trusted_source_root = (
+        Path(str(trusted_source_root_value)).resolve()
+        if trusted_source_root_value is not None
+        else None
+    )
 
     split_counts: Counter[str] = Counter()
     source_counts: Counter[str] = Counter()
@@ -334,9 +393,12 @@ def build_stage211_sft_public_overlap_audit(
                 or ".." in shard_relative.parts
             ):
                 raise ValueError(f"Stage211D row {line_number} escapes its labeled root.")
-            shard_path = (root / shard_relative).resolve()
-            if not shard_path.is_relative_to(root):
-                raise ValueError(f"Stage211D row {line_number} escapes its labeled root.")
+            shard_path = _resolve_labeled_shard(
+                root=root,
+                shard_relative=shard_relative,
+                trusted_source_root=trusted_source_root,
+                line_number=line_number,
+            )
             audio_offset = int(row.get("audio_offset", -1))
             audio_size = int(row.get("audio_size", -1))
             if audio_offset < 0 or audio_size <= 0 or not shard_path.is_file():

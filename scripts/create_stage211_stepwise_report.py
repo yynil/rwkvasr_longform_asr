@@ -30,6 +30,9 @@ from rwkvasr.eval.stage211_public_metrics import (
     replay_stage211_sft_public_evidence,
 )
 from rwkvasr.eval.stage211_supplemental import STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
+from rwkvasr.eval.stage211_sft_public_clean import (
+    validate_stage211_sft_public_clean_rebuild_receipt,
+)
 from rwkvasr.eval.stage211_sft_public_overlap import (
     validate_stage211_sft_public_overlap_receipt,
 )
@@ -704,6 +707,7 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
         )
         overlap_coverage = dict(overlap_receipt["coverage"])
         overlap_result = dict(overlap_receipt["overlap"])
+        overlap_profile = dict(overlap_receipt["labeled_profile"])
         profile_binding.update(
             {
                 "public_audio_isolation_passed": True,
@@ -725,6 +729,36 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
                 "public_audio_near_duplicate_complete": False,
             }
         )
+        rebuild_path_value = overlap_profile.get("public_clean_rebuild_receipt_path")
+        if rebuild_path_value is not None:
+            rebuild_path = Path(str(rebuild_path_value)).resolve()
+            if overlap_profile.get("public_clean_rebuild_receipt_sha256") != sha256_file(
+                rebuild_path
+            ):
+                raise ValueError("Stage211 SFT public-clean rebuild receipt changed.")
+            rebuild = validate_stage211_sft_public_clean_rebuild_receipt(rebuild_path)
+            if (
+                Path(str(rebuild["output_profile_path"])).resolve() != profile_path
+                or rebuild["output_profile_sha256"] != sha256_file(profile_path)
+            ):
+                raise ValueError("Stage211 SFT public-clean rebuild profile changed.")
+            profile_binding.update(
+                {
+                    "public_clean_rebuild_passed": True,
+                    "public_clean_rebuild_receipt_path": str(rebuild_path),
+                    "public_clean_rebuild_receipt_sha256": sha256_file(rebuild_path),
+                    "public_clean_exclusion_reason": rebuild["exclusion_reason"],
+                    "public_clean_exclusions_rows": int(rebuild["exclusions_rows"]),
+                    "public_clean_rejected_training_overlap_rows": int(
+                        rebuild["rejected_overlap_training_rows"]
+                    ),
+                    "public_clean_rejected_internal_eval_overlap_rows": int(
+                        rebuild["rejected_overlap_internal_eval_rows"]
+                    ),
+                    "public_clean_source_profile_path": rebuild["source_profile_path"],
+                    "public_clean_source_profile_sha256": rebuild["source_profile_sha256"],
+                }
+            )
     else:
         labeled_expected = dict(LABELED_EXPECTED)
         expected_source_counts = STAGE211_LABELED_SOURCE_COUNTS

@@ -8027,9 +8027,12 @@ def test_stage211_continuation_watcher_is_hourly_and_restart_safe() -> None:
     assert ".interval_steps == 2000" in script
     assert '.source_order == ["labeled_sft"]' in script
     assert "stage211_full_labeled_profile_valid" in script
-    assert "$labels.total_samples == 1425343" in script
-    assert ".steps == 37506" in script
-    assert ".step_eval_cadence.total_reports == 19" in script
+    assert "$labels.total_samples == ($labels.train_samples + $labels.eval_samples)" in script
+    assert "$labels.public_clean_rebuild_passed == true" in script
+    assert "$labels.public_clean_exclusions_rows == 21" in script
+    assert "$labels.public_audio_scanned_rows == $labels.total_samples" in script
+    assert "$sft.steps > 0" in script
+    assert "$sft.step_eval_cadence.sources[0].terminal_step == $sft.steps" in script
     assert "stage211_requested_nano_gaps_valid" in script
     assert "english_wer_gap_to_nano" in script
     assert "chinese_cer_gap_to_nano" in script
@@ -8373,9 +8376,35 @@ def _run_stage211_continuation_watcher_fixture(
         'mv "${output_json}.tmp" "${output_json}"\n'
         'trajectory=\'{"gate_passed":true,"fixed_eval_samples":256,"source_order":["easy","medium","hard","long","supplemental_natural"],"terminal_entries":5,"best_prior_loss":0.1,"candidate_loss":0.105,"relative_regression_pct":5.0,"max_relative_regression_pct":10.0}\'\n'
         'phase_cadence=\'{"complete":true,"interval_steps":10000,"eval_samples_per_report":256,"source_order":["easy","medium","hard","long","supplemental_natural"],"source_count":5,"total_reports":5,"sources":[{"source":"easy","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"medium","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"hard","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"long","terminal_step":3,"report_count":1,"eval_samples_per_report":256},{"source":"supplemental_natural","terminal_step":3,"report_count":1,"eval_samples_per_report":256}]}\'\n'
-        'sft_cadence=\'{"complete":true,"interval_steps":2000,"eval_samples_per_report":256,"source_order":["labeled_sft"],"source_count":1,"total_reports":19,"sources":[{"source":"labeled_sft","terminal_step":37506,"report_count":19,"eval_samples_per_report":256}]}\'\n'
-        'full_labeled_profile=\'{"labeled_profile_schema_version":2,"labeled_profile_receipt_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","all_accepted_unique_rows_required":true,"source_language_interleave_required":true,"train_samples":1418201,"eval_samples":7142,"total_samples":1425343,"unique_utterance_ids":1425343,"pronunciation_target_samples":1425343,"ctc_feasible_samples":1425343,"ctc_tokens":21711995,"ctc_unk_tokens":0,"ctc_forbidden_tokens":0,"source_counts":{"aishell3":63262,"commonvoice_cn":32712,"commonvoice_en":1109477,"librispeech":219892},"language_counts":{"en":1329369,"zh":95974},"public_audio_isolation_passed":true,"public_audio_overlap_receipt_sha256":"9999999999999999999999999999999999999999999999999999999999999999","public_audio_comparison_mode":"exact_encoded_audio_bytes","public_audio_size_prefilter_lossless_for_exact_bytes":true,"public_audio_scanned_rows":1425343,"public_audio_public_rows":52436,"public_audio_training_overlap_rows":0,"public_audio_internal_eval_overlap_rows":0,"public_audio_normalized_pcm_complete":false,"public_audio_near_duplicate_complete":false}\'\n'
-        'sft_coverage=\'{"unique_or_train_rows":1418201,"evaluation_rows":7142,"hours_per_epoch":2421.999430555555,"epochs":1,"row_exposures":1418201,"hour_exposures":2421.999430555555,"steps":37506,"tail_padding_sample_exposures":567,"executed_sample_exposures":1418768}\'\n'
+        'sft_cadence=\'{"complete":true,"interval_steps":2000,"eval_samples_per_report":256,"source_order":["labeled_sft"],"source_count":1,"total_reports":19,"sources":[{"source":"labeled_sft","terminal_step":37505,"report_count":19,"eval_samples_per_report":256}]}\'\n'
+        'full_labeled_profile=\'{"labeled_profile_schema_version":2,'
+        '"labeled_profile_receipt_path":"/proof/clean-profile.json",'
+        '"labeled_profile_receipt_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",'
+        '"all_accepted_unique_rows_required":true,"source_language_interleave_required":true,'
+        '"train_samples":1418180,"eval_samples":7142,"total_samples":1425322,'
+        '"unique_utterance_ids":1425322,"pronunciation_target_samples":1425322,'
+        '"ctc_feasible_samples":1425322,"ctc_tokens":21711822,"ctc_unk_tokens":0,'
+        '"ctc_forbidden_tokens":0,"source_counts":{"aishell3":63262,'
+        '"commonvoice_cn":32712,"commonvoice_en":1109456,"librispeech":219892},'
+        '"language_counts":{"en":1329348,"zh":95974},'
+        '"public_clean_rebuild_passed":true,'
+        '"public_clean_rebuild_receipt_sha256":"8888888888888888888888888888888888888888888888888888888888888888",'
+        '"public_clean_source_profile_sha256":"7777777777777777777777777777777777777777777777777777777777777777",'
+        '"public_clean_exclusion_reason":"public_evaluation_overlap_exact_encoded_audio",'
+        '"public_clean_exclusions_rows":21,"public_clean_rejected_training_overlap_rows":21,'
+        '"public_clean_rejected_internal_eval_overlap_rows":0,'
+        '"public_audio_isolation_passed":true,'
+        '"public_audio_overlap_receipt_sha256":"9999999999999999999999999999999999999999999999999999999999999999",'
+        '"public_audio_comparison_mode":"exact_encoded_audio_bytes",'
+        '"public_audio_size_prefilter_lossless_for_exact_bytes":true,'
+        '"public_audio_scanned_rows":1425322,"public_audio_public_rows":52436,'
+        '"public_audio_training_overlap_rows":0,"public_audio_internal_eval_overlap_rows":0,'
+        '"public_audio_normalized_pcm_complete":false,'
+        '"public_audio_near_duplicate_complete":false}\'\n'
+        'sft_coverage=\'{"unique_or_train_rows":1418180,"evaluation_rows":7142,'
+        '"hours_per_epoch":2421.973575,"epochs":1,"row_exposures":1418180,'
+        '"hour_exposures":2421.973575,"steps":37505,'
+        '"tail_padding_sample_exposures":552,"executed_sample_exposures":1418732}\'\n'
         'if [[ "${SFT_CORRECTION_MODE}" == corrected ]]; then\n'
         '  sft_correction=\'{"schema_version":1,"applied":true,"rounds":1,"unique_rows_per_round":191024,"row_exposures":191024,"hour_exposures":309.737461,"steps":5147,"tail_padding_sample_exposures":432,"executed_sample_exposures":191456,"language_row_exposures":{"en":95512,"zh":95512},"source_row_exposures":{"aishell3":62952,"commonvoice_cn":32560,"commonvoice_en":47756,"librispeech":47756},"full_sft_completion_path":"/proof/sft_complete.json","full_sft_completion_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","correction_profile_path":"/proof/correction_profile.json","correction_profile_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","initial_checkpoint_path":"/proof/full_sft.pt","initial_checkpoint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","final_checkpoint_path":"/proof/corrected.pt","final_checkpoint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","round_receipts":[{"round":1,"receipt_path":"/proof/round1.json","receipt_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","init_checkpoint_path":"/proof/full_sft.pt","init_checkpoint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","completion_checkpoint_path":"/proof/corrected.pt","completion_checkpoint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","row_exposures":191024,"hour_exposures":309.737461,"steps":5147,"tail_padding_sample_exposures":432,"executed_sample_exposures":191456}]}\'\n'
         "else\n"
@@ -8407,6 +8436,9 @@ def _run_stage211_continuation_watcher_fixture(
         '  mv "${output_json}.tmp" "${output_json}"\n'
         'elif [[ "${UV_MODE}" == missing_sft_public_isolation ]]; then\n'
         '  jq \'del(.ctc_label_proof.public_audio_isolation_passed)\' "${output_json}" >"${output_json}.tmp"\n'
+        '  mv "${output_json}.tmp" "${output_json}"\n'
+        'elif [[ "${UV_MODE}" == missing_sft_public_clean ]]; then\n'
+        '  jq \'del(.ctc_label_proof.public_clean_rebuild_passed)\' "${output_json}" >"${output_json}.tmp"\n'
         '  mv "${output_json}.tmp" "${output_json}"\n'
         'elif [[ "${UV_MODE}" == missing_sft_correction_coverage ]]; then\n'
         '  jq \'.sft_correction_evidence = null\' "${output_json}" >"${output_json}.tmp"\n'
@@ -8647,6 +8679,20 @@ def test_stage211_continuation_watcher_requires_sft_public_audio_isolation(
     result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
         tmp_path,
         uv_mode="missing_sft_public_isolation",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "full-labeled profile proof failed validation" in result.stdout
+    assert "START_STAGE=full" in result.stdout
+    assert "new-session" in tmux_calls
+
+
+def test_stage211_continuation_watcher_requires_sft_public_clean_rebuild(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="missing_sft_public_clean",
     )
 
     assert result.returncode == 0, result.stderr
