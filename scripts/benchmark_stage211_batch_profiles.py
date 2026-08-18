@@ -544,6 +544,28 @@ def _probe_command(config_path: Path, *, world_size: int, master_port: int) -> l
     ]
 
 
+def _probe_environment(
+    *,
+    base: dict[str, str] | None = None,
+    python_executable: str | Path | None = None,
+) -> dict[str, str]:
+    environment = dict(os.environ if base is None else base)
+    interpreter_dir = str(Path(python_executable or sys.executable).resolve().parent)
+    current_path = environment.get("PATH", "")
+    path_entries = [entry for entry in current_path.split(os.pathsep) if entry]
+    environment["PATH"] = os.pathsep.join(
+        [interpreter_dir, *(entry for entry in path_entries if entry != interpreter_dir)]
+    )
+    environment.update(
+        {
+            "PYTHONUNBUFFERED": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+            "WANDB_MODE": "disabled",
+        }
+    )
+    return environment
+
+
 def run_profile(
     *,
     profile: BatchProfile,
@@ -554,14 +576,7 @@ def run_profile(
     memory_poll_seconds: float,
 ) -> dict[str, Any]:
     command = _probe_command(config_path, world_size=world_size, master_port=master_port)
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "PYTHONUNBUFFERED": "1",
-            "TOKENIZERS_PARALLELISM": "false",
-            "WANDB_MODE": "disabled",
-        }
-    )
+    environment = _probe_environment()
     telemetry: list[TrainTelemetry] = []
     tail: deque[str] = deque(maxlen=80)
     peaks: dict[int, float] = {}

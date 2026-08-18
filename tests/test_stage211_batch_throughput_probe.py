@@ -185,6 +185,23 @@ def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> No
     assert executable.stage211_batch_profile_probe_phase == "mixer"
 
 
+def test_probe_environment_exposes_active_virtualenv_tools(tmp_path: Path) -> None:
+    interpreter = tmp_path / ".venv" / "bin" / "python"
+    environment = probe._probe_environment(
+        base={"PATH": "/usr/local/bin:/usr/bin"},
+        python_executable=interpreter,
+    )
+
+    assert environment["PATH"].split(":") == [
+        str(interpreter.parent.resolve()),
+        "/usr/local/bin",
+        "/usr/bin",
+    ]
+    assert environment["PYTHONUNBUFFERED"] == "1"
+    assert environment["TOKENIZERS_PARALLELISM"] == "false"
+    assert environment["WANDB_MODE"] == "disabled"
+
+
 def test_loader_worker_selection_requires_measured_ten_percent_gain() -> None:
     provenance = {"eval": "same"}
 
