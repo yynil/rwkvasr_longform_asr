@@ -25,9 +25,11 @@ from rwkvasr.data import (
     load_webdataset_bucket_manifest,
 )
 from rwkvasr.eval.stage211_batch_profile import (
+    CandidateDominancePolicy,
     STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
     STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
     STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
+    candidate_dominance_evidence,
     validate_stage211_batch_profile_fixed_eval,
 )
 from rwkvasr.eval.stage211_gate import STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES
@@ -68,13 +70,13 @@ class BatchProfile:
 
 DEFAULT_PROFILES = (
     BatchProfile("baseline", 36, 24_000, 8, False),
-    BatchProfile("batch48_frames42k", 48, 42_000, 8, False),
-    BatchProfile("batch64_frames56k", 64, 56_000, 8, False),
-    BatchProfile("batch80_frames70k", 80, 70_000, 8, False),
-    BatchProfile("batch96_frames84k", 96, 84_000, 8, False),
-    BatchProfile("batch128_frames112k", 128, 112_000, 8, False),
-    BatchProfile("batch160_frames140k", 160, 140_000, 8, False),
-    BatchProfile("batch192_frames168k", 192, 168_000, 8, False),
+    BatchProfile("batch48_frames28k", 48, 28_000, 8, False),
+    BatchProfile("batch64_frames32k", 64, 32_000, 8, False),
+    BatchProfile("batch80_frames36k", 80, 36_000, 8, False),
+    BatchProfile("batch96_frames40k", 96, 40_000, 8, False),
+    BatchProfile("batch128_frames48k", 128, 48_000, 8, False),
+    BatchProfile("batch160_frames56k", 160, 56_000, 8, False),
+    BatchProfile("batch192_frames64k", 192, 64_000, 8, False),
 )
 BLOCK_DEFAULT_PROFILES = (
     BatchProfile(
@@ -574,6 +576,7 @@ def run_profile(
     world_size: int,
     master_port: int,
     memory_poll_seconds: float,
+    dominance_policy: CandidateDominancePolicy | None = None,
 ) -> dict[str, Any]:
     command = _probe_command(config_path, world_size=world_size, master_port=master_port)
     environment = _probe_environment()
@@ -581,6 +584,7 @@ def run_profile(
     tail: deque[str] = deque(maxlen=80)
     peaks: dict[int, float] = {}
     monitor_errors: list[str] = []
+    early_termination: dict[str, Any] | None = None
     stop = threading.Event()
     monitor = threading.Thread(
         target=_monitor_gpu_memory,
@@ -618,6 +622,27 @@ def run_profile(
                             f"step={point.step} loss={point.loss:.6f}",
                             flush=True,
                         )
+                    if dominance_policy is not None and early_termination is None:
+                        early_termination = candidate_dominance_evidence(
+                            [asdict(row) for row in telemetry],
+                            dominance_policy,
+                        )
+                        if early_termination is not None:
+                            marker = (
+                                "[stage211-throughput] candidate_dominated "
+                                f"profile={profile.name} step={point.step} "
+                                "window_projected_seconds="
+                                f"{early_termination['window_projected_full_coverage_seconds']:.3f} "
+                                "median_projected_seconds="
+                                f"{early_termination['median_projected_full_coverage_seconds']:.3f} "
+                                "rejection_limit_seconds="
+                                f"{early_termination['rejection_limit_seconds']:.3f}"
+                            )
+                            log.write(marker + "\n")
+                            log.flush()
+                            tail.append(marker)
+                            print(marker, flush=True)
+                            process.terminate()
             return_code = process.wait()
         except BaseException:
             process.terminate()
@@ -642,6 +667,7 @@ def run_profile(
         "gpu_peak_memory_gib": {str(index): value for index, value in sorted(peaks.items())},
         "gpu_memory_monitor_errors": monitor_errors,
         "telemetry": [asdict(point) for point in telemetry],
+        "early_termination": early_termination,
         "error_tail": list(tail) if return_code != 0 else [],
     }
 
@@ -1020,6 +1046,8 @@ def main() -> int:
     parser.add_argument("--max-loss-regression-ratio", type=float, default=0.05)
     parser.add_argument("--max-cosine-regression", type=float, default=0.005)
     parser.add_argument("--memory-poll-seconds", type=float, default=0.25)
+    parser.add_argument("--candidate-dominance-ratio", type=float, default=4.0)
+    parser.add_argument("--candidate-dominance-min-points", type=int, default=12)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -1033,6 +1061,10 @@ def main() -> int:
         parser.error("quality regression limits must be non-negative")
     if args.memory_poll_seconds <= 0.0:
         parser.error("memory poll interval must be positive")
+    if args.candidate_dominance_ratio <= 1.0:
+        parser.error("candidate dominance ratio must be greater than one")
+    if args.candidate_dominance_min_points < 3:
+        parser.error("candidate dominance minimum points must be at least three")
 
     base_config_path = args.base_config.expanduser().resolve()
     init_checkpoint = args.init_checkpoint.expanduser().resolve()
@@ -1183,6 +1215,15 @@ def main() -> int:
         "min_improvement_ratio": float(args.min_improvement_ratio),
         "max_loss_regression_ratio": float(args.max_loss_regression_ratio),
         "max_cosine_regression": float(args.max_cosine_regression),
+        "candidate_dominance": {
+            "enabled_for_capacity_candidates_only": True,
+            "rejection_ratio": float(args.candidate_dominance_ratio),
+            "min_points": int(args.candidate_dominance_min_points),
+            "excluded_profiles": [
+                str(args.baseline_profile),
+                *([worker_candidate_name] if worker_candidate_name is not None else []),
+            ],
+        },
         "loader_worker_search": loader_worker_search,
         "profiles": [],
     }
@@ -1244,6 +1285,31 @@ def main() -> int:
             row["status"] = "dry_run"
         else:
             try:
+                dominance_policy = None
+                if profile.name not in {str(args.baseline_profile), worker_candidate_name}:
+                    baseline_row = next(
+                        (
+                            completed
+                            for completed in report["profiles"]
+                            if completed["profile"]["name"] == str(args.baseline_profile)
+                        ),
+                        None,
+                    )
+                    baseline_seconds = (
+                        baseline_row.get("summary", {}).get(
+                            "projected_full_coverage_seconds"
+                        )
+                        if isinstance(baseline_row, dict)
+                        else None
+                    )
+                    if isinstance(baseline_seconds, (float, int)) and baseline_seconds > 0:
+                        dominance_policy = CandidateDominancePolicy(
+                            full_coverage_steps=int(coverage["full_coverage_steps"]),
+                            baseline_projected_full_coverage_seconds=float(baseline_seconds),
+                            min_improvement_ratio=float(args.min_improvement_ratio),
+                            rejection_ratio=float(args.candidate_dominance_ratio),
+                            min_points=int(args.candidate_dominance_min_points),
+                        )
                 result = run_profile(
                     profile=profile,
                     config_path=config_path,
@@ -1251,6 +1317,7 @@ def main() -> int:
                     world_size=int(args.world_size),
                     master_port=int(args.master_port) + profile_index,
                     memory_poll_seconds=float(args.memory_poll_seconds),
+                    dominance_policy=dominance_policy,
                 )
                 row.update(result)
                 fixed_eval_capture = _capture_probe_fixed_eval(

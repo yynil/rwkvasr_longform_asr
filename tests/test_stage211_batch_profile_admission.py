@@ -10,10 +10,12 @@ import pytest
 
 from rwkvasr.config import load_yaml, save_yaml
 from rwkvasr.eval.stage211_batch_profile import (
+    CandidateDominancePolicy,
     STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
     STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
     STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
     build_stage211_batch_profile_admission,
+    candidate_dominance_evidence,
     validate_stage211_batch_profile_fixed_eval,
     validate_stage211_batch_profile_admission,
     validate_stage211_batch_profile_preflight,
@@ -341,6 +343,12 @@ def _report(
         "min_improvement_ratio": 0.10,
         "max_loss_regression_ratio": 0.05,
         "max_cosine_regression": 0.005,
+        "candidate_dominance": {
+            "enabled_for_capacity_candidates_only": True,
+            "rejection_ratio": 4.0,
+            "min_points": 12,
+            "excluded_profiles": ["baseline"],
+        },
         "loader_worker_search": {
             "schema_version": 1,
             "mode": "explicit_profiles",
@@ -434,6 +442,7 @@ def _worker_only_report(tmp_path: Path) -> Path:
         "selected_profile": candidate_name,
         "selected_num_workers": 2,
     }
+    report["candidate_dominance"]["excluded_profiles"] = ["baseline", candidate_name]
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report_path
 
@@ -464,6 +473,97 @@ def test_measured_phase_specific_profile_can_be_admitted(tmp_path: Path) -> None
         "num_workers": 8,
         "gradient_checkpointing": False,
     }
+
+
+def test_dominated_capacity_candidate_is_replayed_and_tamper_evident(tmp_path: Path) -> None:
+    report_path = _report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    baseline = report["profiles"][0]
+    candidate = report["profiles"][1]
+    telemetry = [
+        {
+            "step": step,
+            "elapsed_seconds": step * 10.0,
+            "loss": 0.1,
+            "cosine": 0.97,
+            "match_count": 8,
+            "match_total": 8,
+            "missing_total": 0,
+            "max_abs_frame_delta": 0,
+            "match_fields": {"online_layer_match": [8, 8]},
+        }
+        for step in range(1, 13)
+    ]
+    policy = CandidateDominancePolicy(
+        full_coverage_steps=int(candidate["coverage"]["full_coverage_steps"]),
+        baseline_projected_full_coverage_seconds=float(
+            baseline["summary"]["projected_full_coverage_seconds"]
+        ),
+        min_improvement_ratio=float(report["min_improvement_ratio"]),
+        rejection_ratio=float(report["candidate_dominance"]["rejection_ratio"]),
+        min_points=int(report["candidate_dominance"]["min_points"]),
+    )
+    termination = candidate_dominance_evidence(telemetry, policy)
+    assert termination is not None
+    fixed_eval_path = Path(candidate["fixed_eval_capture"]["report_path"])
+    fixed_eval_path.unlink()
+    candidate.update(
+        {
+            "return_code": -15,
+            "telemetry": telemetry,
+            "early_termination": termination,
+        }
+    )
+    candidate["fixed_eval_capture"].update({"captured": False, "report_sha256": None})
+    candidate["summary"].update(
+        {
+            "process_ok": False,
+            "complete_steps": False,
+            "safety_pass": False,
+            "fixed_eval_complete": False,
+            "fixed_eval_provenance": None,
+            "mean_loss": None,
+            "mean_cosine": None,
+            "projected_full_coverage_seconds": None,
+        }
+    )
+    report["selection"].update(
+        {
+            "decision": "keep_baseline",
+            "recommended_profile": "baseline",
+            "recommended_improvement_ratio": 0.0,
+        }
+    )
+    report["selection"]["comparisons"][0].update(
+        {
+            "projected_full_coverage_seconds": None,
+            "improvement_ratio": None,
+            "mean_loss": None,
+            "loss_regression_ratio": None,
+            "mean_cosine": None,
+            "cosine_regression": None,
+            "fixed_eval_provenance_match": False,
+            "quality_pass": False,
+            "admissible": False,
+        }
+    )
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    validated = validate_stage211_batch_profile_preflight(
+        report_path,
+        phase="mixer",
+        require_candidate=False,
+    )
+    assert validated["selected_profile_name"] == "baseline"
+
+    report["profiles"][1]["early_termination"]["window_last_step"] = 11
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="dominance evidence changed"):
+        validate_stage211_batch_profile_preflight(
+            report_path,
+            phase="mixer",
+            require_candidate=False,
+        )
 
 
 def test_worker_only_profile_is_measured_admitted_and_tamper_evident(

@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import math
 import re
+import statistics
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from rwkvasr.config import load_yaml
 from rwkvasr.eval.stage211_gate import (
@@ -21,7 +23,7 @@ from rwkvasr.eval.stage211_gate import (
 )
 
 
-STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 6
+STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 7
 STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 3
 STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION = 1
 STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION = 1
@@ -59,6 +61,93 @@ _FIXED_EVAL_LOGIT_METRICS = (
     "matched_utterances",
     "missing_utterances",
 )
+
+
+@dataclass(frozen=True)
+class CandidateDominancePolicy:
+    full_coverage_steps: int
+    baseline_projected_full_coverage_seconds: float
+    min_improvement_ratio: float
+    rejection_ratio: float = 4.0
+    min_points: int = 12
+
+
+def candidate_dominance_evidence(
+    points: list[Mapping[str, Any]],
+    policy: CandidateDominancePolicy,
+) -> dict[str, Any] | None:
+    if policy.full_coverage_steps <= 0:
+        raise ValueError("candidate dominance requires positive full-coverage steps")
+    if policy.baseline_projected_full_coverage_seconds <= 0.0:
+        raise ValueError("candidate dominance requires positive baseline coverage time")
+    if not 0.0 <= policy.min_improvement_ratio < 1.0:
+        raise ValueError("candidate dominance improvement ratio must be in [0, 1)")
+    if policy.rejection_ratio <= 1.0 or policy.min_points < 3:
+        raise ValueError("candidate dominance requires rejection_ratio > 1 and min_points >= 3")
+    normalized: dict[int, tuple[float, Mapping[str, Any]]] = {}
+    for point in points:
+        step = point.get("step")
+        elapsed_seconds = point.get("elapsed_seconds")
+        if (
+            not isinstance(step, int)
+            or isinstance(step, bool)
+            or step <= 0
+            or not isinstance(elapsed_seconds, (float, int))
+            or isinstance(elapsed_seconds, bool)
+            or not math.isfinite(float(elapsed_seconds))
+            or float(elapsed_seconds) <= 0.0
+        ):
+            raise ValueError("candidate dominance telemetry is invalid")
+        normalized[step] = (float(elapsed_seconds), point)
+    ordered = [normalized[step] for step in sorted(normalized)]
+    if len(ordered) < policy.min_points:
+        return None
+    window = ordered[-policy.min_points :]
+    intervals = [
+        (right[0] - left[0]) / (int(right[1]["step"]) - int(left[1]["step"]))
+        for left, right in zip(window, window[1:])
+        if int(right[1]["step"]) > int(left[1]["step"]) and right[0] > left[0]
+    ]
+    if len(intervals) != policy.min_points - 1:
+        return None
+    elapsed = window[-1][0] - window[0][0]
+    completed_steps = int(window[-1][1]["step"]) - int(window[0][1]["step"])
+    if elapsed <= 0.0 or completed_steps <= 0:
+        return None
+    window_rate = completed_steps / elapsed
+    median_seconds_per_step = statistics.median(intervals)
+    if window_rate <= 0.0 or median_seconds_per_step <= 0.0:
+        return None
+    median_rate = 1.0 / median_seconds_per_step
+    admissible_seconds = policy.baseline_projected_full_coverage_seconds * (
+        1.0 - policy.min_improvement_ratio
+    )
+    rejection_limit_seconds = admissible_seconds * policy.rejection_ratio
+    window_projected_seconds = policy.full_coverage_steps / window_rate
+    median_projected_seconds = policy.full_coverage_steps / median_rate
+    if min(window_projected_seconds, median_projected_seconds) <= rejection_limit_seconds:
+        return None
+    return {
+        "artifact": "candidate_dominance_termination",
+        "complete": True,
+        "reason": "mathematically_dominated_after_conservative_probe_window",
+        "observed_points": len(ordered),
+        "window_points": len(window),
+        "window_first_step": int(window[0][1]["step"]),
+        "window_last_step": int(window[-1][1]["step"]),
+        "window_rate_steps_per_second": window_rate,
+        "median_rate_steps_per_second": median_rate,
+        "full_coverage_steps": policy.full_coverage_steps,
+        "baseline_projected_full_coverage_seconds": (
+            policy.baseline_projected_full_coverage_seconds
+        ),
+        "min_improvement_ratio": policy.min_improvement_ratio,
+        "maximum_admissible_coverage_seconds": admissible_seconds,
+        "rejection_ratio": policy.rejection_ratio,
+        "rejection_limit_seconds": rejection_limit_seconds,
+        "window_projected_full_coverage_seconds": window_projected_seconds,
+        "median_projected_full_coverage_seconds": median_projected_seconds,
+    }
 
 
 def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
@@ -707,6 +796,24 @@ def validate_stage211_batch_profile_preflight(
         or float(report["max_cosine_regression"]) < 0.0
     ):
         raise ValueError("Stage211 batch preflight thresholds are invalid.")
+    dominance = report.get("candidate_dominance")
+    if not isinstance(dominance, dict):
+        raise ValueError("Stage211 batch preflight candidate-dominance contract is missing.")
+    rejection_ratio = dominance.get("rejection_ratio")
+    minimum_points = dominance.get("min_points")
+    excluded_profiles = dominance.get("excluded_profiles")
+    if (
+        dominance.get("enabled_for_capacity_candidates_only") is not True
+        or not isinstance(rejection_ratio, (float, int))
+        or isinstance(rejection_ratio, bool)
+        or float(rejection_ratio) <= 1.0
+        or not isinstance(minimum_points, int)
+        or isinstance(minimum_points, bool)
+        or minimum_points < 3
+        or not isinstance(excluded_profiles, list)
+        or not all(isinstance(name, str) and name for name in excluded_profiles)
+    ):
+        raise ValueError("Stage211 batch preflight candidate-dominance contract is invalid.")
     gpu_indices = report.get("gpu_indices")
     if not isinstance(gpu_indices, list) or len(gpu_indices) != STAGE211_FULL_DATA_WORLD_SIZE:
         raise ValueError("Stage211 batch preflight does not bind all four GPUs.")
@@ -763,11 +870,24 @@ def validate_stage211_batch_profile_preflight(
     if baseline_profile not in supported_baselines:
         raise ValueError("Stage211 batch preflight baseline is unsupported for this phase.")
     baseline = _validate_safe_profile(by_name[baseline_name], report=report, phase=phase)
+    if baseline.get("early_termination") is not None:
+        raise ValueError("Stage211 batch preflight baseline cannot be dominance-terminated.")
     baseline_summary = baseline["summary"]
     baseline_seconds = float(baseline_summary["projected_full_coverage_seconds"])
     baseline_loss = float(baseline_summary["mean_loss"])
     baseline_cosine = float(baseline_summary["mean_cosine"])
     baseline_fixed_eval_provenance = baseline_summary["fixed_eval_provenance"]
+    worker_candidate_name = report["loader_worker_search"].get("candidate_profile")
+    expected_excluded_profiles = [
+        baseline_name,
+        *(
+            [worker_candidate_name]
+            if isinstance(worker_candidate_name, str) and worker_candidate_name
+            else []
+        ),
+    ]
+    if excluded_profiles != expected_excluded_profiles:
+        raise ValueError("Stage211 batch preflight dominance exclusions changed.")
     comparisons = selection.get("comparisons")
     if not isinstance(comparisons, list):
         raise ValueError("Stage211 batch preflight candidate comparisons are missing.")
@@ -792,6 +912,41 @@ def validate_stage211_batch_profile_preflight(
             raise ValueError(f"Stage211 batch preflight {candidate_name} summary is missing.")
         if summary.get("safety_pass") is True:
             _validate_safe_profile(candidate_row, report=report, phase=phase)
+        early_termination = candidate_row.get("early_termination")
+        if candidate_name in excluded_profiles:
+            if early_termination is not None:
+                raise ValueError(
+                    f"Stage211 batch preflight {candidate_name} is excluded from dominance termination."
+                )
+        elif early_termination is not None:
+            telemetry = candidate_row.get("telemetry")
+            coverage = candidate_row.get("coverage")
+            if not isinstance(telemetry, list) or not isinstance(coverage, dict):
+                raise ValueError(
+                    f"Stage211 batch preflight {candidate_name} dominance evidence is incomplete."
+                )
+            replayed_termination = candidate_dominance_evidence(
+                telemetry,
+                CandidateDominancePolicy(
+                    full_coverage_steps=int(coverage.get("full_coverage_steps", 0)),
+                    baseline_projected_full_coverage_seconds=baseline_seconds,
+                    min_improvement_ratio=float(report["min_improvement_ratio"]),
+                    rejection_ratio=float(rejection_ratio),
+                    min_points=int(minimum_points),
+                ),
+            )
+            if replayed_termination is None or early_termination != replayed_termination:
+                raise ValueError(
+                    f"Stage211 batch preflight {candidate_name} dominance evidence changed."
+                )
+            if (
+                int(candidate_row.get("return_code", 0)) == 0
+                or summary.get("safety_pass") is True
+                or candidate_row["fixed_eval_capture"].get("captured") is True
+            ):
+                raise ValueError(
+                    f"Stage211 batch preflight {candidate_name} dominance termination is inconsistent."
+                )
         candidate_seconds_value = summary.get("projected_full_coverage_seconds")
         candidate_loss_value = summary.get("mean_loss")
         candidate_cosine_value = summary.get("mean_cosine")

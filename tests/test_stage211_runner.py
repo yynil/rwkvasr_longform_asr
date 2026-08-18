@@ -5890,6 +5890,12 @@ def _write_retention_correction_batch_profile(
         "min_improvement_ratio": 0.10,
         "max_loss_regression_ratio": 0.05,
         "max_cosine_regression": 0.005,
+        "candidate_dominance": {
+            "enabled_for_capacity_candidates_only": True,
+            "rejection_ratio": 4.0,
+            "min_points": 12,
+            "excluded_profiles": ["baseline"],
+        },
         "loader_worker_search": {
             "schema_version": 1,
             "mode": "explicit_profiles",

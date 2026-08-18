@@ -19,14 +19,65 @@ probe = importlib.import_module("scripts.benchmark_stage211_batch_profiles")
 def test_default_profiles_cover_baseline_and_seven_larger_candidates() -> None:
     assert probe.DEFAULT_PROFILES == (
         probe.BatchProfile("baseline", 36, 24_000, 8, False),
-        probe.BatchProfile("batch48_frames42k", 48, 42_000, 8, False),
-        probe.BatchProfile("batch64_frames56k", 64, 56_000, 8, False),
-        probe.BatchProfile("batch80_frames70k", 80, 70_000, 8, False),
-        probe.BatchProfile("batch96_frames84k", 96, 84_000, 8, False),
-        probe.BatchProfile("batch128_frames112k", 128, 112_000, 8, False),
-        probe.BatchProfile("batch160_frames140k", 160, 140_000, 8, False),
-        probe.BatchProfile("batch192_frames168k", 192, 168_000, 8, False),
+        probe.BatchProfile("batch48_frames28k", 48, 28_000, 8, False),
+        probe.BatchProfile("batch64_frames32k", 64, 32_000, 8, False),
+        probe.BatchProfile("batch80_frames36k", 80, 36_000, 8, False),
+        probe.BatchProfile("batch96_frames40k", 96, 40_000, 8, False),
+        probe.BatchProfile("batch128_frames48k", 128, 48_000, 8, False),
+        probe.BatchProfile("batch160_frames56k", 160, 56_000, 8, False),
+        probe.BatchProfile("batch192_frames64k", 192, 64_000, 8, False),
     )
+
+
+def _dominance_point(step: int, elapsed_seconds: float) -> dict[str, object]:
+    return {
+        "step": step,
+        "elapsed_seconds": elapsed_seconds,
+        "loss": 0.1,
+        "cosine": 0.97,
+        "match_count": 8,
+        "match_total": 8,
+        "missing_total": 0,
+        "max_abs_frame_delta": 0,
+    }
+
+
+def test_candidate_dominance_requires_enough_consistently_slow_points() -> None:
+    policy = probe.CandidateDominancePolicy(
+        full_coverage_steps=1_000,
+        baseline_projected_full_coverage_seconds=1_000.0,
+        min_improvement_ratio=0.10,
+        rejection_ratio=4.0,
+        min_points=12,
+    )
+    first_eleven = [_dominance_point(step, step * 10.0) for step in range(1, 12)]
+    evidence = probe.candidate_dominance_evidence(
+        [*first_eleven, _dominance_point(12, 120.0)],
+        policy,
+    )
+
+    assert probe.candidate_dominance_evidence(first_eleven, policy) is None
+    assert evidence is not None
+    assert evidence["window_first_step"] == 1
+    assert evidence["window_last_step"] == 12
+    assert evidence["rejection_limit_seconds"] == pytest.approx(3_600.0)
+    assert evidence["window_projected_full_coverage_seconds"] == pytest.approx(10_000.0)
+    assert evidence["median_projected_full_coverage_seconds"] == pytest.approx(10_000.0)
+
+
+def test_candidate_dominance_does_not_reject_a_single_slow_outlier() -> None:
+    policy = probe.CandidateDominancePolicy(
+        full_coverage_steps=1_000,
+        baseline_projected_full_coverage_seconds=1_000.0,
+        min_improvement_ratio=0.10,
+    )
+    elapsed = 0.0
+    points = []
+    for step in range(1, 13):
+        elapsed += 100.0 if step == 6 else 1.0
+        points.append(_dominance_point(step, elapsed))
+
+    assert probe.candidate_dominance_evidence(points, policy) is None
 
 
 def test_stacked_default_profiles_start_from_memory_safe_baseline() -> None:
