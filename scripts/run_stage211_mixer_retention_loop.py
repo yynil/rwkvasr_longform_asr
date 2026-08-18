@@ -505,10 +505,12 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
         if round_index >= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS and round_index < int(
             args.max_rounds
         ):
-            if last_failed_gate_path is None:
-                raise ValueError("Stage211 correction extension lacks a prior failed gate.")
-            progress_gate_path = last_failed_gate_path
-            prior_gate = _validate_gate_for_phase(progress_gate_path, phase=phase)
+            progress_gate_path = last_failed_gate_path or gate_path
+            prior_gate = (
+                gate
+                if last_failed_gate_path is None
+                else _validate_gate_for_phase(progress_gate_path, phase=phase)
+            )
             decision = _correction_extension_decision(
                 phase=phase,
                 completed_round=round_index,

@@ -90,7 +90,7 @@ STAGE211_RETENTION_CORRECTION_EPOCHS = 1
 STAGE211_RETENTION_CORRECTION_LR = 1.0e-6
 STAGE211_CORRECTION_ADMISSION_FAILED_GATE = "failed_gate"
 STAGE211_CORRECTION_ADMISSION_EARLY_PASS = "early_pass_mandatory_continuation"
-STAGE211_CORRECTION_EXTENSION_DECISION_SCHEMA_VERSION = 2
+STAGE211_CORRECTION_EXTENSION_DECISION_SCHEMA_VERSION = 3
 STAGE211_CORRECTION_LAYER_FOCUS_SCHEMA_VERSION = 2
 STAGE211_HARD_LAYER_IDS = (0, 11, 12, 17, 20, 49, 50, 69)
 STAGE211_POST_COVERAGE_CORRECTION_LRS = {
@@ -1331,6 +1331,18 @@ def build_stage211_correction_extension_decision(
         raise ValueError("Stage211 correction extension exceeds its configured hard cap.")
     if prior_gate.get("gate_passed") is not False or current_gate.get("gate_passed") is not False:
         raise ValueError("Stage211 correction extension requires two failed phase gates.")
+    prior_gate_path = prior_gate_path.resolve()
+    current_gate_path = current_gate_path.resolve()
+    self_first_failed_gate = prior_gate_path == current_gate_path
+    if (
+        self_first_failed_gate
+        and completed_round != STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
+    ):
+        raise ValueError(
+            "Stage211 correction self-baseline is valid only for a first failure at round three."
+        )
+    if self_first_failed_gate and prior_gate != current_gate:
+        raise ValueError("Stage211 correction self-baseline gate payloads differ.")
     prior_metrics = stage211_correction_progress_metrics(prior_gate, phase=phase)
     current_metrics = stage211_correction_progress_metrics(current_gate, phase=phase)
     if prior_metrics.keys() != current_metrics.keys():
@@ -1384,14 +1396,17 @@ def build_stage211_correction_extension_decision(
         "artifact": "post_coverage_correction_extension_decision",
         "phase": phase,
         "completed_round": completed_round,
+        "comparison_mode": (
+            "self_first_failed_gate" if self_first_failed_gate else "prior_failed_gate"
+        ),
         "guaranteed_rounds": STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
         "stall_patience": STAGE211_RETENTION_CORRECTION_STALL_PATIENCE,
         "max_rounds": max_rounds,
         "prior_extension_decision_path": prior_decision_path_value,
         "prior_extension_decision_sha256": prior_decision_sha256,
-        "prior_gate_path": str(prior_gate_path.resolve()),
+        "prior_gate_path": str(prior_gate_path),
         "prior_gate_sha256": sha256_file(prior_gate_path),
-        "current_gate_path": str(current_gate_path.resolve()),
+        "current_gate_path": str(current_gate_path),
         "current_gate_sha256": sha256_file(current_gate_path),
         "prior_metrics": prior_metrics,
         "current_metrics": current_metrics,

@@ -447,6 +447,76 @@ def test_retention_loop_continues_early_passes_and_promotes_only_after_round_thr
     )
 
 
+def test_retention_loop_recovers_when_round_three_is_the_first_failed_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _args(tmp_path)
+    args.max_rounds = 4
+    checkpoints = [tmp_path / f"checkpoint-{index}.pt" for index in range(5)]
+    for checkpoint in checkpoints:
+        checkpoint.write_bytes(checkpoint.name.encode())
+    original_gate = args.original_gate_dir / "phase_gate.json"
+    original_gate.write_text("{}\n", encoding="utf-8")
+    gates = {original_gate: (True, checkpoints[0])}
+    for round_index in range(1, 5):
+        run_dir = args.correction_run_root / f"round_{round_index:02d}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "correction_receipt.json").write_text("{}\n", encoding="utf-8")
+        gate_path = args.correction_gate_root / f"round_{round_index:02d}" / "phase_gate.json"
+        gate_path.parent.mkdir(parents=True)
+        gate_path.write_text("{}\n", encoding="utf-8")
+        gates[gate_path] = (round_index != 3, checkpoints[round_index])
+
+    monkeypatch.setattr(
+        loop,
+        "_validate_gate",
+        lambda path: {
+            "gate_passed": gates[path][0],
+            "checkpoint_path": str(gates[path][1]),
+        },
+    )
+    extension_inputs: list[dict[str, object]] = []
+
+    def fake_extension(**kwargs: object) -> dict[str, object]:
+        extension_inputs.append(kwargs)
+        return {
+            "schema_version": 3,
+            "pipeline": "stage211",
+            "artifact": "post_coverage_correction_extension_decision",
+            "phase": "mixer",
+            "completed_round": 3,
+            "comparison_mode": "self_first_failed_gate",
+            "continue_training": True,
+            "improved_metrics": [],
+        }
+
+    monkeypatch.setattr(loop, "_correction_extension_decision", fake_extension)
+    monkeypatch.setattr(
+        loop,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("complete fixtures must not launch commands"),
+    )
+
+    def fake_ensure_promotion(**kwargs: object) -> Path:
+        gate_dir = Path(str(kwargs["gate_dir"]))
+        promotion = gate_dir / "mixer_promotion_receipt.json"
+        promotion.write_text("{}\n", encoding="utf-8")
+        return promotion
+
+    monkeypatch.setattr(loop, "_ensure_promotion", fake_ensure_promotion)
+
+    assert loop.run_retention_loop(args) == args.selection
+    assert len(extension_inputs) == 1
+    round_three_gate = args.correction_gate_root / "round_03" / "phase_gate.json"
+    assert extension_inputs[0]["prior_gate_path"] == round_three_gate
+    assert extension_inputs[0]["current_gate_path"] == round_three_gate
+    assert extension_inputs[0]["prior_gate"] == extension_inputs[0]["current_gate"]
+    selection = json.loads(args.selection.read_text(encoding="utf-8"))
+    assert selection["correction_round"] == 4
+    assert selection["checkpoint_path"] == str(checkpoints[4].resolve())
+
+
 def test_retention_loop_compares_round_three_failure_to_latest_failed_gate_after_early_passes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -543,6 +613,8 @@ def test_correction_extension_tracks_progress_and_bounded_stall_patience(
 
     assert decision["continue_training"] is True
     assert decision["next_round"] == 4
+    assert decision["schema_version"] == 3
+    assert decision["comparison_mode"] == "prior_failed_gate"
     assert decision["improved_metrics"] == ["trajectory_candidate_loss"]
     assert decision["consecutive_non_improving_rounds"] == 0
     assert decision["stall_patience"] == 3
@@ -623,6 +695,68 @@ def test_correction_extension_tracks_progress_and_bounded_stall_patience(
     assert round_five_decision["continue_training"] is False
     assert round_five_decision["next_round"] is None
     assert round_five_decision["consecutive_non_improving_rounds"] == 3
+
+
+def test_correction_extension_self_baselines_only_the_first_round_three_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate_path, gate = _write_progress_gate(
+        tmp_path,
+        name="first-failed-round-three",
+        trajectory_loss=0.18,
+        public_error=0.45,
+        alignment_loss=0.20,
+    )
+    decision = stage211_gate.build_stage211_correction_extension_decision(
+        phase="mixer",
+        completed_round=3,
+        prior_gate_path=gate_path,
+        prior_gate=gate,
+        current_gate_path=gate_path,
+        current_gate=gate,
+        max_rounds=8,
+    )
+
+    assert decision["schema_version"] == 3
+    assert decision["comparison_mode"] == "self_first_failed_gate"
+    assert decision["prior_gate_path"] == decision["current_gate_path"]
+    assert decision["prior_metrics"] == decision["current_metrics"]
+    assert decision["improved_metrics"] == []
+    assert decision["consecutive_non_improving_rounds"] == 1
+    assert decision["continue_training"] is True
+    assert decision["next_round"] == 4
+
+    decision_path = tmp_path / "self-baseline-decision.json"
+    decision_path.write_text(json.dumps(decision) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        stage211_gate,
+        "validate_stage211_phase_gate_report",
+        lambda *args, **kwargs: gate,
+    )
+    assert (
+        stage211_gate.validate_stage211_correction_extension_decision(
+            decision_path,
+            phase="mixer",
+            next_round=4,
+            admission_gate_path=gate_path,
+            admission_gate=gate,
+        )
+        == decision
+    )
+
+    with pytest.raises(ValueError, match="self-baseline is valid only"):
+        stage211_gate.build_stage211_correction_extension_decision(
+            phase="mixer",
+            completed_round=4,
+            prior_gate_path=gate_path,
+            prior_gate=gate,
+            current_gate_path=gate_path,
+            current_gate=gate,
+            max_rounds=8,
+            prior_extension_decision_path=decision_path,
+            prior_extension_decision=decision,
+        )
 
 
 def test_correction_extension_validator_replays_bound_progress_decision(
