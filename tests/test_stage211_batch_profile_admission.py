@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from rwkvasr.eval.stage211_batch_profile import (
     STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
     build_stage211_batch_profile_admission,
     candidate_dominance_evidence,
+    _validate_git_bound_source,
     validate_stage211_batch_profile_fixed_eval,
     validate_stage211_batch_profile_admission,
     validate_stage211_batch_profile_preflight,
@@ -33,10 +36,89 @@ sys.path.insert(0, str(REPO_ROOT))
 stage211_full_phase = importlib.import_module("scripts.run_stage211_full_phase_curriculum")
 
 
+def _git(repository: Path, *args: str) -> str:
+    result = subprocess.run(
+        ("git", *args),
+        cwd=repository,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
 def _write(path: Path, value: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value, encoding="utf-8")
     return path.resolve()
+
+
+def test_git_bound_source_accepts_only_matching_ancestor_blob(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init")
+    _git(repository, "config", "user.name", "Stage211 Test")
+    _git(repository, "config", "user.email", "stage211@example.invalid")
+    script = _write(repository / "scripts" / "probe.py", "old benchmark\n")
+    _git(repository, "add", "scripts/probe.py")
+    _git(repository, "commit", "-m", "old benchmark")
+    old_commit = _git(repository, "rev-parse", "HEAD")
+    old_sha256 = hashlib.sha256(b"old benchmark\n").hexdigest()
+
+    script.write_text("new benchmark\n", encoding="utf-8")
+    _git(repository, "add", "scripts/probe.py")
+    _git(repository, "commit", "-m", "new benchmark")
+    record = {
+        "script_path": str(script),
+        "script_sha256": old_sha256,
+        "git_commit": old_commit,
+    }
+
+    assert _validate_git_bound_source(
+        record,
+        path_key="script_path",
+        sha256_key="script_sha256",
+        git_commit_key="git_commit",
+        label="test source",
+        repository_root=repository,
+    ) == script
+
+    mismatched = {**record, "script_sha256": "0" * 64}
+    with pytest.raises(ValueError, match="historical Git blob SHA-256 mismatch"):
+        _validate_git_bound_source(
+            mismatched,
+            path_key="script_path",
+            sha256_key="script_sha256",
+            git_commit_key="git_commit",
+            label="test source",
+            repository_root=repository,
+        )
+
+    tree = _git(repository, "write-tree")
+    unrelated_commit = _git(repository, "commit-tree", tree, "-m", "unrelated")
+    non_ancestor = {**record, "git_commit": unrelated_commit}
+    with pytest.raises(ValueError, match="unavailable or not an ancestor"):
+        _validate_git_bound_source(
+            non_ancestor,
+            path_key="script_path",
+            sha256_key="script_sha256",
+            git_commit_key="git_commit",
+            label="test source",
+            repository_root=repository,
+        )
+
+    outside = _write(tmp_path / "outside.py", "new benchmark\n")
+    escaped = {**record, "script_path": str(outside)}
+    with pytest.raises(ValueError, match="outside the bound repository"):
+        _validate_git_bound_source(
+            escaped,
+            path_key="script_path",
+            sha256_key="script_sha256",
+            git_commit_key="git_commit",
+            label="test source",
+            repository_root=repository,
+        )
 
 
 def _profile_row(

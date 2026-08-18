@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 import statistics
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +33,7 @@ STAGE211_BATCH_PROFILE_PHASES = ("mixer", "block", "logits")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _FLOAT_TOLERANCE = 1.0e-12
+_STAGE211_REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 _FIXED_EVAL_COMPONENTS = {
     "mixer": ("mixer",),
     "block": ("mixer", "ffn", "block"),
@@ -178,6 +181,66 @@ def _validate_bound_file(
         raise ValueError(f"{label} has an invalid SHA-256 binding.")
     if sha256_file(path) != fingerprint:
         raise ValueError(f"{label} SHA-256 mismatch: {path}")
+    return path
+
+
+def _validate_git_bound_source(
+    record: dict[str, Any],
+    *,
+    path_key: str,
+    sha256_key: str,
+    git_commit_key: str,
+    label: str,
+    repository_root: Path = _STAGE211_REPOSITORY_ROOT,
+) -> Path:
+    path = Path(str(record.get(path_key) or "")).expanduser().resolve()
+    fingerprint = record.get(sha256_key)
+    if not isinstance(fingerprint, str) or _SHA256_PATTERN.fullmatch(fingerprint) is None:
+        raise ValueError(f"{label} has an invalid SHA-256 binding.")
+    if path.is_file() and path.stat().st_size > 0 and sha256_file(path) == fingerprint:
+        return path
+
+    commit = str(record.get(git_commit_key) or "")
+    if _GIT_COMMIT_PATTERN.fullmatch(commit) is None:
+        raise ValueError(f"{label} has an invalid Git commit binding.")
+    root = repository_root.expanduser().resolve()
+    try:
+        relative_path = path.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"{label} path is outside the bound repository: {path}") from error
+
+    ancestor = subprocess.run(
+        ("git", "merge-base", "--is-ancestor", commit, "HEAD"),
+        cwd=root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        detail = ancestor.stderr.decode("utf-8", errors="replace").strip()
+        suffix = f" ({detail})" if detail else ""
+        raise ValueError(
+            f"{label} Git commit is unavailable or not an ancestor of HEAD: {commit}{suffix}"
+        )
+    historical = subprocess.run(
+        ("git", "show", f"{commit}:{relative_path.as_posix()}"),
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if historical.returncode != 0 or not historical.stdout:
+        detail = historical.stderr.decode("utf-8", errors="replace").strip()
+        suffix = f" ({detail})" if detail else ""
+        raise ValueError(
+            f"{label} historical Git blob is missing or empty: "
+            f"{commit}:{relative_path.as_posix()}{suffix}"
+        )
+    if hashlib.sha256(historical.stdout).hexdigest() != fingerprint:
+        raise ValueError(
+            f"{label} historical Git blob SHA-256 mismatch: "
+            f"{commit}:{relative_path.as_posix()}"
+        )
     return path
 
 
@@ -757,8 +820,14 @@ def validate_stage211_batch_profile_preflight(
         raise ValueError("Stage211 batch profile preflight is not a formal measured report.")
     if _GIT_COMMIT_PATTERN.fullmatch(str(report.get("git_commit") or "")) is None:
         raise ValueError("Stage211 batch profile preflight git commit is invalid.")
+    _validate_git_bound_source(
+        report,
+        path_key="script_path",
+        sha256_key="script_sha256",
+        git_commit_key="git_commit",
+        label="Stage211 batch preflight benchmark script",
+    )
     for path_key, sha_key, label in (
-        ("script_path", "script_sha256", "benchmark script"),
         ("base_config_path", "base_config_sha256", "base config"),
         ("init_checkpoint_path", "init_checkpoint_sha256", "initial checkpoint"),
         ("bucket_manifest_path", "bucket_manifest_sha256", "bucket manifest"),
