@@ -57,10 +57,12 @@ except ModuleNotFoundError as error:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = Path(sys.executable)
 RUNNER = REPO_ROOT / "scripts" / "run_stage211_strict_chained_alignment.py"
-DEFAULT_LABELED_ROOT = Path.home() / "rwkvasr_data" / "stage211_sft_full_labeled_v2"
+DEFAULT_LABELED_ROOT = (
+    Path.home() / "rwkvasr_data" / "stage211_sft_full_labeled_v3_public_clean"
+)
 DEFAULT_LABELED_PROFILE_RECEIPT = DEFAULT_LABELED_ROOT / "stage211_labeled_profile_receipt.json"
 DEFAULT_SFT_PUBLIC_OVERLAP_RECEIPT = (
-    Path.home() / "rwkvasr_data/stage211_sft_public_encoded_overlap_v1/receipt.json"
+    Path.home() / "rwkvasr_data/stage211_sft_public_encoded_overlap_v2_clean/receipt.json"
 )
 DEFAULT_OUTPUT_DIR = (
     Path.home() / "rwkvasr_runs" / "stage211_full_alignment" / "stage211d_labeled_ctc_sft_1ep"

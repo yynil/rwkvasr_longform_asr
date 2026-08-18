@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,9 @@ from rwkvasr.eval.stage211_sft_public_clean import (
     updated_summary,
     updated_webdataset_index,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -173,3 +177,49 @@ def test_updated_webdataset_index_preserves_split_and_shard_accounting() -> None
     assert result["splits"]["train"]["num_samples"] == 8
     assert result["shards"][0]["num_samples"] == 9
     assert result["shards"][0]["splits"]["train"]["num_samples"] == 8
+
+
+def test_stage211_sft_production_defaults_use_public_clean_artifacts() -> None:
+    audit = importlib.import_module("scripts.audit_stage211_sft_public_overlap")
+    correction_builder = importlib.import_module(
+        "scripts.build_stage211_sft_correction_profile"
+    )
+    profile_builder = importlib.import_module(
+        "scripts.create_stage211_labeled_profile_receipt"
+    )
+    sft_runner = importlib.import_module("scripts.run_stage211_labeled_sft")
+    correction_runner = importlib.import_module("scripts.run_stage211_sft_correction")
+    correction_loop = importlib.import_module("scripts.run_stage211_sft_correction_loop")
+
+    data_root = Path.home() / "rwkvasr_data"
+    clean_root = data_root / "stage211_sft_full_labeled_v3_public_clean"
+    clean_overlap = data_root / "stage211_sft_public_encoded_overlap_v2_clean"
+    clean_correction = (
+        data_root / "stage211_sft_source_balanced_correction_v3_public_clean"
+    )
+    assert audit.DEFAULT_LABELED_ROOT == clean_root
+    assert audit.DEFAULT_LABELED_PROFILE == clean_root / "stage211_labeled_profile_receipt.json"
+    assert audit.DEFAULT_OUTPUT_DIR == clean_overlap
+    assert correction_builder.DEFAULT_FULL_ROOT == clean_root
+    assert correction_builder.DEFAULT_FULL_PROFILE == (
+        clean_root / "stage211_labeled_profile_receipt.json"
+    )
+    assert correction_builder.DEFAULT_OUTPUT_ROOT == clean_correction
+    assert profile_builder.DEFAULT_LABELED_ROOT == clean_root
+    assert sft_runner.DEFAULT_LABELED_ROOT == clean_root
+    assert sft_runner.DEFAULT_LABELED_PROFILE_RECEIPT == (
+        clean_root / "stage211_labeled_profile_receipt.json"
+    )
+    assert sft_runner.DEFAULT_SFT_PUBLIC_OVERLAP_RECEIPT == clean_overlap / "receipt.json"
+    expected_correction_profile = clean_correction / "stage211_sft_correction_profile.json"
+    assert correction_runner.DEFAULT_PROFILE == expected_correction_profile
+    assert correction_loop.DEFAULT_PROFILE_ROOT == clean_correction
+
+    bootstrap = (REPO_ROOT / "scripts/start_stage211_abcd_after_calibration.sh").read_text(
+        encoding="utf-8"
+    )
+    monitor = (REPO_ROOT / "scripts/monitor_stage211_abcd.sh").read_text(encoding="utf-8")
+    assert "stage211_sft_full_labeled_v3_public_clean" in bootstrap
+    assert "stage211_sft_public_encoded_overlap_v2_clean" in bootstrap
+    assert "stage211_sft_source_balanced_correction_v3_public_clean" in bootstrap
+    assert "stage211_sft_full_labeled_v3_public_clean" in monitor

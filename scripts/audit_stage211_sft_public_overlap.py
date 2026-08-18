@@ -19,7 +19,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script fallback
     )
 
 
-DEFAULT_LABELED_ROOT = Path.home() / "rwkvasr_data/stage211_sft_full_labeled_v2"
+DEFAULT_LABELED_ROOT = Path.home() / "rwkvasr_data/stage211_sft_full_labeled_v3_public_clean"
 DEFAULT_LABELED_PROFILE = DEFAULT_LABELED_ROOT / "stage211_labeled_profile_receipt.json"
 DEFAULT_NANO_PROVENANCE = (
     Path.home() / "rwkvasr_eval/stage211_public_full/nano_2512/provenance_receipt.json"
@@ -27,7 +27,7 @@ DEFAULT_NANO_PROVENANCE = (
 DEFAULT_PUBLIC_PCM_AUDIT = (
     Path.home() / "rwkvasr_data/stage211_base_public_pcm_overlap_v2/audit_receipt.json"
 )
-DEFAULT_OUTPUT_DIR = Path.home() / "rwkvasr_data/stage211_sft_public_encoded_overlap_v1"
+DEFAULT_OUTPUT_DIR = Path.home() / "rwkvasr_data/stage211_sft_public_encoded_overlap_v2_clean"
 
 
 def main() -> int:

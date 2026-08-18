@@ -1449,7 +1449,8 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert '--block-gate-selection "${BLOCK_SELECTION}"' in script
     assert '--logits-gate-selection "${LOGITS_SELECTION}"' in script
     assert (
-        'LABELED_ROOT="${LABELED_ROOT:-${HOME}/rwkvasr_data/stage211_sft_full_labeled_v2}"'
+        'LABELED_ROOT="${LABELED_ROOT:-${HOME}/rwkvasr_data/'
+        'stage211_sft_full_labeled_v3_public_clean}"'
         in script
     )
     assert '--labeled-profile-receipt "${LABELED_PROFILE_RECEIPT}"' in script

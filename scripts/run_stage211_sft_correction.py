@@ -74,7 +74,7 @@ MAX_CORRECTION_ROUNDS = 3
 DEFAULT_PROFILE = (
     Path.home()
     / "rwkvasr_data"
-    / "stage211_sft_source_balanced_correction_v1"
+    / "stage211_sft_source_balanced_correction_v3_public_clean"
     / "stage211_sft_correction_profile.json"
 )
 DEFAULT_OUTPUT_ROOT = (

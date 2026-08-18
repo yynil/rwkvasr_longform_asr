@@ -33,10 +33,14 @@ except ModuleNotFoundError as error:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FULL_ROOT = Path.home() / "rwkvasr_data" / "stage211_sft_full_labeled_v2"
+DEFAULT_FULL_ROOT = (
+    Path.home() / "rwkvasr_data" / "stage211_sft_full_labeled_v3_public_clean"
+)
 DEFAULT_FULL_PROFILE = DEFAULT_FULL_ROOT / "stage211_labeled_profile_receipt.json"
 DEFAULT_OUTPUT_ROOT = (
-    Path.home() / "rwkvasr_data" / "stage211_sft_source_balanced_correction_v1"
+    Path.home()
+    / "rwkvasr_data"
+    / "stage211_sft_source_balanced_correction_v3_public_clean"
 )
 DEFAULT_SEED = 2114
 DEFAULT_BUCKET_WIDTH = 80

@@ -9,7 +9,9 @@ from typing import Any
 from rwkvasr.eval.stage211_gate import sha256_file
 
 
-DEFAULT_LABELED_ROOT = Path.home() / "rwkvasr_data" / "stage211_sft_full_labeled_v2"
+DEFAULT_LABELED_ROOT = (
+    Path.home() / "rwkvasr_data" / "stage211_sft_full_labeled_v3_public_clean"
+)
 PROFILE_METRIC_KEYS = (
     "train_samples",
     "eval_samples",
