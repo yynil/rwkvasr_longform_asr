@@ -52,6 +52,46 @@ def _run(command: list[str], *, dry_run: bool) -> None:
         subprocess.run(command, cwd=REPO_ROOT, check=True)
 
 
+def _evaluation_command(
+    args: argparse.Namespace,
+    *,
+    completion_receipt: Path,
+    eval_dir: Path,
+) -> list[str]:
+    return [
+        str(PYTHON),
+        str(REPO_ROOT / "scripts" / "evaluate_stage211_sft_correction.py"),
+        "--completion-receipt",
+        str(completion_receipt),
+        "--full-sft-failed-report",
+        str(args.full_sft_failed_report.expanduser().resolve()),
+        "--output-dir",
+        str(eval_dir),
+        "--final-output-dir",
+        str(args.final_output_dir.expanduser().resolve()),
+        "--public-manifest-dir",
+        str(args.public_manifest_dir.expanduser().resolve()),
+        "--nano-prediction-dir",
+        str(args.nano_prediction_dir.expanduser().resolve()),
+        "--public-overlap-receipt",
+        str(args.public_overlap_receipt.expanduser().resolve()),
+        "--phase-gate-root",
+        str(args.phase_gate_root.expanduser().resolve()),
+        "--mixer-gate-selection",
+        str(args.mixer_gate_selection.expanduser().resolve()),
+        "--block-gate-selection",
+        str(args.block_gate_selection.expanduser().resolve()),
+        "--logits-gate-selection",
+        str(args.logits_gate_selection.expanduser().resolve()),
+        "--initialization-receipt",
+        str(args.initialization_receipt.expanduser().resolve()),
+        "--calibration-reuse-receipt",
+        str(args.calibration_reuse_receipt.expanduser().resolve()),
+        "--devices",
+        str(args.devices),
+    ]
+
+
 def run_loop(args: argparse.Namespace) -> Path | None:
     full_completion_path = args.full_sft_completion.expanduser().resolve()
     full_failed_report_path = args.full_sft_failed_report.expanduser().resolve()
@@ -129,6 +169,11 @@ def run_loop(args: argparse.Namespace) -> Path | None:
 
         eval_dir = eval_root / f"round_{round_index:02d}"
         evaluation_path = eval_dir / "correction_evaluation.json"
+        evaluation_command = _evaluation_command(
+            args,
+            completion_receipt=completion_receipt,
+            eval_dir=eval_dir,
+        )
         if evaluation_path.is_file():
             evaluation = validate_correction_evaluation_report(
                 evaluation_path,
@@ -136,40 +181,17 @@ def run_loop(args: argparse.Namespace) -> Path | None:
                 expected_full_completion_path=full_completion_path,
                 expected_correction_profile_path=profile_path,
             )
+            if evaluation.get("gate_passed") is True:
+                _run(evaluation_command, dry_run=False)
+                evaluation = validate_correction_evaluation_report(
+                    evaluation_path,
+                    expected_round=round_index,
+                    expected_full_completion_path=full_completion_path,
+                    expected_correction_profile_path=profile_path,
+                    require_passed=True,
+                )
         else:
-            command = [
-                str(PYTHON),
-                str(REPO_ROOT / "scripts" / "evaluate_stage211_sft_correction.py"),
-                "--completion-receipt",
-                str(completion_receipt),
-                "--full-sft-failed-report",
-                str(full_failed_report_path),
-                "--output-dir",
-                str(eval_dir),
-                "--final-output-dir",
-                str(args.final_output_dir.expanduser().resolve()),
-                "--public-manifest-dir",
-                str(args.public_manifest_dir.expanduser().resolve()),
-                "--nano-prediction-dir",
-                str(args.nano_prediction_dir.expanduser().resolve()),
-                "--public-overlap-receipt",
-                str(args.public_overlap_receipt.expanduser().resolve()),
-                "--phase-gate-root",
-                str(args.phase_gate_root.expanduser().resolve()),
-                "--mixer-gate-selection",
-                str(args.mixer_gate_selection.expanduser().resolve()),
-                "--block-gate-selection",
-                str(args.block_gate_selection.expanduser().resolve()),
-                "--logits-gate-selection",
-                str(args.logits_gate_selection.expanduser().resolve()),
-                "--initialization-receipt",
-                str(args.initialization_receipt.expanduser().resolve()),
-                "--calibration-reuse-receipt",
-                str(args.calibration_reuse_receipt.expanduser().resolve()),
-                "--devices",
-                str(args.devices),
-            ]
-            _run(command, dry_run=False)
+            _run(evaluation_command, dry_run=False)
             evaluation = validate_correction_evaluation_report(
                 evaluation_path,
                 expected_round=round_index,

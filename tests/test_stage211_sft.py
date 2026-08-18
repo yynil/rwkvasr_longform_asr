@@ -698,6 +698,234 @@ def test_stage211_sft_correction_requires_full_profile_completion(
     assert observed["require_full_profile"] is True
 
 
+def test_stage211_sft_passed_evaluation_rebuilds_missing_final_without_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_completion = tmp_path / "sft_complete.json"
+    candidate_checkpoint = tmp_path / "corrected.pt"
+    baseline_report = tmp_path / "baseline.json"
+    comparison_report = tmp_path / "comparison.json"
+    nano_receipt = tmp_path / "nano.json"
+    evaluation_path = tmp_path / "correction_evaluation.json"
+    for path in (
+        full_completion,
+        baseline_report,
+        comparison_report,
+        nano_receipt,
+        evaluation_path,
+    ):
+        path.write_text("{}\n", encoding="utf-8")
+    candidate_checkpoint.write_bytes(b"corrected")
+    evaluation = {
+        "round": 2,
+        "gate_passed": True,
+        "full_sft_completion_path": str(full_completion),
+        "checkpoint_path": str(candidate_checkpoint),
+        "baseline_public_comparison_report_path": str(baseline_report),
+        "public_comparison_report_path": str(comparison_report),
+        "baseline_public_benchmark": {"baseline": True},
+        "public_benchmark": {"candidate": True},
+        "public_overlap": {"receipt": True},
+        "nano_public_baseline_receipt_path": str(nano_receipt),
+    }
+    monkeypatch.setattr(
+        sft_correction_evaluator,
+        "validate_full_sft_completion",
+        lambda path: ({"completion": True}, tmp_path / "full.pt"),
+    )
+    observed: dict[str, object] = {}
+
+    def fake_write_passed_final_report(**kwargs: object) -> Path:
+        observed.update(kwargs)
+        final_path = tmp_path / "final" / "stage211_complete.json"
+        final_path.parent.mkdir()
+        final_path.write_text("{}\n", encoding="utf-8")
+        return final_path
+
+    monkeypatch.setattr(
+        sft_correction_evaluator,
+        "_write_passed_final_report",
+        fake_write_passed_final_report,
+    )
+    monkeypatch.setattr(
+        sft_correction_evaluator,
+        "_run_public_eval",
+        lambda **kwargs: pytest.fail(f"recovery reran public inference: {kwargs}"),
+    )
+
+    final_path = sft_correction_evaluator._recover_passed_final_report(
+        args=SimpleNamespace(),
+        evaluation_path=evaluation_path,
+        evaluation=evaluation,
+    )
+
+    assert final_path == tmp_path / "final" / "stage211_complete.json"
+    assert observed["evaluation"] == evaluation
+    assert observed["full_completion_path"] == full_completion.resolve()
+    assert observed["candidate_checkpoint"] == candidate_checkpoint.resolve()
+    assert observed["baseline_report_path"] == baseline_report.resolve()
+    assert observed["comparison_json"] == comparison_report.resolve()
+    assert observed["nano_receipt_path"] == nano_receipt.resolve()
+
+
+def test_stage211_sft_evaluator_dispatches_existing_passed_report_to_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completion_receipt = tmp_path / "completion.json"
+    full_completion = tmp_path / "sft_complete.json"
+    profile = tmp_path / "profile.json"
+    output_dir = tmp_path / "eval"
+    evaluation_path = output_dir / "correction_evaluation.json"
+    for path in (completion_receipt, full_completion, profile, evaluation_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+    completion = {
+        "round": 1,
+        "full_sft_completion_path": str(full_completion),
+        "correction_profile_path": str(profile),
+    }
+    evaluation = {"round": 1, "gate_passed": True}
+    monkeypatch.setattr(
+        sft_correction_evaluator,
+        "validate_completion_receipt",
+        lambda path: completion,
+    )
+    validation_kwargs: list[dict[str, object]] = []
+
+    def fake_validate(*args: object, **kwargs: object) -> dict[str, object]:
+        validation_kwargs.append(kwargs)
+        return evaluation
+
+    monkeypatch.setattr(
+        sft_correction_evaluator,
+        "validate_correction_evaluation_report",
+        fake_validate,
+    )
+    recovery_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        sft_correction_evaluator,
+        "_recover_passed_final_report",
+        lambda **kwargs: recovery_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        sft_correction_evaluator,
+        "_run_public_eval",
+        lambda **kwargs: pytest.fail(f"existing evaluation reran inference: {kwargs}"),
+    )
+    args = SimpleNamespace(
+        completion_receipt=completion_receipt,
+        output_dir=output_dir,
+        output_root=tmp_path / "unused",
+    )
+
+    assert sft_correction_evaluator.evaluate_correction(args) == evaluation_path
+    assert validation_kwargs == [
+        {
+            "expected_round": 1,
+            "expected_full_completion_path": full_completion.resolve(),
+            "expected_correction_profile_path": profile.resolve(),
+        }
+    ]
+    assert recovery_calls == [
+        {
+            "args": args,
+            "evaluation_path": evaluation_path,
+            "evaluation": evaluation,
+        }
+    ]
+
+
+def test_stage211_sft_loop_relaunches_existing_passed_evaluation_for_final_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_completion = tmp_path / "sft_complete.json"
+    full_checkpoint = tmp_path / "full.pt"
+    failed_report = tmp_path / "failed.json"
+    profile_root = tmp_path / "profile"
+    profile_path = profile_root / "stage211_sft_correction_profile.json"
+    run_root = tmp_path / "runs"
+    completion_receipt = run_root / "round_01" / "sft_correction_complete.json"
+    eval_root = tmp_path / "eval"
+    evaluation_path = eval_root / "round_01" / "correction_evaluation.json"
+    final_output_dir = tmp_path / "final"
+    for path in (full_completion, failed_report, profile_path, completion_receipt, evaluation_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+    full_checkpoint.write_bytes(b"full")
+    monkeypatch.setattr(
+        sft_correction_loop,
+        "validate_full_sft_completion",
+        lambda path, require_full_profile: (
+            {"labeled_profile_receipt_path": str(profile_path)},
+            full_checkpoint,
+        ),
+    )
+    monkeypatch.setattr(
+        sft_correction_loop,
+        "validate_correction_profile",
+        lambda *args, **kwargs: {"valid": True},
+    )
+    monkeypatch.setattr(
+        sft_correction_loop,
+        "validate_completion_receipt",
+        lambda *args, **kwargs: {
+            "round": 1,
+            "completion_checkpoint_path": str(tmp_path / "round-one.pt"),
+        },
+    )
+    validation_calls: list[bool | None] = []
+
+    def fake_validate_evaluation(*args: object, **kwargs: object) -> dict[str, object]:
+        validation_calls.append(kwargs.get("require_passed"))
+        return {"gate_passed": True}
+
+    monkeypatch.setattr(
+        sft_correction_loop,
+        "validate_correction_evaluation_report",
+        fake_validate_evaluation,
+    )
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], *, dry_run: bool) -> None:
+        assert dry_run is False
+        commands.append(command)
+        assert "evaluate_stage211_sft_correction.py" in command[1]
+        final_output_dir.mkdir(parents=True)
+        (final_output_dir / "stage211_complete.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(sft_correction_loop, "_run", fake_run)
+    args = SimpleNamespace(
+        full_sft_completion=full_completion,
+        full_sft_failed_report=failed_report,
+        correction_profile_root=profile_root,
+        run_root=run_root,
+        eval_root=eval_root,
+        final_output_dir=final_output_dir,
+        config_dir=tmp_path / "configs",
+        nano_checkpoint=tmp_path / "nano.pt",
+        public_manifest_dir=tmp_path / "manifests",
+        nano_prediction_dir=tmp_path / "nano-predictions",
+        public_overlap_receipt=tmp_path / "overlap.json",
+        phase_gate_root=tmp_path / "gates",
+        mixer_gate_selection=tmp_path / "mixer.json",
+        block_gate_selection=tmp_path / "block.json",
+        logits_gate_selection=tmp_path / "logits.json",
+        initialization_receipt=tmp_path / "initialization.json",
+        calibration_reuse_receipt=tmp_path / "calibration.json",
+        master_port=29651,
+        max_peak_reserved_gib=22.0,
+        devices="0,1,2,3",
+        dry_run=False,
+    )
+
+    assert sft_correction_loop.run_loop(args) == (final_output_dir / "stage211_complete.json")
+    assert len(commands) == 1
+    assert validation_calls == [None, True]
+
+
 def test_stage211_sft_correction_coverage_sums_contiguous_rounds(
     tmp_path: Path,
 ) -> None:

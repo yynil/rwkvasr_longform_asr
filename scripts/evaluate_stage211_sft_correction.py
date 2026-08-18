@@ -605,10 +605,47 @@ def _write_passed_final_report(
     return final_path
 
 
+def _recover_passed_final_report(
+    *,
+    args: argparse.Namespace,
+    evaluation_path: Path,
+    evaluation: Mapping[str, Any],
+) -> Path | None:
+    if evaluation.get("gate_passed") is not True:
+        return None
+    full_completion_path = Path(str(evaluation["full_sft_completion_path"])).resolve()
+    full_completion, _ = validate_full_sft_completion(full_completion_path)
+    candidate_checkpoint = Path(str(evaluation["checkpoint_path"])).resolve()
+    final_path = _write_passed_final_report(
+        args=args,
+        evaluation_path=evaluation_path,
+        evaluation=evaluation,
+        full_completion_path=full_completion_path,
+        full_completion=full_completion,
+        candidate_checkpoint=candidate_checkpoint,
+        baseline_report_path=Path(
+            str(evaluation["baseline_public_comparison_report_path"])
+        ).resolve(),
+        comparison_json=Path(str(evaluation["public_comparison_report_path"])).resolve(),
+        baseline_benchmark=evaluation["baseline_public_benchmark"],
+        candidate_benchmark=evaluation["public_benchmark"],
+        public_overlap_binding=evaluation["public_overlap"],
+        nano_receipt_path=Path(str(evaluation["nano_public_baseline_receipt_path"])).resolve(),
+    )
+    print(
+        "[stage211-sft-correction-eval] recovered passed evaluation "
+        f"round={evaluation['round']} final={final_path}",
+        flush=True,
+    )
+    return final_path
+
+
 def evaluate_correction(args: argparse.Namespace) -> Path:
     completion_path = args.completion_receipt.expanduser().resolve()
     completion = validate_completion_receipt(completion_path)
     round_index = int(completion["round"])
+    full_completion_path = Path(str(completion["full_sft_completion_path"])).resolve()
+    correction_profile_path = Path(str(completion["correction_profile_path"])).resolve()
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
@@ -616,14 +653,19 @@ def evaluate_correction(args: argparse.Namespace) -> Path:
     )
     report_path = output_dir / "correction_evaluation.json"
     if report_path.is_file():
-        validate_correction_evaluation_report(
+        evaluation = validate_correction_evaluation_report(
             report_path,
             expected_round=round_index,
+            expected_full_completion_path=full_completion_path,
+            expected_correction_profile_path=correction_profile_path,
+        )
+        _recover_passed_final_report(
+            args=args,
+            evaluation_path=report_path,
+            evaluation=evaluation,
         )
         return report_path
     output_dir.mkdir(parents=True, exist_ok=True)
-    full_completion_path = Path(str(completion["full_sft_completion_path"])).resolve()
-    correction_profile_path = Path(str(completion["correction_profile_path"])).resolve()
     full_completion, full_checkpoint = validate_full_sft_completion(full_completion_path)
     full_failed_report_path = args.full_sft_failed_report.expanduser().resolve()
     full_failed_report = _validate_failed_full_sft_report(
