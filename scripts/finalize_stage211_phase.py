@@ -779,6 +779,26 @@ def finalize_phase(args: argparse.Namespace) -> Path:
             str(args.baseline_public_comparison_report.expanduser().resolve()),
         )
     )
+    baseline_public_reuse_receipt = getattr(
+        args,
+        "baseline_public_reuse_receipt",
+        None,
+    )
+    if baseline_public_reuse_receipt is not None:
+        phase_gate_command.extend(
+            (
+                "--baseline-public-reuse-receipt",
+                str(baseline_public_reuse_receipt.expanduser().resolve()),
+            )
+        )
+    initialization_receipt = getattr(args, "initialization_receipt", None)
+    if initialization_receipt is not None:
+        phase_gate_command.extend(
+            (
+                "--initialization-receipt",
+                str(initialization_receipt.expanduser().resolve()),
+            )
+        )
     _run(phase_gate_command, dry_run=bool(args.dry_run))
 
     promotion_receipt = output_dir / f"{phase}_promotion_receipt.json"
@@ -845,6 +865,8 @@ def main() -> int:
         type=Path,
         default=None,
     )
+    parser.add_argument("--baseline-public-reuse-receipt", type=Path, default=None)
+    parser.add_argument("--initialization-receipt", type=Path, default=None)
     parser.add_argument(
         "--post-coverage-correction-receipt",
         type=Path,

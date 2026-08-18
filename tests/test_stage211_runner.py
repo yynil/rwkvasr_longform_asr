@@ -914,6 +914,10 @@ def test_stage211_mixer_finalizer_evaluates_latest_retention_checkpoint(
     correction_receipt.write_text("{}\n", encoding="utf-8")
     manifest = tmp_path / "stratified.json"
     manifest.write_text("{}\n", encoding="utf-8")
+    baseline_reuse_receipt = tmp_path / "calibration-reuse.json"
+    baseline_reuse_receipt.write_text("{}\n", encoding="utf-8")
+    initialization_receipt = tmp_path / "initialization.json"
+    initialization_receipt.write_text("{}\n", encoding="utf-8")
     correction = {
         "completion_checkpoint_path": str(corrected_checkpoint.resolve()),
         "row_exposures": 8,
@@ -974,6 +978,8 @@ def test_stage211_mixer_finalizer_evaluates_latest_retention_checkpoint(
             devices="0,1,2,3",
             dry_run=True,
             baseline_public_comparison_report=tmp_path / "baseline-public.json",
+            baseline_public_reuse_receipt=baseline_reuse_receipt,
+            initialization_receipt=initialization_receipt,
             post_coverage_correction_receipt=[correction_receipt],
             stratified_hidden_receipt=tmp_path / "stratified-receipt.json",
         )
@@ -995,6 +1001,12 @@ def test_stage211_mixer_finalizer_evaluates_latest_retention_checkpoint(
     assert phase_gate_command[
         phase_gate_command.index("--post-coverage-correction-receipt") + 1
     ] == str(correction_receipt.resolve())
+    assert phase_gate_command[
+        phase_gate_command.index("--baseline-public-reuse-receipt") + 1
+    ] == str(baseline_reuse_receipt.resolve())
+    assert phase_gate_command[phase_gate_command.index("--initialization-receipt") + 1] == str(
+        initialization_receipt.resolve()
+    )
 
 
 def test_stage211_logits_finalizer_runs_independent_alignment_gate(
@@ -1435,6 +1447,8 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert '--baseline-public-comparison-report "${block_gate_dir}/nano_comparison.json"' in script
     assert '--baseline-public-comparison-report "${logits_gate_dir}/nano_comparison.json"' in script
     assert '--calibration-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}"' in script
+    assert '--baseline-public-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}"' in script
+    assert '--initialization-receipt "${INITIALIZATION_RECEIPT}"' in script
     assert "create_stage211_nano_baseline_receipt.py" in script
     assert '--output "${NANO_BASELINE_RECEIPT}"' in script
     assert 'START_STAGE="${START_STAGE:-full}"' in script
@@ -4800,10 +4814,12 @@ def _write_public_comparison_evidence_fixture(
     clean_commonvoice_manifest: Path,
 ) -> tuple[Path, dict[str, object], Path, dict[str, object]]:
     candidate_provenance, candidate_tokenizer = stage211_test_student_ctc_context(checkpoint)
+    baseline_provenance, baseline_tokenizer = stage211_test_student_ctc_context(baseline_checkpoint)
     candidate_results: list[dict[str, object]] = []
     baseline_results: list[dict[str, object]] = []
     manifest_paths: dict[str, Path] = {}
     candidate_prediction_paths: dict[str, Path] = {}
+    baseline_prediction_paths: dict[str, Path] = {}
     public_labels = {
         "aishell1_test": "AISHELL-1 test",
         "librispeech_test_clean": "LibriSpeech test-clean",
@@ -4866,11 +4882,13 @@ def _write_public_comparison_evidence_fixture(
             )
             baseline_rows.append(
                 json.dumps(
-                    {
-                        "utt_id": utt_id,
-                        "ref_text": reference,
-                        "pred_text": baseline_prediction,
-                    },
+                    stage211_test_student_ctc_row(
+                        utt_id=utt_id,
+                        ref_text=reference,
+                        pred_text=baseline_prediction,
+                        provenance=baseline_provenance,
+                        tokenizer=baseline_tokenizer,
+                    ),
                     ensure_ascii=True,
                 )
                 + "\n"
@@ -4882,6 +4900,7 @@ def _write_public_comparison_evidence_fixture(
         baseline_path.write_text("".join(baseline_rows), encoding="utf-8")
         manifest_paths[dataset] = manifest_path.resolve()
         candidate_prediction_paths[dataset] = candidate_path.resolve()
+        baseline_prediction_paths[dataset] = baseline_path.resolve()
 
         def fixture_result(*, student_path: Path, baseline: bool) -> dict[str, object]:
             nano_wer = (
@@ -5009,6 +5028,23 @@ def _write_public_comparison_evidence_fixture(
         path=baseline_report_path,
         student_checkpoint=baseline_checkpoint,
         results=baseline_results,
+    )
+    baseline_receipt_path = tmp_path / "baseline-public-prediction-receipt.json"
+    baseline_receipt = build_stage211_student_public_prediction_receipt(
+        checkpoint_path=baseline_checkpoint,
+        manifest_paths=manifest_paths,
+        prediction_paths=baseline_prediction_paths,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+    )
+    baseline_receipt_path.write_text(
+        json.dumps(baseline_receipt, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    baseline_report["student_prediction_receipt_path"] = str(baseline_receipt_path.resolve())
+    baseline_report["student_prediction_receipt_sha256"] = sha256_file(baseline_receipt_path)
+    baseline_report_path.write_text(
+        json.dumps(baseline_report) + "\n",
+        encoding="utf-8",
     )
 
     def enrich_report(report: dict[str, object]) -> dict[str, object]:
@@ -5345,6 +5381,9 @@ def _write_valid_phase_gate(
         baseline_checkpoint=phase_init_checkpoint,
         clean_commonvoice_manifest=clean_commonvoice_manifest,
     )
+    baseline_public_source = json.loads(
+        baseline_public_comparison_report.read_text(encoding="utf-8")
+    )
     public_results = public_benchmark["results"]
 
     baseline_results = []
@@ -5510,6 +5549,15 @@ def _write_valid_phase_gate(
                 "baseline_public_comparison_report": {
                     "path": str(baseline_public_comparison_report.resolve()),
                     "sha256": sha256_file(baseline_public_comparison_report),
+                },
+                "baseline_public_provenance": {
+                    "mode": "student_prediction_receipt",
+                    "student_prediction_receipt_path": baseline_public_source[
+                        "student_prediction_receipt_path"
+                    ],
+                    "student_prediction_receipt_sha256": baseline_public_source[
+                        "student_prediction_receipt_sha256"
+                    ],
                 },
                 "public_progress": public_progress,
                 "global_dedup_manifest_path": str(GLOBAL_DEDUP_FIXTURE.resolve()),
@@ -7125,6 +7173,207 @@ def test_stage211_phase_gate_rejects_missing_student_prediction_provenance(
         validate_stage211_phase_gate_report(
             gate_report,
             expected_phase="logits",
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_phase_gate_rejects_mutated_baseline_prediction_receipt(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="logits",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    receipt_path = Path(gate["baseline_public_provenance"]["student_prediction_receipt_path"])
+    receipt_path.write_text(
+        receipt_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="prediction receipt SHA-256 mismatch"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="logits",
+            checkpoint_path=checkpoint,
+        )
+
+
+@pytest.mark.parametrize("phase", ("block", "logits"))
+def test_stage211_stacked_phase_gate_rejects_legacy_baseline_provenance(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase=phase,
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    gate["baseline_public_provenance"] = {
+        "mode": "legacy_calibration_reuse",
+        "calibration_reuse_receipt_path": str(tmp_path / "reuse.json"),
+        "calibration_reuse_receipt_sha256": "0" * 64,
+        "initialization_receipt_path": str(tmp_path / "initialization.json"),
+        "initialization_receipt_sha256": "1" * 64,
+    }
+    gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="baseline must use intrinsic prediction provenance"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase=phase,
+            checkpoint_path=checkpoint,
+        )
+
+
+def test_stage211_mixer_phase_gate_replays_legacy_calibration_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_report = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_report.read_text(encoding="utf-8"))
+    baseline_path = Path(gate["baseline_public_comparison_report"]["path"])
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline.pop("student_prediction_receipt_path")
+    baseline.pop("student_prediction_receipt_sha256")
+    baseline_path.write_text(json.dumps(baseline) + "\n", encoding="utf-8")
+    gate["baseline_public_comparison_report"]["sha256"] = sha256_file(baseline_path)
+
+    phase_init_checkpoint = Path(gate["full_data_coverage"]["segments"][0]["init_checkpoint_path"])
+    manifest_paths = {
+        str(row["dataset"]): Path(row["manifest_path"])
+        for row in gate["public_benchmark"]["results"]
+    }
+    baseline_benchmark = replay_stage211_public_comparison(
+        baseline,
+        manifest_paths=manifest_paths,
+        benchmarks=STAGE211_PUBLIC_BENCHMARKS,
+        expected_checkpoint=phase_init_checkpoint,
+    )
+    gate["public_progress"] = stage211_phase_gate._build_public_progress(
+        baseline=baseline_benchmark,
+        candidate=gate["public_benchmark"],
+    )
+    selection_path = tmp_path / "calibration-selection.json"
+    selection_path.write_text(
+        json.dumps(
+            {
+                "pipeline": "stage211",
+                "artifact": "calibration_checkpoint_selection",
+                "required_completion_step": 30_064,
+                "selected": {
+                    "eligible": True,
+                    "loss_improved_layers": 70,
+                    "cosine_improved_layers": 70,
+                    "checkpoint_path": str(phase_init_checkpoint.resolve()),
+                    "checkpoint_sha256": sha256_file(phase_init_checkpoint),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    metrics_path = tmp_path / "calibration-metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "dataset": row["dataset"],
+                        "branch": "ctc",
+                        "samples": row["sample_count"],
+                        "wer": row["student_wer"],
+                        "cer": row["student_cer"],
+                    }
+                    for row in baseline_benchmark["results"]
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    reuse_path = tmp_path / "calibration-reuse.json"
+    reuse_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pipeline": "stage211",
+                "artifact": "calibration_public_eval_reuse",
+                "complete": True,
+                "checkpoint_path": str(phase_init_checkpoint.resolve()),
+                "checkpoint_sha256": sha256_file(phase_init_checkpoint),
+                "selection_report_path": str(selection_path.resolve()),
+                "selection_report_sha256": sha256_file(selection_path),
+                "metrics_path": str(metrics_path.resolve()),
+                "metrics_sha256": sha256_file(metrics_path),
+                "comparison_report_path": str(baseline_path.resolve()),
+                "comparison_report_sha256": sha256_file(baseline_path),
+                "public_overlap": gate["public_overlap"],
+                "public_benchmark": baseline_benchmark,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    initialization_path = tmp_path / "initialization.json"
+    initialization_path.write_text("{}\n", encoding="utf-8")
+    initialization_module = importlib.import_module("rwkvasr.eval.stage211_initialization")
+
+    def fake_validate_initialization(
+        receipt_path: Path,
+        *,
+        expected_calibration_checkpoint: Path,
+        expected_nano_checkpoint_sha256: str,
+    ) -> dict[str, object]:
+        assert receipt_path == initialization_path.resolve()
+        assert expected_calibration_checkpoint == phase_init_checkpoint.resolve()
+        assert expected_nano_checkpoint_sha256 == gate["nano_public_baseline_checkpoint_sha256"]
+        return {
+            "calibration_reuse_receipt_path": str(reuse_path.resolve()),
+            "calibration_reuse_receipt_sha256": sha256_file(reuse_path),
+        }
+
+    monkeypatch.setattr(
+        initialization_module,
+        "validate_stage211_initialization_receipt",
+        fake_validate_initialization,
+    )
+    gate["baseline_public_provenance"] = {
+        "mode": "legacy_calibration_reuse",
+        "calibration_reuse_receipt_path": str(reuse_path.resolve()),
+        "calibration_reuse_receipt_sha256": sha256_file(reuse_path),
+        "initialization_receipt_path": str(initialization_path.resolve()),
+        "initialization_receipt_sha256": sha256_file(initialization_path),
+    }
+    gate_report.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    validated = validate_stage211_phase_gate_report(
+        gate_report,
+        expected_phase="mixer",
+        checkpoint_path=checkpoint,
+    )
+    assert validated["baseline_public_provenance"]["mode"] == ("legacy_calibration_reuse")
+
+    reuse_path.write_text(
+        reuse_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="baseline public provenance"):
+        validate_stage211_phase_gate_report(
+            gate_report,
+            expected_phase="mixer",
             checkpoint_path=checkpoint,
         )
 

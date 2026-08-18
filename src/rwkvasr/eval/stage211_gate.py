@@ -31,7 +31,7 @@ from rwkvasr.eval.stage211_supplemental import (
 )
 
 
-STAGE211_PHASE_GATE_SCHEMA_VERSION = 4
+STAGE211_PHASE_GATE_SCHEMA_VERSION = 5
 STAGE211_NANO_PUBLIC_BASELINE_SCHEMA_VERSION = 1
 STAGE211_TRAJECTORY_RETENTION_SCHEMA_VERSION = 1
 STAGE211_STEP_EVAL_CADENCE_SCHEMA_VERSION = 1
@@ -5403,6 +5403,193 @@ def validate_stage211_public_benchmark(
     return dict(public_benchmark)
 
 
+def build_stage211_phase_baseline_public_provenance(
+    *,
+    phase: str,
+    baseline_public_report_path: Path,
+    baseline_public_report: dict[str, Any],
+    baseline_public_benchmark: dict[str, Any],
+    phase_init_checkpoint: Path,
+    nano_teacher_checkpoint_sha256: str,
+    calibration_reuse_receipt_path: Path | None = None,
+    initialization_receipt_path: Path | None = None,
+) -> dict[str, Any]:
+    if phase not in {"mixer", "block", "logits"}:
+        raise ValueError(f"Unsupported Stage211 phase: {phase!r}")
+    baseline_public_report_path = baseline_public_report_path.expanduser().resolve()
+    phase_init_checkpoint = phase_init_checkpoint.expanduser().resolve()
+    receipt_path_value = baseline_public_report.get("student_prediction_receipt_path")
+    receipt_sha256_value = baseline_public_report.get("student_prediction_receipt_sha256")
+    has_receipt_path = receipt_path_value is not None and bool(str(receipt_path_value).strip())
+    has_receipt_sha256 = receipt_sha256_value is not None and bool(
+        str(receipt_sha256_value).strip()
+    )
+    if has_receipt_path != has_receipt_sha256:
+        raise ValueError(
+            "Stage211 baseline public report has a partial student-prediction receipt binding."
+        )
+    if has_receipt_path:
+        if calibration_reuse_receipt_path is not None or initialization_receipt_path is not None:
+            raise ValueError(
+                "Stage211 intrinsic baseline prediction provenance must not mix legacy receipts."
+            )
+        prediction_receipt_path = Path(str(receipt_path_value)).expanduser().resolve()
+        if (
+            not prediction_receipt_path.is_file()
+            or prediction_receipt_path.stat().st_size <= 0
+            or sha256_file(prediction_receipt_path) != str(receipt_sha256_value)
+        ):
+            raise ValueError("Stage211 baseline student-prediction receipt is missing or changed.")
+        return {
+            "mode": "student_prediction_receipt",
+            "student_prediction_receipt_path": str(prediction_receipt_path),
+            "student_prediction_receipt_sha256": str(receipt_sha256_value),
+        }
+
+    if phase != "mixer":
+        raise ValueError(
+            f"Stage211 {phase} baseline requires an intrinsic student-prediction receipt."
+        )
+    if calibration_reuse_receipt_path is None or initialization_receipt_path is None:
+        raise ValueError(
+            "Stage211 Mixer legacy calibration baseline requires reuse and initialization receipts."
+        )
+    calibration_reuse_receipt_path = calibration_reuse_receipt_path.expanduser().resolve()
+    initialization_receipt_path = initialization_receipt_path.expanduser().resolve()
+    reuse = _load_json_object(
+        calibration_reuse_receipt_path,
+        label="Stage211 calibration public-evaluation reuse receipt",
+    )
+    expected_reuse = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "calibration_public_eval_reuse",
+        "complete": True,
+    }
+    if any(reuse.get(key) != value for key, value in expected_reuse.items()):
+        raise ValueError("Stage211 calibration public-evaluation reuse contract mismatch.")
+    reuse_checkpoint = _validate_bound_file(
+        reuse,
+        path_key="checkpoint_path",
+        sha256_key="checkpoint_sha256",
+        label="Stage211 calibration reuse checkpoint",
+    )
+    if reuse_checkpoint != phase_init_checkpoint:
+        raise ValueError("Stage211 calibration reuse receipt binds another Layer checkpoint.")
+    reuse_comparison = _validate_bound_file(
+        reuse,
+        path_key="comparison_report_path",
+        sha256_key="comparison_report_sha256",
+        label="Stage211 calibration reuse public comparison",
+    )
+    if reuse_comparison != baseline_public_report_path:
+        raise ValueError("Stage211 calibration reuse receipt binds another public comparison.")
+    selection_path = _validate_bound_file(
+        reuse,
+        path_key="selection_report_path",
+        sha256_key="selection_report_sha256",
+        label="Stage211 calibration checkpoint selection",
+    )
+    selection = _load_json_object(
+        selection_path,
+        label="Stage211 calibration checkpoint selection",
+    )
+    selected = selection.get("selected")
+    if (
+        selection.get("pipeline") != "stage211"
+        or selection.get("artifact") != "calibration_checkpoint_selection"
+        or int(selection.get("required_completion_step", -1)) != 30_064
+        or not isinstance(selected, dict)
+        or selected.get("eligible") is not True
+        or int(selected.get("loss_improved_layers", -1)) != 70
+        or int(selected.get("cosine_improved_layers", -1)) != 70
+        or Path(str(selected.get("checkpoint_path") or "")).expanduser().resolve()
+        != phase_init_checkpoint
+        or str(selected.get("checkpoint_sha256") or "") != sha256_file(phase_init_checkpoint)
+    ):
+        raise ValueError("Stage211 calibration checkpoint selection contract mismatch.")
+
+    metrics_path = _validate_bound_file(
+        reuse,
+        path_key="metrics_path",
+        sha256_key="metrics_sha256",
+        label="Stage211 calibration public metrics",
+    )
+    metrics = _load_json_object(metrics_path, label="Stage211 calibration public metrics")
+    metric_rows = metrics.get("results")
+    benchmark_rows = baseline_public_benchmark.get("results")
+    if not isinstance(metric_rows, list) or not isinstance(benchmark_rows, list):
+        raise ValueError("Stage211 calibration public metrics lack dataset results.")
+    metrics_by_dataset = {
+        str(row.get("dataset")): row for row in metric_rows if isinstance(row, dict)
+    }
+    benchmark_by_dataset = {
+        str(row.get("dataset")): row for row in benchmark_rows if isinstance(row, dict)
+    }
+    if set(metrics_by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS) or set(
+        benchmark_by_dataset
+    ) != set(STAGE211_PUBLIC_BENCHMARKS):
+        raise ValueError("Stage211 calibration public metric dataset coverage mismatch.")
+    for dataset, expected in STAGE211_PUBLIC_BENCHMARKS.items():
+        metric_row = metrics_by_dataset[dataset]
+        benchmark_row = benchmark_by_dataset[dataset]
+        if (
+            metric_row.get("branch") != "ctc"
+            or int(metric_row.get("samples", -1)) != int(expected["samples"])
+            or int(benchmark_row.get("sample_count", -1)) != int(expected["samples"])
+        ):
+            raise ValueError(f"Stage211 calibration public coverage mismatch for {dataset}.")
+        for metric_name, benchmark_name in (
+            ("wer", "student_wer"),
+            ("cer", "student_cer"),
+        ):
+            metric_value = _stage211_finite_number(
+                metric_row.get(metric_name),
+                label=f"Stage211 calibration {dataset} {metric_name}",
+            )
+            benchmark_value = _stage211_finite_number(
+                benchmark_row.get(benchmark_name),
+                label=f"Stage211 calibration {dataset} {benchmark_name}",
+            )
+            if not math.isclose(metric_value, benchmark_value, rel_tol=0.0, abs_tol=1.0e-12):
+                raise ValueError(
+                    f"Stage211 calibration public {metric_name.upper()} mismatch for {dataset}."
+                )
+    _validate_stage211_replayed_value(
+        reuse.get("public_benchmark"),
+        baseline_public_benchmark,
+        label="Mixer calibration baseline public WER/CER benchmark",
+    )
+    validate_stage211_public_overlap_binding(
+        reuse.get("public_overlap"),
+        public_benchmark=baseline_public_benchmark,
+    )
+
+    # Imported lazily because the initialization module reuses gate helpers.
+    from rwkvasr.eval.stage211_initialization import (
+        validate_stage211_initialization_receipt,
+    )
+
+    initialization = validate_stage211_initialization_receipt(
+        initialization_receipt_path,
+        expected_calibration_checkpoint=phase_init_checkpoint,
+        expected_nano_checkpoint_sha256=nano_teacher_checkpoint_sha256,
+    )
+    if Path(
+        str(initialization.get("calibration_reuse_receipt_path") or "")
+    ).expanduser().resolve() != calibration_reuse_receipt_path or str(
+        initialization.get("calibration_reuse_receipt_sha256") or ""
+    ) != sha256_file(calibration_reuse_receipt_path):
+        raise ValueError("Stage211 initialization receipt binds another calibration reuse receipt.")
+    return {
+        "mode": "legacy_calibration_reuse",
+        "calibration_reuse_receipt_path": str(calibration_reuse_receipt_path),
+        "calibration_reuse_receipt_sha256": sha256_file(calibration_reuse_receipt_path),
+        "initialization_receipt_path": str(initialization_receipt_path),
+        "initialization_receipt_sha256": sha256_file(initialization_receipt_path),
+    }
+
+
 def validate_stage211_phase_gate_report(
     gate_report_path: str | Path,
     *,
@@ -5577,11 +5764,32 @@ def validate_stage211_phase_gate_report(
         baseline_public_path,
         label=f"Stage211 {expected_phase} baseline public comparison report",
     )
+    baseline_public_provenance = report.get("baseline_public_provenance")
+    if not isinstance(baseline_public_provenance, dict):
+        raise ValueError(f"Stage211 {expected_phase} phase gate lacks baseline public provenance.")
+    baseline_provenance_mode = str(baseline_public_provenance.get("mode") or "")
+    if baseline_provenance_mode not in {
+        "student_prediction_receipt",
+        "legacy_calibration_reuse",
+    }:
+        raise ValueError(
+            f"Stage211 {expected_phase} phase gate has invalid baseline provenance mode."
+        )
+    if expected_phase in {"block", "logits"} and baseline_provenance_mode != (
+        "student_prediction_receipt"
+    ):
+        raise ValueError(
+            f"Stage211 {expected_phase} baseline must use intrinsic prediction provenance."
+        )
     replayed_baseline_benchmark = replay_stage211_public_comparison(
         baseline_public_source,
         manifest_paths=manifest_paths,
         benchmarks=STAGE211_PUBLIC_BENCHMARKS,
         expected_checkpoint=phase_init_checkpoint,
+        require_student_prediction_receipt=(
+            expected_phase in {"block", "logits"}
+            or baseline_provenance_mode == "student_prediction_receipt"
+        ),
     )
     replayed_public_progress = build_stage211_public_progress(
         baseline=replayed_baseline_benchmark,
@@ -5606,6 +5814,36 @@ def validate_stage211_phase_gate_report(
     if len(teacher_sha256_values) != 1:
         raise ValueError("Stage211 phase gate does not bind one Nano teacher checkpoint SHA-256.")
     nano_teacher_checkpoint_sha256 = next(iter(teacher_sha256_values))
+    legacy_reuse_path_value = baseline_public_provenance.get("calibration_reuse_receipt_path")
+    legacy_initialization_path_value = baseline_public_provenance.get("initialization_receipt_path")
+    if baseline_provenance_mode == "legacy_calibration_reuse" and (
+        not str(legacy_reuse_path_value or "").strip()
+        or not str(legacy_initialization_path_value or "").strip()
+    ):
+        raise ValueError("Stage211 Mixer legacy baseline provenance lacks its two receipt paths.")
+    replayed_baseline_public_provenance = build_stage211_phase_baseline_public_provenance(
+        phase=expected_phase,
+        baseline_public_report_path=baseline_public_path,
+        baseline_public_report=baseline_public_source,
+        baseline_public_benchmark=replayed_baseline_benchmark,
+        phase_init_checkpoint=phase_init_checkpoint,
+        nano_teacher_checkpoint_sha256=nano_teacher_checkpoint_sha256,
+        calibration_reuse_receipt_path=(
+            Path(str(legacy_reuse_path_value or "")).expanduser().resolve()
+            if baseline_provenance_mode == "legacy_calibration_reuse"
+            else None
+        ),
+        initialization_receipt_path=(
+            Path(str(legacy_initialization_path_value or "")).expanduser().resolve()
+            if baseline_provenance_mode == "legacy_calibration_reuse"
+            else None
+        ),
+    )
+    _validate_stage211_replayed_value(
+        baseline_public_provenance,
+        replayed_baseline_public_provenance,
+        label=f"{expected_phase} baseline public provenance",
+    )
     baseline_receipt_path = _validate_bound_file(
         report,
         path_key="nano_public_baseline_receipt_path",

@@ -261,6 +261,8 @@ run_mixer_retention_loop() {
     --nano-prediction-dir "${NANO_EVAL_DIR}/predictions" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --baseline-public-comparison-report "${CALIBRATION_EVAL_DIR}/public/nano_comparison.json" \
+    --baseline-public-reuse-receipt "${CALIBRATION_REUSE_RECEIPT}" \
+    --initialization-receipt "${INITIALIZATION_RECEIPT}" \
     --config-dir "${FULL_CONFIG_ROOT}" \
     --selection "${MIXER_SELECTION}" \
     --master-port "$((MASTER_PORT + 10))" \

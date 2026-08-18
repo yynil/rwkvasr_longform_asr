@@ -173,6 +173,12 @@ def test_retention_finalizer_command_binds_all_prior_receipts(tmp_path: Path) ->
     assert command[command.index("--baseline-public-comparison-report") + 1] == str(
         args.baseline_public_comparison_report
     )
+    assert command[command.index("--baseline-public-reuse-receipt") + 1] == str(
+        loop.DEFAULT_CALIBRATION_REUSE_RECEIPT
+    )
+    assert command[command.index("--initialization-receipt") + 1] == str(
+        loop.DEFAULT_INITIALIZATION_RECEIPT
+    )
 
 
 @pytest.mark.parametrize("phase", ("block", "logits"))
@@ -208,6 +214,8 @@ def test_phase_correction_commands_preserve_phase_objective(
     assert finalizer[finalizer.index("--baseline-public-comparison-report") + 1] == str(
         args.baseline_public_comparison_report
     )
+    assert "--baseline-public-reuse-receipt" not in finalizer
+    assert "--initialization-receipt" not in finalizer
 
     gate = tmp_path / "gate" / "phase_gate.json"
     checkpoint = tmp_path / f"{phase}.pt"
@@ -252,7 +260,12 @@ def test_phase_selection_rejects_fewer_than_three_correction_rounds(
 
 
 def test_correction_loop_requires_explicit_phase_public_baseline() -> None:
-    assert loop.build_parser().get_default("baseline_public_comparison_report") is None
+    parser = loop.build_parser()
+    assert parser.get_default("baseline_public_comparison_report") is None
+    assert parser.get_default("baseline_public_reuse_receipt") == (
+        loop.DEFAULT_CALIBRATION_REUSE_RECEIPT
+    )
+    assert parser.get_default("initialization_receipt") == loop.DEFAULT_INITIALIZATION_RECEIPT
 
 
 def test_retention_loop_requires_three_complete_rounds_before_promotion(

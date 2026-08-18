@@ -17,6 +17,7 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_PUBLIC_BENCHMARKS,
     build_stage211_correction_round_promotion_gate,
     build_stage211_full_data_coverage,
+    build_stage211_phase_baseline_public_provenance,
     build_stage211_step_eval_cadence,
     build_stage211_trajectory_retention_gate,
     load_stage211_post_coverage_correction_receipts,
@@ -213,6 +214,8 @@ def build_phase_gate(
     alignment_report_path: Path | None,
     post_coverage_correction_receipt_paths: list[Path] | None = None,
     baseline_public_comparison_report_path: Path | None = None,
+    baseline_public_reuse_receipt_path: Path | None = None,
+    initialization_receipt_path: Path | None = None,
     nano_public_baseline_receipt_path: Path = (DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT),
     public_overlap_receipt_path: Path = DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
 ) -> dict[str, Any]:
@@ -399,6 +402,17 @@ def build_phase_gate(
     baseline_benchmark = _enrich_public_benchmark(
         baseline_public_report,
         manifest_dir=manifest_dir.resolve(),
+        require_student_prediction_receipt=phase in {"block", "logits"},
+    )
+    baseline_public_provenance = build_stage211_phase_baseline_public_provenance(
+        phase=phase,
+        baseline_public_report_path=baseline_public_comparison_report_path,
+        baseline_public_report=baseline_public_report,
+        baseline_public_benchmark=baseline_benchmark,
+        phase_init_checkpoint=phase_init_checkpoint,
+        nano_teacher_checkpoint_sha256=nano_teacher_checkpoint_sha256,
+        calibration_reuse_receipt_path=baseline_public_reuse_receipt_path,
+        initialization_receipt_path=initialization_receipt_path,
     )
     public_progress = _build_public_progress(
         baseline=baseline_benchmark,
@@ -457,6 +471,7 @@ def build_phase_gate(
         "loaded_manifest_receipt_sha256": sha256_file(loaded_manifest_receipt_path),
         "alignment_report": alignment_record,
         "baseline_public_comparison_report": baseline_public_record,
+        "baseline_public_provenance": baseline_public_provenance,
         "public_progress": public_progress,
         "full_data_coverage": build_stage211_full_data_coverage(
             phase=phase,
@@ -513,6 +528,8 @@ def main() -> int:
         type=Path,
         default=None,
     )
+    parser.add_argument("--baseline-public-reuse-receipt", type=Path, default=None)
+    parser.add_argument("--initialization-receipt", type=Path, default=None)
     parser.add_argument(
         "--nano-public-baseline-receipt",
         type=Path,
@@ -538,6 +555,8 @@ def main() -> int:
         post_coverage_correction_receipt_paths=list(args.post_coverage_correction_receipt),
         alignment_report_path=args.alignment_report,
         baseline_public_comparison_report_path=(args.baseline_public_comparison_report),
+        baseline_public_reuse_receipt_path=args.baseline_public_reuse_receipt,
+        initialization_receipt_path=args.initialization_receipt,
         nano_public_baseline_receipt_path=args.nano_public_baseline_receipt,
         public_overlap_receipt_path=args.public_overlap_receipt,
     )

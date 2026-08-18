@@ -68,6 +68,16 @@ DEFAULT_PUBLIC_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "man
 DEFAULT_NANO_EVAL_DIR = Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
 DEFAULT_NANO_CHECKPOINT = Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
 DEFAULT_SELECTION = Path.home() / "rwkvasr_eval" / "stage211_phase_gates" / "mixer_selected.json"
+DEFAULT_CALIBRATION_REUSE_RECEIPT = (
+    Path.home()
+    / "rwkvasr_eval"
+    / "stage211_calibration_selected_full"
+    / "public"
+    / "reuse_receipt.json"
+)
+DEFAULT_INITIALIZATION_RECEIPT = (
+    Path.home() / "rwkvasr_eval" / "stage211_initialization" / "nano_initialization_receipt.json"
+)
 PHASE_TARGETS = {"mixer": "block", "block": "logits", "logits": "sft"}
 
 
@@ -166,6 +176,27 @@ def _finalizer_command(
             str(args.baseline_public_comparison_report),
         )
     )
+    if phase == "mixer":
+        command.extend(
+            (
+                "--baseline-public-reuse-receipt",
+                str(
+                    getattr(
+                        args,
+                        "baseline_public_reuse_receipt",
+                        DEFAULT_CALIBRATION_REUSE_RECEIPT,
+                    )
+                ),
+                "--initialization-receipt",
+                str(
+                    getattr(
+                        args,
+                        "initialization_receipt",
+                        DEFAULT_INITIALIZATION_RECEIPT,
+                    )
+                ),
+            )
+        )
     for receipt in correction_receipts:
         command.extend(("--post-coverage-correction-receipt", str(receipt)))
     return command
@@ -580,6 +611,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--baseline-public-reuse-receipt",
+        type=Path,
+        default=DEFAULT_CALIBRATION_REUSE_RECEIPT,
+    )
+    parser.add_argument(
+        "--initialization-receipt",
+        type=Path,
+        default=DEFAULT_INITIALIZATION_RECEIPT,
+    )
+    parser.add_argument(
         "--config-dir",
         type=Path,
         default=Path.home() / "rwkvasr_configs" / "stage211_full_alignment",
@@ -615,6 +656,8 @@ def main() -> int:
         "nano_prediction_dir",
         "nano_checkpoint",
         "baseline_public_comparison_report",
+        "baseline_public_reuse_receipt",
+        "initialization_receipt",
         "config_dir",
         "selection",
     ):
