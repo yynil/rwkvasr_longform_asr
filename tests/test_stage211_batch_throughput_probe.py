@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from rwkvasr.eval.stage211_gate import stage211_phase_train_config_contract
+from rwkvasr.training.deepspeed_loop import DeepSpeedTrainConfig
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -178,6 +179,10 @@ def test_parse_profile_and_build_config_do_not_mutate_base(tmp_path: Path) -> No
     assert config["gradient_checkpointing"] is False
     assert config["deepspeed"]["train_micro_batch_size_per_gpu"] == 48
     assert config["deepspeed"]["train_batch_size"] == 384
+
+    config["stage211_batch_profile_probe_phase"] = "mixer"
+    executable = DeepSpeedTrainConfig(**config)
+    assert executable.stage211_batch_profile_probe_phase == "mixer"
 
 
 def test_loader_worker_selection_requires_measured_ten_percent_gain() -> None:

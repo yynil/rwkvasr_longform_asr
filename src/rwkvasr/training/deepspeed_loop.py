@@ -487,6 +487,38 @@ class DeepSpeedTrainConfig:
     specaugment_time_width: int = 40
     specaugment_freq_masks: int = 2
     specaugment_freq_width: int = 15
+    # Receipt-bound Stage211 metadata; these fields do not affect training behavior.
+    stage211_batch_profile_probe_phase: str | None = None
+    stage211_batch_profile_admission_path: str | None = None
+    stage211_batch_profile_admission_sha256: str | None = None
+    stage211_batch_profile_name: str | None = None
+    stage211_batch_profile_num_workers: int | None = None
+    stage211_batch_profile_gradient_checkpointing: bool | None = None
+    stage211_post_coverage_correction_phase: str | None = None
+    stage211_post_coverage_correction_round: int | None = None
+    stage211_post_coverage_replay_receipt_path: str | None = None
+    stage211_post_coverage_admission_gate_path: str | None = None
+    stage211_post_coverage_admission_gate_sha256: str | None = None
+    stage211_post_coverage_admission_mode: str | None = None
+    stage211_post_coverage_layer_focus_path: str | None = None
+    stage211_post_coverage_layer_focus_sha256: str | None = None
+    stage211_post_coverage_layer_rotation_offset: int | None = None
+    stage211_post_coverage_batch_profile_preflight_path: str | None = None
+    stage211_post_coverage_batch_profile_preflight_sha256: str | None = None
+    stage211_post_coverage_batch_profile_admission_path: str | None = None
+    stage211_post_coverage_batch_profile_admission_sha256: str | None = None
+    stage211_post_coverage_batch_profile_name: str | None = None
+    stage211_post_coverage_batch_size: int | None = None
+    stage211_post_coverage_frame_budget: int | None = None
+    stage211_post_coverage_num_workers: int | None = None
+    stage211_post_coverage_gradient_checkpointing: bool | None = None
+    stage211_post_coverage_original_coverage_unchanged: bool | None = None
+    stage211_post_coverage_smoke_marker_path: str | None = None
+    stage211_post_coverage_smoke_marker_sha256: str | None = None
+    stage211_sft_correction_profile_path: str | None = None
+    stage211_sft_correction_profile_sha256: str | None = None
+    stage211_full_sft_completion_path: str | None = None
+    stage211_full_sft_completion_sha256: str | None = None
 
 
 def _validate_exact_batch_coverage(

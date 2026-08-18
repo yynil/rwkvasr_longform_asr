@@ -1159,6 +1159,61 @@ def test_deepspeed_cli_accepts_init_checkpoint_override(tmp_path: Path) -> None:
     assert resolved.init_checkpoint_path == str(init_path)
 
 
+def test_deepspeed_cli_preserves_stage211_receipt_metadata(tmp_path: Path) -> None:
+    config_path = tmp_path / "train_ds.yaml"
+    metadata = {
+        "stage211_batch_profile_probe_phase": "mixer",
+        "stage211_batch_profile_admission_path": "/evidence/admission.json",
+        "stage211_batch_profile_admission_sha256": "a" * 64,
+        "stage211_batch_profile_name": "batch48_frames42k",
+        "stage211_batch_profile_num_workers": 8,
+        "stage211_batch_profile_gradient_checkpointing": False,
+        "stage211_post_coverage_correction_phase": "mixer",
+        "stage211_post_coverage_correction_round": 1,
+        "stage211_post_coverage_replay_receipt_path": "/evidence/replay.json",
+        "stage211_post_coverage_admission_gate_path": "/evidence/gate.json",
+        "stage211_post_coverage_admission_gate_sha256": "b" * 64,
+        "stage211_post_coverage_admission_mode": "failed_gate",
+        "stage211_post_coverage_layer_focus_path": "/evidence/focus.json",
+        "stage211_post_coverage_layer_focus_sha256": "c" * 64,
+        "stage211_post_coverage_layer_rotation_offset": 3,
+        "stage211_post_coverage_batch_profile_preflight_path": "/evidence/profile.json",
+        "stage211_post_coverage_batch_profile_preflight_sha256": "d" * 64,
+        "stage211_post_coverage_batch_profile_admission_path": "/evidence/round.json",
+        "stage211_post_coverage_batch_profile_admission_sha256": "e" * 64,
+        "stage211_post_coverage_batch_profile_name": "baseline",
+        "stage211_post_coverage_batch_size": 4,
+        "stage211_post_coverage_frame_budget": 4_000,
+        "stage211_post_coverage_num_workers": 8,
+        "stage211_post_coverage_gradient_checkpointing": True,
+        "stage211_post_coverage_original_coverage_unchanged": True,
+        "stage211_post_coverage_smoke_marker_path": "/evidence/smoke.json",
+        "stage211_post_coverage_smoke_marker_sha256": "f" * 64,
+        "stage211_sft_correction_profile_path": "/evidence/sft-profile.json",
+        "stage211_sft_correction_profile_sha256": "1" * 64,
+        "stage211_full_sft_completion_path": "/evidence/full-sft.json",
+        "stage211_full_sft_completion_sha256": "2" * 64,
+    }
+    config_path.write_text(
+        json.dumps(
+            {
+                "output_dir": str(tmp_path / "out"),
+                "device": "cpu",
+                "deepspeed": {"train_micro_batch_size_per_gpu": 1},
+                **metadata,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = _resolve_deepspeed_train_config(
+        build_parser().parse_args(["--config-yaml", str(config_path)])
+    )
+
+    for key, expected in metadata.items():
+        assert getattr(resolved, key) == expected
+
+
 def test_deepspeed_cli_accepts_decoder_text_token_budget(tmp_path: Path) -> None:
     config_path = tmp_path / "train_ds.yaml"
     config_path.write_text(
