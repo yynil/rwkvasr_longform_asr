@@ -32,6 +32,7 @@ RECENT_LOG_MINUTES="${RECENT_LOG_MINUTES:-90}"
 MONITOR_ONCE="${MONITOR_ONCE:-0}"
 FIXED_EVAL_CANONICAL_PART="${FIXED_EVAL_CANONICAL_PART:-${HOME}/rwkvasr_data/stage211_full_curriculum/fixed_hidden_eval/part_000000.jsonl}"
 FIXED_EVAL_CANONICAL_PART_SHA256="${FIXED_EVAL_CANONICAL_PART_SHA256:-9f4bf09cdbbf5bc963d6282a640e45fcd8da75f2e23a41e4515b6766288c84f1}"
+FIXED_EVAL_LAYER_REPORTER="${FIXED_EVAL_LAYER_REPORTER:-${REPO_ROOT}/scripts/report_stage211_fixed_eval_layer_progress.py}"
 
 ATTEMPT_MARKER='[rwkvasr] Distributed init complete.'
 ERROR_PATTERN='traceback|out of memory|\boom\b|loss=(nan|inf)|exception|decode error|NCCL.*(error|abort)|teacher_missing=[1-9]|online_layer_missing=[1-9]|online_layer_frame_delta=[1-9]|dropped_tail=[1-9]|skipped_samples=[1-9]'
@@ -185,6 +186,14 @@ stage211_emit_fixed_step_eval_progress() {
         }
       }
     '
+  if [[ -x "${MONITOR_PYTHON}" && -f "${FIXED_EVAL_LAYER_REPORTER}" ]]; then
+    nice -n 10 "${MONITOR_PYTHON}" "${FIXED_EVAL_LAYER_REPORTER}" \
+      --baseline "${baseline_path}" \
+      --candidate "${latest_path}" || true
+  else
+    printf 'fixed_eval_layer_progress status=unavailable reason=reporter_unavailable reporter=%s python=%s\n' \
+      "${FIXED_EVAL_LAYER_REPORTER}" "${MONITOR_PYTHON}"
+  fi
 }
 
 stage211_active_config_paths() {

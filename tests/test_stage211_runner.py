@@ -76,6 +76,9 @@ stage211_phase_gate = importlib.import_module("scripts.create_stage211_phase_gat
 stage211_full_phase = importlib.import_module("scripts.run_stage211_full_phase_curriculum")
 stage211_phase_finalizer = importlib.import_module("scripts.finalize_stage211_phase")
 stage211_stepwise_report = importlib.import_module("scripts.create_stage211_stepwise_report")
+stage211_fixed_eval_layer_progress = importlib.import_module(
+    "scripts.report_stage211_fixed_eval_layer_progress"
+)
 stage211_calibration_eval = importlib.import_module("scripts.validate_stage211_calibration_eval")
 stage211_supplemental_profile_receipt = importlib.import_module(
     "scripts.create_stage211_supplemental_profile_receipt"
@@ -1946,6 +1949,100 @@ def test_stage211_hourly_monitor_reports_latest_fixed_eval_without_calling_it_pu
     assert "eval_samples=256" in result.stdout
     assert f"report={latest}" in result.stdout
     assert "step-999" not in result.stdout
+    assert (
+        "fixed_eval_layer_progress status=unavailable reason=missing_layer_metrics "
+        "baseline_layers=absent candidate_layers=absent"
+    ) in result.stdout
+
+
+def _stage211_monitor_layer_metrics(
+    *,
+    loss: float,
+    cosine: float,
+) -> dict[str, dict[str, float]]:
+    return {
+        str(layer_id): {
+            "loss": loss,
+            "cosine": cosine,
+        }
+        for layer_id in range(70)
+    }
+
+
+def test_stage211_hourly_monitor_reports_gate_like_per_layer_progress(
+    tmp_path: Path,
+) -> None:
+    monitor_script = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    baseline_layers = _stage211_monitor_layer_metrics(loss=1.0, cosine=0.5)
+    candidate_layers = _stage211_monitor_layer_metrics(loss=0.8, cosine=0.7)
+    candidate_layers["69"] = {"loss": 1.2, "cosine": 0.4}
+    baseline_component = _stage211_monitor_layer_metrics(loss=0.5, cosine=0.6)
+    candidate_component = _stage211_monitor_layer_metrics(loss=0.4, cosine=0.8)
+    save_yaml(
+        run_dir / "step_eval_baseline.yaml",
+        {
+            "step": 0,
+            "eval_loss": 1.0,
+            "eval_samples": 256,
+            "layer_metrics": baseline_layers,
+            "layer_component_metrics": {"mixer": baseline_component},
+        },
+    )
+    latest = run_dir / "step_eval_layers_step-10000.yaml"
+    save_yaml(
+        latest,
+        {
+            "step": 10000,
+            "eval_loss": 0.8,
+            "eval_samples": 256,
+            "layers": candidate_layers,
+            "layer_components": {"mixer": candidate_component},
+        },
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; stage211_emit_fixed_step_eval_progress "$2"',
+            "stage211-monitor-test",
+            str(monitor_script),
+            str(run_dir),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "fixed_eval_layer_progress status=ok layer_count=70" in result.stdout
+    assert "loss_improved=69 loss_regressed=1 loss_flat=0" in result.stdout
+    assert "cosine_improved=69 cosine_regressed=1 cosine_flat=0" in result.stdout
+    assert "worst_loss_layer=69 worst_loss_delta=+0.2000000000" in result.stdout
+    assert "worst_cosine_layer=69 worst_cosine_delta=-0.1000000000" in result.stdout
+    assert "min_68_loss=true min_68_cosine=true" in result.stdout
+    assert "fixed_eval_component_progress status=ok component=mixer layer_count=70" in result.stdout
+    assert "loss_improved=70 loss_regressed=0 loss_flat=0" in result.stdout
+    assert "cosine_improved=70 cosine_regressed=0 cosine_flat=0" in result.stdout
+
+
+def test_stage211_fixed_eval_layer_reporter_rejects_partial_formal_maps() -> None:
+    baseline = {
+        "layer_metrics": _stage211_monitor_layer_metrics(loss=1.0, cosine=0.5),
+    }
+    candidate = {
+        "layers": _stage211_monitor_layer_metrics(loss=0.8, cosine=0.7),
+    }
+    candidate["layers"].pop("69")
+
+    with pytest.raises(ValueError, match="does not contain exactly 70 layers"):
+        stage211_fixed_eval_layer_progress.build_fixed_eval_layer_progress(
+            baseline,
+            candidate,
+        )
 
 
 def test_stage211_hourly_monitor_identifies_sha_bound_easy_zh_sentinel(
