@@ -219,13 +219,7 @@ def stage211_phase_gate_decision(
     trajectory_retention_gate_passed: bool,
     all_datasets_pass: bool,
 ) -> bool:
-    if phase in {"mixer", "block"}:
-        return (
-            alignment_gate_passed
-            and public_progress_gate_passed
-            and trajectory_retention_gate_passed
-        )
-    if phase == "logits":
+    if phase in {"mixer", "block", "logits"}:
         return (
             alignment_gate_passed
             and public_progress_gate_passed

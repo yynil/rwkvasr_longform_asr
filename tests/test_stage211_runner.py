@@ -2262,7 +2262,7 @@ def test_stage211_public_progress_requires_macro_and_deletion_improvement() -> N
 
 
 @pytest.mark.parametrize("phase", ("mixer", "block"))
-def test_stage211_hidden_phases_promote_on_bilingual_progress_before_nano_proximity(
+def test_stage211_hidden_phases_require_every_dataset_nano_proximity(
     phase: str,
 ) -> None:
     assert (
@@ -2273,14 +2273,15 @@ def test_stage211_hidden_phases_promote_on_bilingual_progress_before_nano_proxim
             trajectory_retention_gate_passed=True,
             all_datasets_pass=False,
         )
-        is True
+        is False
     )
 
 
-def test_stage211_logits_requires_every_dataset_nano_proximity() -> None:
+@pytest.mark.parametrize("phase", ("mixer", "block", "logits"))
+def test_stage211_every_phase_requires_progress_and_nano_proximity(phase: str) -> None:
     assert (
         stage211_gate_module.stage211_phase_gate_decision(
-            phase="logits",
+            phase=phase,
             alignment_gate_passed=True,
             public_progress_gate_passed=True,
             trajectory_retention_gate_passed=True,
@@ -2290,7 +2291,7 @@ def test_stage211_logits_requires_every_dataset_nano_proximity() -> None:
     )
     assert (
         stage211_gate_module.stage211_phase_gate_decision(
-            phase="logits",
+            phase=phase,
             alignment_gate_passed=True,
             public_progress_gate_passed=False,
             trajectory_retention_gate_passed=True,
@@ -2300,7 +2301,7 @@ def test_stage211_logits_requires_every_dataset_nano_proximity() -> None:
     )
     assert (
         stage211_gate_module.stage211_phase_gate_decision(
-            phase="logits",
+            phase=phase,
             alignment_gate_passed=True,
             public_progress_gate_passed=True,
             trajectory_retention_gate_passed=True,
