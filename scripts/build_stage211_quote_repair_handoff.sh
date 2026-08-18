@@ -115,7 +115,17 @@ env CUDA_VISIBLE_DEVICES='' nice -n 10 ionice -c 2 -n 7 uv run python \
   scripts/validate_stage211_supplemental_retention.py \
   --receipt "${RETENTION_OUTPUT_ROOT}/retention_replay_v3/receipt.json"
 
-printf '[stage211-quote-repair-handoff] complete combined=%s stratified=%s replay=%s\n' \
+env CUDA_VISIBLE_DEVICES='' nice -n 10 ionice -c 2 -n 7 uv run python \
+  scripts/repack_stage211_retention_replay_locality.py \
+  --selection-receipt "${RETENTION_OUTPUT_ROOT}/retention_replay_v3/receipt.json" \
+  --output-root "${RETENTION_OUTPUT_ROOT}/retention_replay_v4_locality"
+
+env CUDA_VISIBLE_DEVICES='' nice -n 10 ionice -c 2 -n 7 uv run python \
+  scripts/validate_stage211_retention_replay.py \
+  --receipt "${RETENTION_OUTPUT_ROOT}/retention_replay_v4_locality/receipt.json"
+
+printf '[stage211-quote-repair-handoff] complete combined=%s stratified=%s replay=%s runtime_replay=%s\n' \
   "${COMBINED_ROOT}/supplemental_inventory.json" \
   "${RETENTION_OUTPUT_ROOT}/stratified_hidden_eval_v3/receipt.json" \
-  "${RETENTION_OUTPUT_ROOT}/retention_replay_v3/receipt.json"
+  "${RETENTION_OUTPUT_ROOT}/retention_replay_v3/receipt.json" \
+  "${RETENTION_OUTPUT_ROOT}/retention_replay_v4_locality/receipt.json"

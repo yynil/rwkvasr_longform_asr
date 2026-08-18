@@ -4000,10 +4000,19 @@ def _validate_stage211_retention_replay_binding(
         sha256_key="replay_receipt_sha256",
         label="Stage211 retention replay receipt",
     )
-    replay = _load_json_object(
-        replay_receipt_path,
-        label="Stage211 retention replay receipt",
-    )
+    try:
+        from scripts.validate_stage211_retention_replay import validate_retention_replay
+    except ModuleNotFoundError as error:
+        if error.name != "scripts":
+            raise
+        from validate_stage211_retention_replay import validate_retention_replay
+
+    replay = validate_retention_replay(replay_receipt_path)
+    if (
+        Path(str(replay.get("receipt_path") or "")).resolve() != replay_receipt_path
+        or replay.get("receipt_sha256") != sha256_file(replay_receipt_path)
+    ):
+        raise ValueError("Stage211 retention replay deep-validation binding changed.")
     expected = {
         "schema_version": 2,
         "pipeline": "stage211",

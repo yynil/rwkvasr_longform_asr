@@ -198,7 +198,8 @@ def test_retention_barrier_deep_validates_both_receipts_before_preflight(
 
     assert commands[0][-2:] == ["--stratified-receipt", str(stratified)]
     assert commands[1][-2:] == ["--receipt", str(replay)]
-    assert all(str(handoff.SUPPLEMENTAL_RETENTION_VALIDATOR) in command for command in commands)
+    assert str(handoff.SUPPLEMENTAL_RETENTION_VALIDATOR) in commands[0]
+    assert str(handoff.RETENTION_REPLAY_VALIDATOR) in commands[1]
 
     source = inspect.getsource(handoff.main)
     wait_index = source.index("(stratified_hidden_receipt, retention_replay_receipt)")

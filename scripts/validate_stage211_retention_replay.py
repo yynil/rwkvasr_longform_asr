@@ -37,6 +37,9 @@ REPLAY_METADATA_KEYS = (
     "_stage211_replay_seed",
     "_stage211_replay_source_part",
 )
+RUNTIME_LAYOUT_ARTIFACT = "retention_replay_runtime_layout"
+RUNTIME_LAYOUT_POLICY = "retention_replay_parquet_row_group_max_frames_v1"
+PARQUET_SOURCES = frozenset({"peoples_speech_clean", "peoples_speech_dirty"})
 
 
 def sha256_file(path: str | Path) -> str:
@@ -75,6 +78,312 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"{label} must be a JSON object: {path}")
     return payload
+
+
+def _resolve_manifest_part(path: str, *, manifest_path: Path) -> Path:
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = manifest_path.parent / resolved
+    resolved = resolved.resolve()
+    if not resolved.is_file() or resolved.stat().st_size <= 0:
+        raise ValueError(f"Replay manifest part is missing or empty: {resolved}")
+    return resolved
+
+
+def _raw_manifest_parts(
+    manifest: Mapping[str, Any],
+    *,
+    manifest_path: Path,
+    split: str,
+) -> dict[Path, tuple[int, int, str | None, dict[str, Any]]]:
+    split_payload = (manifest.get("splits") or {}).get(split)
+    if not isinstance(split_payload, dict):
+        return {}
+    output: dict[Path, tuple[int, int, str | None, dict[str, Any]]] = {}
+    for bucket in split_payload.get("buckets") or []:
+        if not isinstance(bucket, dict):
+            raise ValueError(f"Replay runtime manifest has an invalid {split} bucket.")
+        bucket_id = int(bucket.get("bucket_id", -1))
+        declared_rows = int(bucket.get("num_samples", -1))
+        part_rows = 0
+        for part in bucket.get("parts") or []:
+            if not isinstance(part, dict):
+                raise ValueError(f"Replay runtime manifest has an invalid {split} part.")
+            path = _resolve_manifest_part(str(part.get("path") or ""), manifest_path=manifest_path)
+            if path in output:
+                raise ValueError(f"Replay runtime manifest duplicates a part: {path}")
+            rows = int(part.get("num_samples", -1))
+            if rows <= 0:
+                raise ValueError(f"Replay runtime manifest has a non-positive part: {path}")
+            label = part.get("source_label")
+            output[path] = (bucket_id, rows, None if label is None else str(label), dict(part))
+            part_rows += rows
+        if part_rows != declared_rows:
+            raise ValueError(f"Replay runtime manifest {split} bucket count mismatch.")
+    declared_split_rows = int(split_payload.get("num_samples", sum(row[1] for row in output.values())))
+    if sum(row[1] for row in output.values()) != declared_split_rows:
+        raise ValueError(f"Replay runtime manifest {split} count mismatch.")
+    return output
+
+
+def _runtime_parquet_identity(row: Mapping[str, Any]) -> tuple[str, str, int, int, str]:
+    source = str(row.get("source_dataset") or "")
+    shard = str(row.get("shard_name") or "")
+    row_group = row.get("parquet_row_group")
+    row_index = row.get("parquet_row_index")
+    key = _row_key(row)
+    if (
+        source not in PARQUET_SOURCES
+        or str(row.get("storage_kind") or "") != "parquet"
+        or not shard
+        or not isinstance(row_group, int)
+        or isinstance(row_group, bool)
+        or row_group < 0
+        or not isinstance(row_index, int)
+        or isinstance(row_index, bool)
+        or row_index < 0
+        or not key
+    ):
+        raise ValueError(f"Invalid Stage211 replay Parquet identity: {row!r}")
+    return source, shard, row_group, row_index, key
+
+
+def _is_runtime_parquet_label(value: str | None) -> bool:
+    return bool(value) and str(value).rsplit(":", 1)[-1] in PARQUET_SOURCES
+
+
+def _validate_runtime_layout_replay(
+    receipt_path: Path,
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": RUNTIME_LAYOUT_ARTIFACT,
+        "complete": True,
+        "policy": RUNTIME_LAYOUT_POLICY,
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 replay runtime-layout contract mismatch.")
+    selection_record = receipt.get("selection_receipt")
+    if not isinstance(selection_record, dict):
+        raise ValueError("Stage211 replay runtime layout lacks its selection receipt.")
+    selection_path = _validate_bound_path(
+        selection_record,
+        label="Stage211 replay runtime selection receipt",
+    )
+    if selection_path == receipt_path:
+        raise ValueError("Stage211 replay runtime layout recursively selects itself.")
+    selection = validate_retention_replay(selection_path)
+    source_manifest_path = Path(str(receipt.get("source_manifest_path") or "")).resolve()
+    if (
+        not source_manifest_path.is_file()
+        or receipt.get("source_manifest_sha256") != sha256_file(source_manifest_path)
+        or source_manifest_path != Path(str(selection.get("manifest_path") or "")).resolve()
+        or receipt.get("source_manifest_sha256") != selection.get("manifest_sha256")
+    ):
+        raise ValueError("Stage211 replay runtime source-manifest binding changed.")
+    runtime_manifest_path = Path(str(receipt.get("runtime_manifest_path") or "")).resolve()
+    if (
+        not runtime_manifest_path.is_file()
+        or receipt.get("runtime_manifest_sha256") != sha256_file(runtime_manifest_path)
+    ):
+        raise ValueError("Stage211 replay runtime manifest is missing or changed.")
+    source_manifest = _load_json(source_manifest_path, label="Stage211 replay source manifest")
+    runtime_manifest = _load_json(runtime_manifest_path, label="Stage211 replay runtime manifest")
+    if (
+        int(source_manifest.get("bucket_width", -1)) != 80
+        or int(runtime_manifest.get("bucket_width", -1)) != 80
+        or runtime_manifest.get("batching_policy") != RUNTIME_LAYOUT_POLICY
+    ):
+        raise ValueError("Stage211 replay runtime bucketing policy changed.")
+    source_train = _raw_manifest_parts(
+        source_manifest,
+        manifest_path=source_manifest_path,
+        split="train",
+    )
+    runtime_train = _raw_manifest_parts(
+        runtime_manifest,
+        manifest_path=runtime_manifest_path,
+        split="train",
+    )
+    source_eval = _raw_manifest_parts(
+        source_manifest,
+        manifest_path=source_manifest_path,
+        split="eval",
+    )
+    runtime_eval = _raw_manifest_parts(
+        runtime_manifest,
+        manifest_path=runtime_manifest_path,
+        split="eval",
+    )
+    if source_eval != runtime_eval:
+        raise ValueError("Stage211 replay runtime layout changed the fixed eval split.")
+    source_parquet_paths = tuple(
+        path for path, (_, _, label, _) in source_train.items() if _is_runtime_parquet_label(label)
+    )
+    unchanged_source = {
+        path: binding for path, binding in source_train.items() if path not in source_parquet_paths
+    }
+    rewritten_records = receipt.get("rewritten_parts")
+    if not isinstance(rewritten_records, list) or not rewritten_records:
+        raise ValueError("Stage211 replay runtime layout lacks rewritten parts.")
+    rewritten: dict[Path, Mapping[str, Any]] = {}
+    for record in rewritten_records:
+        if not isinstance(record, dict):
+            raise ValueError("Stage211 replay runtime rewritten-part record is invalid.")
+        path = _validate_bound_path(record, label="Stage211 replay runtime rewritten part")
+        if path in rewritten:
+            raise ValueError(f"Stage211 replay runtime duplicates a rewritten part: {path}")
+        rewritten[path] = record
+    runtime_rewritten = {path: runtime_train[path] for path in rewritten if path in runtime_train}
+    runtime_unchanged = {
+        path: binding for path, binding in runtime_train.items() if path not in rewritten
+    }
+    if set(runtime_rewritten) != set(rewritten) or runtime_unchanged != unchanged_source:
+        raise ValueError("Stage211 replay runtime changed non-Parquet parts or rewritten coverage.")
+
+    source_rows: dict[str, tuple[str, tuple[str, str, int], int, str]] = {}
+    source_groups: Counter[tuple[str, str, int]] = Counter()
+    source_adjacent_same_row_group = 0
+    previous_source_group: tuple[str, str, int] | None = None
+    for part_path in source_parquet_paths:
+        _, declared_rows, source_label, _ = source_train[part_path]
+        observed_rows = 0
+        with part_path.open("r", encoding="utf-8") as source:
+            for line in source:
+                if not line.strip():
+                    continue
+                observed_rows += 1
+                row = json.loads(line)
+                identity = _runtime_parquet_identity(row)
+                key = identity[-1]
+                group = identity[:3]
+                if key in source_rows:
+                    raise ValueError(f"Stage211 replay source Parquet key is duplicated: {key}")
+                expected_label = f"{row.get('_stage211_replay_cell')}:{identity[0]}"
+                if source_label != expected_label:
+                    raise ValueError(f"Stage211 replay source Parquet label mismatch: {key}")
+                frames = int(row.get("num_frames") or 0)
+                if frames <= 0:
+                    raise ValueError(f"Stage211 replay source frame count is invalid: {key}")
+                source_rows[key] = (_payload_sha256(row), group, frames, expected_label)
+                source_groups[group] += 1
+                if group == previous_source_group:
+                    source_adjacent_same_row_group += 1
+                previous_source_group = group
+        if observed_rows != declared_rows:
+            raise ValueError(f"Stage211 replay source Parquet part count mismatch: {part_path}")
+
+    runtime_keys: set[str] = set()
+    group_buckets: dict[tuple[str, str, int], int] = {}
+    group_parts: dict[tuple[str, str, int], Path] = {}
+    group_max_frames: Counter[tuple[str, str, int]] = Counter()
+    rows_by_source: Counter[str] = Counter()
+    row_groups_by_source: Counter[str] = Counter()
+    rows_by_runtime_bucket: Counter[int] = Counter()
+    for part_path, record in rewritten.items():
+        runtime_bucket, declared_rows, source_label, manifest_record = runtime_train[part_path]
+        if (
+            int(record.get("bucket_id", -1)) != runtime_bucket
+            or int(record.get("num_samples", -1)) != declared_rows
+            or record.get("source_label") != source_label
+            or any(
+                record.get(key) != manifest_record.get(key)
+                for key in (
+                    "num_samples",
+                    "source_label",
+                    "first_shard",
+                    "last_shard",
+                    "size_bytes",
+                    "sha256",
+                )
+            )
+        ):
+            raise ValueError(f"Stage211 replay runtime rewritten-part binding changed: {part_path}")
+        previous_identity: tuple[str, str, int, int, str] | None = None
+        observed_rows = 0
+        with part_path.open("r", encoding="utf-8") as source:
+            for line in source:
+                if not line.strip():
+                    continue
+                observed_rows += 1
+                row = json.loads(line)
+                identity = _runtime_parquet_identity(row)
+                if previous_identity is not None and identity <= previous_identity:
+                    raise ValueError(f"Stage211 replay runtime part is not locality ordered: {part_path}")
+                previous_identity = identity
+                key = identity[-1]
+                group = identity[:3]
+                source_record = source_rows.get(key)
+                if source_record is None or source_record[0] != _payload_sha256(row):
+                    raise ValueError(f"Stage211 replay runtime row changed: {key}")
+                if source_record[1:] != (
+                    group,
+                    int(row.get("num_frames") or 0),
+                    source_label,
+                ):
+                    raise ValueError(f"Stage211 replay runtime provenance changed: {key}")
+                if key in runtime_keys:
+                    raise ValueError(f"Stage211 replay runtime key is duplicated: {key}")
+                runtime_keys.add(key)
+                if group in group_buckets and group_buckets[group] != runtime_bucket:
+                    raise ValueError("Stage211 replay row group spans runtime buckets.")
+                if group in group_parts and group_parts[group] != part_path:
+                    raise ValueError("Stage211 replay row group spans runtime parts.")
+                group_buckets[group] = runtime_bucket
+                group_parts[group] = part_path
+                frames = int(row["num_frames"])
+                group_max_frames[group] = max(group_max_frames[group], frames)
+                rows_by_source[identity[0]] += 1
+                rows_by_runtime_bucket[runtime_bucket] += 1
+        if observed_rows != declared_rows:
+            raise ValueError(f"Stage211 replay runtime rewritten-part count mismatch: {part_path}")
+    if runtime_keys != set(source_rows):
+        raise ValueError("Stage211 replay runtime Parquet key coverage changed.")
+    if set(group_buckets) != set(source_groups):
+        raise ValueError("Stage211 replay runtime row-group coverage changed.")
+    for group, bucket_id in group_buckets.items():
+        if bucket_id != group_max_frames[group] // 80:
+            raise ValueError("Stage211 replay runtime row group uses the wrong maximum-frame bucket.")
+        row_groups_by_source[group[0]] += 1
+
+    source_train_rows = sum(binding[1] for binding in source_train.values())
+    runtime_train_rows = sum(binding[1] for binding in runtime_train.values())
+    runtime_eval_rows = sum(binding[1] for binding in runtime_eval.values())
+    computed = {
+        "selected_rows": source_train_rows,
+        "eval_rows": runtime_eval_rows,
+        "parquet_rows": len(source_rows),
+        "parquet_row_groups": len(source_groups),
+        "unchanged_rows": sum(binding[1] for binding in unchanged_source.values()),
+        "source_parquet_parts": len(source_parquet_paths),
+        "runtime_parquet_parts": len(rewritten),
+        "rows_by_source": dict(sorted(rows_by_source.items())),
+        "row_groups_by_source": dict(sorted(row_groups_by_source.items())),
+        "rows_by_runtime_bucket": {
+            str(bucket): rows for bucket, rows in sorted(rows_by_runtime_bucket.items())
+        },
+        "maximum_num_frames": max(group_max_frames.values(), default=0),
+        "source_adjacent_same_row_group": source_adjacent_same_row_group,
+        "runtime_adjacent_same_row_group": len(source_rows) - len(source_groups),
+    }
+    if source_train_rows != runtime_train_rows or source_train_rows != int(
+        selection.get("validated_unique_keys", -1)
+    ):
+        raise ValueError("Stage211 replay runtime train coverage changed.")
+    if any(receipt.get(key) != value for key, value in computed.items()):
+        raise ValueError("Stage211 replay runtime receipt statistics changed.")
+    return {
+        **selection,
+        "selection_receipt_path": str(selection_path),
+        "selection_receipt_sha256": sha256_file(selection_path),
+        "manifest_path": str(runtime_manifest_path),
+        "manifest_sha256": sha256_file(runtime_manifest_path),
+        "runtime_layout": dict(receipt),
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": sha256_file(receipt_path),
+    }
 
 
 def _row_key(row: Mapping[str, Any]) -> str:
@@ -499,6 +808,10 @@ def validate_retention_replay(
 ) -> dict[str, Any]:
     receipt_path = receipt_path.expanduser().resolve()
     receipt = _load_json(receipt_path, label="Stage211 retention replay receipt")
+    if receipt.get("artifact") == RUNTIME_LAYOUT_ARTIFACT:
+        if expected_cell_targets != DEFAULT_CELL_TARGETS or expected_fixed_eval_samples != 256:
+            raise ValueError("Stage211 replay runtime layout uses production selection targets.")
+        return _validate_runtime_layout_replay(receipt_path, receipt)
     if int(receipt.get("schema_version", -1)) == 2:
         if expected_cell_targets != DEFAULT_CELL_TARGETS or expected_fixed_eval_samples != 256:
             raise ValueError("Stage211 replay v2 uses its receipt-bound production targets.")

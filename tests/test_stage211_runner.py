@@ -80,8 +80,32 @@ stage211_calibration_eval = importlib.import_module("scripts.validate_stage211_c
 stage211_supplemental_profile_receipt = importlib.import_module(
     "scripts.create_stage211_supplemental_profile_receipt"
 )
+stage211_replay_validator = importlib.import_module(
+    "scripts.validate_stage211_retention_replay"
+)
 stage211_gate_module = importlib.import_module("rwkvasr.eval.stage211_gate")
 stage211_batch_profile_test = importlib.import_module("tests.test_stage211_batch_profile_admission")
+
+
+def _validate_synthetic_retention_replay(receipt_path: Path) -> dict[str, object]:
+    receipt_path = receipt_path.resolve()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    for index, record in enumerate(receipt.get("supplemental_output_parts", [])):
+        part_path = Path(str(record.get("path") or "")).resolve()
+        if (
+            not part_path.is_file()
+            or record.get("sha256") != sha256_file(part_path)
+        ):
+            raise ValueError(
+                f"Stage211 retention replay output part {index} SHA-256 mismatch: "
+                f"{part_path}"
+            )
+    return {
+        **receipt,
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": sha256_file(receipt_path),
+        "validated_unique_keys": int(receipt["samples"]),
+    }
 
 
 def _stage211_smoke_runtime_fields(phase: str) -> str:
@@ -133,6 +157,20 @@ def _compact_public_replay_for_phase_gate_tests(
     )
     if not phase_gate_test:
         return
+    if request.node.name in {
+        "test_stage211_phase_gate_validates_retention_correction_chain",
+        "test_stage211_phase_gate_rejects_mutated_correction_focus_summary",
+        "test_stage211_phase_gate_rejects_spoofed_early_pass_admission_mode",
+        "test_stage211_phase_gate_rejects_mutated_correction_layer_rotation_offset",
+        "test_stage211_phase_gate_rejects_correction_checkpoint_chain_break",
+    }:
+        # These fixtures exercise the correction chain. Production replay deep-validation
+        # is covered independently with a schema-v2 runtime-layout artifact.
+        monkeypatch.setattr(
+            stage211_replay_validator,
+            "validate_retention_replay",
+            _validate_synthetic_retention_replay,
+        )
     compact = {
         dataset: {
             **expected,
@@ -1417,7 +1455,10 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert "wait_for_supplemental_training_data()" in script
     assert '--inventory "${SUPPLEMENTAL_INVENTORY}"' in script
     assert '--output "${SUPPLEMENTAL_PROFILE_RECEIPT}"' in script
-    assert "supplemental inventory, profile, nine-cell eval, and replay v2 validated" in script
+    assert (
+        "supplemental inventory, profile, nine-cell eval, and runtime replay validated"
+        in script
+    )
     assert "CTC_TEXT_NORMALIZATION=ctc" in script
 
     main_body = script[script.index("main() {") :]

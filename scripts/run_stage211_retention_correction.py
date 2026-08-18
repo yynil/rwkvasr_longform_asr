@@ -100,7 +100,7 @@ DEFAULT_REPLAY_RECEIPT = (
     Path.home()
     / "rwkvasr_data"
     / "stage211_full_curriculum"
-    / "retention_replay_v3"
+    / "retention_replay_v4_locality"
     / "receipt.json"
 )
 DEFAULT_OUTPUT_ROOT = (

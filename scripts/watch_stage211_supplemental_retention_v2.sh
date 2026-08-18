@@ -10,6 +10,8 @@ INVENTORY="${COMBINED_ROOT}/supplemental_inventory.json"
 PROFILE="${COMBINED_ROOT}/supplemental_profile_receipt.json"
 STRATIFIED_RECEIPT="${OUTPUT_ROOT}/stratified_hidden_eval_v3/receipt.json"
 REPLAY_RECEIPT="${OUTPUT_ROOT}/retention_replay_v3/receipt.json"
+RUNTIME_REPLAY_ROOT="${OUTPUT_ROOT}/retention_replay_v4_locality"
+RUNTIME_REPLAY_RECEIPT="${RUNTIME_REPLAY_ROOT}/receipt.json"
 
 cd "${REPO_ROOT}"
 
@@ -35,5 +37,14 @@ nice -n 10 ionice -c 2 -n 7 uv run python \
   scripts/validate_stage211_supplemental_retention.py \
   --receipt "${REPLAY_RECEIPT}"
 
-printf '[stage211-supplemental-retention-watch] complete stratified=%s replay=%s\n' \
-  "${STRATIFIED_RECEIPT}" "${REPLAY_RECEIPT}"
+nice -n 10 ionice -c 2 -n 7 uv run python \
+  scripts/repack_stage211_retention_replay_locality.py \
+  --selection-receipt "${REPLAY_RECEIPT}" \
+  --output-root "${RUNTIME_REPLAY_ROOT}"
+
+nice -n 10 ionice -c 2 -n 7 uv run python \
+  scripts/validate_stage211_retention_replay.py \
+  --receipt "${RUNTIME_REPLAY_RECEIPT}"
+
+printf '[stage211-supplemental-retention-watch] complete stratified=%s replay=%s runtime_replay=%s\n' \
+  "${STRATIFIED_RECEIPT}" "${REPLAY_RECEIPT}" "${RUNTIME_REPLAY_RECEIPT}"

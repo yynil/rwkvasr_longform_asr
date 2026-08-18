@@ -33,6 +33,7 @@ CURRICULUM_VALIDATOR = REPO_ROOT / "scripts" / "finalize_stage211_phase.py"
 SUPPLEMENTAL_RETENTION_VALIDATOR = (
     REPO_ROOT / "scripts" / "validate_stage211_supplemental_retention.py"
 )
+RETENTION_REPLAY_VALIDATOR = REPO_ROOT / "scripts" / "validate_stage211_retention_replay.py"
 BOOTSTRAP = REPO_ROOT / "scripts" / "start_stage211_abcd_after_calibration.sh"
 
 DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_runs" / "stage211_full_alignment"
@@ -122,7 +123,7 @@ def _retention_validation_commands(
         ],
         [
             str(PYTHON),
-            str(SUPPLEMENTAL_RETENTION_VALIDATOR),
+            str(RETENTION_REPLAY_VALIDATOR),
             "--receipt",
             str(retention_replay_receipt),
         ],
@@ -480,7 +481,7 @@ def main() -> int:
     retention_replay_receipt = (
         args.retention_replay_receipt.expanduser().resolve()
         if args.retention_replay_receipt is not None
-        else metadata_root / "retention_replay_v3" / "receipt.json"
+        else metadata_root / "retention_replay_v4_locality" / "receipt.json"
     )
     nano_checkpoint = args.nano_checkpoint.expanduser().resolve()
     handoff_log = args.handoff_log.expanduser().resolve()

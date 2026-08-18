@@ -37,7 +37,7 @@ PUBLIC_CLEAN_INSTALL_RECEIPT="${PUBLIC_CLEAN_INSTALL_RECEIPT:-${HOME}/rwkvasr_ev
 REUSE_COMPLETED_CALIBRATION_EVAL="${REUSE_COMPLETED_CALIBRATION_EVAL:-0}"
 CALIBRATION_REUSE_RECEIPT="${CALIBRATION_REUSE_RECEIPT:-${CALIBRATION_EVAL_DIR}/public/reuse_receipt.json}"
 START_STAGE="${START_STAGE:-full}"
-RETENTION_REPLAY_RECEIPT="${RETENTION_REPLAY_RECEIPT:-${METADATA_ROOT}/retention_replay_v3/receipt.json}"
+RETENTION_REPLAY_RECEIPT="${RETENTION_REPLAY_RECEIPT:-${METADATA_ROOT}/retention_replay_v4_locality/receipt.json}"
 STRATIFIED_HIDDEN_RECEIPT="${STRATIFIED_HIDDEN_RECEIPT:-${METADATA_ROOT}/stratified_hidden_eval_v3/receipt.json}"
 RETENTION_RUN_ROOT="${RETENTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211a_mixer_retention_correction}"
 RETENTION_GATE_ROOT="${RETENTION_GATE_ROOT:-${PHASE_GATE_ROOT}/mixer_retention}"
@@ -88,9 +88,9 @@ wait_for_supplemental_training_data() {
         --output "${SUPPLEMENTAL_PROFILE_RECEIPT}" \
       && uv run python "${REPO_ROOT}/scripts/validate_stage211_supplemental_retention.py" \
         --stratified-receipt "${STRATIFIED_HIDDEN_RECEIPT}" \
-      && uv run python "${REPO_ROOT}/scripts/validate_stage211_supplemental_retention.py" \
+      && uv run python "${REPO_ROOT}/scripts/validate_stage211_retention_replay.py" \
         --receipt "${RETENTION_REPLAY_RECEIPT}"; then
-      log "supplemental inventory, profile, nine-cell eval, and replay v2 validated"
+      log "supplemental inventory, profile, nine-cell eval, and runtime replay validated"
       return
     else
       log "supplemental readiness validation failed; waiting ${SUPPLEMENTAL_POLL_SECONDS}s"
