@@ -2,13 +2,100 @@ from __future__ import annotations
 
 import hashlib
 import os
+import signal
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MONITOR = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+
+
+def test_stage211_monitor_daemon_is_singleton_but_one_shot_remains_available(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    monitor_log = output_root / "monitor.log"
+    daemon_lock = output_root / "daemon.lock"
+    snapshot_lock = output_root / "snapshot.lock"
+    environment = {
+        **os.environ,
+        "OUTPUT_ROOT": str(output_root),
+        "MONITOR_LOG": str(monitor_log),
+        "MONITOR_DAEMON_LOCK": str(daemon_lock),
+        "MONITOR_SNAPSHOT_LOCK": str(snapshot_lock),
+        "POLL_SECONDS": "60",
+    }
+    command = (
+        'source "$1"; '
+        'stage211_emit_snapshot() { printf "snapshot\\n"; }; '
+        "tmux() { return 0; }; "
+        "stage211_main"
+    )
+    arguments = [
+        "bash",
+        "-c",
+        command,
+        "stage211-monitor-test",
+        str(MONITOR),
+    ]
+    daemon = subprocess.Popen(
+        arguments,
+        cwd=REPO_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if monitor_log.is_file() and monitor_log.read_text(encoding="utf-8") == "snapshot\n":
+                break
+            if daemon.poll() is not None:
+                stdout, stderr = daemon.communicate()
+                raise AssertionError(
+                    f"monitor daemon exited before acquiring its lock: {stdout=} {stderr=}"
+                )
+            time.sleep(0.05)
+        else:
+            raise AssertionError("monitor daemon did not publish its initial snapshot")
+
+        duplicate = subprocess.run(
+            arguments,
+            cwd=REPO_ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        assert duplicate.returncode == 0
+        assert "hourly monitor already active" in duplicate.stderr
+        assert monitor_log.read_text(encoding="utf-8") == "snapshot\n"
+
+        one_shot = subprocess.run(
+            arguments,
+            cwd=REPO_ROOT,
+            env={**environment, "MONITOR_ONCE": "1"},
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        assert one_shot.returncode == 0, one_shot.stderr
+        assert monitor_log.read_text(encoding="utf-8") == "snapshot\nsnapshot\n"
+    finally:
+        if daemon.poll() is None:
+            os.killpg(daemon.pid, signal.SIGTERM)
+            try:
+                daemon.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                os.killpg(daemon.pid, signal.SIGKILL)
+                daemon.wait(timeout=5.0)
 
 
 def _emit_readiness(tmp_path: Path) -> str:

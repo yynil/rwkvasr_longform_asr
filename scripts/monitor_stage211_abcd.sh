@@ -10,6 +10,8 @@ CALIBRATION_EVAL_ROOT="${CALIBRATION_EVAL_ROOT:-${HOME}/rwkvasr_eval/stage211_ca
 CORRECTED_PUBLIC_ROOT="${CORRECTED_PUBLIC_ROOT:-${HOME}/rwkvasr_eval/stage211_public_clean_v2}"
 PHASE_GATE_ROOT="${PHASE_GATE_ROOT:-${HOME}/rwkvasr_eval/stage211_phase_gates}"
 MONITOR_LOG="${MONITOR_LOG:-${OUTPUT_ROOT}/monitor_hourly.log}"
+MONITOR_DAEMON_LOCK="${MONITOR_DAEMON_LOCK:-${OUTPUT_ROOT}/monitor_hourly.daemon.lock}"
+MONITOR_SNAPSHOT_LOCK="${MONITOR_SNAPSHOT_LOCK:-${OUTPUT_ROOT}/monitor_hourly.snapshot.lock}"
 BASE_PUBLIC_OVERLAP_ROOT="${BASE_PUBLIC_OVERLAP_ROOT:-${HOME}/rwkvasr_data/stage211_base_public_pcm_overlap_v2}"
 SUPPLEMENTAL_PROGRESS_REPORTER="${SUPPLEMENTAL_PROGRESS_REPORTER:-${REPO_ROOT}/scripts/report_stage211_base_public_pcm_progress.py}"
 SOCIAL_PCM_INVENTORY="${SOCIAL_PCM_INVENTORY:-${HOME}/rwkvasr_data/stage211_social_vad_materialized_v1/materialized_inventory.json}"
@@ -30,6 +32,7 @@ MONITOR_PYTHON="${MONITOR_PYTHON:-${REPO_ROOT}/.venv/bin/python3}"
 POLL_SECONDS="${POLL_SECONDS:-3600}"
 RECENT_LOG_MINUTES="${RECENT_LOG_MINUTES:-90}"
 MONITOR_ONCE="${MONITOR_ONCE:-0}"
+MONITOR_INITIAL_DELAY_SECONDS="${MONITOR_INITIAL_DELAY_SECONDS:-0}"
 FIXED_EVAL_CANONICAL_PART="${FIXED_EVAL_CANONICAL_PART:-${HOME}/rwkvasr_data/stage211_full_curriculum/fixed_hidden_eval/part_000000.jsonl}"
 FIXED_EVAL_CANONICAL_PART_SHA256="${FIXED_EVAL_CANONICAL_PART_SHA256:-9f4bf09cdbbf5bc963d6282a640e45fcd8da75f2e23a41e4515b6766288c84f1}"
 FIXED_EVAL_LAYER_REPORTER="${FIXED_EVAL_LAYER_REPORTER:-${REPO_ROOT}/scripts/report_stage211_fixed_eval_layer_progress.py}"
@@ -507,14 +510,43 @@ stage211_emit_snapshot() {
   df -h / /media/usbhd 2>&1 || true
 }
 
+stage211_emit_snapshot_locked() {
+  (
+    if ! flock -x 8; then
+      printf 'failed to acquire Stage211 monitor snapshot lock: %s\n' \
+        "${MONITOR_SNAPSHOT_LOCK}" >&2
+      exit 1
+    fi
+    stage211_emit_snapshot >>"${MONITOR_LOG}" 2>&1
+  ) 8>"${MONITOR_SNAPSHOT_LOCK}"
+}
+
 stage211_main() {
   mkdir -p "$(dirname "${MONITOR_LOG}")"
+  if ! command -v flock >/dev/null 2>&1; then
+    printf '%s\n' 'Stage211 monitor requires flock.' >&2
+    return 1
+  fi
+  if [[ ! "${MONITOR_INITIAL_DELAY_SECONDS}" =~ ^[0-9]+$ ]]; then
+    printf 'MONITOR_INITIAL_DELAY_SECONDS must be a nonnegative integer, got %s\n' \
+      "${MONITOR_INITIAL_DELAY_SECONDS}" >&2
+    return 2
+  fi
   if stage211_truthy "${MONITOR_ONCE}"; then
-    stage211_emit_snapshot >>"${MONITOR_LOG}" 2>&1
+    stage211_emit_snapshot_locked
     return
   fi
+  exec 9>"${MONITOR_DAEMON_LOCK}"
+  if ! flock -n 9; then
+    printf 'Stage211 hourly monitor already active lock=%s\n' \
+      "${MONITOR_DAEMON_LOCK}" >&2
+    return 0
+  fi
+  if ((MONITOR_INITIAL_DELAY_SECONDS > 0)); then
+    sleep "${MONITOR_INITIAL_DELAY_SECONDS}"
+  fi
   while tmux has-session -t "${SUPERVISOR_SESSION}" 2>/dev/null; do
-    stage211_emit_snapshot >>"${MONITOR_LOG}" 2>&1
+    stage211_emit_snapshot_locked
     sleep "${POLL_SECONDS}"
   done
 }
