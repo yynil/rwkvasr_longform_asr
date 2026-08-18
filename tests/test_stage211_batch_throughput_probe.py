@@ -95,6 +95,8 @@ def test_stacked_default_profiles_start_from_memory_safe_baseline() -> None:
         probe.BatchProfile("batch36_frames24k", 36, 24_000, 8, True),
         probe.BatchProfile("batch48_frames32k", 48, 32_000, 8, True),
         probe.BatchProfile("batch64_frames42k", 64, 42_000, 8, True),
+        probe.BatchProfile("batch80_frames48k", 80, 48_000, 8, True),
+        probe.BatchProfile("batch96_frames56k", 96, 56_000, 8, True),
     )
     assert probe.default_profiles_for_phase("logits") == (
         probe.BatchProfile("baseline", 4, 4_000, 8, True),
@@ -109,6 +111,8 @@ def test_stacked_default_profiles_start_from_memory_safe_baseline() -> None:
         probe.BatchProfile("batch24_frames16k", 24, 16_000, 8, True),
         probe.BatchProfile("batch36_frames24k", 36, 24_000, 8, True),
         probe.BatchProfile("batch48_frames32k", 48, 32_000, 8, True),
+        probe.BatchProfile("batch56_frames36k", 56, 36_000, 8, True),
+        probe.BatchProfile("batch64_frames40k", 64, 40_000, 8, True),
     )
     assert probe.default_profiles_for_phase("mixer") is probe.DEFAULT_PROFILES
 

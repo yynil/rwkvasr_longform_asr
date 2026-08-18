@@ -98,6 +98,8 @@ BLOCK_DEFAULT_PROFILES = (
     BatchProfile("batch36_frames24k", 36, 24_000, 8, True),
     BatchProfile("batch48_frames32k", 48, 32_000, 8, True),
     BatchProfile("batch64_frames42k", 64, 42_000, 8, True),
+    BatchProfile("batch80_frames48k", 80, 48_000, 8, True),
+    BatchProfile("batch96_frames56k", 96, 56_000, 8, True),
 )
 LOGITS_DEFAULT_PROFILES = (
     BatchProfile(
@@ -118,6 +120,8 @@ LOGITS_DEFAULT_PROFILES = (
     BatchProfile("batch24_frames16k", 24, 16_000, 8, True),
     BatchProfile("batch36_frames24k", 36, 24_000, 8, True),
     BatchProfile("batch48_frames32k", 48, 32_000, 8, True),
+    BatchProfile("batch56_frames36k", 56, 36_000, 8, True),
+    BatchProfile("batch64_frames40k", 64, 40_000, 8, True),
 )
 
 
