@@ -16,7 +16,7 @@ from rwkvasr.data import (
 
 STAGE211_SUPPLEMENTAL_DIFFICULTY = "supplemental_natural"
 DEFAULT_STAGE211_SUPPLEMENTAL_ROOT = (
-    Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v3"
+    Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v4_locality"
 )
 DEFAULT_STAGE211_SUPPLEMENTAL_INVENTORY = (
     DEFAULT_STAGE211_SUPPLEMENTAL_ROOT / "supplemental_inventory.json"
@@ -30,6 +30,9 @@ STAGE211_BASE_SUPPLEMENTAL_SOURCES = {
 }
 STAGE211_SUPPLEMENTAL_SOURCES = STAGE211_BASE_SUPPLEMENTAL_SOURCES
 STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER = "manifest_location_index_archive_order_v1"
+STAGE211_PARQUET_LOCALITY_POLICY = "parquet_row_group_max_frames_v1"
+STAGE211_PARQUET_LOCALITY_ARTIFACT = "stage211_parquet_locality_receipt"
+STAGE211_PARQUET_SOURCES = {"peoples_speech_clean", "peoples_speech_dirty"}
 STAGE211_USB_PENDING_NATURAL_ADMISSION = {
     "LLaSO-Align",
     "MLCommons",
@@ -75,6 +78,103 @@ def _bound_file(
     if verify_sha256 and _sha256_file(path) != expected_sha256:
         raise ValueError(f"{label} SHA-256 changed: {path}")
     return path
+
+
+def _validate_parquet_runtime_layout(
+    inventory: dict[str, Any],
+    *,
+    inventory_path: Path,
+    manifest_path: Path,
+    manifest_payload: dict[str, Any],
+    selected_rows: int,
+    source_counts: dict[str, Any],
+) -> None:
+    policy = manifest_payload.get("batching_policy")
+    layout = inventory.get("runtime_layout")
+    if policy is None and layout is None:
+        return
+    if policy != STAGE211_PARQUET_LOCALITY_POLICY or not isinstance(layout, dict):
+        raise ValueError("Stage211 supplemental Parquet runtime-layout contract mismatch.")
+    if layout.get("policy") != STAGE211_PARQUET_LOCALITY_POLICY:
+        raise ValueError("Stage211 supplemental Parquet runtime-layout policy changed.")
+
+    source_inventory_path = _bound_file(
+        layout,
+        path_key="source_inventory_path",
+        sha256_key="source_inventory_sha256",
+        label="Stage211 Parquet-locality source inventory",
+        verify_sha256=True,
+    )
+    source_manifest_path = _bound_file(
+        layout,
+        path_key="source_manifest_path",
+        sha256_key="source_manifest_sha256",
+        label="Stage211 Parquet-locality source manifest",
+        verify_sha256=True,
+    )
+    receipt_path = _bound_file(
+        layout,
+        path_key="receipt_path",
+        sha256_key="receipt_sha256",
+        label="Stage211 Parquet-locality receipt",
+        verify_sha256=True,
+    )
+    if source_inventory_path == inventory_path or source_manifest_path == manifest_path:
+        raise ValueError("Stage211 Parquet-locality source and output artifacts are not distinct.")
+    source_inventory = _load_json(
+        source_inventory_path,
+        label="Stage211 Parquet-locality source inventory",
+    )
+    if (
+        int(source_inventory.get("selected_rows", -1)) != selected_rows
+        or Path(str(source_inventory.get("bucket_manifest_path") or "")).resolve()
+        != source_manifest_path
+        or str(source_inventory.get("bucket_manifest_sha256") or "")
+        != str(layout.get("source_manifest_sha256") or "")
+    ):
+        raise ValueError("Stage211 Parquet-locality source inventory coverage changed.")
+
+    receipt = _load_json(receipt_path, label="Stage211 Parquet-locality receipt")
+    parquet_rows = sum(int(source_counts[source]) for source in STAGE211_PARQUET_SOURCES)
+    rows_by_source = receipt.get("rows_by_source")
+    digests = (receipt.get("identity_multiset"), receipt.get("payload_multiset"))
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("artifact") != STAGE211_PARQUET_LOCALITY_ARTIFACT
+        or receipt.get("complete") is not True
+        or receipt.get("policy") != STAGE211_PARQUET_LOCALITY_POLICY
+        or receipt.get("source_inventory_path") != str(source_inventory_path)
+        or receipt.get("source_inventory_sha256")
+        != str(layout.get("source_inventory_sha256") or "")
+        or receipt.get("source_manifest_path") != str(source_manifest_path)
+        or receipt.get("source_manifest_sha256")
+        != str(layout.get("source_manifest_sha256") or "")
+        or receipt.get("output_manifest_path") != str(manifest_path)
+        or receipt.get("output_manifest_sha256")
+        != str(inventory.get("bucket_manifest_sha256") or "")
+        or int(receipt.get("selected_rows", -1)) != selected_rows
+        or int(receipt.get("parquet_rows", -1)) != parquet_rows
+        or int(receipt.get("unchanged_rows", -1)) != selected_rows - parquet_rows
+        or int(receipt.get("parquet_row_groups", -1)) <= 0
+        or int(receipt.get("maximum_num_frames", -1)) <= 0
+        or not isinstance(rows_by_source, dict)
+        or set(rows_by_source) != STAGE211_PARQUET_SOURCES
+        or any(
+            int(rows_by_source[source]) != int(source_counts[source])
+            for source in STAGE211_PARQUET_SOURCES
+        )
+        or any(
+            not isinstance(digest, dict)
+            or int(digest.get("rows", -1)) != parquet_rows
+            or _SHA256_PATTERN.fullmatch(str(digest.get("sha256_xor") or "")) is None
+            or _SHA256_PATTERN.fullmatch(
+                str(digest.get("sha256_sum_mod_2_256") or "")
+            )
+            is None
+            for digest in digests
+        )
+    ):
+        raise ValueError("Stage211 supplemental Parquet locality receipt is inconsistent.")
 
 
 def _validate_combined_component_inventories(
@@ -494,6 +594,18 @@ def validate_stage211_supplemental_inventory(
         sha256_key="bucket_manifest_sha256",
         label="Stage211 supplemental bucket manifest",
         verify_sha256=True,
+    )
+    manifest_payload = _load_json(
+        manifest_path,
+        label="Stage211 supplemental bucket manifest",
+    )
+    _validate_parquet_runtime_layout(
+        inventory,
+        inventory_path=inventory_path,
+        manifest_path=manifest_path,
+        manifest_payload=manifest_payload,
+        selected_rows=selected_rows,
+        source_counts=source_counts,
     )
     manifest = load_webdataset_bucket_manifest(manifest_path)
     train_rows = sum(bucket.num_samples for bucket in manifest.splits.get("train", ()))

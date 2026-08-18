@@ -56,7 +56,9 @@ DEFAULT_LONG_MANIFEST = (
     / "manifest_stage211_fixed_eval.json"
 )
 DEFAULT_NANO_CHECKPOINT = Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
-DEFAULT_SUPPLEMENTAL_ROOT = Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v3"
+DEFAULT_SUPPLEMENTAL_ROOT = (
+    Path.home() / "rwkvasr_data" / "stage211_supplemental_combined_v4_locality"
+)
 DEFAULT_SUPPLEMENTAL_INVENTORY = DEFAULT_SUPPLEMENTAL_ROOT / "supplemental_inventory.json"
 DEFAULT_SUPPLEMENTAL_PROFILE_RECEIPT = (
     DEFAULT_SUPPLEMENTAL_ROOT / "supplemental_profile_receipt.json"
@@ -556,7 +558,9 @@ def main() -> int:
         expected_steps=int(supplemental["steps"]),
     )
     init_sha = sha256_file(long_checkpoint)
-    preflight_root = phase_root / "batch_profile_preflight" / f"supplemental-{init_sha[:16]}"
+    manifest_sha = sha256_file(manifest)
+    profile_scope = f"supplemental-{init_sha[:16]}-{manifest_sha[:16]}"
+    preflight_root = phase_root / "batch_profile_preflight" / profile_scope
     report_path = preflight_root / "batch_throughput_preflight.json"
     if report_path.is_file():
         report = validate_stage211_batch_profile_preflight(
@@ -589,7 +593,9 @@ def main() -> int:
 
     admission_path: Path | None = None
     if _supplemental_profile_requires_admission(report):
-        admission_path = phase_root / "batch_profile_preflight" / "supplemental-admission.json"
+        admission_path = (
+            phase_root / "batch_profile_preflight" / f"{profile_scope}-admission.json"
+        )
         _run(
             _admission_command(
                 report_path=report_path,

@@ -48,8 +48,8 @@ BLOCK_SELECTION="${BLOCK_SELECTION:-${PHASE_GATE_ROOT}/block_selected.json}"
 LOGITS_CORRECTION_RUN_ROOT="${LOGITS_CORRECTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211c_logits_post_coverage_correction}"
 LOGITS_CORRECTION_GATE_ROOT="${LOGITS_CORRECTION_GATE_ROOT:-${PHASE_GATE_ROOT}/logits_correction}"
 LOGITS_SELECTION="${LOGITS_SELECTION:-${PHASE_GATE_ROOT}/logits_selected.json}"
-SUPPLEMENTAL_INVENTORY="${SUPPLEMENTAL_INVENTORY:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v3/supplemental_inventory.json}"
-SUPPLEMENTAL_PROFILE_RECEIPT="${SUPPLEMENTAL_PROFILE_RECEIPT:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v3/supplemental_profile_receipt.json}"
+SUPPLEMENTAL_INVENTORY="${SUPPLEMENTAL_INVENTORY:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v4_locality/supplemental_inventory.json}"
+SUPPLEMENTAL_PROFILE_RECEIPT="${SUPPLEMENTAL_PROFILE_RECEIPT:-${HOME}/rwkvasr_data/stage211_supplemental_combined_v4_locality/supplemental_profile_receipt.json}"
 INITIALIZATION_RECEIPT="${INITIALIZATION_RECEIPT:-${HOME}/rwkvasr_eval/stage211_initialization/nano_initialization_receipt.json}"
 
 log() {
