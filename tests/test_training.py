@@ -85,7 +85,7 @@ def test_stage211_frozen_nano_ctc_path_backpropagates_only_to_birwkv() -> None:
             ctc_decoder_type="funasr_nano_transformer",
             ctc_decoder_dim=8,
             ctc_decoder_ffn_dim=16,
-            ctc_decoder_num_layers=1,
+            ctc_decoder_num_layers=5,
             ctc_decoder_attention_heads=2,
         )
     )
