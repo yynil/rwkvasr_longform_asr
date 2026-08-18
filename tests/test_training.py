@@ -85,7 +85,7 @@ def test_stage211_frozen_nano_ctc_path_backpropagates_only_to_birwkv() -> None:
             ctc_decoder_type="funasr_nano_transformer",
             ctc_decoder_dim=8,
             ctc_decoder_ffn_dim=16,
-            ctc_decoder_num_layers=5,
+            ctc_decoder_num_layers=1,
             ctc_decoder_attention_heads=2,
         )
     )
@@ -173,7 +173,7 @@ def _build_stage211_gradient_probe_model() -> RWKVCTCModel:
             ctc_decoder_type="funasr_nano_transformer",
             ctc_decoder_dim=8,
             ctc_decoder_ffn_dim=16,
-            ctc_decoder_num_layers=1,
+            ctc_decoder_num_layers=5,
             ctc_decoder_attention_heads=2,
         )
     )
@@ -245,6 +245,14 @@ def test_stage211_block_objectives_backpropagate_to_frozen_nano_birwkv_path() ->
     assert isinstance(encoded, torch.Tensor)
     assert isinstance(encoded_lengths, torch.Tensor)
     assert isinstance(logit_lengths, torch.Tensor)
+    assert set(decoder_hiddens) == {
+        "input",
+        "layer_0",
+        "layer_1",
+        "layer_2",
+        "layer_3",
+        "layer_4",
+    }
 
     teacher_records: dict[str, dict[str, object]] = {}
     for sample_idx, utt_id in enumerate(utt_ids):
@@ -321,6 +329,7 @@ def test_stage211_block_objectives_backpropagate_to_frozen_nano_birwkv_path() ->
     assert (layer_result.matched_samples, layer_result.missing_samples) == (2, 0)
     assert (encoder_matched, encoder_missing) == (2, 0)
     assert (decoder_result.matched_samples, decoder_result.missing_samples) == (2, 0)
+    assert decoder_result.events == 12
     total.backward()
     _assert_stage211_gradient_probe_reaches_only_birwkv(model)
 
