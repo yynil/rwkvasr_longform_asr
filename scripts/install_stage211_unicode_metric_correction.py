@@ -340,7 +340,7 @@ def _validate_prior_install(path: Path) -> dict[str, Any]:
         or int(metrics.get("sample_count", -1))
         != int(STAGE211_PUBLIC_BENCHMARKS["commonvoice_en_test"]["samples"])
         or not isinstance(installed_files, list)
-        or len(installed_files) != 12
+        or len(installed_files) != 11 + len(STAGE211_PUBLIC_BENCHMARKS)
     ):
         raise ValueError("Stage211 prior clean public coverage is invalid.")
     for record in installed_files:

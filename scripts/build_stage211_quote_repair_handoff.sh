@@ -60,6 +60,7 @@ env CUDA_VISIBLE_DEVICES='' uv run python scripts/install_stage211_clean_public_
   --clean-root "${PUBLIC_CLEAN_ROOT}" \
   --manifest-dir "${PUBLIC_MANIFEST_DIR}" \
   --nano-root "${NANO_EVAL_ROOT}" \
+  --nano-checkpoint "${NANO_CHECKPOINT}" \
   --calibration-root "${CALIBRATION_EVAL_ROOT}" \
   --overlap-receipt "${PUBLIC_OVERLAP_RECEIPT}"
 

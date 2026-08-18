@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from rwkvasr.eval.stage211_gate import (
-    DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
     DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
     STAGE211_PUBLIC_BENCHMARKS,
     sha256_file,
@@ -23,8 +22,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLEAN_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_clean_v2"
 DEFAULT_NANO_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_full" / "nano_2512"
 DEFAULT_CALIBRATION_ROOT = Path.home() / "rwkvasr_eval" / "stage211_calibration_selected_full"
-DEFAULT_ARCHIVE_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_pre_quote_repair_archive_v2"
+DEFAULT_ARCHIVE_ROOT = Path.home() / "rwkvasr_eval" / "stage211_public_pre_quote_repair_archive_v3"
 DEFAULT_MANIFEST_DIR = REPO_ROOT / "artifacts" / "eval_benchmarks" / "manifests"
+DEFAULT_NANO_CHECKPOINT = Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -99,13 +99,10 @@ def _canonical_archive_map(
     archive_root: Path,
 ) -> dict[Path, Path]:
     calibration_public = calibration_root / "public"
-    return {
+    mapping = {
         manifest_dir / "commonvoice_en_test.jsonl": archive_root / "manifest.jsonl",
         nano_root / "predictions" / "commonvoice_en_test.ctc.jsonl": (
             archive_root / "nano" / "commonvoice_en_test.ctc.jsonl"
-        ),
-        nano_root / "reports" / "commonvoice_en_test.json": (
-            archive_root / "nano" / "commonvoice_en_test.report.json"
         ),
         nano_root / "metrics.json": archive_root / "nano" / "metrics.json",
         nano_root / "metrics.md": archive_root / "nano" / "metrics.md",
@@ -125,6 +122,122 @@ def _canonical_archive_map(
             archive_root / "calibration" / "reuse_receipt.json"
         ),
     }
+    for dataset in STAGE211_PUBLIC_BENCHMARKS:
+        mapping[nano_root / "reports" / f"{dataset}.json"] = (
+            archive_root / "nano" / "reports" / f"{dataset}.json"
+        )
+    return mapping
+
+
+def _report_checkpoint_path(report: dict[str, Any]) -> Path:
+    embedded = report.get("model_checkpoint_path")
+    if embedded is not None and str(embedded).strip():
+        return Path(str(embedded)).expanduser().resolve()
+    model_path = Path(str(report.get("model_path") or "")).expanduser().resolve()
+    return model_path if model_path.name == "model.pt" else model_path / "model.pt"
+
+
+def _validate_nano_checkpoint(nano_checkpoint: Path) -> tuple[Path, str]:
+    nano_checkpoint = nano_checkpoint.expanduser().resolve()
+    if (
+        not nano_checkpoint.is_file()
+        or nano_checkpoint.stat().st_size <= 0
+        or nano_checkpoint.name != "model.pt"
+    ):
+        raise ValueError(
+            f"Stage211 Nano checkpoint must be a non-empty model.pt: {nano_checkpoint}"
+        )
+    return nano_checkpoint, sha256_file(nano_checkpoint)
+
+
+def _bind_nano_report_checkpoint_identity(
+    *,
+    nano_root: Path,
+    nano_checkpoint: Path,
+) -> dict[str, Any]:
+    nano_checkpoint, checkpoint_sha256 = _validate_nano_checkpoint(nano_checkpoint)
+    prepared: list[tuple[str, Path, dict[str, Any]]] = []
+    for dataset in STAGE211_PUBLIC_BENCHMARKS:
+        report_path = (nano_root / "reports" / f"{dataset}.json").resolve()
+        report = _load_json(report_path, label=f"Stage211 {dataset} Nano report")
+        if _report_checkpoint_path(report) != nano_checkpoint:
+            raise ValueError(f"Stage211 {dataset} Nano report refers to a different checkpoint.")
+        embedded_path = report.get("model_checkpoint_path")
+        embedded_sha256 = report.get("model_checkpoint_sha256")
+        if (embedded_path is None) != (embedded_sha256 is None):
+            raise ValueError(f"Stage211 {dataset} Nano report has partial checkpoint identity.")
+        if embedded_path is not None and (
+            Path(str(embedded_path)).expanduser().resolve() != nano_checkpoint
+            or embedded_sha256 != checkpoint_sha256
+        ):
+            raise ValueError(f"Stage211 {dataset} Nano report checkpoint identity conflicts.")
+        updated = dict(report)
+        updated["model_checkpoint_path"] = str(nano_checkpoint)
+        updated["model_checkpoint_sha256"] = checkpoint_sha256
+        prepared.append((dataset, report_path, updated))
+
+    for _, report_path, report in prepared:
+        _write_json(report_path, report)
+
+    return {
+        "artifact": "stage211_nano_report_checkpoint_identity",
+        "checkpoint_path": str(nano_checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
+        "complete": True,
+        "mode": "embedded_checkpoint_sha256",
+        "reports": [
+            {
+                "dataset": dataset,
+                "path": str(report_path),
+                "sha256": sha256_file(report_path),
+            }
+            for dataset, report_path, _ in prepared
+        ],
+        "schema_version": 1,
+    }
+
+
+def _validate_nano_report_checkpoint_identity(
+    proof: object,
+    *,
+    nano_root: Path,
+    nano_checkpoint: Path,
+) -> dict[str, Any]:
+    nano_checkpoint, checkpoint_sha256 = _validate_nano_checkpoint(nano_checkpoint)
+    if not isinstance(proof, dict):
+        raise ValueError("Stage211 canonical install lacks Nano report checkpoint identity proof.")
+    expected = {
+        "artifact": "stage211_nano_report_checkpoint_identity",
+        "checkpoint_path": str(nano_checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
+        "complete": True,
+        "mode": "embedded_checkpoint_sha256",
+        "schema_version": 1,
+    }
+    if any(proof.get(key) != value for key, value in expected.items()):
+        raise ValueError("Stage211 Nano report checkpoint identity proof mismatch.")
+    reports = proof.get("reports")
+    if not isinstance(reports, list) or len(reports) != len(STAGE211_PUBLIC_BENCHMARKS):
+        raise ValueError("Stage211 Nano report checkpoint identity coverage mismatch.")
+    by_dataset = {str(row.get("dataset")): row for row in reports if isinstance(row, dict)}
+    if len(by_dataset) != len(reports) or set(by_dataset) != set(STAGE211_PUBLIC_BENCHMARKS):
+        raise ValueError("Stage211 Nano report checkpoint identity dataset set mismatch.")
+    for dataset, row in by_dataset.items():
+        report_path = (nano_root / "reports" / f"{dataset}.json").resolve()
+        if (
+            Path(str(row.get("path") or "")).resolve() != report_path
+            or not report_path.is_file()
+            or row.get("sha256") != sha256_file(report_path)
+        ):
+            raise ValueError(f"Stage211 {dataset} Nano report identity binding changed.")
+        report = _load_json(report_path, label=f"Stage211 {dataset} Nano report")
+        if (
+            Path(str(report.get("model_checkpoint_path") or "")).expanduser().resolve()
+            != nano_checkpoint
+            or report.get("model_checkpoint_sha256") != checkpoint_sha256
+        ):
+            raise ValueError(f"Stage211 {dataset} Nano report embedded identity mismatch.")
+    return proof
 
 
 def _archive_originals(mapping: dict[Path, Path], archive_root: Path) -> dict[str, Any]:
@@ -174,6 +287,7 @@ def _validate_existing_install(
     calibration_root: Path,
     archive_root: Path,
     overlap_receipt: Path,
+    nano_checkpoint: Path,
 ) -> dict[str, Any] | None:
     if not receipt_path.is_file():
         return None
@@ -195,8 +309,7 @@ def _validate_existing_install(
         or Path(str(receipt.get("overlap_receipt_path") or "")).resolve()
         != overlap_receipt.resolve()
         or receipt.get("overlap_receipt_sha256") != sha256_file(overlap_receipt)
-        or Path(str(receipt.get("derivation_receipt_path") or "")).resolve()
-        != derivation_path
+        or Path(str(receipt.get("derivation_receipt_path") or "")).resolve() != derivation_path
         or receipt.get("derivation_receipt_sha256") != sha256_file(derivation_path)
         or int(derivation.get("total_samples", -1))
         != sum(int(row["samples"]) for row in STAGE211_PUBLIC_BENCHMARKS.values())
@@ -204,10 +317,8 @@ def _validate_existing_install(
         raise ValueError("Stage211 clean public install provenance mismatch.")
 
     metrics = receipt.get("commonvoice_clean_metrics")
-    if (
-        not isinstance(metrics, dict)
-        or int(metrics.get("sample_count", -1))
-        != int(STAGE211_PUBLIC_BENCHMARKS["commonvoice_en_test"]["samples"])
+    if not isinstance(metrics, dict) or int(metrics.get("sample_count", -1)) != int(
+        STAGE211_PUBLIC_BENCHMARKS["commonvoice_en_test"]["samples"]
     ):
         raise ValueError("Stage211 clean public install Common Voice coverage mismatch.")
 
@@ -239,8 +350,7 @@ def _validate_existing_install(
 
     archive_receipt_path = (archive_root / "archive_receipt.json").resolve()
     if (
-        Path(str(receipt.get("archive_receipt_path") or "")).resolve()
-        != archive_receipt_path
+        Path(str(receipt.get("archive_receipt_path") or "")).resolve() != archive_receipt_path
         or not archive_receipt_path.is_file()
         or receipt.get("archive_receipt_sha256") != sha256_file(archive_receipt_path)
     ):
@@ -281,6 +391,17 @@ def _validate_existing_install(
         archived_by_canonical[canonical] = row
     if set(archived_by_canonical) != expected_paths:
         raise ValueError("Stage211 clean public source archive destination set mismatch.")
+    _validate_nano_report_checkpoint_identity(
+        receipt.get("nano_report_checkpoint_identity"),
+        nano_root=nano_root,
+        nano_checkpoint=nano_checkpoint,
+    )
+    nano_provenance = validate_stage211_nano_public_baseline_receipt(
+        nano_root / "provenance_receipt.json",
+        expected_nano_checkpoint_sha256=sha256_file(nano_checkpoint),
+    )
+    if nano_provenance.get("provenance_mode") != "embedded_checkpoint_sha256":
+        raise ValueError("Stage211 canonical Nano baseline must use embedded checkpoint identity.")
     return receipt
 
 
@@ -292,6 +413,7 @@ def install_clean_public_eval(
     calibration_root: Path,
     archive_root: Path,
     overlap_receipt: Path,
+    nano_checkpoint: Path,
 ) -> dict[str, Any]:
     clean_root = clean_root.expanduser().resolve()
     manifest_dir = manifest_dir.expanduser().resolve()
@@ -299,6 +421,7 @@ def install_clean_public_eval(
     calibration_root = calibration_root.expanduser().resolve()
     archive_root = archive_root.expanduser().resolve()
     overlap_receipt = overlap_receipt.expanduser().resolve()
+    nano_checkpoint, nano_checkpoint_sha256 = _validate_nano_checkpoint(nano_checkpoint)
     install_receipt_path = clean_root / "canonical_install_receipt.json"
     existing = _validate_existing_install(
         install_receipt_path,
@@ -308,6 +431,7 @@ def install_clean_public_eval(
         calibration_root=calibration_root,
         archive_root=archive_root,
         overlap_receipt=overlap_receipt,
+        nano_checkpoint=nano_checkpoint,
     )
     if existing is not None:
         return existing
@@ -345,6 +469,10 @@ def install_clean_public_eval(
         nano_report["manifest_path"] = str(canonical_manifest.resolve())
         nano_report["predictions_path"] = str(canonical_nano_prediction.resolve())
         _write_json(canonical_nano_report, nano_report)
+        nano_report_checkpoint_identity = _bind_nano_report_checkpoint_identity(
+            nano_root=nano_root,
+            nano_checkpoint=nano_checkpoint,
+        )
 
         _run(
             [
@@ -360,13 +488,14 @@ def install_clean_public_eval(
                 "ctc",
             ]
         )
-        DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT.unlink(missing_ok=True)
+        nano_baseline_receipt = nano_root / "provenance_receipt.json"
+        nano_baseline_receipt.unlink(missing_ok=True)
         _run(
             [
                 sys.executable,
                 str(REPO_ROOT / "scripts" / "create_stage211_nano_baseline_receipt.py"),
                 "--nano-checkpoint",
-                str(Path.home() / "models" / "Fun-ASR-Nano-2512-modelscope" / "model.pt"),
+                str(nano_checkpoint),
                 "--report-dir",
                 str(nano_root / "reports"),
                 "--prediction-dir",
@@ -374,7 +503,7 @@ def install_clean_public_eval(
                 "--manifest-dir",
                 str(manifest_dir),
                 "--output",
-                str(DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT),
+                str(nano_baseline_receipt),
                 "--public-overlap-receipt",
                 str(overlap_receipt),
             ]
@@ -448,9 +577,14 @@ def install_clean_public_eval(
                 str(calibration_reuse_receipt),
             ]
         )
-        validate_stage211_nano_public_baseline_receipt(
-            DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT
+        nano_provenance = validate_stage211_nano_public_baseline_receipt(
+            nano_baseline_receipt,
+            expected_nano_checkpoint_sha256=nano_checkpoint_sha256,
         )
+        if nano_provenance.get("provenance_mode") != "embedded_checkpoint_sha256":
+            raise ValueError(
+                "Stage211 canonical Nano baseline must use embedded checkpoint identity."
+            )
     except Exception:
         _restore(mapping)
         raise
@@ -479,6 +613,7 @@ def install_clean_public_eval(
         "derivation_receipt_path": str((clean_root / "derivation_receipt.json").resolve()),
         "derivation_receipt_sha256": sha256_file(clean_root / "derivation_receipt.json"),
         "installed_files": installed_files,
+        "nano_report_checkpoint_identity": nano_report_checkpoint_identity,
         "overlap_receipt_path": str(overlap_receipt),
         "overlap_receipt_sha256": sha256_file(overlap_receipt),
         "pipeline": "stage211",
@@ -498,6 +633,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nano-root", type=Path, default=DEFAULT_NANO_ROOT)
     parser.add_argument("--calibration-root", type=Path, default=DEFAULT_CALIBRATION_ROOT)
     parser.add_argument("--archive-root", type=Path, default=DEFAULT_ARCHIVE_ROOT)
+    parser.add_argument("--nano-checkpoint", type=Path, default=DEFAULT_NANO_CHECKPOINT)
     parser.add_argument(
         "--overlap-receipt",
         type=Path,
@@ -515,6 +651,7 @@ def main() -> None:
         calibration_root=args.calibration_root,
         archive_root=args.archive_root,
         overlap_receipt=args.overlap_receipt,
+        nano_checkpoint=args.nano_checkpoint,
     )
     metrics = receipt["commonvoice_clean_metrics"]
     print(

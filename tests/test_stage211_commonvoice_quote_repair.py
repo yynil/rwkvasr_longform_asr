@@ -35,6 +35,7 @@ def test_quote_repair_handoff_validates_corrected_public_before_supplemental_pub
         '--clean-root "${PUBLIC_CLEAN_ROOT}"',
         '--manifest-dir "${PUBLIC_MANIFEST_DIR}"',
         '--nano-root "${NANO_EVAL_ROOT}"',
+        '--nano-checkpoint "${NANO_CHECKPOINT}"',
         '--calibration-root "${CALIBRATION_EVAL_ROOT}"',
         '--overlap-receipt "${PUBLIC_OVERLAP_RECEIPT}"',
     ):
@@ -141,7 +142,7 @@ def test_unicode_correction_prior_install_requires_v2_overlap(
         encoding="utf-8",
     )
     installed_files = [{"path": str(manifest), "sha256": sha256_file(manifest)}]
-    for index in range(11):
+    for index in range(15):
         artifact = tmp_path / f"artifact-{index}.json"
         artifact.write_text(f"{index}\n", encoding="utf-8")
         installed_files.append({"path": str(artifact), "sha256": sha256_file(artifact)})
@@ -323,6 +324,9 @@ def _canonical_install_fixture(
     nano_root = tmp_path / "canonical" / "nano"
     calibration_root = tmp_path / "canonical" / "calibration"
     archive_root = tmp_path / "archive"
+    nano_checkpoint = tmp_path / "model" / "model.pt"
+    nano_checkpoint.parent.mkdir(parents=True)
+    nano_checkpoint.write_bytes(b"nano-checkpoint")
     overlap_receipt = tmp_path / "overlap.json"
     overlap_receipt.write_text("{}\n", encoding="utf-8")
     derivation_path = clean_root / "derivation_receipt.json"
@@ -338,7 +342,6 @@ def _canonical_install_fixture(
         calibration_root=calibration_root,
         archive_root=archive_root,
     )
-    installed_files = []
     archived_files = []
     for index, (canonical, archived) in enumerate(mapping.items()):
         canonical.parent.mkdir(parents=True, exist_ok=True)
@@ -346,7 +349,6 @@ def _canonical_install_fixture(
         archived.parent.mkdir(parents=True, exist_ok=True)
         archived.write_text(f"archived-{index}\n", encoding="utf-8")
         archive_sha256 = sha256_file(archived)
-        installed_files.append({"path": str(canonical.resolve()), "sha256": sha256_file(canonical)})
         archived_files.append(
             {
                 "archive_path": str(archived.resolve()),
@@ -355,6 +357,27 @@ def _canonical_install_fixture(
                 "canonical_sha256": archive_sha256,
             }
         )
+    for dataset in STAGE211_PUBLIC_BENCHMARKS:
+        report = nano_root / "reports" / f"{dataset}.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "dataset": dataset,
+                    "model_path": str(nano_checkpoint.parent),
+                    "preserved": {"value": dataset},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    identity = clean_install._bind_nano_report_checkpoint_identity(
+        nano_root=nano_root,
+        nano_checkpoint=nano_checkpoint,
+    )
+    installed_files = [
+        {"path": str(canonical.resolve()), "sha256": sha256_file(canonical)}
+        for canonical in mapping
+    ]
     archive = {
         "artifact": "stage211_contaminated_public_archive",
         "complete": True,
@@ -375,6 +398,7 @@ def _canonical_install_fixture(
         "derivation_receipt_path": str(derivation_path.resolve()),
         "derivation_receipt_sha256": sha256_file(derivation_path),
         "installed_files": installed_files,
+        "nano_report_checkpoint_identity": identity,
         "overlap_receipt_path": str(overlap_receipt.resolve()),
         "overlap_receipt_sha256": sha256_file(overlap_receipt),
         "pipeline": "stage211",
@@ -389,12 +413,18 @@ def _canonical_install_fixture(
         lambda path: {},
     )
     monkeypatch.setattr(clean_install, "_validate_derivation", lambda *args: derivation)
+    monkeypatch.setattr(
+        clean_install,
+        "validate_stage211_nano_public_baseline_receipt",
+        lambda *args, **kwargs: {"provenance_mode": "embedded_checkpoint_sha256"},
+    )
     return {
         "archive_root": archive_root,
         "calibration_root": calibration_root,
         "clean_root": clean_root,
         "manifest_dir": manifest_dir,
         "nano_root": nano_root,
+        "nano_checkpoint": nano_checkpoint,
         "overlap_receipt": overlap_receipt,
         "receipt": receipt,
         "receipt_path": receipt_path,
@@ -410,7 +440,55 @@ def _validate_canonical_install_fixture(fixture: dict[str, object]) -> dict[str,
         calibration_root=fixture["calibration_root"],
         archive_root=fixture["archive_root"],
         overlap_receipt=fixture["overlap_receipt"],
+        nano_checkpoint=fixture["nano_checkpoint"],
     )
+
+
+def test_nano_report_identity_binding_preserves_reports_and_rolls_back_all_five(
+    tmp_path: Path,
+) -> None:
+    nano_root = tmp_path / "nano"
+    checkpoint = tmp_path / "model" / "model.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"nano-checkpoint")
+    originals: dict[Path, bytes] = {}
+    archive_mapping: dict[Path, Path] = {}
+    for index, dataset in enumerate(STAGE211_PUBLIC_BENCHMARKS):
+        report_path = nano_root / "reports" / f"{dataset}.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "dataset": dataset,
+            "model_path": str(checkpoint.parent),
+            "nested": {"index": index, "text": "preserve-me"},
+        }
+        if dataset == "commonvoice_en_test":
+            payload["model_checkpoint_path"] = str(checkpoint)
+            payload["model_checkpoint_sha256"] = sha256_file(checkpoint)
+        report_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        originals[report_path] = report_path.read_bytes()
+        archive_mapping[report_path] = tmp_path / "archive" / f"{dataset}.json"
+
+    clean_install._archive_originals(archive_mapping, tmp_path / "archive")
+    proof = clean_install._bind_nano_report_checkpoint_identity(
+        nano_root=nano_root,
+        nano_checkpoint=checkpoint,
+    )
+
+    assert proof["mode"] == "embedded_checkpoint_sha256"
+    assert len(proof["reports"]) == len(STAGE211_PUBLIC_BENCHMARKS)
+    clean_install._validate_nano_report_checkpoint_identity(
+        proof,
+        nano_root=nano_root,
+        nano_checkpoint=checkpoint,
+    )
+    for index, dataset in enumerate(STAGE211_PUBLIC_BENCHMARKS):
+        report = json.loads((nano_root / "reports" / f"{dataset}.json").read_text())
+        assert report["nested"] == {"index": index, "text": "preserve-me"}
+        assert report["model_checkpoint_path"] == str(checkpoint.resolve())
+        assert report["model_checkpoint_sha256"] == sha256_file(checkpoint)
+
+    clean_install._restore(archive_mapping)
+    assert {path: path.read_bytes() for path in originals} == originals
 
 
 def test_clean_public_install_exact_reuse_is_deeply_validated(
