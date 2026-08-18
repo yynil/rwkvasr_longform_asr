@@ -53,6 +53,7 @@ env CUDA_VISIBLE_DEVICES='' nice -n 10 ionice -c 2 -n 7 uv run python \
 env CUDA_VISIBLE_DEVICES='' nice -n 10 ionice -c 2 -n 7 uv run python \
   scripts/rebase_stage211_social_public_pcm_overlap.py \
   --source-filtered-inventory "${SOCIAL_SOURCE_INVENTORY}" \
+  --public-fingerprint-source-root "${BASE_REBASED_ROOT}" \
   --output-root "${SOCIAL_REBASED_ROOT}"
 
 env CUDA_VISIBLE_DEVICES='' uv run python scripts/install_stage211_clean_public_eval.py \

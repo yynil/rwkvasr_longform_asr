@@ -10,9 +10,12 @@ from typing import Any
 try:
     from scripts.filter_stage211_social_pcm_overlap import (
         EXPECTED_PUBLIC_ROWS,
+        _immutable_hardlink,
         _immutable_json,
+        _public_fingerprint_paths,
         _sha256,
         _source_fingerprint_paths,
+        _validate_public_fingerprint_receipt,
         build_public_fingerprints,
         finalize_filtered_inventory,
         rebase_social_source_fingerprints,
@@ -22,9 +25,12 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
     from filter_stage211_social_pcm_overlap import (
         EXPECTED_PUBLIC_ROWS,
+        _immutable_hardlink,
         _immutable_json,
+        _public_fingerprint_paths,
         _sha256,
         _source_fingerprint_paths,
+        _validate_public_fingerprint_receipt,
         build_public_fingerprints,
         finalize_filtered_inventory,
         rebase_social_source_fingerprints,
@@ -37,12 +43,83 @@ DEFAULT_SOURCE_INVENTORY = (
     Path.home() / "rwkvasr_data/stage211_social_vad_filtered_v1/filtered_inventory.json"
 )
 DEFAULT_OUTPUT_ROOT = Path.home() / "rwkvasr_data/stage211_social_vad_filtered_v2"
+DEFAULT_PUBLIC_FINGERPRINT_SOURCE_ROOT = (
+    Path.home() / "rwkvasr_data/stage211_base_public_pcm_overlap_v2"
+)
 DEFAULT_CLEAN_MANIFEST_ROOT = Path.home() / "rwkvasr_eval/stage211_public_clean_v2/manifests"
 DEFAULT_PUBLIC_MANIFESTS = {
     dataset: DEFAULT_CLEAN_MANIFEST_ROOT / f"{dataset}.jsonl"
     for dataset in EXPECTED_PUBLIC_ROWS
 }
 REBASE_ARTIFACT = "stage211_social_public_pcm_fingerprint_rebase"
+
+
+def rebind_corrected_public_fingerprints(
+    *,
+    source_root: Path,
+    output_root: Path,
+    public_manifests: dict[str, Path],
+    expected_public_rows: dict[str, int],
+) -> dict[str, Any]:
+    source_root = source_root.expanduser().resolve()
+    output_root = output_root.expanduser().resolve()
+    if source_root == output_root:
+        raise ValueError(
+            "Stage211 corrected-public fingerprint source and destination must differ."
+        )
+    if set(public_manifests) != set(expected_public_rows):
+        raise ValueError("Stage211 corrected-public fingerprint reuse dataset set changed.")
+    statuses: dict[str, str] = {}
+    records: list[dict[str, Any]] = []
+    for dataset, manifest_path in sorted(public_manifests.items()):
+        manifest_path = manifest_path.expanduser().resolve()
+        source_part, source_receipt_path = _public_fingerprint_paths(source_root, dataset)
+        source_receipt = _validate_public_fingerprint_receipt(
+            source_receipt_path,
+            dataset=dataset,
+            manifest_path=manifest_path,
+            expected_rows=int(expected_public_rows[dataset]),
+        )
+        destination_part, destination_receipt_path = _public_fingerprint_paths(
+            output_root,
+            dataset,
+        )
+        statuses[dataset] = _immutable_hardlink(source_part, destination_part)
+        destination_receipt = {
+            **source_receipt,
+            "part_path": str(destination_part.resolve()),
+        }
+        _immutable_json(destination_receipt_path, destination_receipt)
+        _validate_public_fingerprint_receipt(
+            destination_receipt_path,
+            dataset=dataset,
+            manifest_path=manifest_path,
+            expected_rows=int(expected_public_rows[dataset]),
+        )
+        if not source_part.samefile(destination_part):
+            raise ValueError(
+                f"Stage211 corrected-public fingerprint hardlink changed: {dataset}"
+            )
+        records.append(
+            {
+                "dataset": dataset,
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": _sha256(manifest_path),
+                "rows": int(expected_public_rows[dataset]),
+                "source_receipt_path": str(source_receipt_path.resolve()),
+                "source_receipt_sha256": _sha256(source_receipt_path),
+                "destination_receipt_path": str(destination_receipt_path.resolve()),
+                "destination_receipt_sha256": _sha256(destination_receipt_path),
+                "part_sha256": source_receipt["part_sha256"],
+            }
+        )
+    return {
+        "mode": "same_filesystem_hardlink_rebound_receipts_v1",
+        "source_root": str(source_root),
+        "destination_root": str(output_root),
+        "datasets": records,
+        "hardlink_status": dict(sorted(statuses.items())),
+    }
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -125,6 +202,64 @@ def validate_rebase_receipt(path: str | Path) -> dict[str, Any]:
         != sum(int(value) for value in public_manifest_rows.values())
     ):
         raise ValueError("Stage211 social PCM corrected public coverage changed.")
+    public_reuse = receipt.get("corrected_public_fingerprint_reuse")
+    if public_reuse is not None:
+        if (
+            not isinstance(public_reuse, dict)
+            or public_reuse.get("mode")
+            != "same_filesystem_hardlink_rebound_receipts_v1"
+            or Path(str(public_reuse.get("destination_root") or "")).resolve()
+            != destination_root
+        ):
+            raise ValueError("Stage211 corrected-public fingerprint reuse contract changed.")
+        source_public_root = Path(str(public_reuse.get("source_root") or "")).resolve()
+        records = public_reuse.get("datasets")
+        if not isinstance(records, list) or len(records) != len(public_manifest_rows):
+            raise ValueError("Stage211 corrected-public fingerprint reuse coverage changed.")
+        by_dataset = {
+            str(record.get("dataset")): record
+            for record in records
+            if isinstance(record, dict)
+        }
+        if set(by_dataset) != set(public_manifest_rows):
+            raise ValueError("Stage211 corrected-public fingerprint reuse dataset set changed.")
+        for dataset, expected_rows in public_manifest_rows.items():
+            record = by_dataset[dataset]
+            manifest_path = Path(str(record.get("manifest_path") or "")).resolve()
+            source_part, source_receipt_path = _public_fingerprint_paths(
+                source_public_root,
+                dataset,
+            )
+            destination_part, destination_receipt_path = _public_fingerprint_paths(
+                destination_root,
+                dataset,
+            )
+            source_receipt = _validate_public_fingerprint_receipt(
+                source_receipt_path,
+                dataset=dataset,
+                manifest_path=manifest_path,
+                expected_rows=int(expected_rows),
+            )
+            _validate_public_fingerprint_receipt(
+                destination_receipt_path,
+                dataset=dataset,
+                manifest_path=manifest_path,
+                expected_rows=int(expected_rows),
+            )
+            if (
+                record.get("manifest_sha256") != _sha256(manifest_path)
+                or record.get("source_receipt_path") != str(source_receipt_path.resolve())
+                or record.get("source_receipt_sha256") != _sha256(source_receipt_path)
+                or record.get("destination_receipt_path")
+                != str(destination_receipt_path.resolve())
+                or record.get("destination_receipt_sha256")
+                != _sha256(destination_receipt_path)
+                or record.get("part_sha256") != source_receipt.get("part_sha256")
+                or not source_part.samefile(destination_part)
+            ):
+                raise ValueError(
+                    f"Stage211 corrected-public fingerprint reuse changed: {dataset}"
+                )
     return receipt
 
 
@@ -134,6 +269,7 @@ def _validate_reusable_rebase_receipt(
     source_filtered_inventory: Path,
     public_manifests: dict[str, Path],
     expected_public_rows: dict[str, int],
+    public_fingerprint_source_root: Path | None,
 ) -> dict[str, Any]:
     receipt = validate_rebase_receipt(receipt_path)
     if (
@@ -148,6 +284,19 @@ def _validate_reusable_rebase_receipt(
     if receipt.get("public_manifest_rows") != dict(sorted(expected_rows.items())):
         raise ValueError(
             "Stage211 existing social PCM rebase does not bind the requested public row map."
+        )
+    public_reuse = receipt.get("corrected_public_fingerprint_reuse")
+    expected_reuse_root = (
+        None
+        if public_fingerprint_source_root is None
+        else str(public_fingerprint_source_root.expanduser().resolve())
+    )
+    recorded_reuse_root = (
+        None if public_reuse is None else str(public_reuse.get("source_root") or "")
+    )
+    if recorded_reuse_root != expected_reuse_root:
+        raise ValueError(
+            "Stage211 existing social PCM rebase corrected-public reuse source changed."
         )
     destination_inventory = _load_json(
         Path(str(receipt.get("destination_filtered_inventory_path") or "")).resolve(),
@@ -188,6 +337,7 @@ def rebase_and_finalize(
     output_root: Path,
     public_manifests: dict[str, Path],
     expected_public_rows: dict[str, int],
+    public_fingerprint_source_root: Path | None = None,
 ) -> dict[str, Any]:
     source_filtered_inventory = source_filtered_inventory.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
@@ -202,6 +352,7 @@ def rebase_and_finalize(
             source_filtered_inventory=source_filtered_inventory,
             public_manifests=public_manifests,
             expected_public_rows=expected_public_rows,
+            public_fingerprint_source_root=public_fingerprint_source_root,
         )
     source = validate_filtered_inventory(
         source_filtered_inventory,
@@ -215,11 +366,20 @@ def rebase_and_finalize(
         source_root=source_filtered_inventory.parent,
         output_root=output_root,
     )
-    build_public_fingerprints(
-        public_manifests=public_manifests,
-        output_root=output_root,
-        expected_rows=expected_public_rows,
-    )
+    public_reuse = None
+    if public_fingerprint_source_root is None:
+        build_public_fingerprints(
+            public_manifests=public_manifests,
+            output_root=output_root,
+            expected_rows=expected_public_rows,
+        )
+    else:
+        public_reuse = rebind_corrected_public_fingerprints(
+            source_root=public_fingerprint_source_root,
+            output_root=output_root,
+            public_manifests=public_manifests,
+            expected_public_rows=expected_public_rows,
+        )
     destination = finalize_filtered_inventory(
         materialized=materialized,
         public_manifests=public_manifests,
@@ -243,6 +403,8 @@ def rebase_and_finalize(
         "destination_selected_hours": float(destination["selected_hours"]),
         "public_manifest_rows": dict(sorted(expected_public_rows.items())),
     }
+    if public_reuse is not None:
+        receipt["corrected_public_fingerprint_reuse"] = public_reuse
     _immutable_json(receipt_path, receipt)
     return validate_rebase_receipt(receipt_path)
 
@@ -275,6 +437,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--public-manifest", action="append", default=[])
+    parser.add_argument(
+        "--public-fingerprint-source-root",
+        type=Path,
+        default=DEFAULT_PUBLIC_FINGERPRINT_SOURCE_ROOT,
+    )
     return parser.parse_args()
 
 
@@ -285,6 +452,7 @@ def main() -> int:
         output_root=args.output_root,
         public_manifests=_parse_public_manifests(args.public_manifest),
         expected_public_rows=EXPECTED_PUBLIC_ROWS,
+        public_fingerprint_source_root=args.public_fingerprint_source_root,
     )
     print(
         "[stage211-social-public-pcm-rebase] "

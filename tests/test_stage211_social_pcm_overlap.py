@@ -462,3 +462,48 @@ def test_social_pcm_rebase_reuses_source_fingerprints_without_audio_decode(
             public_manifests={"public_test": corrected_manifest},
             expected_public_rows={"public_test": 2},
         )
+
+
+def test_social_pcm_rebase_hardlinks_corrected_public_fingerprints(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "public.flac"
+    audio_path.write_bytes(_flac(np.linspace(-0.2, 0.2, 8_000, dtype=np.float32)))
+    manifest_path = tmp_path / "public.jsonl"
+    _write_jsonl(
+        manifest_path,
+        [
+            {
+                "utt_id": "public-utt",
+                "audio_filepath": str(audio_path),
+                "dataset": "public_test",
+                "text": "reference",
+            }
+        ],
+    )
+    source_root = tmp_path / "base_public"
+    destination_root = tmp_path / "social_public"
+    pcm_filter.build_public_fingerprints(
+        public_manifests={"public_test": manifest_path},
+        output_root=source_root,
+        expected_rows={"public_test": 1},
+    )
+
+    proof = pcm_rebase.rebind_corrected_public_fingerprints(
+        source_root=source_root,
+        output_root=destination_root,
+        public_manifests={"public_test": manifest_path},
+        expected_public_rows={"public_test": 1},
+    )
+
+    source_part, source_receipt = pcm_filter._public_fingerprint_paths(
+        source_root, "public_test"
+    )
+    destination_part, destination_receipt = pcm_filter._public_fingerprint_paths(
+        destination_root, "public_test"
+    )
+    assert proof["mode"] == "same_filesystem_hardlink_rebound_receipts_v1"
+    assert proof["hardlink_status"] == {"public_test": "created"}
+    assert source_part.samefile(destination_part)
+    assert source_receipt.read_bytes() != destination_receipt.read_bytes()
+    assert proof["datasets"][0]["part_sha256"] == pcm_filter._sha256(source_part)
