@@ -184,3 +184,49 @@ def test_stage211_monitor_reports_only_authoritative_corrected_public_coverage(
         "role=phase_gate dataset=commonvoice_en_test rows=14926 expected_rows=14927 status=mismatch"
     ) in result.stdout
     assert str(stale) not in result.stdout
+
+
+def test_stage211_monitor_formal_errors_exclude_archived_and_probe_logs(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "stage211"
+    current = output_root / "stage211a_mixer_full_data_3ep/supplemental_natural/logs/train.log"
+    failed = output_root / (
+        "stage211a_mixer_full_data_3ep/"
+        "supplemental_natural.failed_parquet_io_step710/logs/train.log"
+    )
+    probe = output_root / (
+        "stage211a_mixer_full_data_3ep/batch_profile_preflight/profile/train.log"
+    )
+    nonrepresentative = output_root / (
+        "stage211a_mixer_full_data_3ep/attempt.nonrepresentative_stopped/logs/train.log"
+    )
+    for path in (current, failed, probe, nonrepresentative):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "[rwkvasr] Distributed init complete.\nTraceback: synthetic failure\n",
+            encoding="utf-8",
+        )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                'source "$1"; '
+                'while IFS= read -r -d "" path; do printf "%s\\n" "$path"; done '
+                '< <(stage211_recent_formal_training_logs "$2")'
+            ),
+            "stage211-monitor-test",
+            str(MONITOR),
+            str(output_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env={**os.environ, "RECENT_LOG_MINUTES": "90"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(current)]

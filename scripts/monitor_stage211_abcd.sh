@@ -416,6 +416,11 @@ stage211_recent_logs() {
 stage211_recent_formal_training_logs() {
   local log_path
   while IFS= read -r -d '' log_path; do
+    case "${log_path}" in
+      */batch_profile_preflight/*|*/?*.failed_*/*|*/?*.nonrepresentative_*/*)
+        continue
+        ;;
+    esac
     if rg -q -F "${ATTEMPT_MARKER}" "${log_path}" 2>/dev/null; then
       printf '%s\0' "${log_path}"
     fi
