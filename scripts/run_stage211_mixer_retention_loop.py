@@ -309,6 +309,11 @@ def _selection_payload(
     promotion: Path,
     phase: str = "mixer",
 ) -> dict[str, Any]:
+    if round_index < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+        raise ValueError(
+            "Stage211 phase selection requires at least "
+            f"{STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS} complete correction rounds."
+        )
     gate_path = gate_dir / "phase_gate.json"
     checkpoint = Path(str(gate["checkpoint_path"])).resolve()
     return {
@@ -459,7 +464,7 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
 
         gate = _validate_gate_for_phase(gate_path, phase=phase)
         if gate.get("gate_passed") is True:
-            if 0 < round_index < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+            if round_index < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
                 print(
                     "[stage211-correction-loop] early gate pass requires mandatory continuation "
                     f"phase={phase} completed_round={round_index} "

@@ -127,12 +127,12 @@ def test_stage211_correction_admission_supports_mandatory_early_pass_continuatio
         )
 
     gate["full_data_coverage"]["post_coverage_corrections"] = []
-    with pytest.raises(ValueError, match="failed gate or an early passing gate"):
-        runner._admit_gate(
-            admission_gate_path=gate_path,
-            init_checkpoint=checkpoint,
-            round_index=1,
-        )
+    _, _, admission_mode = runner._admit_gate(
+        admission_gate_path=gate_path,
+        init_checkpoint=checkpoint,
+        round_index=1,
+    )
+    assert admission_mode == "early_pass_mandatory_continuation"
 
     gate["gate_passed"] = False
     gate["full_data_coverage"]["post_coverage_corrections"] = []

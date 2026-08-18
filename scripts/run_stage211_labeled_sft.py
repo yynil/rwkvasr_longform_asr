@@ -27,6 +27,9 @@ from rwkvasr.eval.stage211_gate import (
 from rwkvasr.eval.stage211_runtime import (
     audit_stage211_runtime_epoch_coverage,
 )
+from rwkvasr.eval.stage211_sft_public_overlap import (
+    validate_stage211_sft_public_overlap_receipt,
+)
 
 try:
     from scripts.run_stage211_strict_chained_alignment import (
@@ -56,6 +59,9 @@ PYTHON = Path(sys.executable)
 RUNNER = REPO_ROOT / "scripts" / "run_stage211_strict_chained_alignment.py"
 DEFAULT_LABELED_ROOT = Path.home() / "rwkvasr_data" / "stage211_sft_full_labeled_v2"
 DEFAULT_LABELED_PROFILE_RECEIPT = DEFAULT_LABELED_ROOT / "stage211_labeled_profile_receipt.json"
+DEFAULT_SFT_PUBLIC_OVERLAP_RECEIPT = (
+    Path.home() / "rwkvasr_data/stage211_sft_public_encoded_overlap_v1/receipt.json"
+)
 DEFAULT_OUTPUT_DIR = (
     Path.home() / "rwkvasr_runs" / "stage211_full_alignment" / "stage211d_labeled_ctc_sft_1ep"
 )
@@ -301,6 +307,7 @@ def _audit_smoke(
     promotion_receipt: Path,
     bucket_manifest: Path,
     length_index: Path,
+    sft_public_overlap_receipt: Path,
     max_peak_reserved_gib: float,
 ) -> dict[str, Any]:
     checkpoint = smoke_dir / "step-2.pt"
@@ -345,6 +352,8 @@ def _audit_smoke(
         "bucket_manifest_sha256": sha256_file(bucket_manifest),
         "length_index_path": str(length_index),
         "length_index_sha256": sha256_file(length_index),
+        "sft_public_overlap_receipt_path": str(sft_public_overlap_receipt),
+        "sft_public_overlap_receipt_sha256": sha256_file(sft_public_overlap_receipt),
         "smoke_checkpoint_path": str(checkpoint),
         "smoke_checkpoint_sha256": sha256_file(checkpoint),
         "smoke_log_path": str(log_path),
@@ -361,6 +370,7 @@ def _validate_smoke_marker(
     promotion_receipt: Path,
     bucket_manifest: Path,
     length_index: Path,
+    sft_public_overlap_receipt: Path | None = None,
 ) -> dict[str, Any]:
     marker = _load_json(marker_path, label="Stage211D smoke marker")
     expected = {
@@ -378,6 +388,15 @@ def _validate_smoke_marker(
         "length_index_path": str(length_index),
         "length_index_sha256": sha256_file(length_index),
     }
+    if sft_public_overlap_receipt is not None:
+        expected.update(
+            {
+                "sft_public_overlap_receipt_path": str(sft_public_overlap_receipt),
+                "sft_public_overlap_receipt_sha256": sha256_file(
+                    sft_public_overlap_receipt
+                ),
+            }
+        )
     for key, value in expected.items():
         if marker.get(key) != value:
             raise ValueError(f"Stage211D smoke marker {key} mismatch.")
@@ -437,6 +456,7 @@ def _validate_completion(
     bucket_manifest = Path(str(completion.get("bucket_manifest_path") or "")).resolve()
     profile_path_value = completion.get("labeled_profile_receipt_path")
     labeled_profile: dict[str, Any] | None = None
+    sft_public_overlap_receipt: Path | None = None
     if profile_path_value is not None:
         profile_path = Path(str(profile_path_value)).resolve()
         if not profile_path.is_file() or completion.get(
@@ -456,6 +476,19 @@ def _validate_completion(
         ):
             raise ValueError("Stage211D formal labeled profile contract mismatch.")
         labeled_expected = dict(labeled_profile["expected"])
+        sft_public_overlap_receipt = Path(
+            str(completion.get("sft_public_overlap_receipt_path") or "")
+        ).resolve()
+        if (
+            not sft_public_overlap_receipt.is_file()
+            or completion.get("sft_public_overlap_receipt_sha256")
+            != sha256_file(sft_public_overlap_receipt)
+        ):
+            raise ValueError("Stage211D public-audio overlap receipt is unavailable or changed.")
+        validate_stage211_sft_public_overlap_receipt(
+            sft_public_overlap_receipt,
+            expected_labeled_profile=profile_path,
+        )
     else:
         if require_full_profile:
             raise ValueError(
@@ -518,6 +551,7 @@ def _validate_completion(
         promotion_receipt=Path(str(completion["logits_promotion_receipt_path"])).resolve(),
         bucket_manifest=Path(str(completion["bucket_manifest_path"])).resolve(),
         length_index=Path(str(completion["length_index_path"])).resolve(),
+        sft_public_overlap_receipt=sft_public_overlap_receipt,
     )
     train_config_path = Path(str(completion["train_config_path"])).resolve()
     train_config = load_yaml(train_config_path)
@@ -593,6 +627,15 @@ def run_sft(args: argparse.Namespace) -> Path | None:
         bucket_manifest=bucket_manifest,
     )
     labeled_expected = dict(labeled_profile["expected"])
+    sft_public_overlap_receipt = getattr(
+        args,
+        "sft_public_overlap_receipt",
+        DEFAULT_SFT_PUBLIC_OVERLAP_RECEIPT,
+    ).expanduser().resolve()
+    validate_stage211_sft_public_overlap_receipt(
+        sft_public_overlap_receipt,
+        expected_labeled_profile=labeled_profile_path,
+    )
     audit = _validate_labeled_audit(
         dict(labeled_profile["labeled_data_audit"]),
         labeled_root=labeled_root,
@@ -616,6 +659,7 @@ def run_sft(args: argparse.Namespace) -> Path | None:
             promotion_receipt=promotion_receipt,
             bucket_manifest=bucket_manifest,
             length_index=length_index,
+            sft_public_overlap_receipt=sft_public_overlap_receipt,
         )
     else:
         if formal_training_started and not args.dry_run:
@@ -648,6 +692,7 @@ def run_sft(args: argparse.Namespace) -> Path | None:
                     promotion_receipt=promotion_receipt,
                     bucket_manifest=bucket_manifest,
                     length_index=length_index,
+                    sft_public_overlap_receipt=sft_public_overlap_receipt,
                     max_peak_reserved_gib=float(args.max_peak_reserved_gib),
                 ),
             )
@@ -657,6 +702,7 @@ def run_sft(args: argparse.Namespace) -> Path | None:
                 promotion_receipt=promotion_receipt,
                 bucket_manifest=bucket_manifest,
                 length_index=length_index,
+                sft_public_overlap_receipt=sft_public_overlap_receipt,
             )
     if args.smoke_only or args.dry_run:
         return None
@@ -754,6 +800,8 @@ def run_sft(args: argparse.Namespace) -> Path | None:
         "bucket_manifest_sha256": sha256_file(bucket_manifest),
         "length_index_path": str(length_index),
         "length_index_sha256": sha256_file(length_index),
+        "sft_public_overlap_receipt_path": str(sft_public_overlap_receipt),
+        "sft_public_overlap_receipt_sha256": sha256_file(sft_public_overlap_receipt),
         "provenance_path": str(provenance_path),
         "provenance_sha256": sha256_file(provenance_path),
         "train_config_path": str(train_config_path),
@@ -827,6 +875,11 @@ def main() -> int:
         "--labeled-profile-receipt",
         type=Path,
         default=DEFAULT_LABELED_PROFILE_RECEIPT,
+    )
+    parser.add_argument(
+        "--sft-public-overlap-receipt",
+        type=Path,
+        default=DEFAULT_SFT_PUBLIC_OVERLAP_RECEIPT,
     )
     parser.add_argument("--nano-checkpoint", type=Path, default=DEFAULT_NANO_CHECKPOINT)
     parser.add_argument("--master-port", type=int, default=29634)

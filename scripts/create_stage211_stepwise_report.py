@@ -30,6 +30,9 @@ from rwkvasr.eval.stage211_public_metrics import (
     replay_stage211_sft_public_evidence,
 )
 from rwkvasr.eval.stage211_supplemental import STAGE211_BASE_PUBLIC_PCM_SCAN_ORDER
+from rwkvasr.eval.stage211_sft_public_overlap import (
+    validate_stage211_sft_public_overlap_receipt,
+)
 
 try:
     from scripts.install_stage211_unicode_metric_correction import (
@@ -690,6 +693,38 @@ def _sft_ctc_label_proof(coverage: dict[str, Any]) -> dict[str, Any]:
             "all_accepted_unique_rows_required": True,
             "source_language_interleave_required": True,
         }
+        overlap_path = Path(
+            str(coverage.get("sft_public_overlap_receipt_path") or "")
+        ).resolve()
+        if coverage.get("sft_public_overlap_receipt_sha256") != sha256_file(overlap_path):
+            raise ValueError("Stage211 SFT public-audio overlap receipt changed.")
+        overlap_receipt = validate_stage211_sft_public_overlap_receipt(
+            overlap_path,
+            expected_labeled_profile=profile_path,
+        )
+        overlap_coverage = dict(overlap_receipt["coverage"])
+        overlap_result = dict(overlap_receipt["overlap"])
+        profile_binding.update(
+            {
+                "public_audio_isolation_passed": True,
+                "public_audio_overlap_receipt_path": str(overlap_path),
+                "public_audio_overlap_receipt_sha256": sha256_file(overlap_path),
+                "public_audio_comparison_mode": overlap_receipt["comparison_mode"],
+                "public_audio_size_prefilter_lossless_for_exact_bytes": True,
+                "public_audio_scanned_rows": int(overlap_coverage["scanned_rows"]),
+                "public_audio_public_rows": int(
+                    overlap_receipt["public_benchmark"]["public_rows"]
+                ),
+                "public_audio_training_overlap_rows": int(
+                    overlap_result["training_rows"]
+                ),
+                "public_audio_internal_eval_overlap_rows": int(
+                    overlap_result["internal_eval_rows"]
+                ),
+                "public_audio_normalized_pcm_complete": False,
+                "public_audio_near_duplicate_complete": False,
+            }
+        )
     else:
         labeled_expected = dict(LABELED_EXPECTED)
         expected_source_counts = STAGE211_LABELED_SOURCE_COUNTS
@@ -1980,6 +2015,20 @@ def build_stepwise_report(
 
 
 def render_markdown(report: dict[str, Any]) -> str:
+    label_proof = report["ctc_label_proof"]
+    if label_proof.get("public_audio_isolation_passed") is True:
+        public_audio_isolation = (
+            "SFT/public exact encoded-audio isolation: `true`, "
+            f"scanned `{int(label_proof['public_audio_scanned_rows']):,}` labeled rows "
+            f"against `{int(label_proof['public_audio_public_rows']):,}` public rows, "
+            "training overlap: `0` (normalized-PCM/near-duplicate completeness: "
+            "`false/false`)"
+        )
+    else:
+        public_audio_isolation = (
+            "SFT/public exact encoded-audio isolation: `unavailable` "
+            "(legacy labeled-profile evidence)"
+        )
     lines = [
         "# Stage211 Stepwise Alignment Results",
         "",
@@ -2025,6 +2074,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "CTC label normalization: `ctc`, tokenizer: `sensevoice_tiktoken`, "
         f"unknown tokens: `{int(report['ctc_label_proof']['ctc_unk_tokens'])}`, "
         "non-pronunciation logits suppressed: `true`",
+        "",
+        public_audio_isolation,
         "",
         "Public WER/CER normalization: `ctc`.",
         "",

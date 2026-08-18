@@ -217,7 +217,7 @@ def test_phase_correction_commands_preserve_phase_objective(
     checkpoint.write_bytes(phase.encode())
     promotion.write_text("{}\n", encoding="utf-8")
     selection = loop._selection_payload(
-        round_index=1,
+        round_index=3,
         gate_dir=gate.parent,
         gate={"checkpoint_path": str(checkpoint.resolve())},
         promotion=promotion,
@@ -226,6 +226,29 @@ def test_phase_correction_commands_preserve_phase_objective(
     assert selection["artifact"] == "phase_gate_selection"
     assert selection["phase"] == phase
     assert selection["checkpoint_sha256"] == loop.sha256_file(checkpoint)
+
+
+@pytest.mark.parametrize("round_index", (0, 1, 2))
+def test_phase_selection_rejects_fewer_than_three_correction_rounds(
+    tmp_path: Path,
+    round_index: int,
+) -> None:
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    (gate_dir / "phase_gate.json").write_text("{}\n", encoding="utf-8")
+    checkpoint = tmp_path / "mixer.pt"
+    checkpoint.write_bytes(b"mixer")
+    promotion = tmp_path / "promotion.json"
+    promotion.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="at least 3 complete correction rounds"):
+        loop._selection_payload(
+            round_index=round_index,
+            gate_dir=gate_dir,
+            gate={"checkpoint_path": str(checkpoint.resolve())},
+            promotion=promotion,
+            phase="mixer",
+        )
 
 
 def test_correction_loop_requires_explicit_phase_public_baseline() -> None:
@@ -371,7 +394,7 @@ def test_retention_loop_continues_early_passes_and_promotes_only_after_round_thr
 
     def fake_validate_gate(path: Path) -> dict[str, object]:
         if path == original_gate:
-            return {"gate_passed": False, "checkpoint_path": str(checkpoints[0])}
+            return {"gate_passed": True, "checkpoint_path": str(checkpoints[0])}
         round_index = int(path.parent.name.removeprefix("round_"))
         return {"gate_passed": True, "checkpoint_path": str(checkpoints[round_index])}
 

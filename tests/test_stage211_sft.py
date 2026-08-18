@@ -375,6 +375,11 @@ def test_stage211_sft_refuses_retroactive_smoke_marker(
         "validate_labeled_profile_receipt",
         lambda path, **_kwargs: profile if path == profile_path.resolve() else None,
     )
+    monkeypatch.setattr(
+        sft_runner,
+        "validate_stage211_sft_public_overlap_receipt",
+        lambda *_args, **_kwargs: {"training_ready": True},
+    )
 
     monkeypatch.setattr(
         sft_runner,

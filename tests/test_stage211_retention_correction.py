@@ -708,7 +708,7 @@ def test_create_stage211_retention_correction_receipt(
     )
 
     gate_payload["gate_passed"] = True
-    with pytest.raises(ValueError, match="failed gate or an early passing gate"):
+    with pytest.raises(ValueError, match="provenance contract mismatch"):
         correction.build_receipt(
             round_index=1,
             run_dir=run_dir,

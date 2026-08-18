@@ -26,6 +26,7 @@ MASTER_PORT="${MASTER_PORT:-29631}"
 PHASE_GATE_ROOT="${PHASE_GATE_ROOT:-${HOME}/rwkvasr_eval/stage211_phase_gates}"
 LABELED_ROOT="${LABELED_ROOT:-${HOME}/rwkvasr_data/stage211_sft_full_labeled_v2}"
 LABELED_PROFILE_RECEIPT="${LABELED_PROFILE_RECEIPT:-${LABELED_ROOT}/stage211_labeled_profile_receipt.json}"
+SFT_PUBLIC_OVERLAP_RECEIPT="${SFT_PUBLIC_OVERLAP_RECEIPT:-${HOME}/rwkvasr_data/stage211_sft_public_encoded_overlap_v1/receipt.json}"
 SFT_OUTPUT_DIR="${SFT_OUTPUT_DIR:-${FULL_OUTPUT_ROOT}/stage211d_labeled_ctc_sft_1ep}"
 SFT_CORRECTION_PROFILE_ROOT="${SFT_CORRECTION_PROFILE_ROOT:-${HOME}/rwkvasr_data/stage211_sft_source_balanced_correction_v1}"
 SFT_CORRECTION_RUN_ROOT="${SFT_CORRECTION_RUN_ROOT:-${FULL_OUTPUT_ROOT}/stage211d_sft_correction}"
@@ -405,6 +406,7 @@ run_labeled_sft_phase() {
     --labeled-length-index "${LABELED_ROOT}/webdataset_lengths.jsonl" \
     --bucket-manifest "${LABELED_ROOT}/webdataset_buckets_audio_text/manifest.json" \
     --labeled-profile-receipt "${LABELED_PROFILE_RECEIPT}" \
+    --sft-public-overlap-receipt "${SFT_PUBLIC_OVERLAP_RECEIPT}" \
     --nano-checkpoint "${NANO_CHECKPOINT}" \
     --master-port "$((MASTER_PORT + 3))" \
     --final-checkpoint-path-output "${final_checkpoint_file}"

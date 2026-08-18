@@ -203,7 +203,7 @@ def stage211_correction_admission_mode(*, gate_passed: Any, round_index: int) ->
     """Derive the correction admission mode from immutable gate state and round order."""
     if gate_passed is False:
         return STAGE211_CORRECTION_ADMISSION_FAILED_GATE
-    if gate_passed is True and 1 < round_index <= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+    if gate_passed is True and 1 <= round_index <= STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
         return STAGE211_CORRECTION_ADMISSION_EARLY_PASS
     raise ValueError(
         "Stage211 correction admission requires a failed gate or an early passing gate "
