@@ -98,6 +98,28 @@ def test_stage211_monitor_reports_missing_readiness_as_pending(tmp_path: Path) -
     assert "supplemental_replay_receipt=pending" in output
 
 
+def test_stage211_monitor_uses_profile_total_after_metadata_exclusion(
+    tmp_path: Path,
+) -> None:
+    labeled_root = tmp_path / "labeled"
+    labeled_root.mkdir()
+    (labeled_root / "prepare.log").write_text(
+        "[rwkvasr] ctc-align lengths complete processed=100 kept=92 lengths=index.jsonl\n"
+        "CTC-aligned clean preprocessing complete\n",
+        encoding="utf-8",
+    )
+    (labeled_root / "profile.json").write_text(
+        '{"expected":{"total_samples":90}}\n',
+        encoding="utf-8",
+    )
+
+    output = _emit_readiness(tmp_path)
+
+    assert (
+        "sft_labeled_preparation=complete processed=100 expected=100 progress_pct=100.0000 kept=90"
+    ) in output
+
+
 def test_stage211_monitor_supersedes_stale_sft_finalizer_failure(
     tmp_path: Path,
 ) -> None:

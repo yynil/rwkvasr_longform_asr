@@ -289,7 +289,7 @@ stage211_emit_artifact_status() {
 }
 
 stage211_emit_sft_readiness() {
-  local latest_record processed=0 kept=0 progress state finalizer_record
+  local latest_record processed=0 kept=0 profile_total progress state finalizer_record
   latest_record="$(
     rg 'ctc-align (progress|lengths complete) processed=[0-9]+ kept=[0-9]+' \
       "${SFT_PREPARATION_LOG}" 2>/dev/null | tail -n 1 || true
@@ -300,6 +300,16 @@ stage211_emit_sft_readiness() {
   fi
   processed="${processed:-0}"
   kept="${kept:-0}"
+  if [[ -s "${SFT_PROFILE_RECEIPT}" ]]; then
+    profile_total="$(
+      jq -er \
+        '.expected.total_samples | select(type == "number" and . > 0 and floor == .)' \
+        "${SFT_PROFILE_RECEIPT}" 2>/dev/null || true
+    )"
+    if [[ "${profile_total}" =~ ^[0-9]+$ ]]; then
+      kept="${profile_total}"
+    fi
+  fi
   if rg -q -F 'CTC-aligned clean preprocessing complete' "${SFT_PREPARATION_LOG}" 2>/dev/null; then
     state=complete
     processed="${SFT_EXPECTED_INPUT_SAMPLES}"
