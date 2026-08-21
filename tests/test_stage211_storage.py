@@ -271,6 +271,38 @@ def test_completed_segment_compaction_resumes_an_interrupted_plan(
     assert all(not (run_dir / "ds_checkpoints" / tag).exists() for tag in result["removed_tags"])
 
 
+def test_completed_segment_compaction_accepts_profiled_schema_two_receipt(
+    tmp_path: Path,
+) -> None:
+    receipt_path, _ = _fixture(tmp_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["schema_version"] = 2
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    plan = stage211_storage.compact_stage211_completed_segment(
+        curriculum_receipt_path=receipt_path,
+        execute=False,
+    )
+
+    assert plan["complete"] is False
+    assert plan["curriculum_receipt_sha256"] == sha256_file(receipt_path)
+
+
+def test_completed_segment_compaction_rejects_unsupported_receipt_schema(
+    tmp_path: Path,
+) -> None:
+    receipt_path, _ = _fixture(tmp_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["schema_version"] = 3
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="supported curriculum receipt schema"):
+        stage211_storage.compact_stage211_completed_segment(
+            curriculum_receipt_path=receipt_path,
+            execute=False,
+        )
+
+
 def test_completed_segment_compaction_rejects_unknown_or_active_state(
     tmp_path: Path,
 ) -> None:

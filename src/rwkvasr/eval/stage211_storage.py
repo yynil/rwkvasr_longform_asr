@@ -148,8 +148,12 @@ def _validate_receipt(
 ) -> tuple[dict[str, Any], Path]:
     receipt_path = receipt_path.expanduser().resolve()
     receipt = _load_json(receipt_path, label="curriculum coverage receipt")
+    schema_version = receipt.get("schema_version")
+    if schema_version not in (1, 2):
+        raise ValueError(
+            "Stage211 storage compaction requires a supported curriculum receipt schema."
+        )
     expected = {
-        "schema_version": 1,
         "pipeline": "stage211",
         "artifact": "curriculum_coverage",
         "complete": True,
