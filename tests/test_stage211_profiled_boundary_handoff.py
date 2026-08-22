@@ -161,6 +161,91 @@ def test_template_config_selection_requires_one_exact_step_contract(
         handoff._find_template_config(tmp_path, expected_steps=456)
 
 
+def test_completed_boundary_reuses_existing_template_without_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    phase_root = tmp_path / "runs" / "phase"
+    provenance = phase_root / "supplemental_natural" / "stage211_provenance.json"
+    provenance.parent.mkdir(parents=True)
+    provenance.write_text("{}\n", encoding="utf-8")
+    template = tmp_path / "configs" / "mixer" / "full_supplemental_natural" / "base.yaml"
+    save_yaml(template, {"max_steps": 456})
+    monkeypatch.setattr(
+        handoff,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("completed boundary must not rerun strict template"),
+    )
+
+    selected = handoff._ensure_template_config(
+        phase_root=phase_root,
+        config_root=tmp_path / "configs",
+        manifest=tmp_path / "manifest.json",
+        inventory=tmp_path / "inventory.json",
+        nano_checkpoint=tmp_path / "nano.pt",
+        master_port=29631,
+        expected_steps=456,
+        log_path=tmp_path / "handoff.log",
+    )
+
+    assert selected == template.resolve()
+
+
+def test_completed_boundary_rejects_missing_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    phase_root = tmp_path / "runs" / "phase"
+    provenance = phase_root / "supplemental_natural" / "stage211_provenance.json"
+    provenance.parent.mkdir(parents=True)
+    provenance.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        handoff,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("recovery must fail before strict template runner"),
+    )
+
+    with pytest.raises(ValueError, match="missing after formal provenance"):
+        handoff._ensure_template_config(
+            phase_root=phase_root,
+            config_root=tmp_path / "configs",
+            manifest=tmp_path / "manifest.json",
+            inventory=tmp_path / "inventory.json",
+            nano_checkpoint=tmp_path / "nano.pt",
+            master_port=29631,
+            expected_steps=456,
+            log_path=tmp_path / "handoff.log",
+        )
+
+
+def test_fresh_boundary_generates_missing_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    phase_root = tmp_path / "runs" / "phase"
+    config_root = tmp_path / "configs"
+    template = config_root / "mixer" / "full_supplemental_natural" / "base.yaml"
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], *, log_path: Path | None = None) -> None:
+        commands.append(command)
+        save_yaml(template, {"max_steps": 456})
+
+    monkeypatch.setattr(handoff, "_run", fake_run)
+
+    selected = handoff._ensure_template_config(
+        phase_root=phase_root,
+        config_root=config_root,
+        manifest=tmp_path / "manifest.json",
+        inventory=tmp_path / "inventory.json",
+        nano_checkpoint=tmp_path / "nano.pt",
+        master_port=29631,
+        expected_steps=456,
+        log_path=tmp_path / "handoff.log",
+    )
+
+    assert selected == template.resolve()
+    assert len(commands) == 1
+    assert str(handoff.STRICT_RUNNER) in commands[0]
+
+
 def test_supervisor_replacement_resumes_after_mixer(tmp_path: Path) -> None:
     command = handoff._supervisor_command(
         session="stage211-supervisor",
@@ -204,6 +289,6 @@ def test_retention_barrier_deep_validates_both_receipts_before_preflight(
     source = inspect.getsource(handoff.main)
     wait_index = source.index("(stratified_hidden_receipt, retention_replay_receipt)")
     validation_index = source.index("_retention_validation_commands(")
-    template_index = source.index("_template_command(")
+    template_index = source.index("_ensure_template_config(")
     preflight_index = source.index("_preflight_command(")
     assert wait_index < validation_index < template_index < preflight_index

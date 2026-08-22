@@ -236,6 +236,56 @@ def _find_template_config(config_root: Path, *, expected_steps: int) -> Path:
     return matches[0].resolve()
 
 
+def _ensure_template_config(
+    *,
+    phase_root: Path,
+    config_root: Path,
+    manifest: Path,
+    inventory: Path,
+    nano_checkpoint: Path,
+    master_port: int,
+    expected_steps: int,
+    log_path: Path,
+) -> Path:
+    root = config_root / "mixer" / "full_supplemental_natural"
+    matches = [
+        path
+        for path in sorted(root.glob("*.yaml"))
+        if int(load_yaml(path).get("max_steps", -1)) == int(expected_steps)
+    ]
+    if len(matches) == 1:
+        template = matches[0].resolve()
+        print(
+            "[stage211-profiled-handoff] reusing Supplemental template "
+            f"path={template} expected_steps={expected_steps}",
+            flush=True,
+        )
+        return template
+    if len(matches) > 1:
+        raise ValueError(
+            "Stage211 Supplemental template config is ambiguous: "
+            f"expected_steps={expected_steps} matches={matches}"
+        )
+    provenance = phase_root / STAGE211_SUPPLEMENTAL_DIFFICULTY / "stage211_provenance.json"
+    if provenance.is_file():
+        raise ValueError(
+            "Stage211 Supplemental template is missing after formal provenance was recorded; "
+            "refusing fresh initialization during recovery."
+        )
+    _run(
+        _template_command(
+            phase_root=phase_root,
+            config_root=config_root,
+            manifest=manifest,
+            inventory=inventory,
+            nano_checkpoint=nano_checkpoint,
+            master_port=master_port,
+        ),
+        log_path=log_path,
+    )
+    return _find_template_config(config_root, expected_steps=expected_steps)
+
+
 def _preflight_command(
     *,
     base_config: Path,
@@ -543,20 +593,15 @@ def main() -> int:
         flush=True,
     )
     manifest = Path(str(supplemental["bucket_manifest_path"])).resolve()
-    _run(
-        _template_command(
-            phase_root=phase_root,
-            config_root=config_root,
-            manifest=manifest,
-            inventory=inventory,
-            nano_checkpoint=nano_checkpoint,
-            master_port=int(args.master_port),
-        ),
-        log_path=handoff_log,
-    )
-    base_config = _find_template_config(
-        config_root,
+    base_config = _ensure_template_config(
+        phase_root=phase_root,
+        config_root=config_root,
+        manifest=manifest,
+        inventory=inventory,
+        nano_checkpoint=nano_checkpoint,
+        master_port=int(args.master_port),
         expected_steps=int(supplemental["steps"]),
+        log_path=handoff_log,
     )
     init_sha = sha256_file(long_checkpoint)
     manifest_sha = sha256_file(manifest)
