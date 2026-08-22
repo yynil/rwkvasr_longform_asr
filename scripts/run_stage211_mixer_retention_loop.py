@@ -445,8 +445,10 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
         )
         if args.dry_run:
             return None
-        if code == 0 and not original_gate_path.is_file():
-            raise ValueError(f"Stage211 original {phase} finalizer produced no phase gate.")
+        if not original_gate_path.is_file():
+            raise ValueError(
+                f"Stage211 original {phase} finalizer exited code={code} without a phase gate."
+            )
 
     prior_gate_path = original_gate_path
     last_failed_gate_path: Path | None = None
@@ -501,9 +503,10 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
                 )
                 if args.dry_run:
                     return None
-                if code == 0 and not gate_path.is_file():
+                if not gate_path.is_file():
                     raise ValueError(
-                        f"Stage211 correction round {round_index} produced no phase gate."
+                        f"Stage211 correction round {round_index} finalizer exited "
+                        f"code={code} without a phase gate."
                     )
 
         gate = _validate_gate_for_phase(gate_path, phase=phase)

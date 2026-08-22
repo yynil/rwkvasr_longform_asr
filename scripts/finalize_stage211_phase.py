@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import shlex
 import subprocess
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +96,153 @@ def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"{label} must be a JSON object: {path}")
     return payload
+
+
+@lru_cache(maxsize=None)
+def _immutable_file_sha256(path_value: str, size: int, mtime_ns: int) -> str:
+    del size, mtime_ns
+    return sha256_file(Path(path_value))
+
+
+def _cached_sha256(path: Path) -> str:
+    resolved = path.resolve()
+    stat = resolved.stat()
+    return _immutable_file_sha256(str(resolved), stat.st_size, stat.st_mtime_ns)
+
+
+def _validate_existing_alignment_pair(
+    *,
+    phase: str,
+    baseline_report_path: Path,
+    candidate_report_path: Path,
+    baseline_checkpoint: Path,
+    candidate_checkpoint: Path,
+    train_config_path: Path,
+    model_config_path: Path,
+    eval_bucket_manifest_path: Path | None = None,
+    samples: int = 256,
+    feature_seed: int = 0,
+) -> bool:
+    exists = (baseline_report_path.is_file(), candidate_report_path.is_file())
+    if not any(exists):
+        return False
+    if not all(exists):
+        raise ValueError("Stage211 alignment resume found only one report in a pair.")
+    reports = {
+        "baseline": _load_json(
+            baseline_report_path,
+            label="Stage211 existing alignment baseline report",
+        ),
+        "candidate": _load_json(
+            candidate_report_path,
+            label="Stage211 existing alignment candidate report",
+        ),
+    }
+    expected_paths = {
+        "baseline": baseline_checkpoint.resolve(),
+        "candidate": candidate_checkpoint.resolve(),
+    }
+    for role, report in reports.items():
+        checkpoint = expected_paths[role]
+        expected = {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "alignment_checkpoint_eval",
+            "phase": phase,
+            "role": role,
+            "checkpoint_path": str(checkpoint),
+            "checkpoint_sha256": _cached_sha256(checkpoint),
+            "train_config_path": str(train_config_path.resolve()),
+            "train_config_sha256": _cached_sha256(train_config_path),
+            "model_config_path": str(model_config_path.resolve()),
+            "model_config_sha256": _cached_sha256(model_config_path),
+            "feature_seed": feature_seed,
+            "eval_samples": samples,
+        }
+        if any(report.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"Stage211 existing alignment {role} report binding changed.")
+        eval_loss = report.get("eval_loss")
+        if (
+            isinstance(eval_loss, bool)
+            or not isinstance(eval_loss, int | float)
+            or not math.isfinite(float(eval_loss))
+        ):
+            raise ValueError(f"Stage211 existing alignment {role} loss is invalid.")
+
+    shared_fields = (
+        "pair_eval_id",
+        "train_config_path",
+        "train_config_sha256",
+        "model_config_path",
+        "model_config_sha256",
+        "nano_checkpoint_path",
+        "nano_checkpoint_sha256",
+        "feature_seed",
+        "eval_provenance",
+    )
+    baseline = reports["baseline"]
+    candidate = reports["candidate"]
+    if any(baseline.get(key) != candidate.get(key) for key in shared_fields):
+        raise ValueError("Stage211 existing alignment reports are not one exact pair.")
+    nano_checkpoint = Path(str(baseline.get("nano_checkpoint_path") or "")).resolve()
+    if not nano_checkpoint.is_file() or baseline.get("nano_checkpoint_sha256") != _cached_sha256(
+        nano_checkpoint
+    ):
+        raise ValueError("Stage211 existing alignment Nano checkpoint binding changed.")
+    provenance = baseline.get("eval_provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("Stage211 existing alignment pair lacks eval provenance.")
+    if (
+        provenance.get("requested_samples") != samples
+        or provenance.get("split_samples") != samples
+        or provenance.get("feature_seed") != feature_seed
+    ):
+        raise ValueError("Stage211 existing alignment eval provenance coverage changed.")
+    manifest = Path(str(provenance.get("bucket_manifest_path") or "")).resolve()
+    if not manifest.is_file() or provenance.get("bucket_manifest_sha256") != _cached_sha256(
+        manifest
+    ):
+        raise ValueError("Stage211 existing alignment eval manifest binding changed.")
+    if eval_bucket_manifest_path is not None and manifest != eval_bucket_manifest_path.resolve():
+        raise ValueError("Stage211 existing stratified alignment uses another manifest.")
+    parts = provenance.get("parts")
+    if not isinstance(parts, list) or not parts:
+        raise ValueError("Stage211 existing alignment eval provenance lacks data parts.")
+    for part in parts:
+        if not isinstance(part, dict):
+            raise ValueError("Stage211 existing alignment eval provenance part is invalid.")
+        path = Path(str(part.get("path") or "")).resolve()
+        if not path.is_file() or part.get("sha256") != _cached_sha256(path):
+            raise ValueError("Stage211 existing alignment eval data-part binding changed.")
+
+    pair_binding = {
+        "schema_version": 1,
+        "phase": phase,
+        "baseline_checkpoint_path": str(expected_paths["baseline"]),
+        "baseline_checkpoint_sha256": _cached_sha256(expected_paths["baseline"]),
+        "candidate_checkpoint_path": str(expected_paths["candidate"]),
+        "candidate_checkpoint_sha256": _cached_sha256(expected_paths["candidate"]),
+        "train_config_path": str(train_config_path.resolve()),
+        "train_config_sha256": _cached_sha256(train_config_path),
+        "model_config_path": str(model_config_path.resolve()),
+        "model_config_sha256": _cached_sha256(model_config_path),
+        "nano_checkpoint_path": str(nano_checkpoint),
+        "nano_checkpoint_sha256": _cached_sha256(nano_checkpoint),
+        "eval_provenance": provenance,
+        "feature_seed": feature_seed,
+        "samples": samples,
+    }
+    expected_pair_id = hashlib.sha256(
+        json.dumps(
+            pair_binding,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    if baseline.get("pair_eval_id") != expected_pair_id:
+        raise ValueError("Stage211 existing alignment pair ID does not replay its bindings.")
+    return True
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
@@ -537,15 +687,17 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     alignment_eval_dir = output_dir / "alignment_pair"
     baseline_report = alignment_eval_dir / "baseline.json"
     candidate_report = alignment_eval_dir / "candidate.json"
+    train_config_path = phase_root / "easy" / "train_config.yaml"
+    model_config_path = phase_root / "easy" / "model_config.yaml"
     pair_eval_command = [
         str(PYTHON),
         str(ALIGNMENT_PAIR_EVAL_SCRIPT),
         "--phase",
         phase,
         "--train-config",
-        str(phase_root / "easy" / "train_config.yaml"),
+        str(train_config_path),
         "--model-config",
-        str(phase_root / "easy" / "model_config.yaml"),
+        str(model_config_path),
         "--baseline-checkpoint",
         str(baseline_checkpoint),
         "--candidate-checkpoint",
@@ -568,7 +720,22 @@ def finalize_phase(args: argparse.Namespace) -> Path:
     alignment_teacher_device = getattr(args, "alignment_teacher_device", None)
     if alignment_teacher_device is not None:
         pair_eval_command.extend(("--teacher-device", str(alignment_teacher_device)))
-    _run(pair_eval_command, dry_run=bool(args.dry_run))
+    if _validate_existing_alignment_pair(
+        phase=phase,
+        baseline_report_path=baseline_report,
+        candidate_report_path=candidate_report,
+        baseline_checkpoint=baseline_checkpoint,
+        candidate_checkpoint=checkpoint,
+        train_config_path=train_config_path,
+        model_config_path=model_config_path,
+    ):
+        print(
+            f"[stage211-finalize] reused alignment pair phase={phase} "
+            f"baseline={baseline_report} candidate={candidate_report}",
+            flush=True,
+        )
+    else:
+        _run(pair_eval_command, dry_run=bool(args.dry_run))
 
     stratified_summary_path: Path | None = None
     if phase in {"mixer", "block", "logits"}:
@@ -600,9 +767,9 @@ def finalize_phase(args: argparse.Namespace) -> Path:
                 "--phase",
                 phase,
                 "--train-config",
-                str(phase_root / "easy" / "train_config.yaml"),
+                str(train_config_path),
                 "--model-config",
-                str(phase_root / "easy" / "model_config.yaml"),
+                str(model_config_path),
                 "--baseline-checkpoint",
                 str(baseline_checkpoint),
                 "--candidate-checkpoint",
@@ -628,7 +795,24 @@ def finalize_phase(args: argparse.Namespace) -> Path:
                 "--audio-cache-dir",
                 str(stratified_eval_dir / "teacher_audio_cache" / cell_name),
             ]
-            stratified_commands.append(cell_command)
+            cell_baseline = stratified_eval_dir / f"{cell_name}_baseline.json"
+            cell_candidate = stratified_eval_dir / f"{cell_name}_candidate.json"
+            if _validate_existing_alignment_pair(
+                phase=phase,
+                baseline_report_path=cell_baseline,
+                candidate_report_path=cell_candidate,
+                baseline_checkpoint=baseline_checkpoint,
+                candidate_checkpoint=checkpoint,
+                train_config_path=train_config_path,
+                model_config_path=model_config_path,
+                eval_bucket_manifest_path=stratified_manifests[cell_name],
+            ):
+                print(
+                    f"[stage211-finalize] reused stratified alignment cell={cell_name}",
+                    flush=True,
+                )
+            else:
+                stratified_commands.append(cell_command)
         _run_parallel_waves(
             stratified_commands,
             width=len(stratified_devices),

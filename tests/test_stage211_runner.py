@@ -9065,3 +9065,107 @@ def test_stage211_mixer_phase_gate_accepts_coverage_nondivergence_policy(
 
     assert validated["promotion_policy"] == (STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT)
     assert validated["alignment_loss_nondivergence"]["gate_passed"] is True
+
+
+def test_stage211_finalizer_reuses_only_an_exact_immutable_alignment_pair(
+    tmp_path: Path,
+) -> None:
+    baseline_checkpoint = tmp_path / "baseline.pt"
+    candidate_checkpoint = tmp_path / "step-10.pt"
+    train_config = tmp_path / "train.yaml"
+    model_config = tmp_path / "model.yaml"
+    nano_checkpoint = tmp_path / "nano.pt"
+    manifest = tmp_path / "manifest.json"
+    part = tmp_path / "part.jsonl"
+    for path, payload in (
+        (baseline_checkpoint, b"baseline"),
+        (candidate_checkpoint, b"candidate"),
+        (train_config, b"train"),
+        (model_config, b"model"),
+        (nano_checkpoint, b"nano"),
+        (manifest, b"manifest"),
+        (part, b"part"),
+    ):
+        path.write_bytes(payload)
+    provenance = {
+        "schema_version": 1,
+        "split": "eval",
+        "requested_samples": 256,
+        "feature_seed": 0,
+        "bucket_manifest_path": str(manifest.resolve()),
+        "bucket_manifest_sha256": sha256_file(manifest),
+        "split_samples": 256,
+        "parts": [
+            {
+                "path": str(part.resolve()),
+                "sha256": sha256_file(part),
+                "num_samples": 256,
+            }
+        ],
+    }
+    pair_binding = {
+        "schema_version": 1,
+        "phase": "mixer",
+        "baseline_checkpoint_path": str(baseline_checkpoint.resolve()),
+        "baseline_checkpoint_sha256": sha256_file(baseline_checkpoint),
+        "candidate_checkpoint_path": str(candidate_checkpoint.resolve()),
+        "candidate_checkpoint_sha256": sha256_file(candidate_checkpoint),
+        "train_config_path": str(train_config.resolve()),
+        "train_config_sha256": sha256_file(train_config),
+        "model_config_path": str(model_config.resolve()),
+        "model_config_sha256": sha256_file(model_config),
+        "nano_checkpoint_path": str(nano_checkpoint.resolve()),
+        "nano_checkpoint_sha256": sha256_file(nano_checkpoint),
+        "eval_provenance": provenance,
+        "feature_seed": 0,
+        "samples": 256,
+    }
+    pair_id = hashlib.sha256(
+        json.dumps(pair_binding, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    report_paths: dict[str, Path] = {}
+    for role, checkpoint in (
+        ("baseline", baseline_checkpoint),
+        ("candidate", candidate_checkpoint),
+    ):
+        report = {
+            "schema_version": 1,
+            "pipeline": "stage211",
+            "artifact": "alignment_checkpoint_eval",
+            "phase": "mixer",
+            "role": role,
+            "pair_eval_id": pair_id,
+            "checkpoint_path": str(checkpoint.resolve()),
+            "checkpoint_sha256": sha256_file(checkpoint),
+            "train_config_path": str(train_config.resolve()),
+            "train_config_sha256": sha256_file(train_config),
+            "model_config_path": str(model_config.resolve()),
+            "model_config_sha256": sha256_file(model_config),
+            "nano_checkpoint_path": str(nano_checkpoint.resolve()),
+            "nano_checkpoint_sha256": sha256_file(nano_checkpoint),
+            "feature_seed": 0,
+            "eval_samples": 256,
+            "eval_loss": 1.0 if role == "baseline" else 0.5,
+            "eval_provenance": provenance,
+        }
+        path = tmp_path / f"{role}.json"
+        path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+        report_paths[role] = path
+
+    kwargs = {
+        "phase": "mixer",
+        "baseline_report_path": report_paths["baseline"],
+        "candidate_report_path": report_paths["candidate"],
+        "baseline_checkpoint": baseline_checkpoint,
+        "candidate_checkpoint": candidate_checkpoint,
+        "train_config_path": train_config,
+        "model_config_path": model_config,
+        "eval_bucket_manifest_path": manifest,
+    }
+    assert stage211_phase_finalizer._validate_existing_alignment_pair(**kwargs) is True
+
+    candidate = json.loads(report_paths["candidate"].read_text(encoding="utf-8"))
+    candidate["checkpoint_sha256"] = "0" * 64
+    report_paths["candidate"].write_text(json.dumps(candidate) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="candidate report binding changed"):
+        stage211_phase_finalizer._validate_existing_alignment_pair(**kwargs)
