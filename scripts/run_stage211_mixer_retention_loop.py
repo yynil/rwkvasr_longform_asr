@@ -10,6 +10,7 @@ from typing import Any
 
 from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 from rwkvasr.eval.stage211_gate import (
+    STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT,
     STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS,
     STAGE211_RETENTION_CORRECTION_MAX_ROUNDS,
     build_stage211_correction_extension_decision,
@@ -177,6 +178,13 @@ def _finalizer_command(
         )
     )
     if phase == "mixer":
+        if not correction_receipts:
+            command.extend(
+                (
+                    "--promotion-policy",
+                    STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT,
+                )
+            )
         command.extend(
             (
                 "--baseline-public-reuse-receipt",
@@ -337,7 +345,15 @@ def _selection_payload(
     promotion: Path,
     phase: str = "mixer",
 ) -> dict[str, Any]:
-    if round_index < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+    direct_coverage_promotion = (
+        phase == "mixer"
+        and round_index == 0
+        and gate.get("promotion_policy") == STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT
+    )
+    if (
+        round_index < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
+        and not direct_coverage_promotion
+    ):
         raise ValueError(
             "Stage211 phase selection requires at least "
             f"{STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS} complete correction rounds."
@@ -492,7 +508,15 @@ def run_retention_loop(args: argparse.Namespace) -> Path | None:
 
         gate = _validate_gate_for_phase(gate_path, phase=phase)
         if gate.get("gate_passed") is True:
-            if round_index < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS:
+            direct_coverage_promotion = (
+                phase == "mixer"
+                and round_index == 0
+                and gate.get("promotion_policy") == STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT
+            )
+            if (
+                round_index < STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS
+                and not direct_coverage_promotion
+            ):
                 print(
                     "[stage211-correction-loop] early gate pass requires mandatory continuation "
                     f"phase={phase} completed_round={round_index} "

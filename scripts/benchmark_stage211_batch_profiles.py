@@ -86,11 +86,15 @@ BLOCK_DEFAULT_PROFILES = (
         8,
         True,
     ),
+    BatchProfile("no_ckpt_batch1_frames2k", 1, 2_000, 8, False),
+    BatchProfile("no_ckpt_batch2_frames3k", 2, 3_000, 8, False),
     BatchProfile("no_ckpt_batch4_frames4k", 4, 4_000, 8, False),
     BatchProfile("no_ckpt_batch8_frames6k", 8, 6_000, 8, False),
     BatchProfile("no_ckpt_batch12_frames8k", 12, 8_000, 8, False),
     BatchProfile("no_ckpt_batch16_frames10k", 16, 10_000, 8, False),
     BatchProfile("no_ckpt_batch24_frames16k", 24, 16_000, 8, False),
+    BatchProfile("batch2_frames3k", 2, 3_000, 8, True),
+    BatchProfile("batch4_frames4k", 4, 4_000, 8, True),
     BatchProfile("batch8_frames6k", 8, 6_000, 8, True),
     BatchProfile("batch12_frames8k", 12, 8_000, 8, True),
     BatchProfile("batch16_frames10k", 16, 10_000, 8, True),
@@ -109,10 +113,14 @@ LOGITS_DEFAULT_PROFILES = (
         8,
         True,
     ),
+    BatchProfile("no_ckpt_batch1_frames2k", 1, 2_000, 8, False),
+    BatchProfile("no_ckpt_batch2_frames3k", 2, 3_000, 8, False),
     BatchProfile("no_ckpt_batch4_frames4k", 4, 4_000, 8, False),
     BatchProfile("no_ckpt_batch8_frames6k", 8, 6_000, 8, False),
     BatchProfile("no_ckpt_batch12_frames8k", 12, 8_000, 8, False),
     BatchProfile("no_ckpt_batch16_frames10k", 16, 10_000, 8, False),
+    BatchProfile("batch2_frames3k", 2, 3_000, 8, True),
+    BatchProfile("batch4_frames4k", 4, 4_000, 8, True),
     BatchProfile("batch8_frames6k", 8, 6_000, 8, True),
     BatchProfile("batch12_frames8k", 12, 8_000, 8, True),
     BatchProfile("batch16_frames10k", 16, 10_000, 8, True),
@@ -1318,9 +1326,7 @@ def main() -> int:
                         None,
                     )
                     baseline_seconds = (
-                        baseline_row.get("summary", {}).get(
-                            "projected_full_coverage_seconds"
-                        )
+                        baseline_row.get("summary", {}).get("projected_full_coverage_seconds")
                         if isinstance(baseline_row, dict)
                         else None
                     )

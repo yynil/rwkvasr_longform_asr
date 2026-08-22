@@ -179,6 +179,21 @@ def test_retention_finalizer_command_binds_all_prior_receipts(tmp_path: Path) ->
     assert command[command.index("--initialization-receipt") + 1] == str(
         loop.DEFAULT_INITIALIZATION_RECEIPT
     )
+    assert "--promotion-policy" not in command
+
+
+def test_initial_mixer_finalizer_uses_coverage_nondivergence_policy(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+
+    command = loop._finalizer_command(
+        args,
+        output_dir=tmp_path / "gate",
+        correction_receipts=[],
+    )
+
+    assert command[command.index("--promotion-policy") + 1] == (
+        stage211_gate.STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT
+    )
 
 
 @pytest.mark.parametrize("phase", ("block", "logits"))
@@ -257,6 +272,32 @@ def test_phase_selection_rejects_fewer_than_three_correction_rounds(
             promotion=promotion,
             phase="mixer",
         )
+
+
+def test_mixer_selection_accepts_round_zero_coverage_nondivergence_gate(
+    tmp_path: Path,
+) -> None:
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    (gate_dir / "phase_gate.json").write_text("{}\n", encoding="utf-8")
+    checkpoint = tmp_path / "mixer.pt"
+    checkpoint.write_bytes(b"mixer")
+    promotion = tmp_path / "promotion.json"
+    promotion.write_text("{}\n", encoding="utf-8")
+
+    selection = loop._selection_payload(
+        round_index=0,
+        gate_dir=gate_dir,
+        gate={
+            "checkpoint_path": str(checkpoint.resolve()),
+            "promotion_policy": (stage211_gate.STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT),
+        },
+        promotion=promotion,
+        phase="mixer",
+    )
+
+    assert selection["correction_round"] == 0
+    assert selection["checkpoint_path"] == str(checkpoint.resolve())
 
 
 def test_correction_loop_requires_explicit_phase_public_baseline() -> None:

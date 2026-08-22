@@ -82,12 +82,16 @@ def test_candidate_dominance_does_not_reject_a_single_slow_outlier() -> None:
 
 def test_stacked_default_profiles_start_from_memory_safe_baseline() -> None:
     assert probe.default_profiles_for_phase("block") == (
-        probe.BatchProfile("baseline", 4, 4_000, 8, True),
+        probe.BatchProfile("baseline", 1, 2_000, 8, True),
+        probe.BatchProfile("no_ckpt_batch1_frames2k", 1, 2_000, 8, False),
+        probe.BatchProfile("no_ckpt_batch2_frames3k", 2, 3_000, 8, False),
         probe.BatchProfile("no_ckpt_batch4_frames4k", 4, 4_000, 8, False),
         probe.BatchProfile("no_ckpt_batch8_frames6k", 8, 6_000, 8, False),
         probe.BatchProfile("no_ckpt_batch12_frames8k", 12, 8_000, 8, False),
         probe.BatchProfile("no_ckpt_batch16_frames10k", 16, 10_000, 8, False),
         probe.BatchProfile("no_ckpt_batch24_frames16k", 24, 16_000, 8, False),
+        probe.BatchProfile("batch2_frames3k", 2, 3_000, 8, True),
+        probe.BatchProfile("batch4_frames4k", 4, 4_000, 8, True),
         probe.BatchProfile("batch8_frames6k", 8, 6_000, 8, True),
         probe.BatchProfile("batch12_frames8k", 12, 8_000, 8, True),
         probe.BatchProfile("batch16_frames10k", 16, 10_000, 8, True),
@@ -99,11 +103,15 @@ def test_stacked_default_profiles_start_from_memory_safe_baseline() -> None:
         probe.BatchProfile("batch96_frames56k", 96, 56_000, 8, True),
     )
     assert probe.default_profiles_for_phase("logits") == (
-        probe.BatchProfile("baseline", 4, 4_000, 8, True),
+        probe.BatchProfile("baseline", 1, 2_000, 8, True),
+        probe.BatchProfile("no_ckpt_batch1_frames2k", 1, 2_000, 8, False),
+        probe.BatchProfile("no_ckpt_batch2_frames3k", 2, 3_000, 8, False),
         probe.BatchProfile("no_ckpt_batch4_frames4k", 4, 4_000, 8, False),
         probe.BatchProfile("no_ckpt_batch8_frames6k", 8, 6_000, 8, False),
         probe.BatchProfile("no_ckpt_batch12_frames8k", 12, 8_000, 8, False),
         probe.BatchProfile("no_ckpt_batch16_frames10k", 16, 10_000, 8, False),
+        probe.BatchProfile("batch2_frames3k", 2, 3_000, 8, True),
+        probe.BatchProfile("batch4_frames4k", 4, 4_000, 8, True),
         probe.BatchProfile("batch8_frames6k", 8, 6_000, 8, True),
         probe.BatchProfile("batch12_frames8k", 12, 8_000, 8, True),
         probe.BatchProfile("batch16_frames10k", 16, 10_000, 8, True),

@@ -31,11 +31,13 @@ from rwkvasr.eval.stage211_gate import (
     STAGE211_FULL_DATA_WORLD_SIZE,
     STAGE211_GLOBAL_DEDUP_TOTAL_HOURS,
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
+    STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT,
     STAGE211_PUBLIC_BENCHMARKS,
     STAGE211_RETENTION_CORRECTION_EPOCHS,
     STAGE211_RETENTION_CORRECTION_LR,
     STAGE211_STACKED_SAFE_BATCH_SIZE,
     STAGE211_STACKED_SAFE_FRAME_BUDGET,
+    build_stage211_alignment_loss_nondivergence,
     build_stage211_correction_round_promotion_gate,
     build_stage211_correction_layer_focus,
     build_stage211_full_data_coverage,
@@ -83,9 +85,7 @@ stage211_calibration_eval = importlib.import_module("scripts.validate_stage211_c
 stage211_supplemental_profile_receipt = importlib.import_module(
     "scripts.create_stage211_supplemental_profile_receipt"
 )
-stage211_replay_validator = importlib.import_module(
-    "scripts.validate_stage211_retention_replay"
-)
+stage211_replay_validator = importlib.import_module("scripts.validate_stage211_retention_replay")
 stage211_gate_module = importlib.import_module("rwkvasr.eval.stage211_gate")
 stage211_batch_profile_test = importlib.import_module("tests.test_stage211_batch_profile_admission")
 
@@ -95,13 +95,9 @@ def _validate_synthetic_retention_replay(receipt_path: Path) -> dict[str, object
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     for index, record in enumerate(receipt.get("supplemental_output_parts", [])):
         part_path = Path(str(record.get("path") or "")).resolve()
-        if (
-            not part_path.is_file()
-            or record.get("sha256") != sha256_file(part_path)
-        ):
+        if not part_path.is_file() or record.get("sha256") != sha256_file(part_path):
             raise ValueError(
-                f"Stage211 retention replay output part {index} SHA-256 mismatch: "
-                f"{part_path}"
+                f"Stage211 retention replay output part {index} SHA-256 mismatch: {part_path}"
             )
     return {
         **receipt,
@@ -1464,8 +1460,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert '--logits-gate-selection "${LOGITS_SELECTION}"' in script
     assert (
         'LABELED_ROOT="${LABELED_ROOT:-${HOME}/rwkvasr_data/'
-        'stage211_sft_full_labeled_v3_public_clean}"'
-        in script
+        'stage211_sft_full_labeled_v3_public_clean}"' in script
     )
     assert '--labeled-profile-receipt "${LABELED_PROFILE_RECEIPT}"' in script
     assert "post_mixer)" in script
@@ -1473,10 +1468,7 @@ def test_stage211_supervisor_bootstrap_supports_immutable_snapshot() -> None:
     assert "wait_for_supplemental_training_data()" in script
     assert '--inventory "${SUPPLEMENTAL_INVENTORY}"' in script
     assert '--output "${SUPPLEMENTAL_PROFILE_RECEIPT}"' in script
-    assert (
-        "supplemental inventory, profile, nine-cell eval, and runtime replay validated"
-        in script
-    )
+    assert "supplemental inventory, profile, nine-cell eval, and runtime replay validated" in script
     assert "CTC_TEXT_NORMALIZATION=ctc" in script
 
     main_body = script[script.index("main() {") :]
@@ -3209,6 +3201,9 @@ def test_stage211_mixer_phase_has_only_teacher_forced_mixer_objective(
     assert config["ctc_teacher_online_conditional_nonblank_loss_weight"] == 0.0
     assert config["ctc_teacher_online_sequence_loss_weight"] == 0.0
     assert config["ctc_teacher_online_nonblank_window_loss_weight"] == 0.0
+    assert config["ctc_teacher_online_layer_sample_count"] == 70
+    assert config["ctc_teacher_online_layer_boundary_ids"] == []
+    assert config["ctc_teacher_online_layer_include_boundaries"] is False
 
 
 def test_stage211_block_phase_chains_stacked_block_without_logits(
@@ -3229,6 +3224,9 @@ def test_stage211_block_phase_chains_stacked_block_without_logits(
     assert config["ctc_teacher_online_conditional_nonblank_loss_weight"] == 0.0
     assert config["ctc_teacher_online_sequence_loss_weight"] == 0.0
     assert config["ctc_teacher_online_nonblank_window_loss_weight"] == 0.0
+    assert config["ctc_teacher_online_layer_sample_count"] == 70
+    assert config["ctc_teacher_online_layer_boundary_ids"] == []
+    assert config["ctc_teacher_online_layer_include_boundaries"] is False
 
 
 def test_stage211_logits_phase_enables_outputs_after_hidden_anchors(
@@ -3250,8 +3248,9 @@ def test_stage211_logits_phase_enables_outputs_after_hidden_anchors(
     )
     assert config["ctc_teacher_online_sequence_loss_weight"] == 0.0
     assert config["ctc_teacher_online_nonblank_window_loss_weight"] == 0.0
-    assert config["ctc_teacher_online_layer_include_boundaries"] is True
-    assert config["ctc_teacher_online_layer_boundary_ids"] == list(stage211.HARD_LAYER_IDS)
+    assert config["ctc_teacher_online_layer_sample_count"] == 70
+    assert config["ctc_teacher_online_layer_include_boundaries"] is False
+    assert config["ctc_teacher_online_layer_boundary_ids"] == []
 
 
 def test_stage211_sft_phase_uses_labels_after_logits_with_low_teacher_anchors(
@@ -3289,6 +3288,9 @@ def test_stage211_sft_phase_uses_labels_after_logits_with_low_teacher_anchors(
     assert config["ctc_teacher_online_decoder_hidden_loss_weight"] == pytest.approx(0.10)
     assert config["ctc_teacher_online_sequence_loss_weight"] == 0.0
     assert config["ctc_teacher_online_nonblank_window_loss_weight"] == 0.0
+    assert config["ctc_teacher_online_layer_sample_count"] == 70
+    assert config["ctc_teacher_online_layer_boundary_ids"] == []
+    assert config["ctc_teacher_online_layer_include_boundaries"] is False
 
 
 def test_stage211_sft_phase_contract_rejects_teacher_student_support_mismatch(
@@ -9011,3 +9013,55 @@ def test_stage211_continuation_watcher_survives_multiple_supervisor_handoffs(
     assert result.stdout.count("replacement supervisor launched") == 2
     assert "SFT and stepwise proofs pass" in result.stdout
     assert (phase_gate_root / "sft" / "stage211_stepwise_results.json").is_file()
+
+
+def test_stage211_alignment_loss_nondivergence_uses_aggregate_fixed_eval_loss() -> None:
+    improved = build_stage211_alignment_loss_nondivergence(
+        baseline_source={"eval_loss": 0.325721},
+        candidate_source={"eval_loss": 0.159513},
+    )
+    regressed = build_stage211_alignment_loss_nondivergence(
+        baseline_source={"eval_loss": 1.0},
+        candidate_source={"eval_loss": 1.21},
+    )
+
+    assert improved["candidate_to_baseline_ratio"] == pytest.approx(0.159513 / 0.325721)
+    assert improved["maximum_ratio"] == pytest.approx(1.2)
+    assert improved["gate_passed"] is True
+    assert regressed["gate_passed"] is False
+
+
+def test_stage211_mixer_phase_gate_accepts_coverage_nondivergence_policy(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step-final.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    gate_path = _write_valid_phase_gate(
+        tmp_path,
+        phase="mixer",
+        checkpoint=checkpoint,
+    )
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    alignment = json.loads(Path(gate["alignment_report"]["path"]).read_text(encoding="utf-8"))
+    baseline = json.loads(Path(alignment["baseline_report_path"]).read_text(encoding="utf-8"))
+    candidate = json.loads(Path(alignment["candidate_report_path"]).read_text(encoding="utf-8"))
+    gate.update(
+        {
+            "promotion_policy": (STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT),
+            "strict_metric_gate_passed": True,
+            "alignment_loss_nondivergence": build_stage211_alignment_loss_nondivergence(
+                baseline_source=baseline,
+                candidate_source=candidate,
+            ),
+        }
+    )
+    gate_path.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+
+    validated = validate_stage211_phase_gate_report(
+        gate_path,
+        expected_phase="mixer",
+        checkpoint_path=checkpoint,
+    )
+
+    assert validated["promotion_policy"] == (STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT)
+    assert validated["alignment_loss_nondivergence"]["gate_passed"] is True

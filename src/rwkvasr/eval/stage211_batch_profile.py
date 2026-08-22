@@ -31,6 +31,8 @@ STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 3
 STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION = 1
 STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION = 1
 STAGE211_BATCH_PROFILE_PHASES = ("mixer", "block", "logits")
+_STAGE211_LEGACY_STACKED_SAFE_BATCH_SIZE = 4
+_STAGE211_LEGACY_STACKED_SAFE_FRAME_BUDGET = 4_000
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _FLOAT_TOLERANCE = 1.0e-12
@@ -239,8 +241,7 @@ def _validate_git_bound_source(
         )
     if hashlib.sha256(historical.stdout).hexdigest() != fingerprint:
         raise ValueError(
-            f"{label} historical Git blob SHA-256 mismatch: "
-            f"{commit}:{relative_path.as_posix()}"
+            f"{label} historical Git blob SHA-256 mismatch: {commit}:{relative_path.as_posix()}"
         )
     return path
 
@@ -967,15 +968,22 @@ def validate_stage211_batch_profile_preflight(
         }
     ]
     if phase in {"block", "logits"}:
-        supported_baselines.append(
-            {
+        for batch_size, frame_budget in (
+            (STAGE211_STACKED_SAFE_BATCH_SIZE, STAGE211_STACKED_SAFE_FRAME_BUDGET),
+            (
+                _STAGE211_LEGACY_STACKED_SAFE_BATCH_SIZE,
+                _STAGE211_LEGACY_STACKED_SAFE_FRAME_BUDGET,
+            ),
+        ):
+            candidate = {
                 "name": baseline_name,
-                "batch_size": STAGE211_STACKED_SAFE_BATCH_SIZE,
-                "frame_budget": STAGE211_STACKED_SAFE_FRAME_BUDGET,
+                "batch_size": batch_size,
+                "frame_budget": frame_budget,
                 "num_workers": int(base_config.get("num_workers", 0) or 0),
                 "gradient_checkpointing": bool(base_config.get("gradient_checkpointing")),
             }
-        )
+            if candidate not in supported_baselines:
+                supported_baselines.append(candidate)
     if baseline_profile not in supported_baselines:
         raise ValueError("Stage211 batch preflight baseline is unsupported for this phase.")
     baseline = _validate_safe_profile(by_name[baseline_name], report=report, phase=phase)

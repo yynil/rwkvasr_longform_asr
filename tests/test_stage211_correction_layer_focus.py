@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from rwkvasr.eval.stage211_gate import (
-    STAGE211_HARD_LAYER_IDS,
     build_stage211_correction_layer_focus,
     sha256_file,
     stage211_correction_layer_rotation_offset,
@@ -197,171 +196,41 @@ def _focus_fixture(
     return gate_path, gate
 
 
-@pytest.mark.parametrize("phase", ("mixer", "block"))
-def test_stage211_correction_focus_pins_top_five_and_preserves_rotation(
+@pytest.mark.parametrize("phase", ("mixer", "block", "logits"))
+def test_stage211_correction_focus_uses_all_layers_and_keeps_ranking_diagnostic(
     tmp_path: Path,
     phase: str,
 ) -> None:
-    failed = {40, 55, 64, 65, 68, 69}
-    gate_path, gate = _focus_fixture(tmp_path, phase=phase, failed=failed)
-
-    focus = build_stage211_correction_layer_focus(
-        phase=phase,
-        admission_gate_path=gate_path,
-        admission_gate=gate,
-    )
-
-    assert focus["all_failed_layer_ids"] == sorted(failed)
-    assert focus["selected_failure_layer_ids"] == [69, 68, 65, 64, 55]
-    assert focus["boundary_layer_ids"] == [55, 64, 65, 68, 69]
-    assert focus["failed_layer_count"] == 6
-    assert focus["adaptive_dynamic_layer_limit"] == 5
-    assert focus["adaptive_rotating_slots_target"] == 3
-    assert focus["rotating_slots"] == 3
-    selections = {
-        layer_id
-        for step in range(65)
-        for layer_id in _select_layer_hidden_ids(
-            step=step,
-            num_layers=70,
-            sample_count=8,
-            boundary_ids=focus["boundary_layer_ids"],
-            include_boundaries=True,
-        )
-    }
-    assert selections == set(range(70))
-
-
-@pytest.mark.parametrize("phase", ("mixer", "block"))
-def test_stage211_correction_focus_uses_uniform_rotation_for_broad_failure(
-    tmp_path: Path,
-    phase: str,
-) -> None:
-    gate_path, gate = _focus_fixture(tmp_path, phase=phase, failed=set(range(70)))
-
-    focus = build_stage211_correction_layer_focus(
-        phase=phase,
-        admission_gate_path=gate_path,
-        admission_gate=gate,
-    )
-
-    assert focus["strategy"] == "broad_failure_uniform_full_rotation"
-    assert focus["failed_layer_count"] == 70
-    assert focus["adaptive_dynamic_layer_limit"] == 0
-    assert focus["adaptive_rotating_slots_target"] == 8
-    assert focus["selected_failure_layer_ids"] == []
-    assert focus["boundary_layer_ids"] == []
-    assert focus["rotating_slots"] == 8
-    selections = {
-        layer_id
-        for step in range(9)
-        for layer_id in _select_layer_hidden_ids(
-            step=step,
-            num_layers=70,
-            sample_count=8,
-            boundary_ids=focus["boundary_layer_ids"],
-            include_boundaries=False,
-        )
-    }
-    assert selections == set(range(70))
-
-
-@pytest.mark.parametrize("phase", ("mixer", "block"))
-def test_stage211_correction_focus_scales_rotation_with_failure_breadth(
-    tmp_path: Path,
-    phase: str,
-) -> None:
-    gate_path, gate = _focus_fixture(tmp_path, phase=phase, failed=set(range(35)))
-
-    focus = build_stage211_correction_layer_focus(
-        phase=phase,
-        admission_gate_path=gate_path,
-        admission_gate=gate,
-    )
-
-    assert focus["strategy"] == "gate_ranked_failed_layers_with_adaptive_rotation"
-    assert focus["failed_layer_count"] == 35
-    assert focus["adaptive_dynamic_layer_limit"] == 4
-    assert focus["adaptive_rotating_slots_target"] == 4
-    assert focus["selected_failure_layer_ids"] == [34, 33, 32, 31]
-    assert focus["boundary_layer_ids"] == [31, 32, 33, 34]
-    assert focus["rotating_slots"] == 4
-
-
-def test_stage211_logits_focus_retains_hard_anchors_and_one_rotating_slot(
-    tmp_path: Path,
-) -> None:
-    failed = {55, 60, 61, 62, 63, 68, 69}
-    gate_path, gate = _focus_fixture(tmp_path, phase="logits", failed=failed)
-
-    focus = build_stage211_correction_layer_focus(
-        phase="logits",
-        admission_gate_path=gate_path,
-        admission_gate=gate,
-    )
-
-    assert focus["selected_failure_layer_ids"] == [68, 63, 62]
-    assert set(STAGE211_HARD_LAYER_IDS).issubset(focus["boundary_layer_ids"])
-    assert len(focus["boundary_layer_ids"]) == 11
-    assert focus["rotating_slots"] == 1
-
-
-def test_stage211_logits_focus_names_static_anchors_without_hidden_failure(
-    tmp_path: Path,
-) -> None:
-    gate_path, gate = _focus_fixture(tmp_path, phase="logits", failed=set())
-
-    focus = build_stage211_correction_layer_focus(
-        phase="logits",
-        admission_gate_path=gate_path,
-        admission_gate=gate,
-    )
-
-    assert focus["strategy"] == "static_hard_anchors"
-    assert focus["failed_layer_count"] == 0
-    assert focus["boundary_layer_ids"] == list(STAGE211_HARD_LAYER_IDS)
-    assert focus["adaptive_rotating_slots_target"] == 1
-    assert focus["rotating_slots"] == 4
-
-
-def test_stage211_correction_focus_preserves_uniform_schedule_without_hidden_failure(
-    tmp_path: Path,
-) -> None:
-    gate_path, gate = _focus_fixture(tmp_path, phase="mixer", failed=set())
-
-    focus = build_stage211_correction_layer_focus(
-        phase="mixer",
-        admission_gate_path=gate_path,
-        admission_gate=gate,
-    )
-
-    assert focus["strategy"] == "uniform_full_rotation"
-    assert focus["failed_layer_count"] == 0
-    assert focus["adaptive_dynamic_layer_limit"] == 5
-    assert focus["adaptive_rotating_slots_target"] == 3
-    assert focus["boundary_layer_ids"] == []
-    assert focus["rotating_slots"] == 8
-
-
-def test_stage211_correction_focus_includes_failed_trajectory_layers(tmp_path: Path) -> None:
     trajectory_failed = {55, 68, 69}
     gate_path, gate = _focus_fixture(
         tmp_path,
-        phase="mixer",
-        failed=set(),
+        phase=phase,
+        failed={40, 64, 65},
         trajectory_failed=trajectory_failed,
     )
 
     focus = build_stage211_correction_layer_focus(
-        phase="mixer",
+        phase=phase,
         admission_gate_path=gate_path,
         admission_gate=gate,
     )
 
-    assert focus["all_failed_layer_ids"] == sorted(trajectory_failed)
-    assert focus["selected_failure_layer_ids"] == [69, 68, 55]
+    assert focus["strategy"] == "simultaneous_all_layers"
+    assert focus["sample_count"] == 70
+    assert focus["optimization_layer_ids"] == list(range(70))
+    assert focus["failure_ranking_diagnostic_only"] is True
+    assert focus["selected_failure_layer_ids"] == []
+    assert focus["boundary_layer_ids"] == []
+    assert focus["rotating_slots"] == 70
+    assert focus["all_failed_layer_ids"] == [40, 55, 64, 65, 68, 69]
     assert focus["trajectory_evidence"]["failure_signals_used"] is True
-    assert all("trajectory_retention" in row["scopes"] for row in focus["ranking"])
+    assert any("trajectory_retention" in row["scopes"] for row in focus["ranking"])
+    assert _select_layer_hidden_ids(
+        step=123,
+        num_layers=70,
+        sample_count=focus["sample_count"],
+        boundary_ids=focus["boundary_layer_ids"],
+    ) == tuple(range(70))
 
 
 def test_stage211_correction_focus_replay_rejects_modified_selection(tmp_path: Path) -> None:
@@ -383,59 +252,30 @@ def test_stage211_correction_focus_replay_rejects_modified_selection(tmp_path: P
         )
 
 
-def test_stage211_correction_config_contract_rejects_lost_rotation() -> None:
-    with pytest.raises(ValueError, match="rotating coverage"):
+def test_stage211_correction_config_contract_rejects_focus_and_rotation() -> None:
+    with pytest.raises(ValueError, match="forbids layer focus"):
         stage211_post_coverage_train_config_contract(
             "mixer",
-            boundary_layer_ids=[0, 1, 2, 3, 4, 5],
+            boundary_layer_ids=[0],
         )
-    with pytest.raises(ValueError, match="hard-layer anchor"):
+    with pytest.raises(ValueError, match="forbids layer rotation"):
         stage211_post_coverage_train_config_contract(
             "logits",
-            boundary_layer_ids=[0, 11, 12],
+            boundary_layer_ids=[],
+            rotation_offset=1,
         )
 
 
-@pytest.mark.parametrize(
-    ("boundary_layer_ids", "expected_offsets"),
-    (
-        ([], [0, 24, 48]),
-        ([55, 64, 65, 68, 69], [0, 22, 44]),
-        (list(STAGE211_HARD_LAYER_IDS) + [60, 61, 62], [0, 20, 40]),
-    ),
-)
-def test_stage211_correction_rounds_shift_non_anchor_layer_coverage(
-    boundary_layer_ids: list[int],
-    expected_offsets: list[int],
-) -> None:
-    boundary_layer_ids = sorted(boundary_layer_ids)
+def test_stage211_correction_rounds_keep_zero_rotation_for_all_layers() -> None:
     offsets = [
         stage211_correction_layer_rotation_offset(
             round_index=round_index,
-            boundary_layer_ids=boundary_layer_ids,
+            boundary_layer_ids=[],
         )
         for round_index in range(1, 4)
     ]
 
-    assert offsets == expected_offsets
-    selections = [
-        _select_layer_hidden_ids(
-            step=0,
-            num_layers=70,
-            sample_count=12 if len(boundary_layer_ids) > 8 else 8,
-            boundary_ids=boundary_layer_ids,
-            include_boundaries=bool(boundary_layer_ids),
-            rotation_offset=rotation_offset,
-        )
-        for rotation_offset in offsets
-    ]
-    assert all(set(boundary_layer_ids).issubset(selection) for selection in map(set, selections))
-    rotating_selections = [set(selection) - set(boundary_layer_ids) for selection in selections]
-    assert all(
-        first.isdisjoint(second)
-        for index, first in enumerate(rotating_selections)
-        for second in rotating_selections[index + 1 :]
-    )
+    assert offsets == [0, 0, 0]
 
 
 def test_layer_hidden_sampler_rejects_negative_cross_round_offset() -> None:

@@ -12,9 +12,12 @@ from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
     DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT,
     DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
+    STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT,
+    STAGE211_PROMOTION_POLICY_STRICT,
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_PHASE_GATE_SCHEMA_VERSION,
     STAGE211_PUBLIC_BENCHMARKS,
+    build_stage211_alignment_loss_nondivergence,
     build_stage211_correction_round_promotion_gate,
     build_stage211_full_data_coverage,
     build_stage211_phase_baseline_public_provenance,
@@ -218,6 +221,7 @@ def build_phase_gate(
     initialization_receipt_path: Path | None = None,
     nano_public_baseline_receipt_path: Path = (DEFAULT_STAGE211_NANO_PUBLIC_BASELINE_RECEIPT),
     public_overlap_receipt_path: Path = DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
+    promotion_policy: str = STAGE211_PROMOTION_POLICY_STRICT,
 ) -> dict[str, Any]:
     checkpoint_path = checkpoint_path.resolve()
     if not checkpoint_path.is_file():
@@ -437,13 +441,32 @@ def build_phase_gate(
         supplemental_segment=supplemental_coverage,
         post_coverage_corrections=correction_receipts,
     )
-    metric_gate_passed = stage211_phase_gate_decision(
+    strict_metric_gate_passed = stage211_phase_gate_decision(
         phase=phase,
         alignment_gate_passed=alignment_gate_passed,
         public_progress_gate_passed=public_progress_gate_passed,
         trajectory_retention_gate_passed=trajectory_retention_gate_passed,
         all_datasets_pass=benchmark.get("all_datasets_pass") is True,
     )
+    alignment_loss_nondivergence = build_stage211_alignment_loss_nondivergence(
+        baseline_source=baseline_alignment_source,
+        candidate_source=_load_json(
+            candidate_alignment_report_path,
+            label="Stage211 alignment candidate source report",
+        ),
+    )
+    if promotion_policy == STAGE211_PROMOTION_POLICY_STRICT:
+        metric_gate_passed = strict_metric_gate_passed
+    elif promotion_policy == STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT:
+        if phase != "mixer":
+            raise ValueError("Stage211 coverage/non-divergence promotion is restricted to Mixer.")
+        if correction_receipts:
+            raise ValueError(
+                "Stage211 Mixer coverage/non-divergence promotion must precede corrections."
+            )
+        metric_gate_passed = bool(alignment_loss_nondivergence["gate_passed"])
+    else:
+        raise ValueError(f"Unsupported Stage211 promotion policy: {promotion_policy!r}")
     correction_round_promotion = build_stage211_correction_round_promotion_gate(
         len(correction_receipts)
     )
@@ -457,7 +480,10 @@ def build_phase_gate(
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": final_checkpoint_sha256,
         "gate_passed": gate_passed,
+        "promotion_policy": promotion_policy,
         "metric_gate_passed": metric_gate_passed,
+        "strict_metric_gate_passed": strict_metric_gate_passed,
+        "alignment_loss_nondivergence": alignment_loss_nondivergence,
         "correction_round_promotion": correction_round_promotion,
         "alignment_gate_passed": alignment_gate_passed,
         "public_progress_gate_passed": public_progress_gate_passed,
@@ -541,6 +567,14 @@ def main() -> int:
         default=DEFAULT_STAGE211_PUBLIC_OVERLAP_RECEIPT,
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--promotion-policy",
+        choices=(
+            STAGE211_PROMOTION_POLICY_STRICT,
+            STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT,
+        ),
+        default=STAGE211_PROMOTION_POLICY_STRICT,
+    )
     args = parser.parse_args()
 
     report = build_phase_gate(
@@ -559,6 +593,7 @@ def main() -> int:
         initialization_receipt_path=args.initialization_receipt,
         nano_public_baseline_receipt_path=args.nano_public_baseline_receipt,
         public_overlap_receipt_path=args.public_overlap_receipt,
+        promotion_policy=str(args.promotion_policy),
     )
     output_path = args.output.resolve()
     rendered = json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n"

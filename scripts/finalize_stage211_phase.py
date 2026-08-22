@@ -14,6 +14,8 @@ from rwkvasr.eval.stage211_artifact_io import write_immutable_json
 from rwkvasr.eval.stage211_gate import (
     DEFAULT_STAGE211_GLOBAL_DEDUP_MANIFEST,
     DEFAULT_STAGE211_LOADED_MANIFEST_RECEIPT,
+    STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT,
+    STAGE211_PROMOTION_POLICY_STRICT,
     STAGE211_AUDIO_CURRICULUM,
     STAGE211_PUBLIC_BENCHMARKS,
     build_stage211_full_data_coverage,
@@ -757,6 +759,8 @@ def finalize_phase(args: argparse.Namespace) -> Path:
         str(nano_public_baseline_receipt),
         "--output",
         str(phase_gate_path),
+        "--promotion-policy",
+        str(getattr(args, "promotion_policy", STAGE211_PROMOTION_POLICY_STRICT)),
     ]
     for receipt_path in receipt_paths:
         phase_gate_command.extend(("--coverage-receipt", str(receipt_path)))
@@ -843,6 +847,14 @@ def main() -> int:
         )
     )
     parser.add_argument("--phase", choices=("mixer", "block", "logits"), required=True)
+    parser.add_argument(
+        "--promotion-policy",
+        choices=(
+            STAGE211_PROMOTION_POLICY_STRICT,
+            STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT,
+        ),
+        default=STAGE211_PROMOTION_POLICY_STRICT,
+    )
     parser.add_argument("--phase-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument(

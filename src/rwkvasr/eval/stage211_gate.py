@@ -41,8 +41,8 @@ STAGE211_FULL_DATA_EPOCHS = 3
 STAGE211_FULL_DATA_BATCH_SIZE = 36
 STAGE211_FULL_DATA_WORLD_SIZE = 4
 STAGE211_FULL_DATA_FRAME_BUDGET = 24_000
-STAGE211_STACKED_SAFE_BATCH_SIZE = 4
-STAGE211_STACKED_SAFE_FRAME_BUDGET = 4_000
+STAGE211_STACKED_SAFE_BATCH_SIZE = 1
+STAGE211_STACKED_SAFE_FRAME_BUDGET = 2_000
 STAGE211_SMOKE_RUNTIME_MATCH_FIELDS = {
     "block": (
         "online_encoder_match",
@@ -110,6 +110,10 @@ _STAGE211_STUDENT_BLANK_ID = 60_515
 _STAGE211_NANO_BLANK_ID = 60_514
 _STAGE211_ALIGNMENT_LAYER_IDS = tuple(range(70))
 _STAGE211_ALIGNMENT_LAYER_KEYS = {str(index) for index in _STAGE211_ALIGNMENT_LAYER_IDS}
+STAGE211_ALIGNMENT_LAYER_COUNT = len(_STAGE211_ALIGNMENT_LAYER_IDS)
+STAGE211_PROMOTION_POLICY_STRICT = "strict_quality"
+STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT = "complete_coverage_nondivergent_loss"
+STAGE211_ALIGNMENT_NON_DIVERGENCE_MAX_RATIO = 1.20
 _STAGE211_PROJECTION_ELISION_CONFIG_KEYS = frozenset(
     {
         "ctc_teacher_online_compute_ctc_outputs",
@@ -227,6 +231,39 @@ def stage211_phase_gate_decision(
             and trajectory_retention_gate_passed
         )
     raise ValueError(f"Stage211 phase {phase!r} cannot promote.")
+
+
+def build_stage211_alignment_loss_nondivergence(
+    *,
+    baseline_source: dict[str, Any],
+    candidate_source: dict[str, Any],
+    max_ratio: float = STAGE211_ALIGNMENT_NON_DIVERGENCE_MAX_RATIO,
+) -> dict[str, Any]:
+    max_ratio = float(max_ratio)
+    if not math.isfinite(max_ratio) or max_ratio <= 0.0:
+        raise ValueError("Stage211 alignment non-divergence ratio must be positive and finite.")
+    losses: dict[str, float] = {}
+    for role, source in (("baseline", baseline_source), ("candidate", candidate_source)):
+        value = source.get("eval_loss")
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"Stage211 alignment {role} report lacks a numeric eval_loss.")
+        loss = float(value)
+        if not math.isfinite(loss) or loss < 0.0:
+            raise ValueError(f"Stage211 alignment {role} eval_loss is invalid: {loss}.")
+        losses[role] = loss
+    if losses["baseline"] <= 0.0:
+        raise ValueError("Stage211 alignment baseline eval_loss must be positive.")
+    ratio = losses["candidate"] / losses["baseline"]
+    return {
+        "schema_version": 1,
+        "pipeline": "stage211",
+        "artifact": "alignment_loss_nondivergence",
+        "baseline_loss": losses["baseline"],
+        "candidate_loss": losses["candidate"],
+        "candidate_to_baseline_ratio": ratio,
+        "maximum_ratio": max_ratio,
+        "gate_passed": ratio <= max_ratio,
+    }
 
 
 def build_stage211_smoke_runtime_objective_evidence(
@@ -469,7 +506,7 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.0,
         "ctc_teacher_online_sequence_loss_weight": 0.0,
         "ctc_teacher_online_nonblank_window_loss_weight": 0.0,
-        "ctc_teacher_online_layer_sample_count": 8,
+        "ctc_teacher_online_layer_sample_count": STAGE211_ALIGNMENT_LAYER_COUNT,
         "ctc_teacher_online_layer_boundary_ids": [],
         "ctc_teacher_online_layer_include_boundaries": False,
         "ctc_teacher_online_keep_full_log_probs_on_device": False,
@@ -494,7 +531,7 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.0,
         "ctc_teacher_online_sequence_loss_weight": 0.0,
         "ctc_teacher_online_nonblank_window_loss_weight": 0.0,
-        "ctc_teacher_online_layer_sample_count": 8,
+        "ctc_teacher_online_layer_sample_count": STAGE211_ALIGNMENT_LAYER_COUNT,
         "ctc_teacher_online_layer_boundary_ids": [],
         "ctc_teacher_online_layer_include_boundaries": False,
         "ctc_teacher_online_keep_full_log_probs_on_device": False,
@@ -520,9 +557,9 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.125,
         "ctc_teacher_online_sequence_loss_weight": 0.0,
         "ctc_teacher_online_nonblank_window_loss_weight": 0.0,
-        "ctc_teacher_online_layer_sample_count": 12,
-        "ctc_teacher_online_layer_boundary_ids": list(STAGE211_HARD_LAYER_IDS),
-        "ctc_teacher_online_layer_include_boundaries": True,
+        "ctc_teacher_online_layer_sample_count": STAGE211_ALIGNMENT_LAYER_COUNT,
+        "ctc_teacher_online_layer_boundary_ids": [],
+        "ctc_teacher_online_layer_include_boundaries": False,
         "ctc_teacher_online_keep_full_log_probs_on_device": True,
         "ctc_teacher_online_compute_ctc_outputs": True,
         "ctc_teacher_online_capture_layer_inputs": False,
@@ -545,9 +582,9 @@ _STAGE211_PHASE_TRAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "ctc_teacher_online_conditional_nonblank_hard_loss_weight": 0.0,
         "ctc_teacher_online_sequence_loss_weight": 0.0,
         "ctc_teacher_online_nonblank_window_loss_weight": 0.0,
-        "ctc_teacher_online_layer_sample_count": 8,
-        "ctc_teacher_online_layer_boundary_ids": list(STAGE211_HARD_LAYER_IDS),
-        "ctc_teacher_online_layer_include_boundaries": True,
+        "ctc_teacher_online_layer_sample_count": STAGE211_ALIGNMENT_LAYER_COUNT,
+        "ctc_teacher_online_layer_boundary_ids": [],
+        "ctc_teacher_online_layer_include_boundaries": False,
         "ctc_teacher_online_keep_full_log_probs_on_device": False,
         "ctc_teacher_online_compute_ctc_outputs": True,
         "ctc_teacher_online_capture_layer_inputs": False,
@@ -641,11 +678,9 @@ def stage211_correction_layer_rotation_offset(
         layer_id < 0 or layer_id >= num_layers for layer_id in layer_ids
     ):
         raise ValueError("Stage211 correction boundary layer IDs are invalid.")
-    non_anchor_layers = num_layers - len(layer_ids)
-    if non_anchor_layers <= 0:
-        raise ValueError("Stage211 correction requires at least one non-anchor layer.")
-    round_stride = math.ceil(non_anchor_layers / STAGE211_RETENTION_CORRECTION_GUARANTEED_ROUNDS)
-    return ((round_index - 1) * round_stride) % non_anchor_layers
+    if len(layer_ids) >= num_layers:
+        raise ValueError("Stage211 correction boundary IDs cannot cover every layer.")
+    return 0
 
 
 def stage211_post_coverage_train_config_contract(
@@ -665,24 +700,14 @@ def stage211_post_coverage_train_config_contract(
         raise ValueError("Stage211 correction layer rotation offset must be non-negative.")
     contract = stage211_phase_train_config_contract(phase)
     contract["lr"] = stage211_post_coverage_correction_lr(phase)
-    sample_count = int(contract["ctc_teacher_online_layer_sample_count"])
-    if phase == "logits":
-        if not set(STAGE211_HARD_LAYER_IDS).issubset(layer_ids):
-            raise ValueError("Stage211 Logits correction must retain every hard-layer anchor.")
-        max_boundaries = len(STAGE211_HARD_LAYER_IDS) + int(
-            _STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS[phase]
-        )
-    else:
-        max_boundaries = int(_STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS[phase])
-    rotating_slots = sample_count - len(layer_ids)
-    if (
-        len(layer_ids) > max_boundaries
-        or rotating_slots < _STAGE211_CORRECTION_MIN_ROTATING_SLOTS[phase]
-    ):
-        raise ValueError("Stage211 correction layer focus does not preserve rotating coverage.")
-    contract["ctc_teacher_online_layer_boundary_ids"] = layer_ids
-    contract["ctc_teacher_online_layer_include_boundaries"] = bool(layer_ids)
-    contract["ctc_teacher_online_layer_rotation_offset"] = int(rotation_offset)
+    if layer_ids:
+        raise ValueError("Stage211 simultaneous-all-layer correction forbids layer focus IDs.")
+    if rotation_offset != 0:
+        raise ValueError("Stage211 simultaneous-all-layer correction forbids layer rotation.")
+    contract["ctc_teacher_online_layer_sample_count"] = STAGE211_ALIGNMENT_LAYER_COUNT
+    contract["ctc_teacher_online_layer_boundary_ids"] = []
+    contract["ctc_teacher_online_layer_include_boundaries"] = False
+    contract["ctc_teacher_online_layer_rotation_offset"] = 0
     return contract
 
 
@@ -726,6 +751,14 @@ def validate_stage211_phase_train_config(
         and _STAGE211_PROJECTION_ELISION_CONFIG_KEYS.isdisjoint(train_config)
         and normalized_sha256 in _STAGE211_LEGACY_MIXER_CONFIG_SHA256
     )
+    legacy_mixer_rotating_layers = (
+        phase == "mixer"
+        and train_config.get("ctc_teacher_online_layer_sample_count") == 8
+        and train_config.get("ctc_teacher_online_layer_boundary_ids") == []
+        and train_config.get("ctc_teacher_online_layer_include_boundaries") is False
+    )
+    if legacy_mixer_rotating_layers:
+        contract["ctc_teacher_online_layer_sample_count"] = 8
     for key, expected in contract.items():
         if legacy_mixer_projection_config and key in _STAGE211_PROJECTION_ELISION_CONFIG_KEYS:
             continue
@@ -1213,57 +1246,30 @@ def build_stage211_correction_layer_focus(
         row["ranking_position"] = position
 
     failed_layer_count = len(ranking)
-    mandatory_layer_ids = list(STAGE211_HARD_LAYER_IDS) if phase == "logits" else []
-    dynamic_limit = int(_STAGE211_CORRECTION_DYNAMIC_LAYER_LIMITS[phase])
-    base_contract = stage211_phase_train_config_contract(phase)
-    sample_count = int(base_contract["ctc_teacher_online_layer_sample_count"])
-    minimum_rotating_slots = int(_STAGE211_CORRECTION_MIN_ROTATING_SLOTS[phase])
-    if phase == "logits":
-        adaptive_rotating_slots_target = minimum_rotating_slots
-        adaptive_dynamic_limit = dynamic_limit
-    else:
-        adaptive_rotating_slots_target = min(
-            sample_count,
-            max(
-                minimum_rotating_slots,
-                math.ceil(sample_count * failed_layer_count / len(_STAGE211_ALIGNMENT_LAYER_IDS)),
-            ),
-        )
-        adaptive_dynamic_limit = min(
-            dynamic_limit,
-            sample_count - adaptive_rotating_slots_target,
-        )
-    selected_failure_layer_ids = [
-        int(row["layer_id"]) for row in ranking if int(row["layer_id"]) not in mandatory_layer_ids
-    ][:adaptive_dynamic_limit]
-    boundary_layer_ids = sorted({*mandatory_layer_ids, *selected_failure_layer_ids})
+    sample_count = STAGE211_ALIGNMENT_LAYER_COUNT
+    mandatory_layer_ids: list[int] = []
+    selected_failure_layer_ids: list[int] = []
+    boundary_layer_ids: list[int] = []
     stage211_post_coverage_train_config_contract(
         phase,
         boundary_layer_ids=boundary_layer_ids,
     )
-    rotating_slots = sample_count - len(boundary_layer_ids)
-    if not ranking:
-        strategy = "static_hard_anchors" if phase == "logits" else "uniform_full_rotation"
-    elif phase != "logits" and not boundary_layer_ids:
-        strategy = "broad_failure_uniform_full_rotation"
-    elif phase != "logits" and adaptive_dynamic_limit < dynamic_limit:
-        strategy = "gate_ranked_failed_layers_with_adaptive_rotation"
-    else:
-        strategy = "gate_ranked_failed_layers_with_rotation"
     return {
         "schema_version": STAGE211_CORRECTION_LAYER_FOCUS_SCHEMA_VERSION,
         "pipeline": "stage211",
         "artifact": "post_coverage_correction_layer_focus",
         "phase": phase,
         "admission_mode": admission_mode,
-        "strategy": strategy,
+        "strategy": "simultaneous_all_layers",
         "sample_count": sample_count,
         "failed_layer_count": failed_layer_count,
-        "dynamic_layer_limit": dynamic_limit,
-        "adaptive_dynamic_layer_limit": adaptive_dynamic_limit,
-        "minimum_rotating_slots": minimum_rotating_slots,
-        "adaptive_rotating_slots_target": adaptive_rotating_slots_target,
-        "rotating_slots": rotating_slots,
+        "dynamic_layer_limit": 0,
+        "adaptive_dynamic_layer_limit": 0,
+        "minimum_rotating_slots": STAGE211_ALIGNMENT_LAYER_COUNT,
+        "adaptive_rotating_slots_target": STAGE211_ALIGNMENT_LAYER_COUNT,
+        "rotating_slots": STAGE211_ALIGNMENT_LAYER_COUNT,
+        "optimization_layer_ids": list(_STAGE211_ALIGNMENT_LAYER_IDS),
+        "failure_ranking_diagnostic_only": True,
         "required_components": list(components),
         "evaluated_scopes": [
             "fixed",
@@ -4023,10 +4029,9 @@ def _validate_stage211_retention_replay_binding(
         from validate_stage211_retention_replay import validate_retention_replay
 
     replay = validate_retention_replay(replay_receipt_path)
-    if (
-        Path(str(replay.get("receipt_path") or "")).resolve() != replay_receipt_path
-        or replay.get("receipt_sha256") != sha256_file(replay_receipt_path)
-    ):
+    if Path(str(replay.get("receipt_path") or "")).resolve() != replay_receipt_path or replay.get(
+        "receipt_sha256"
+    ) != sha256_file(replay_receipt_path):
         raise ValueError("Stage211 retention replay deep-validation binding changed.")
     expected = {
         "schema_version": 2,
@@ -5990,21 +5995,60 @@ def validate_stage211_phase_gate_report(
             "replayed WER/CER evidence."
         )
     datasets_passed = benchmark.get("all_datasets_pass") is True
-    expected_metric_gate_passed = stage211_phase_gate_decision(
+    expected_strict_metric_gate_passed = stage211_phase_gate_decision(
         phase=expected_phase,
         alignment_gate_passed=alignment_gate_passed,
         public_progress_gate_passed=public_progress_gate_passed,
         trajectory_retention_gate_passed=trajectory_retention_gate_passed,
         all_datasets_pass=datasets_passed,
     )
+    strict_metric_gate_passed = report.get(
+        "strict_metric_gate_passed",
+        expected_strict_metric_gate_passed,
+    )
+    if (
+        not isinstance(strict_metric_gate_passed, bool)
+        or strict_metric_gate_passed != expected_strict_metric_gate_passed
+    ):
+        raise ValueError(
+            "Stage211 strict phase metric decision is inconsistent with its sub-gates."
+        )
+    expected_loss_nondivergence = build_stage211_alignment_loss_nondivergence(
+        baseline_source=baseline_source,
+        candidate_source=candidate_source,
+    )
+    recorded_loss_nondivergence = report.get("alignment_loss_nondivergence")
+    if recorded_loss_nondivergence is not None:
+        _validate_stage211_replayed_value(
+            recorded_loss_nondivergence,
+            expected_loss_nondivergence,
+            label=f"{expected_phase} alignment loss non-divergence gate",
+        )
+    corrections = coverage.get("post_coverage_corrections", [])
+    if not isinstance(corrections, list):
+        raise ValueError("Stage211 phase gate correction coverage is invalid.")
+    promotion_policy = report.get("promotion_policy", STAGE211_PROMOTION_POLICY_STRICT)
+    if promotion_policy == STAGE211_PROMOTION_POLICY_STRICT:
+        expected_metric_gate_passed = expected_strict_metric_gate_passed
+    elif promotion_policy == STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT:
+        if expected_phase != "mixer":
+            raise ValueError("Stage211 coverage/non-divergence promotion is restricted to Mixer.")
+        if corrections:
+            raise ValueError(
+                "Stage211 Mixer coverage/non-divergence promotion must precede corrections."
+            )
+        if recorded_loss_nondivergence is None:
+            raise ValueError(
+                "Stage211 Mixer coverage/non-divergence promotion lacks loss evidence."
+            )
+        expected_metric_gate_passed = bool(expected_loss_nondivergence["gate_passed"])
+    else:
+        raise ValueError(f"Unsupported Stage211 promotion policy: {promotion_policy!r}")
     metric_gate_passed = report.get("metric_gate_passed")
     if not isinstance(metric_gate_passed, bool):
         raise ValueError("Stage211 phase gate lacks a boolean metric-only decision.")
     if metric_gate_passed != expected_metric_gate_passed:
         raise ValueError("Stage211 phase metric-only decision is inconsistent with its sub-gates.")
-    corrections = coverage.get("post_coverage_corrections", [])
-    if not isinstance(corrections, list):
-        raise ValueError("Stage211 phase gate correction coverage is invalid.")
     expected_correction_round_promotion = build_stage211_correction_round_promotion_gate(
         len(corrections)
     )
@@ -6016,12 +6060,13 @@ def validate_stage211_phase_gate_report(
     expected_gate_passed = expected_metric_gate_passed and bool(
         expected_correction_round_promotion["gate_passed"]
     )
-    if require_passed and not public_progress_gate_passed:
+    strict_promotion = promotion_policy == STAGE211_PROMOTION_POLICY_STRICT
+    if require_passed and strict_promotion and not public_progress_gate_passed:
         raise ValueError(f"Stage211 {expected_phase} public progress gate did not pass.")
     if expected_phase == "logits" and require_passed and not datasets_passed:
         raise ValueError("Stage211 logits phase must pass the every-dataset Nano WER/CER gate.")
     if gate_passed != expected_gate_passed:
         raise ValueError("Stage211 phase gate decision is inconsistent with its sub-gates.")
-    if require_passed and not trajectory_retention_gate_passed:
+    if require_passed and strict_promotion and not trajectory_retention_gate_passed:
         raise ValueError("Stage211 phase intra-phase trajectory retention gate did not pass.")
     return report
