@@ -7,6 +7,9 @@ import sys
 from pathlib import Path
 
 from rwkvasr.config import load_yaml
+from rwkvasr.eval.stage211_public_metrics import (
+    build_stage211_student_ctc_execution_provenance,
+)
 from rwkvasr.modules import RWKVCTCModelConfig
 from rwkvasr.predict import PredictionConfig, labeled_prediction_to_json_dict, predict_ctc_labeled
 
@@ -91,6 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frontend-type", default="conv2d6")
     parser.add_argument("--cmvn-file", default=None)
     parser.add_argument("--cmvn-is-json", action="store_true", default=True)
+    parser.add_argument(
+        "--embed-stage211-ctc-provenance",
+        action="store_true",
+        help="Embed the strict Stage211 checkpoint and CTC-only decode contract in every row.",
+    )
     return parser
 
 
@@ -122,6 +130,12 @@ def _resolve_model_config(args: argparse.Namespace) -> RWKVCTCModelConfig:
         cmvn_file=args.cmvn_file,
         cmvn_is_json=args.cmvn_is_json,
     )
+
+
+def _resolve_model_config_path(args: argparse.Namespace) -> Path:
+    if args.config_yaml is not None:
+        return Path(args.config_yaml).expanduser().resolve()
+    return (Path(args.checkpoint_path).expanduser().resolve().parent / "model_config.yaml").resolve()
 
 
 def _resolve_tokenizer_config(args: argparse.Namespace) -> dict[str, object]:
@@ -218,11 +232,28 @@ def main() -> None:
     if (args.manifest_path is None) == (args.webdataset_root is None):
         raise ValueError("Exactly one of --manifest-path or --webdataset-root must be provided.")
     tokenizer_config = _resolve_tokenizer_config(args)
+    model_config = _resolve_model_config(args)
+    inference_provenance = None
+    if args.embed_stage211_ctc_provenance:
+        checkpoint_path = Path(args.checkpoint_path).expanduser().resolve()
+        inference_provenance = build_stage211_student_ctc_execution_provenance(
+            checkpoint_path=checkpoint_path,
+            model_config_path=_resolve_model_config_path(args),
+            tokenizer_config_path=checkpoint_path.parent / "tokenizer_config.yaml",
+            mode=args.mode,
+            beam_size=args.beam_size,
+            token_prune_topk=args.token_prune_topk,
+            decoder_rescore_topk=args.decoder_rescore_topk,
+            blank_logit_bias=args.blank_logit_bias,
+            hotwords_path=args.hotwords_path,
+            text_normalization=args.text_normalization,
+            save_debug_lengths=args.save_debug_lengths,
+        )
 
     config = PredictionConfig(
         checkpoint_path=args.checkpoint_path,
         batch_size=args.batch_size,
-        model_config=_resolve_model_config(args),
+        model_config=model_config,
         manifest_path=args.manifest_path,
         webdataset_root=args.webdataset_root,
         webdataset_length_index_path=args.webdataset_length_index_path,
@@ -280,7 +311,10 @@ def main() -> None:
     with output_path.open(output_mode, encoding="utf-8") as handle:
         def on_prediction(prediction) -> None:
             nonlocal num_predictions
-            handle.write(json.dumps(labeled_prediction_to_json_dict(prediction), ensure_ascii=False) + "\n")
+            row = labeled_prediction_to_json_dict(prediction)
+            if inference_provenance is not None:
+                row["inference_provenance"] = inference_provenance
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             num_predictions += 1
             if args.preview_path is not None and len(preview_predictions) < int(args.preview_count):
                 preview_predictions.append(prediction)

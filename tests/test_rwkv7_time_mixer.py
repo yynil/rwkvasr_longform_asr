@@ -13,7 +13,7 @@ from rwkvasr.modules import (
     reverse_time,
     reverse_time_by_lengths,
 )
-from rwkvasr.modules.rwkv7_cuda import fused_wkv7
+from rwkvasr.modules.rwkv7_cuda import fused_wkv7, fused_wkv7_clampw
 from rwkvasr.modules.rwkv7_time_mixer import _native_wkv7, pad_to_chunk_length
 
 
@@ -81,10 +81,12 @@ def test_fused_wkv7_matches_native_forward_on_cuda() -> None:
     torch.manual_seed(9)
     bsz, tsz, hidden, head_size = 2, 17, 128, 64
     n_head = hidden // head_size
-    q, w, k, v, z, a = [
-        torch.randn(bsz, tsz, hidden, device="cuda", dtype=torch.bfloat16).contiguous()
-        for _ in range(6)
+    q, k, v, z, a = [
+        (torch.randn(bsz, tsz, hidden, device="cuda", dtype=torch.bfloat16) * 0.2).contiguous()
+        for _ in range(5)
     ]
+    raw_w = torch.randn(bsz, tsz, hidden, device="cuda", dtype=torch.float32)
+    w = (-torch.nn.functional.softplus(-raw_w) - 0.5).to(torch.bfloat16).contiguous()
 
     native_y, _ = _native_wkv7(
         q.view(bsz, tsz, n_head, head_size),
@@ -97,6 +99,74 @@ def test_fused_wkv7_matches_native_forward_on_cuda() -> None:
     fused_y = fused_wkv7(q, w, k, v, z, a, head_size=head_size, chunk_len=16)
 
     assert torch.allclose(fused_y.float(), native_y.view_as(fused_y).float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for fused RWKV-7")
+def test_fused_clampw_matches_recurrent_forward_and_backward_on_cuda() -> None:
+    torch.manual_seed(210)
+    batch_size, timesteps, hidden, head_size = 1, 16, 64, 64
+    shape = (batch_size, timesteps, hidden)
+    base_inputs = [
+        (torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.2).contiguous()
+        for _ in range(6)
+    ]
+    fused_inputs = [value.detach().clone().requires_grad_() for value in base_inputs]
+    reference_inputs = [value.detach().clone().requires_grad_() for value in base_inputs]
+
+    fused_y = fused_wkv7_clampw(
+        *fused_inputs,
+        head_size=head_size,
+        chunk_len=16,
+    )
+
+    r, raw_w, k, v, a, b = [
+        value.view(batch_size, timesteps, 1, head_size) for value in reference_inputs
+    ]
+    state = torch.zeros(
+        batch_size,
+        1,
+        head_size,
+        head_size,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    outputs = []
+    w_scale = -0.6065306597
+    for timestep in range(timesteps):
+        rt = r[:, timestep].float()
+        decay = torch.exp(w_scale * torch.sigmoid(raw_w[:, timestep].float()))
+        kt = k[:, timestep].float()
+        vt = v[:, timestep].float()
+        at = a[:, timestep].float()
+        bt = b[:, timestep].float()
+        state_a = torch.einsum("bhij,bhj->bhi", state, at)
+        state = state * decay.unsqueeze(-2)
+        state = state + state_a.unsqueeze(-1) * bt.unsqueeze(-2)
+        state = state + vt.unsqueeze(-1) * kt.unsqueeze(-2)
+        outputs.append(torch.einsum("bhij,bhj->bhi", state, rt).to(torch.bfloat16))
+    reference_y = torch.stack(outputs, dim=1).reshape_as(fused_y)
+
+    forward_relative_error = (fused_y.float() - reference_y.float()).norm() / reference_y.float().norm()
+    assert forward_relative_error.item() < 1.0e-4
+
+    output_gradient = (torch.randn_like(reference_y) * 0.1).contiguous()
+    fused_y.backward(output_gradient)
+    reference_y.backward(output_gradient)
+    for fused_input, reference_input in zip(fused_inputs, reference_inputs, strict=True):
+        assert fused_input.grad is not None
+        assert reference_input.grad is not None
+        assert torch.isfinite(fused_input.grad).all()
+        gradient_relative_error = (
+            (fused_input.grad.float() - reference_input.grad.float()).norm()
+            / reference_input.grad.float().norm().clamp_min(1.0e-12)
+        )
+        gradient_cosine = torch.nn.functional.cosine_similarity(
+            fused_input.grad.float().flatten(),
+            reference_input.grad.float().flatten(),
+            dim=0,
+        )
+        assert gradient_relative_error.item() < 1.0e-3
+        assert gradient_cosine.item() > 0.999
 
 
 def test_bidirectional_merge_matches_branch_outputs() -> None:

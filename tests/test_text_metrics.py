@@ -1,7 +1,13 @@
 from pathlib import Path
 
 from rwkvasr.data import normalize_asr_text
-from rwkvasr.eval import compute_text_error_stats, compare_prediction_text_sets, tokenize_for_cer, tokenize_for_wer
+from rwkvasr.eval import (
+    compare_prediction_text_sets,
+    compute_text_error_decomposition,
+    compute_text_error_stats,
+    tokenize_for_cer,
+    tokenize_for_wer,
+)
 
 
 def _write_jsonl(path: Path, lines: list[dict[str, str]]) -> Path:
@@ -20,6 +26,13 @@ def test_tokenization_is_word_and_char_aware() -> None:
     assert tokenize_for_wer("OK okay O.K.") == ["ok", "ok", "ok"]
     assert tokenize_for_wer("你好世界") == ["你", "好", "世", "界"]
     assert tokenize_for_wer("mix中文text") == ["mix", "中", "文", "text"]
+    assert tokenize_for_wer("Popayán Hückeswagen Wipperfürth Fortià") == [
+        "popayán",
+        "hückeswagen",
+        "wipperfürth",
+        "fortià",
+    ]
+    assert tokenize_for_wer("a\u0338 mix中café") == ["a\u0338", "mix", "中", "café"]
     assert tokenize_for_cer("a b") == ["a", "b"]
     assert tokenize_for_cer("a,b.") == ["a", "b"]
     assert tokenize_for_cer("okay O.K.") == ["o", "k", "o", "k"]
@@ -30,8 +43,7 @@ def test_ctc_text_normalization_removes_punctuation_and_symbols() -> None:
     assert normalize_asr_text("你好，世界！", language="zh", mode="ctc") == "你好世界"
     assert normalize_asr_text("A <COMMA> B <NOISE> C", language="en", mode="ctc") == "a b c"
     assert (
-        normalize_asr_text("A [noise] B (laughter) C {music}", language="en", mode="ctc")
-        == "a b c"
+        normalize_asr_text("A [noise] B (laughter) C {music}", language="en", mode="ctc") == "a b c"
     )
 
 
@@ -59,6 +71,27 @@ def test_ctc_text_normalization_removes_project_language_confirmation_prefix() -
     )
 
 
+def test_ctc_metric_normalization_can_score_project_language_confirmation_prefix() -> None:
+    assert (
+        normalize_asr_text(
+            "This is English text. I have 21 apples.",
+            language="en",
+            mode="ctc",
+            strip_language_confirmation=False,
+        )
+        == "this is english text i have twenty one apples"
+    )
+    assert (
+        normalize_asr_text(
+            "这是中文文字。2024年增长3.5%",
+            language="zh",
+            mode="ctc",
+            strip_language_confirmation=False,
+        )
+        == "这是中文文字二零二四年增长百分之三点五"
+    )
+
+
 def test_ctc_text_normalization_verbalizes_english_numbers() -> None:
     assert (
         normalize_asr_text("I paid $12.50 for 21 apples on 3/4.", language="en", mode="ctc")
@@ -75,7 +108,10 @@ def test_ctc_text_normalization_verbalizes_english_numbers() -> None:
 
 
 def test_ctc_text_normalization_verbalizes_chinese_numbers() -> None:
-    assert normalize_asr_text("2024年增长3.5%。", language="zh", mode="ctc") == "二零二四年增长百分之三点五"
+    assert (
+        normalize_asr_text("2024年增长3.5%。", language="zh", mode="ctc")
+        == "二零二四年增长百分之三点五"
+    )
     assert normalize_asr_text("第12次测试", language="zh", mode="ctc") == "第十二次测试"
     assert normalize_asr_text("编号010", language="zh", mode="ctc") == "编号零一零"
 
@@ -92,6 +128,34 @@ def test_compute_text_error_stats(tmp_path: Path) -> None:
     assert stats["sample_count"] == 2
     assert stats["avg_wer"] == 1.0 / 6.0
     assert abs(stats["avg_cer"] - (1.0 / 6.0)) < 1e-9
+
+
+def test_compute_text_error_decomposition_reports_deletions_and_length(
+    tmp_path: Path,
+) -> None:
+    path = _write_jsonl(
+        tmp_path / "preds.jsonl",
+        [
+            {
+                "utt_id": "u1",
+                "pred_text": "one three extra",
+                "ref_text": "one two three four",
+            }
+        ],
+    )
+
+    decomposition = compute_text_error_decomposition(
+        path,
+        language="en",
+        normalization="none",
+        metric="wer",
+    )
+
+    assert decomposition["reference_units"] == 4
+    assert decomposition["prediction_units"] == 3
+    assert decomposition["prediction_reference_unit_ratio"] == 0.75
+    assert decomposition["deletions"] + decomposition["substitutions"] == 2
+    assert decomposition["error_rate"] == 0.5
 
 
 def test_text_error_stats_ignore_punctuation(tmp_path: Path) -> None:

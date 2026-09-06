@@ -16,6 +16,16 @@ from rwkvasr.training import (
     RWKVDualModeCTCTrainer,
     build_rwkv_param_groups,
 )
+from rwkvasr.training.deepspeed_loop import (
+    DeepSpeedTrainConfig,
+    _apply_training_freeze as _apply_deepspeed_training_freeze,
+    _capture_student_ctc_decoder_hiddens,
+    _capture_student_sensevoice_layer_hiddens,
+    _ctc_teacher_decoder_hidden_loss,
+    _ctc_teacher_hidden_loss,
+    _ctc_teacher_layer_hidden_loss,
+    _online_ctc_teacher_distillation_loss,
+)
 from rwkvasr.training.train_loop import TrainConfig, _resolve_vocab_size
 from rwkvasr.training.wandb_logger import finish_wandb, init_wandb_run, log_wandb
 from rwkvasr.data import can_load_webdataset_length_index_in_memory
@@ -55,6 +65,334 @@ def test_rwkv_optimizer_param_groups_respect_w0_and_weight_decay() -> None:
     decay_names = names["rwkv_decay"]
     assert "ctc_head.weight" in decay_names
     assert "encoder.blocks.0.ffn1_norm.weight" not in decay_names
+
+
+def test_stage211_frozen_nano_ctc_path_backpropagates_only_to_birwkv() -> None:
+    torch.manual_seed(211)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=10,
+            n_embd=8,
+            encoder_output_dim=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=3,
+            vocab_size=6,
+            head_size=4,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+            ctc_decoder_type="funasr_nano_transformer",
+            ctc_decoder_dim=8,
+            ctc_decoder_ffn_dim=16,
+            ctc_decoder_num_layers=1,
+            ctc_decoder_attention_heads=2,
+        )
+    )
+    _apply_deepspeed_training_freeze(
+        model,
+        DeepSpeedTrainConfig(
+            output_dir=".",
+            deepspeed={},
+            frontend_type="sensevoice_rwkv",
+            freeze_encoder_except_time_mixer=True,
+            freeze_ctc_decoder=True,
+            freeze_ctc_head=True,
+        ),
+    )
+
+    features = torch.randn(2, 12, 10)
+    feature_lengths = torch.tensor([12, 10], dtype=torch.long)
+    targets = torch.tensor([1, 2, 1, 3], dtype=torch.long)
+    target_lengths = torch.tensor([2, 2], dtype=torch.long)
+    optimizer = torch.optim.SGD(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=1.0e-2,
+    )
+    losses = model.joint_losses(
+        features,
+        feature_lengths,
+        targets,
+        target_lengths,
+    )
+    losses["loss"].backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    losses = model.joint_losses(
+        features,
+        feature_lengths,
+        targets,
+        target_lengths,
+    )
+    losses["loss"].backward()
+
+    trainable = {
+        name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert trainable
+    assert all(".time_mixer." in name or ".input_proj." in name for name in trainable)
+    assert any(
+        ".time_mixer." in name
+        and parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and torch.count_nonzero(parameter.grad) > 0
+        for name, parameter in trainable.items()
+    )
+    assert any(
+        ".input_proj." in name
+        and parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and torch.count_nonzero(parameter.grad) > 0
+        for name, parameter in trainable.items()
+    )
+    assert model.ctc_decoder is not None
+    frozen_ctc_parameters = [
+        *model.ctc_decoder.parameters(),
+        *model.ctc_head.parameters(),
+    ]
+    assert all(not parameter.requires_grad for parameter in frozen_ctc_parameters)
+    assert all(parameter.grad is None for parameter in frozen_ctc_parameters)
+
+
+def _build_stage211_gradient_probe_model() -> RWKVCTCModel:
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=10,
+            n_embd=8,
+            encoder_output_dim=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=3,
+            vocab_size=6,
+            blank_id=5,
+            head_size=4,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+            ctc_loss_weight=0.0,
+            ctc_decoder_type="funasr_nano_transformer",
+            ctc_decoder_dim=8,
+            ctc_decoder_ffn_dim=16,
+            ctc_decoder_num_layers=5,
+            ctc_decoder_attention_heads=2,
+        )
+    )
+    _apply_deepspeed_training_freeze(
+        model,
+        DeepSpeedTrainConfig(
+            output_dir=".",
+            deepspeed={},
+            frontend_type="sensevoice_rwkv",
+            freeze_encoder_except_time_mixer=True,
+            freeze_ctc_decoder=True,
+            freeze_ctc_head=True,
+        ),
+    )
+    return model
+
+
+def _assert_stage211_gradient_probe_reaches_only_birwkv(model: RWKVCTCModel) -> None:
+    trainable = {
+        name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert trainable
+    assert all(".time_mixer." in name or ".input_proj." in name for name in trainable)
+    finite_nonzero = {
+        name
+        for name, parameter in trainable.items()
+        if parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and torch.count_nonzero(parameter.grad) > 0
+    }
+    assert any(".time_mixer." in name for name in finite_nonzero)
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in trainable.values()
+    )
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if ".time_mixer." not in name and ".input_proj." not in name
+    )
+
+
+def test_stage211_block_objectives_backpropagate_to_frozen_nano_birwkv_path() -> None:
+    torch.manual_seed(212)
+    model = _build_stage211_gradient_probe_model()
+    model.enable_gradient_checkpointing(True)
+    model.train()
+    features = torch.randn(2, 12, 10)
+    feature_lengths = torch.tensor([12, 10], dtype=torch.long)
+    empty_targets = torch.empty(0, dtype=torch.long)
+    empty_target_lengths = torch.zeros(2, dtype=torch.long)
+    layer_ids = (0, 1, 2)
+    utt_ids = ("utt-a", "utt-b")
+
+    with (
+        _capture_student_sensevoice_layer_hiddens(model, layer_ids) as layer_hiddens,
+        _capture_student_ctc_decoder_hiddens(model, enabled=True) as decoder_hiddens,
+    ):
+        losses = model.joint_losses(
+            features,
+            feature_lengths,
+            empty_targets,
+            empty_target_lengths,
+            compute_ctc_logits=False,
+        )
+    encoded = losses["ctc_encoded"]
+    encoded_lengths = losses["ctc_encoded_lengths"]
+    logit_lengths = losses["logit_lengths"]
+    assert isinstance(encoded, torch.Tensor)
+    assert isinstance(encoded_lengths, torch.Tensor)
+    assert isinstance(logit_lengths, torch.Tensor)
+    assert set(decoder_hiddens) == {
+        "input",
+        "layer_0",
+        "layer_1",
+        "layer_2",
+        "layer_3",
+        "layer_4",
+    }
+
+    teacher_records: dict[str, dict[str, object]] = {}
+    for sample_idx, utt_id in enumerate(utt_ids):
+        encoded_length = int(encoded_lengths[sample_idx])
+        logit_length = int(logit_lengths[sample_idx])
+        teacher_records[utt_id] = {
+            "encoder_out": torch.flip(
+                encoded[sample_idx, :encoded_length].detach(),
+                dims=(-1,),
+            )
+            + 0.05,
+            "encoder_layer_hiddens": {
+                str(layer_id): {
+                    component: torch.flip(
+                        layer_hiddens[layer_id][component][sample_idx, :encoded_length].detach(),
+                        dims=(-1,),
+                    )
+                    + 0.05
+                    for component in ("mixer", "ffn", "block")
+                }
+                for layer_id in layer_ids
+            },
+            "ctc_decoder_hiddens": {
+                name: torch.flip(
+                    hidden[sample_idx, :logit_length].detach(),
+                    dims=(-1,),
+                )
+                + 0.05
+                for name, hidden in decoder_hiddens.items()
+            },
+        }
+
+    layer_result = _ctc_teacher_layer_hidden_loss(
+        layer_hiddens,
+        encoded_lengths,
+        utt_ids,
+        teacher_records,
+        layer_ids=layer_ids,
+        component_weights={"mixer": 0.25, "ffn": 0.25, "block": 1.0},
+        normalized_mse_weight=1.0,
+        cosine_weight=0.25,
+        energy_mse_weight=0.25,
+        log_rms_weight=0.1,
+        raw_mse_weight=0.0,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+    encoder_loss, encoder_matched, encoder_missing = _ctc_teacher_hidden_loss(
+        encoded,
+        encoded_lengths,
+        utt_ids,
+        teacher_records,
+        teacher_field="encoder_out",
+        time_map="nearest",
+        missing_policy="error",
+    )
+    decoder_result = _ctc_teacher_decoder_hidden_loss(
+        decoder_hiddens,
+        logit_lengths,
+        utt_ids,
+        teacher_records,
+        normalized_mse_weight=1.0,
+        cosine_weight=0.25,
+        energy_mse_weight=0.25,
+        log_rms_weight=0.1,
+        raw_mse_weight=0.0,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+    total = layer_result.loss + 0.5 * encoder_loss + 0.5 * decoder_result.loss
+
+    assert torch.isfinite(total)
+    assert total.item() > 0.0
+    assert (layer_result.matched_samples, layer_result.missing_samples) == (2, 0)
+    assert (encoder_matched, encoder_missing) == (2, 0)
+    assert (decoder_result.matched_samples, decoder_result.missing_samples) == (2, 0)
+    assert decoder_result.events == 12
+    total.backward()
+    _assert_stage211_gradient_probe_reaches_only_birwkv(model)
+
+
+def test_stage211_logits_only_objectives_backpropagate_through_frozen_nano_path() -> None:
+    torch.manual_seed(213)
+    model = _build_stage211_gradient_probe_model()
+    model.enable_gradient_checkpointing(True)
+    model.train()
+    features = torch.randn(2, 12, 10)
+    feature_lengths = torch.tensor([12, 10], dtype=torch.long)
+    losses = model.joint_losses(
+        features,
+        feature_lengths,
+        torch.empty(0, dtype=torch.long),
+        torch.zeros(2, dtype=torch.long),
+        compute_ctc_logits=True,
+    )
+    student_logits = losses["logits"]
+    logit_lengths = losses["logit_lengths"]
+    assert isinstance(student_logits, torch.Tensor)
+    assert isinstance(logit_lengths, torch.Tensor)
+    utt_ids = ("utt-a", "utt-b")
+    teacher_records: dict[str, dict[str, object]] = {}
+    for sample_idx, utt_id in enumerate(utt_ids):
+        length = int(logit_lengths[sample_idx])
+        teacher_logits = torch.randn(length, student_logits.size(-1))
+        teacher_logits[:, 5] += 1.0
+        teacher_logits[::2, sample_idx + 1] += 4.0
+        teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+        topk_log_probs, topk_token_ids = teacher_log_probs.topk(4, dim=-1)
+        teacher_records[utt_id] = {
+            "full_log_probs": teacher_log_probs.to(torch.float16),
+            "topk_token_ids": topk_token_ids,
+            "topk_log_probs": topk_log_probs,
+            "blank_log_probs": teacher_log_probs[:, 5],
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [],
+        }
+
+    total = _online_ctc_teacher_distillation_loss(
+        config=DeepSpeedTrainConfig(
+            output_dir=".",
+            deepspeed={},
+            blank_id=5,
+            ctc_teacher_online_full_loss_weight=1.0,
+            ctc_teacher_online_blank_loss_weight=0.25,
+            ctc_teacher_online_conditional_nonblank_loss_weight=1.0,
+            ctc_teacher_online_conditional_nonblank_hard_loss_weight=0.125,
+            ctc_teacher_online_full_frame_filter="all",
+            ctc_teacher_online_project_ignored_token_ids=(),
+            ctc_teacher_topk_missing_policy="error",
+        ),
+        losses=losses,
+        batch=types.SimpleNamespace(utt_ids=utt_ids),
+        ctc_teacher_online_records=teacher_records,
+    )
+
+    assert torch.isfinite(total)
+    assert total.item() > 0.0
+    total.backward()
+    _assert_stage211_gradient_probe_reaches_only_birwkv(model)
 
 
 def test_dual_mode_trainer_returns_valid_training_mask() -> None:

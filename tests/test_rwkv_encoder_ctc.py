@@ -1,5 +1,10 @@
+import math
+from types import SimpleNamespace
+
+import pytest
 import torch
 import torch.nn.functional as F
+import rwkvasr.training.deepspeed_loop as deepspeed_loop
 
 from rwkvasr.modules import (
     RWKVCTCModel,
@@ -10,12 +15,22 @@ from rwkvasr.modules import (
     build_inference_direction_mask,
 )
 from rwkvasr.training.deepspeed_loop import (
+    _CTC_FULL_EVAL_WIDTH,
+    DeepSpeedTrainConfig,
+    _ctc_teacher_blank_frame_bce,
+    _ctc_teacher_blank_loss,
+    _ctc_teacher_decoder_hidden_loss,
+    _ctc_teacher_full_loss,
+    _ctc_teacher_full_objective_losses,
     _ctc_teacher_hidden_loss,
     _ctc_teacher_nonblank_hard_loss,
     _ctc_teacher_nonblank_window_loss,
     _ctc_teacher_nonblank_window_topk_loss,
     _ctc_teacher_sequence_presence_loss,
     _ctc_teacher_sequence_window_loss,
+    _ctc_teacher_shared_full_alignment_enabled,
+    _finalize_ctc_full_eval_metrics,
+    _online_ctc_teacher_distillation_loss,
     _project_ctc_teacher_full_log_probs,
 )
 
@@ -175,6 +190,77 @@ def test_ctc_bridge_residual_mlp_is_identity_initialized() -> None:
     assert losses["encoded"].shape == (2, 7, 16)
     assert losses["ctc_encoded"].shape == (2, 7, 16)
     assert torch.equal(losses["ctc_encoded_lengths"], lengths)
+
+
+def test_joint_losses_hidden_only_skips_ctc_head_and_preserves_hidden_gradients() -> None:
+    torch.manual_seed(22015)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=8,
+            n_embd=16,
+            dim_att=16,
+            dim_ff=32,
+            num_layers=2,
+            vocab_size=10,
+            blank_id=10,
+            head_size=8,
+            conv_kernel_size=3,
+            dropout=0.0,
+            frontend_type="linear",
+            ctc_bridge_type="residual_mlp",
+            ctc_bridge_hidden_dim=32,
+            ctc_bridge_dropout=0.0,
+            ctc_loss_weight=0.0,
+        )
+    ).eval()
+    features = torch.randn(2, 7, 8)
+    lengths = torch.tensor([7, 5], dtype=torch.long)
+    targets = torch.empty(0, dtype=torch.long)
+    target_lengths = torch.tensor([0, 0], dtype=torch.long)
+    full = model.joint_losses(features, lengths, targets, target_lengths)
+    full_hidden_loss = (
+        full["encoded"].float().square().mean()
+        + full["ctc_encoded"].float().abs().mean()
+    )
+    full_hidden_loss.backward()
+    full_gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    model.zero_grad(set_to_none=True)
+
+    class TrapHead(torch.nn.Module):
+        def forward(self, _features: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("CTC head must not run for hidden-only student forward")
+
+    model.ctc_head = TrapHead()
+    hidden_only = model.joint_losses(
+        features,
+        lengths,
+        targets,
+        target_lengths,
+        compute_ctc_logits=False,
+    )
+
+    assert hidden_only["logits"] is None
+    torch.testing.assert_close(hidden_only["encoded"], full["encoded"])
+    torch.testing.assert_close(hidden_only["ctc_encoded"], full["ctc_encoded"])
+    assert torch.equal(hidden_only["logit_lengths"], full["logit_lengths"])
+    hidden_only_loss = (
+        hidden_only["encoded"].float().square().mean()
+        + hidden_only["ctc_encoded"].float().abs().mean()
+    )
+    torch.testing.assert_close(hidden_only_loss, full_hidden_loss)
+    hidden_only_loss.backward()
+    hidden_only_gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    assert hidden_only_gradients.keys() == full_gradients.keys()
+    for name, gradient in hidden_only_gradients.items():
+        torch.testing.assert_close(gradient, full_gradients[name])
 
 
 def test_ctc_bridge_context_residual_mlp_is_identity_initialized_and_masks_padding() -> None:
@@ -403,6 +489,831 @@ def test_project_ctc_teacher_full_log_probs_keeps_preprojected_blank() -> None:
     assert torch.allclose(projected[:, 5], raw[:, 5])
 
 
+@pytest.mark.parametrize("time_map", ["nearest", "linear"])
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_ctc_teacher_full_loss_supports_device_resident_targets(
+    time_map: str,
+    device_type: str,
+) -> None:
+    if device_type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    device = torch.device(device_type)
+    teacher_logits = torch.randn(5, 6, device=device)
+    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1).to(dtype=torch.float16)
+    student_logits = torch.randn(1, 3, 6, device=device, requires_grad=True)
+    records = {
+        "utt-a": {
+            "full_log_probs": teacher_log_probs,
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [],
+        }
+    }
+
+    loss, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3], device=device),
+        ["utt-a"],
+        records,
+        blank_id=5,
+        time_map=time_map,
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+    )
+
+    assert loss.device == student_logits.device
+    assert torch.isfinite(loss)
+    assert matched == 1
+    assert missing == 0
+    loss.backward()
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
+
+
+@pytest.mark.parametrize("time_map", ["nearest", "linear"])
+def test_ctc_teacher_shared_full_alignment_matches_separate_losses_and_gradients(
+    monkeypatch: pytest.MonkeyPatch,
+    time_map: str,
+) -> None:
+    torch.manual_seed(417)
+    teacher_cache: dict[str, dict[str, object]] = {}
+    for index, (utt_id, teacher_time) in enumerate((("utt-a", 5), ("utt-b", 4))):
+        teacher_logits = torch.randn(teacher_time, 7)
+        teacher_logits[:, 6] -= 0.75
+        teacher_logits[index::2, index + 1] += 3.0
+        teacher_cache[utt_id] = {
+            "full_log_probs": F.log_softmax(teacher_logits, dim=-1).to(torch.float16),
+            "project_blank_id": 6,
+            "teacher_blank_id": 6,
+            "project_ignored_token_ids": [5],
+        }
+    utt_ids = ["utt-a", "utt-b", "utt-missing"]
+    lengths = torch.tensor([3, 4, 2])
+    initial_logits = torch.randn(3, 4, 7)
+
+    separate_logits = initial_logits.clone().requires_grad_(True)
+    separate_accumulator = torch.zeros(_CTC_FULL_EVAL_WIDTH, dtype=torch.float64)
+    separate_results = {
+        "full": _ctc_teacher_full_loss(
+            separate_logits,
+            lengths,
+            utt_ids,
+            teacher_cache,
+            blank_id=6,
+            time_map=time_map,
+            frame_filter="all",
+            frame_filter_neighbor_radius=0,
+            frame_filter_min_nonblank_prob=0.05,
+            missing_policy="skip",
+            temperature=0.7,
+            nonblank_frame_weight=2.5,
+            frame_weight_mode="posterior_nonblank",
+            eval_accumulator=separate_accumulator,
+        ),
+        "conditional_nonblank": _ctc_teacher_full_loss(
+            separate_logits,
+            lengths,
+            utt_ids,
+            teacher_cache,
+            blank_id=6,
+            time_map=time_map,
+            frame_filter="all",
+            frame_filter_neighbor_radius=0,
+            frame_filter_min_nonblank_prob=0.05,
+            missing_policy="skip",
+            temperature=0.7,
+            loss_mode="conditional_nonblank",
+        ),
+        "conditional_nonblank_hard": _ctc_teacher_full_loss(
+            separate_logits,
+            lengths,
+            utt_ids,
+            teacher_cache,
+            blank_id=6,
+            time_map=time_map,
+            frame_filter="all",
+            frame_filter_neighbor_radius=0,
+            frame_filter_min_nonblank_prob=0.05,
+            missing_policy="skip",
+            temperature=1.0,
+            loss_mode="conditional_nonblank_hard",
+        ),
+    }
+    separate_total = (
+        separate_results["full"][0]
+        + 0.75 * separate_results["conditional_nonblank"][0]
+        + 0.125 * separate_results["conditional_nonblank_hard"][0]
+    )
+    separate_total.backward()
+    assert separate_logits.grad is not None
+    separate_gradient = separate_logits.grad.detach().clone()
+
+    projection_calls = 0
+    original_project = deepspeed_loop._project_ctc_teacher_full_log_probs
+
+    def counted_project(*args: object, **kwargs: object) -> torch.Tensor:
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_project(*args, **kwargs)
+
+    monkeypatch.setattr(
+        deepspeed_loop,
+        "_project_ctc_teacher_full_log_probs",
+        counted_project,
+    )
+    shared_logits = initial_logits.clone().requires_grad_(True)
+    shared_accumulator = torch.zeros(_CTC_FULL_EVAL_WIDTH, dtype=torch.float64)
+    shared_results, shared_active = _ctc_teacher_full_objective_losses(
+        shared_logits,
+        lengths,
+        utt_ids,
+        teacher_cache,
+        blank_id=6,
+        time_map=time_map,
+        full_frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.05,
+        missing_policy="skip",
+        full_temperature=0.7,
+        full_nonblank_frame_weight=2.5,
+        full_frame_weight_mode="posterior_nonblank",
+        full_weight=1.0,
+        conditional_nonblank_weight=0.75,
+        conditional_nonblank_hard_weight=0.125,
+        full_eval_accumulator=shared_accumulator,
+    )
+
+    assert shared_active is True
+    assert projection_calls == 2
+    for name in separate_results:
+        separate_loss, separate_matched, separate_missing = separate_results[name]
+        shared_loss, shared_matched, shared_missing = shared_results[name]
+        assert torch.equal(shared_loss, separate_loss)
+        assert (shared_matched, shared_missing) == (separate_matched, separate_missing) == (2, 1)
+    assert torch.equal(shared_accumulator, separate_accumulator)
+
+    shared_total = (
+        shared_results["full"][0]
+        + 0.75 * shared_results["conditional_nonblank"][0]
+        + 0.125 * shared_results["conditional_nonblank_hard"][0]
+    )
+    shared_total.backward()
+    assert shared_logits.grad is not None
+    assert torch.equal(shared_total, separate_total)
+    assert torch.equal(shared_logits.grad, separate_gradient)
+
+
+def test_ctc_teacher_shared_full_alignment_falls_back_for_single_or_filtered_objectives() -> None:
+    teacher_probs = torch.tensor(
+        [
+            [0.05, 0.70, 0.05, 0.05, 0.05, 0.10],
+            [0.05, 0.05, 0.60, 0.05, 0.05, 0.20],
+        ]
+    )
+    topk_log_probs, topk_ids = teacher_probs.log().topk(2, dim=-1)
+    teacher_cache = {
+        "utt-a": {
+            "full_log_probs": teacher_probs.log(),
+            "topk_token_ids": topk_ids,
+            "topk_log_probs": topk_log_probs,
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+    student_logits = torch.randn(1, 2, 6, requires_grad=True)
+
+    single_results, single_shared = _ctc_teacher_full_objective_losses(
+        student_logits,
+        torch.tensor([2]),
+        ["utt-a"],
+        teacher_cache,
+        blank_id=5,
+        time_map="nearest",
+        full_frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        full_temperature=1.0,
+        full_nonblank_frame_weight=1.0,
+        full_frame_weight_mode="hard_top1",
+        full_weight=1.0,
+        conditional_nonblank_weight=0.0,
+        conditional_nonblank_hard_weight=0.0,
+    )
+    filtered_results, filtered_shared = _ctc_teacher_full_objective_losses(
+        student_logits,
+        torch.tensor([2]),
+        ["utt-a"],
+        teacher_cache,
+        blank_id=5,
+        time_map="nearest",
+        full_frame_filter="nonblank",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        full_temperature=1.0,
+        full_nonblank_frame_weight=1.0,
+        full_frame_weight_mode="hard_top1",
+        full_weight=1.0,
+        conditional_nonblank_weight=1.0,
+        conditional_nonblank_hard_weight=0.0,
+    )
+
+    assert single_shared is False
+    assert set(single_results) == {"full"}
+    assert filtered_shared is False
+    assert set(filtered_results) == {"full", "conditional_nonblank"}
+    assert all(torch.isfinite(result[0]) for result in filtered_results.values())
+    assert not _ctc_teacher_shared_full_alignment_enabled(
+        full_weight=1.0,
+        conditional_nonblank_weight=0.0,
+        conditional_nonblank_hard_weight=0.0,
+        full_frame_filter="all",
+    )
+    assert not _ctc_teacher_shared_full_alignment_enabled(
+        full_weight=1.0,
+        conditional_nonblank_weight=1.0,
+        conditional_nonblank_hard_weight=0.0,
+        full_frame_filter="nonblank",
+    )
+
+
+def test_online_ctc_teacher_distillation_uses_shared_full_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    teacher_probs = torch.tensor(
+        [
+            [0.05, 0.70, 0.05, 0.05, 0.05, 0.10],
+            [0.05, 0.05, 0.60, 0.05, 0.05, 0.20],
+        ]
+    )
+    teacher_cache = {
+        "utt-a": {
+            "full_log_probs": teacher_probs.log().to(torch.float16),
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+    student_logits = torch.randn(1, 2, 6, requires_grad=True)
+    base_loss = student_logits.float().sum() * 0.0
+    config = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        blank_id=5,
+        ctc_teacher_online_full_loss_weight=1.0,
+        ctc_teacher_online_conditional_nonblank_loss_weight=0.75,
+        ctc_teacher_online_conditional_nonblank_hard_loss_weight=0.125,
+        ctc_teacher_online_full_temperature=0.7,
+        ctc_teacher_online_full_frame_filter="all",
+        ctc_teacher_online_full_nonblank_weight=2.0,
+        ctc_teacher_online_full_frame_weight_mode="posterior_nonblank",
+        ctc_teacher_online_project_ignored_token_ids=(4,),
+        ctc_teacher_topk_missing_policy="error",
+    )
+    projection_calls = 0
+    original_project = deepspeed_loop._project_ctc_teacher_full_log_probs
+
+    def counted_project(*args: object, **kwargs: object) -> torch.Tensor:
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_project(*args, **kwargs)
+
+    monkeypatch.setattr(
+        deepspeed_loop,
+        "_project_ctc_teacher_full_log_probs",
+        counted_project,
+    )
+    total = _online_ctc_teacher_distillation_loss(
+        config=config,
+        losses={
+            "loss": base_loss,
+            "logits": student_logits,
+            "logit_lengths": torch.tensor([2]),
+        },
+        batch=SimpleNamespace(utt_ids=["utt-a"]),
+        ctc_teacher_online_records=teacher_cache,
+    )
+
+    assert projection_calls == 1
+    assert torch.isfinite(total)
+    total.backward()
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
+    assert torch.count_nonzero(student_logits.grad).item() > 0
+
+
+def test_ctc_teacher_full_eval_metrics_expose_blank_peak_and_collapsed_sequence_gap() -> None:
+    teacher_ids = torch.tensor([5, 1, 1, 5, 2])
+    student_ids = torch.tensor([5, 1, 5, 3, 3])
+    teacher_logits = torch.full((5, 6), -20.0)
+    student_logits = torch.full((1, 5, 6), -20.0, requires_grad=True)
+    teacher_logits.scatter_(1, teacher_ids.unsqueeze(1), 20.0)
+    with torch.no_grad():
+        student_logits.scatter_(2, student_ids.view(1, 5, 1), 20.0)
+    records = {
+        "utt-a": {
+            "full_log_probs": F.log_softmax(teacher_logits, dim=-1),
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [],
+        }
+    }
+    accumulator = torch.zeros(_CTC_FULL_EVAL_WIDTH, dtype=torch.float64)
+
+    loss, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([5]),
+        ["utt-a"],
+        records,
+        blank_id=5,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        eval_accumulator=accumulator,
+    )
+    metrics = _finalize_ctc_full_eval_metrics(accumulator, device=torch.device("cpu"))
+
+    assert torch.isfinite(loss)
+    assert matched == 1
+    assert missing == 0
+    assert metrics["full_kl"] > 0.0
+    assert metrics["conditional_nonblank_kl"] > 0.0
+    assert metrics["conditional_nonblank_hard_ce"] > 0.0
+    assert metrics["blank_binary_kl"] > 0.0
+    assert metrics["selected_top1_agreement"] == pytest.approx(0.4)
+    assert metrics["all_top1_agreement"] == pytest.approx(0.4)
+    assert metrics["blank_prob_mae"] > 0.0
+    assert metrics["teacher_nonblank_rate"] == pytest.approx(0.6)
+    assert metrics["student_nonblank_rate"] == pytest.approx(0.6)
+    assert metrics["nonblank_rate_ratio"] == pytest.approx(1.0)
+    assert metrics["ctc_token_error_rate"] == pytest.approx(0.5)
+    assert metrics["collapsed_length_ratio"] == pytest.approx(1.0)
+    assert metrics["sequence_exact_rate"] == 0.0
+    assert metrics["mean_frame_delta"] == 0.0
+    assert metrics["teacher_tokens"] == 2.0
+    assert metrics["student_tokens"] == 2.0
+    assert metrics["matched_utterances"] == 1.0
+    assert metrics["missing_utterances"] == 0.0
+
+
+def test_ctc_teacher_full_loss_upweights_nonblank_frames_without_masking_blank_frames() -> None:
+    teacher_ids = torch.tensor([3, 1, 3])
+    teacher_logits = torch.full((3, 4), -20.0)
+    teacher_logits.scatter_(1, teacher_ids.unsqueeze(1), 20.0)
+    student_logits = torch.tensor(
+        [[[0.0, 0.0, 0.0, 5.0], [0.0, -3.0, 0.0, 3.0], [2.0, 0.0, 0.0, 1.0]]],
+        requires_grad=True,
+    )
+    records = {
+        "utt-a": {
+            "full_log_probs": F.log_softmax(teacher_logits, dim=-1),
+            "project_blank_id": 3,
+            "teacher_blank_id": 3,
+            "project_ignored_token_ids": [],
+        }
+    }
+
+    unweighted, _, _ = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3]),
+        ["utt-a"],
+        records,
+        blank_id=3,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        nonblank_frame_weight=1.0,
+    )
+    weighted, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3]),
+        ["utt-a"],
+        records,
+        blank_id=3,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        nonblank_frame_weight=4.0,
+    )
+
+    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+    teacher_probs = teacher_log_probs.exp()
+    student_log_probs = F.log_softmax(student_logits[0], dim=-1)
+    per_frame = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
+    expected = (per_frame[0] + 4.0 * per_frame[1] + per_frame[2]) / 6.0
+
+    assert weighted.item() == pytest.approx(expected.item())
+    assert weighted.item() > unweighted.item()
+    assert matched == 1
+    assert missing == 0
+    weighted.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad[0, 0]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[0, 1]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[0, 2]).item() > 0
+
+
+def test_ctc_teacher_full_loss_supports_posterior_nonblank_frame_weights() -> None:
+    teacher_probs = torch.tensor(
+        [
+            [0.05, 0.05, 0.10, 0.80],
+            [0.05, 0.70, 0.05, 0.20],
+            [0.05, 0.05, 0.40, 0.50],
+        ]
+    )
+    teacher_log_probs = teacher_probs.log()
+    student_logits = torch.tensor(
+        [[[0.0, 0.0, 0.0, 3.0], [0.0, -2.0, 0.0, 2.0], [2.0, 0.0, 0.0, 1.0]]],
+        requires_grad=True,
+    )
+    records = {
+        "utt-a": {
+            "full_log_probs": teacher_log_probs,
+            "project_blank_id": 3,
+            "teacher_blank_id": 3,
+            "project_ignored_token_ids": [],
+        }
+    }
+
+    loss, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3]),
+        ["utt-a"],
+        records,
+        blank_id=3,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        nonblank_frame_weight=4.0,
+        frame_weight_mode="posterior_nonblank",
+    )
+
+    student_log_probs = F.log_softmax(student_logits[0], dim=-1)
+    per_frame = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
+    frame_weights = 1.0 + 3.0 * (1.0 - teacher_probs[:, 3])
+    expected = (per_frame * frame_weights).sum() / frame_weights.sum()
+
+    assert loss.item() == pytest.approx(expected.item())
+    assert matched == 1
+    assert missing == 0
+    loss.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad).item() == student_logits.numel()
+
+
+def test_ctc_teacher_conditional_nonblank_loss_matches_only_teacher_active_frames() -> None:
+    teacher_probs = torch.tensor(
+        [
+            [0.05, 0.05, 0.05, 0.05, 0.10, 0.70],
+            [0.05, 0.60, 0.05, 0.05, 0.05, 0.20],
+            [0.10, 0.10, 0.50, 0.05, 0.15, 0.10],
+        ]
+    )
+    student_logits = torch.tensor(
+        [
+            [
+                [0.3, -0.1, 0.2, 0.0, 2.0, 1.0],
+                [0.0, -1.0, 0.5, 0.2, 3.0, 2.0],
+                [0.4, 0.1, -0.5, 0.3, 4.0, 1.5],
+            ]
+        ],
+        requires_grad=True,
+    )
+    records = {
+        "utt-a": {
+            "full_log_probs": teacher_probs.log(),
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+
+    loss, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3]),
+        ["utt-a"],
+        records,
+        blank_id=5,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        loss_mode="conditional_nonblank",
+    )
+
+    teacher_conditional = teacher_probs[1:, :4]
+    teacher_conditional = teacher_conditional / teacher_conditional.sum(dim=-1, keepdim=True)
+    teacher_conditional_log = teacher_conditional.log()
+    student_conditional_log = F.log_softmax(student_logits[0, 1:, :4], dim=-1)
+    expected = (
+        teacher_conditional * (teacher_conditional_log - student_conditional_log)
+    ).sum(dim=-1).mean()
+
+    assert loss.item() == pytest.approx(expected.item())
+    assert matched == 1
+    assert missing == 0
+    loss.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad[0, 0]).item() == 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:, :4]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:, 4]).item() == 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:, 5]).item() == 0
+
+
+def test_ctc_teacher_conditional_nonblank_hard_loss_changes_only_token_identity() -> None:
+    teacher_probs = torch.tensor(
+        [
+            [0.05, 0.05, 0.05, 0.05, 0.10, 0.70],
+            [0.05, 0.60, 0.05, 0.05, 0.05, 0.20],
+            [0.10, 0.10, 0.50, 0.05, 0.15, 0.10],
+        ]
+    )
+    student_logits = torch.tensor(
+        [
+            [
+                [0.3, -0.1, 0.2, 0.0, 2.0, 1.0],
+                [0.0, -1.0, 0.5, 0.2, 3.0, 2.0],
+                [0.4, 0.1, -0.5, 0.3, 4.0, 1.5],
+            ]
+        ],
+        requires_grad=True,
+    )
+    records = {
+        "utt-a": {
+            "full_log_probs": teacher_probs.log(),
+            "project_blank_id": 5,
+            "teacher_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+
+    loss, matched, missing = _ctc_teacher_full_loss(
+        student_logits,
+        torch.tensor([3]),
+        ["utt-a"],
+        records,
+        blank_id=5,
+        time_map="nearest",
+        frame_filter="all",
+        frame_filter_neighbor_radius=0,
+        frame_filter_min_nonblank_prob=0.0,
+        missing_policy="error",
+        temperature=1.0,
+        loss_mode="conditional_nonblank_hard",
+    )
+
+    expected = F.cross_entropy(
+        student_logits[0, 1:, :4],
+        torch.tensor([1, 2]),
+    )
+    assert loss.item() == pytest.approx(expected.item())
+    assert matched == 1
+    assert missing == 0
+    loss.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad[0, 0]).item() == 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:, :4]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:, 4]).item() == 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:, 5]).item() == 0
+
+
+def test_ctc_teacher_blank_frame_bce_excludes_ignored_token_gradient() -> None:
+    student_logits = torch.tensor(
+        [[0.2, -0.4, 5.0, 1.0]],
+        requires_grad=True,
+    )
+    teacher_blank_log_probs = torch.tensor([math.log(0.75)])
+
+    loss = _ctc_teacher_blank_frame_bce(
+        student_logits,
+        teacher_blank_log_probs,
+        blank_id=3,
+        ignored_token_ids=(2,),
+    ).mean()
+    expected_logit = student_logits[0, 3] - torch.logsumexp(student_logits[0, :2], dim=-1)
+    expected = F.binary_cross_entropy_with_logits(
+        expected_logit,
+        torch.tensor(0.75),
+    )
+
+    assert loss.item() == pytest.approx(expected.item())
+    loss.backward()
+    assert student_logits.grad is not None
+    assert student_logits.grad[0, 2].item() == 0.0
+    assert torch.count_nonzero(student_logits.grad[0, [0, 1, 3]]).item() == 3
+
+
+def test_ctc_teacher_blank_loss_balances_teacher_active_and_blank_frames() -> None:
+    student_logits = torch.tensor(
+        [
+            [
+                [0.1, 0.7, -0.2, 0.0, 5.0, -0.3],
+                [0.2, -0.1, 0.3, 0.0, 5.0, 0.8],
+                [0.4, -0.2, 0.1, 0.0, 5.0, 1.1],
+                [-0.2, 0.1, 0.3, 0.0, 5.0, 0.5],
+            ]
+        ],
+        requires_grad=True,
+    )
+    teacher_blank_log_probs = torch.tensor([0.2, 0.9, 0.8, 0.7]).log()
+    teacher_record = {
+        "topk_token_ids": torch.tensor([[1, 5], [5, 1], [5, 2], [5, 3]]),
+        "topk_log_probs": torch.tensor(
+            [[0.8, 0.2], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3]]
+        ).log(),
+        "blank_log_probs": teacher_blank_log_probs,
+        "project_blank_id": 5,
+        "project_ignored_token_ids": [4],
+    }
+
+    loss, matched, missing = _ctc_teacher_blank_loss(
+        student_logits,
+        torch.tensor([4]),
+        ["utt-a"],
+        {"utt-a": teacher_record},
+        blank_id=5,
+        time_map="nearest",
+        missing_policy="error",
+        frame_balance_mode="teacher_top1_balanced",
+    )
+    frame_loss = _ctc_teacher_blank_frame_bce(
+        student_logits[0],
+        teacher_blank_log_probs,
+        blank_id=5,
+        ignored_token_ids=(4,),
+    )
+    expected = 0.5 * (frame_loss[0] + frame_loss[1:].mean())
+
+    assert loss.item() == pytest.approx(expected.item())
+    assert matched == 1
+    assert missing == 0
+    loss.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad[0, 0]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[0, 1:]).item() > 0
+    assert torch.count_nonzero(student_logits.grad[..., 4]).item() == 0
+
+
+def test_ctc_teacher_decoder_hidden_loss_aligns_all_decoder_states() -> None:
+    student_hiddens = {
+        "input": torch.randn(2, 4, 6, requires_grad=True),
+        "layer_0": torch.randn(2, 4, 6, requires_grad=True),
+        "layer_1": torch.randn(2, 4, 6, requires_grad=True),
+    }
+    teacher_records = {
+        "utt-a": {
+            "ctc_decoder_hiddens": {
+                name: value[0, :4].detach().clone()
+                for name, value in student_hiddens.items()
+            }
+        },
+        "utt-b": {
+            "ctc_decoder_hiddens": {
+                name: value[1, :2].detach().clone() + 0.25
+                for name, value in student_hiddens.items()
+            }
+        },
+    }
+
+    result = _ctc_teacher_decoder_hidden_loss(
+        student_hiddens,
+        torch.tensor([4, 2]),
+        ["utt-a", "utt-b"],
+        teacher_records,
+        normalized_mse_weight=1.0,
+        cosine_weight=0.25,
+        energy_mse_weight=0.25,
+        log_rms_weight=0.1,
+        raw_mse_weight=0.0,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+
+    assert torch.isfinite(result.loss)
+    assert result.loss.item() > 0.0
+    assert set(result.state_losses) == {"input", "layer_0", "layer_1"}
+    assert result.matched_samples == 2
+    assert result.missing_samples == 0
+    assert result.events == 6
+    assert result.max_frame_delta == 0
+    result.loss.backward()
+    for hidden in student_hiddens.values():
+        assert hidden.grad is not None
+        assert torch.isfinite(hidden.grad).all()
+
+
+def test_ctc_teacher_decoder_hidden_loss_packs_metric_kernels_by_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(23)
+    batch_size = 4
+    state_names = ("input", "layer_0", "layer_1")
+    lengths = torch.tensor([5, 4, 3, 2])
+    student_hiddens = {
+        name: torch.randn(batch_size, 5, 8, requires_grad=True) for name in state_names
+    }
+    teacher_records = {
+        f"utt-{sample_idx}": {
+            "ctc_decoder_hiddens": {
+                name: student_hiddens[name][
+                    sample_idx, : int(lengths[sample_idx])
+                ].detach().to(dtype=torch.float16)
+                for name in state_names
+            }
+        }
+        for sample_idx in range(batch_size)
+    }
+    calls = {"layer_norm": 0, "cosine": 0}
+    original_layer_norm = F.layer_norm
+    original_cosine = F.cosine_similarity
+
+    def counted_layer_norm(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["layer_norm"] += 1
+        return original_layer_norm(*args, **kwargs)
+
+    def counted_cosine(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["cosine"] += 1
+        return original_cosine(*args, **kwargs)
+
+    monkeypatch.setattr(F, "layer_norm", counted_layer_norm)
+    monkeypatch.setattr(F, "cosine_similarity", counted_cosine)
+    result = _ctc_teacher_decoder_hidden_loss(
+        student_hiddens,
+        lengths,
+        tuple(teacher_records),
+        teacher_records,
+        normalized_mse_weight=1.0,
+        cosine_weight=0.25,
+        energy_mse_weight=0.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=0.0,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+
+    assert calls == {"layer_norm": len(state_names) * 2, "cosine": len(state_names)}
+    assert result.events == batch_size * len(state_names)
+    assert result.matched_samples == batch_size
+    result.loss.backward()
+    assert all(hidden.grad is not None for hidden in student_hiddens.values())
+
+
+def test_ctc_teacher_decoder_hidden_loss_balances_teacher_active_and_blank_frames() -> None:
+    student = torch.tensor(
+        [[[2.0, 2.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]],
+        requires_grad=True,
+    )
+    result = _ctc_teacher_decoder_hidden_loss(
+        {"input": student},
+        torch.tensor([4]),
+        ["utt-a"],
+        {
+            "utt-a": {
+                "ctc_decoder_hiddens": {"input": torch.zeros(4, 2)},
+                "topk_token_ids": torch.tensor([[1], [5], [5], [5]]),
+                "topk_log_probs": torch.zeros(4, 1),
+                "project_blank_id": 5,
+                "project_ignored_token_ids": [4],
+            }
+        },
+        normalized_mse_weight=0.0,
+        cosine_weight=0.0,
+        energy_mse_weight=0.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=1.0,
+        frame_tolerance=0,
+        missing_policy="error",
+        frame_balance_mode="teacher_top1_balanced",
+        blank_id=5,
+    )
+
+    assert result.loss.item() == pytest.approx(2.5)
+    assert result.state_losses["input"].item() == pytest.approx(2.5)
+    result.loss.backward()
+    assert student.grad is not None
+    assert torch.count_nonzero(student.grad[0, 0]).item() == 2
+    assert torch.count_nonzero(student.grad[0, 1:]).item() == 6
+
+
 def test_ctc_suppressed_token_ids_mask_logits_but_not_blank() -> None:
     model = RWKVCTCModel(
         RWKVCTCModelConfig(
@@ -424,6 +1335,65 @@ def test_ctc_suppressed_token_ids_mask_logits_but_not_blank() -> None:
     assert masked[..., 3].max().item() < -999.0
     assert torch.equal(masked[..., 7], logits[..., 7])
     assert torch.equal(masked[..., 0], logits[..., 0])
+
+
+def test_ctc_loss_rejects_suppressed_non_pronunciation_target() -> None:
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=1,
+            head_size=4,
+            vocab_size=8,
+            blank_id=7,
+            ctc_suppressed_token_ids=(3,),
+        )
+    )
+
+    with pytest.raises(ValueError, match=r"suppressed non-pronunciation token ids: \[3\]"):
+        model.ctc_loss(
+            torch.zeros(1, 3, 8),
+            torch.tensor([3]),
+            torch.tensor([1, 3]),
+            torch.tensor([2]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("targets", "target_lengths", "message"),
+    (
+        ([1, 7], [2], "must not contain the blank token id 7"),
+        ([1, 8], [2], r"outside \[0, 8\): \[8\]"),
+        ([1, 2], [1], "Packed CTC target length mismatch"),
+    ),
+)
+def test_ctc_loss_rejects_invalid_packed_targets(
+    targets: list[int],
+    target_lengths: list[int],
+    message: str,
+) -> None:
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=1,
+            head_size=4,
+            vocab_size=8,
+            blank_id=7,
+        )
+    )
+
+    with pytest.raises(ValueError, match=message):
+        model.ctc_loss(
+            torch.zeros(1, 3, 8),
+            torch.tensor([3]),
+            torch.tensor(targets),
+            torch.tensor(target_lengths),
+        )
 
 
 def test_ctc_teacher_nonblank_hard_loss_selects_teacher_emission_frames() -> None:
@@ -533,6 +1503,70 @@ def test_ctc_teacher_nonblank_window_loss_allows_local_emission_shift() -> None:
     assert events == 1
     assert torch.allclose(token_loss, expected_token)
     assert torch.allclose(margin_loss, torch.tensor(0.0))
+
+
+def test_ctc_teacher_conditional_nonblank_window_hard_loss_isolates_blank_and_ignored() -> None:
+    student_logits = torch.zeros(1, 5, 6, requires_grad=True)
+    with torch.no_grad():
+        student_logits[0, 2, 4] = 20.0
+        student_logits[0, 2, 5] = 20.0
+        student_logits[0, 3, 2] = 5.0
+    teacher_ids = torch.tensor(
+        [
+            [5, 1],
+            [5, 1],
+            [2, 5],
+            [5, 3],
+            [5, 3],
+        ],
+        dtype=torch.long,
+    )
+    teacher_log_probs = torch.log(
+        torch.tensor(
+            [
+                [0.95, 0.05],
+                [0.90, 0.10],
+                [0.80, 0.20],
+                [0.96, 0.04],
+                [0.96, 0.04],
+            ],
+            dtype=torch.float32,
+        )
+    )
+    records = {
+        "utt-1": {
+            "topk_token_ids": teacher_ids,
+            "topk_log_probs": teacher_log_probs,
+            "project_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        }
+    }
+
+    token_loss, _, matched, missing, events = _ctc_teacher_nonblank_window_loss(
+        student_logits,
+        torch.tensor([5]),
+        ["utt-1"],
+        records,
+        blank_id=5,
+        time_map="nearest",
+        frame_filter_min_nonblank_prob=0.5,
+        missing_policy="error",
+        margin=0.0,
+        window_radius=1,
+        temperature=0.0,
+        loss_mode="conditional_nonblank_hard",
+    )
+
+    legal_logits = student_logits[0, 3, :4].unsqueeze(0)
+    expected = F.cross_entropy(legal_logits, torch.tensor([2]))
+    assert matched == 1
+    assert missing == 0
+    assert events == 1
+    assert torch.allclose(token_loss, expected)
+    token_loss.backward()
+    assert student_logits.grad is not None
+    assert torch.count_nonzero(student_logits.grad[..., 4]) == 0
+    assert torch.count_nonzero(student_logits.grad[..., 5]) == 0
 
 
 def test_ctc_teacher_nonblank_window_topk_loss_uses_local_nonblank_distribution() -> None:
@@ -679,6 +1713,60 @@ def test_ctc_teacher_hidden_loss_matches_equal_encoder_states() -> None:
     assert matched == 1
     assert missing == 0
     assert torch.equal(loss, torch.zeros_like(loss))
+
+
+@pytest.mark.parametrize("time_map", ["nearest", "linear"])
+def test_ctc_teacher_hidden_loss_maps_different_encoder_lengths(time_map: str) -> None:
+    student = torch.randn(2, 5, 4, requires_grad=True)
+    records = {
+        "utt0": {"encoder_out": torch.randn(3, 4, dtype=torch.float16)},
+        "utt1": {"encoder_out": torch.randn(4, 4, dtype=torch.float16)},
+    }
+
+    loss, matched, missing = _ctc_teacher_hidden_loss(
+        student,
+        torch.tensor([5, 4]),
+        ("utt0", "utt1"),
+        records,
+        teacher_field="encoder_out",
+        time_map=time_map,
+        missing_policy="error",
+    )
+
+    assert matched == 2
+    assert missing == 0
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("time_map", ["nearest", "linear"])
+def test_ctc_teacher_hidden_loss_maps_gpu_teacher_indices_on_teacher_device(
+    time_map: str,
+) -> None:
+    device = torch.device("cuda:0")
+    student = torch.randn(1, 5, 4, device=device, requires_grad=True)
+    teacher = torch.randn(3, 4, device=device, dtype=torch.float16)
+
+    loss, matched, missing = _ctc_teacher_hidden_loss(
+        student,
+        torch.tensor([5], device=device),
+        ("utt0",),
+        {"utt0": {"encoder_out": teacher}},
+        teacher_field="encoder_out",
+        time_map=time_map,
+        missing_policy="error",
+    )
+
+    assert matched == 1
+    assert missing == 0
+    assert loss.device == device
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
 
 
 def test_ctc_teacher_hidden_loss_can_filter_to_teacher_nonblank_frames() -> None:
@@ -1063,6 +2151,126 @@ def test_sensevoice_rwkv_loads_non_attention_matching_keys() -> None:
     assert torch.equal(
         encoder.layers[2].feed_forward.w_2.bias,
         torch.full_like(encoder.layers[2].feed_forward.w_2.bias, 1.25),
+    )
+
+
+def test_sensevoice_rwkv_maps_nano_qkv_into_both_directions() -> None:
+    torch.manual_seed(2451)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=10,
+            n_embd=8,
+            encoder_output_dim=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=3,
+            vocab_size=16,
+            head_size=4,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    encoder = model.encoder.sensevoice_encoder
+    first_basis = torch.linalg.qr(torch.randn(10, 8), mode="reduced").Q.transpose(0, 1)
+    first_qkv = torch.cat(
+        [torch.randn(8, 8) @ first_basis for _ in range(3)],
+        dim=0,
+    )
+    prefixes = ("encoders0.0", "encoders.0", "tp_encoders.0")
+    source: dict[str, torch.Tensor] = {}
+    for layer_idx, prefix in enumerate(prefixes):
+        qkv = first_qkv if layer_idx == 0 else torch.randn(24, 8)
+        source[f"audio_encoder.{prefix}.self_attn.linear_q_k_v.weight"] = qkv
+        source[f"audio_encoder.{prefix}.self_attn.linear_out.weight"] = torch.randn(8, 8)
+
+    report = encoder.load_sensevoice_qkv_state_dict(source)
+
+    assert len(report["loaded"]) == 25
+    assert report["first_layer_reconstruction_errors"]["q"] < 1.0e-5
+    assert report["first_layer_reconstruction_errors"]["k"] < 1.0e-5
+    assert report["first_layer_reconstruction_errors"]["v"] < 1.0e-5
+    first_projection = encoder.layers[0].input_proj
+    assert first_projection is not None
+    for direction in (
+        encoder.layers[0].time_mixer.forward_mixer,
+        encoder.layers[0].time_mixer.backward_mixer,
+    ):
+        for mapped, expected in zip(
+            (direction.receptance.weight, direction.key.weight, direction.value.weight),
+            first_qkv.chunk(3, dim=0),
+            strict=True,
+        ):
+            reconstructed = mapped.float() @ first_projection.weight.float()
+            assert torch.allclose(reconstructed, expected, atol=2.0e-5, rtol=2.0e-5)
+
+    second_q, second_k, second_v = source[
+        "audio_encoder.encoders.0.self_attn.linear_q_k_v.weight"
+    ].chunk(3, dim=0)
+    for direction in (
+        encoder.layers[1].time_mixer.forward_mixer,
+        encoder.layers[1].time_mixer.backward_mixer,
+    ):
+        assert torch.equal(direction.receptance.weight, second_q)
+        assert torch.equal(direction.key.weight, second_k)
+        assert torch.equal(direction.value.weight, second_v)
+        assert torch.equal(
+            direction.output.weight,
+            source["audio_encoder.encoders.0.self_attn.linear_out.weight"],
+        )
+
+
+def test_sensevoice_rwkv_can_norm_match_nano_qkv_directions() -> None:
+    torch.manual_seed(2452)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=10,
+            n_embd=8,
+            encoder_output_dim=8,
+            dim_att=8,
+            dim_ff=16,
+            num_layers=3,
+            vocab_size=16,
+            head_size=4,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    encoder = model.encoder.sensevoice_encoder
+    prefixes = ("encoders0.0", "encoders.0", "tp_encoders.0")
+    source: dict[str, torch.Tensor] = {}
+    for prefix in prefixes:
+        source[f"audio_encoder.{prefix}.self_attn.linear_q_k_v.weight"] = torch.randn(24, 10 if prefix == "encoders0.0" else 8)
+        source[f"audio_encoder.{prefix}.self_attn.linear_out.weight"] = torch.randn(8, 8)
+
+    report = encoder.load_sensevoice_qkv_state_dict(
+        source,
+        projection_scale_mode="rwkv_norm",
+    )
+
+    assert report["projection_scale_mode"] == "rwkv_norm"
+    target_rms = {
+        "receptance": 0.5 / math.sqrt(3.0 * 8.0),
+        "key": 0.05 / math.sqrt(3.0 * 8.0),
+        "value": 0.5 / math.sqrt(3.0 * 8.0),
+    }
+    for layer in encoder.layers:
+        for direction in (layer.time_mixer.forward_mixer, layer.time_mixer.backward_mixer):
+            for name, expected_rms in target_rms.items():
+                actual_rms = getattr(direction, name).weight.float().square().mean().sqrt().item()
+                assert actual_rms == pytest.approx(expected_rms, rel=1.0e-5)
+
+    second_q = source["audio_encoder.encoders.0.self_attn.linear_q_k_v.weight"].chunk(3, dim=0)[0]
+    mapped_q = encoder.layers[1].time_mixer.forward_mixer.receptance.weight
+    assert torch.nn.functional.cosine_similarity(
+        mapped_q.flatten(),
+        second_q.flatten(),
+        dim=0,
+    ).item() == pytest.approx(1.0, abs=1.0e-6)
+    assert torch.equal(
+        encoder.layers[1].time_mixer.forward_mixer.output.weight,
+        source["audio_encoder.encoders.0.self_attn.linear_out.weight"],
     )
 
 

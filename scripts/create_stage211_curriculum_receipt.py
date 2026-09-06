@@ -1,0 +1,455 @@
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from rwkvasr.config import load_yaml
+from rwkvasr.data import (
+    estimate_bucket_manifest_steps,
+    estimate_bucket_manifest_tail_padding_samples,
+    load_webdataset_bucket_manifest,
+)
+from rwkvasr.eval.stage211_artifact_io import write_immutable_json
+from rwkvasr.eval.stage211_batch_profile import (
+    validate_stage211_batch_profile_admission,
+)
+from rwkvasr.eval.stage211_gate import (
+    STAGE211_ALLOWED_OPERATOR_KEY_MARKERS,
+    STAGE211_AUDIO_CURRICULUM,
+    STAGE211_FULL_DATA_BATCH_SIZE,
+    STAGE211_FULL_DATA_EPOCHS,
+    STAGE211_FULL_DATA_FRAME_BUDGET,
+    STAGE211_FULL_DATA_WORLD_SIZE,
+    resolve_stage211_nano_teacher_checkpoint,
+    sha256_file,
+    validate_stage211_phase_train_config,
+)
+from rwkvasr.eval.stage211_runtime import (
+    audit_stage211_runtime_epoch_coverage,
+)
+from rwkvasr.eval.stage211_supplemental import (
+    STAGE211_SUPPLEMENTAL_DIFFICULTY,
+    stage211_supplemental_profile,
+)
+
+
+def _checkpoint_step(path: Path) -> int:
+    payload = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+    try:
+        return int(payload.get("step", 0))
+    finally:
+        del payload
+
+
+def audit_stage211_checkpoint_delta(
+    *,
+    init_checkpoint_path: Path,
+    completion_checkpoint_path: Path,
+) -> dict[str, Any]:
+    init_payload = torch.load(
+        init_checkpoint_path,
+        map_location="cpu",
+        mmap=True,
+        weights_only=True,
+    )
+    completion_payload = torch.load(
+        completion_checkpoint_path,
+        map_location="cpu",
+        mmap=True,
+        weights_only=True,
+    )
+    try:
+        init_state = init_payload.get("model", init_payload)
+        completion_state = completion_payload.get("model", completion_payload)
+        if not isinstance(init_state, dict) or not isinstance(completion_state, dict):
+            raise ValueError("Stage211 checkpoint delta audit requires model state dictionaries.")
+
+        init_keys = set(init_state)
+        completion_keys = set(completion_state)
+        if init_keys != completion_keys:
+            missing = sorted(init_keys - completion_keys)
+            unexpected = sorted(completion_keys - init_keys)
+            raise ValueError(
+                "Stage211 checkpoint delta tensor keys changed: "
+                f"missing={len(missing)} unexpected={len(unexpected)} "
+                f"first_missing={missing[:3]} first_unexpected={unexpected[:3]}"
+            )
+
+        allowed_changed: list[str] = []
+        forbidden_changed: list[str] = []
+        allowed_unchanged = 0
+        frozen_unchanged = 0
+        allowed_changed_numel = 0
+        for key in sorted(init_keys):
+            initial = init_state[key]
+            completion = completion_state[key]
+            if not isinstance(initial, torch.Tensor) or not isinstance(completion, torch.Tensor):
+                raise ValueError(f"Stage211 checkpoint model entry is not a tensor: {key}")
+            if initial.shape != completion.shape or initial.dtype != completion.dtype:
+                raise ValueError(
+                    "Stage211 checkpoint delta tensor metadata changed: "
+                    f"{key} shape={tuple(initial.shape)}/{tuple(completion.shape)} "
+                    f"dtype={initial.dtype}/{completion.dtype}"
+                )
+            is_allowed = any(marker in key for marker in STAGE211_ALLOWED_OPERATOR_KEY_MARKERS)
+            if torch.equal(initial, completion):
+                if is_allowed:
+                    allowed_unchanged += 1
+                else:
+                    frozen_unchanged += 1
+                continue
+            if is_allowed:
+                allowed_changed.append(key)
+                allowed_changed_numel += int(completion.numel())
+            else:
+                forbidden_changed.append(key)
+
+        if forbidden_changed:
+            raise ValueError(
+                "Stage211 frozen parameter path changed: "
+                f"count={len(forbidden_changed)} first={forbidden_changed[:8]}"
+            )
+        if not allowed_changed:
+            raise ValueError(
+                "Stage211 completion checkpoint changed no TimeMixer/input-projection tensors."
+            )
+        return {
+            "schema_version": 1,
+            "policy": "stage211_timemixer_and_input_projection_only",
+            "complete": True,
+            "allowed_key_markers": list(STAGE211_ALLOWED_OPERATOR_KEY_MARKERS),
+            "initial_tensor_count": len(init_keys),
+            "completion_tensor_count": len(completion_keys),
+            "allowed_changed_tensors": len(allowed_changed),
+            "allowed_changed_numel": allowed_changed_numel,
+            "allowed_unchanged_tensors": allowed_unchanged,
+            "frozen_unchanged_tensors": frozen_unchanged,
+            "forbidden_changed_tensors": 0,
+        }
+    finally:
+        del init_payload, completion_payload
+        gc.collect()
+
+
+def build_receipt(
+    *,
+    phase: str,
+    difficulty: str,
+    run_dir: Path,
+    bucket_manifest_path: Path,
+    init_checkpoint_path: Path,
+    completion_checkpoint_path: Path,
+    supplemental_inventory_path: Path | None = None,
+    batch_profile_admission_path: Path | None = None,
+) -> dict[str, Any]:
+    batch_profile_admission: dict[str, Any] | None = None
+    batch_size = STAGE211_FULL_DATA_BATCH_SIZE
+    frame_budget = STAGE211_FULL_DATA_FRAME_BUDGET
+    num_workers = 8
+    gradient_checkpointing = phase != "mixer"
+    receipt_schema_version = 1
+    if batch_profile_admission_path is not None:
+        batch_profile_admission = validate_stage211_batch_profile_admission(
+            batch_profile_admission_path,
+            phase=phase,
+            expected_init_checkpoint=init_checkpoint_path,
+            expected_bucket_manifest=bucket_manifest_path,
+        )
+        selected_profile = batch_profile_admission["selected_profile"]
+        batch_size = int(selected_profile["batch_size"])
+        frame_budget = int(selected_profile["frame_budget"])
+        num_workers = int(selected_profile["num_workers"])
+        gradient_checkpointing = selected_profile["gradient_checkpointing"]
+        if type(gradient_checkpointing) is not bool:
+            raise ValueError("Stage211 admitted gradient_checkpointing must be boolean.")
+        receipt_schema_version = 2
+    supplemental_profile: dict[str, Any] | None = None
+    if difficulty == STAGE211_SUPPLEMENTAL_DIFFICULTY:
+        if supplemental_inventory_path is None:
+            raise ValueError("Stage211 supplemental coverage requires its inventory.")
+        supplemental_profile = stage211_supplemental_profile(
+            supplemental_inventory_path,
+            epochs=STAGE211_FULL_DATA_EPOCHS,
+            batch_size=batch_size,
+            world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+            frame_budget=frame_budget,
+            require_training_ready=True,
+            verify_part_sha256=True,
+        )
+        expected = supplemental_profile
+    else:
+        if supplemental_inventory_path is not None:
+            raise ValueError(
+                "Stage211 supplemental inventory is valid only for supplemental_natural."
+            )
+        expected = STAGE211_AUDIO_CURRICULUM[difficulty]
+    run_dir = run_dir.resolve()
+    bucket_manifest_path = bucket_manifest_path.resolve()
+    init_checkpoint_path = init_checkpoint_path.resolve()
+    completion_checkpoint_path = completion_checkpoint_path.resolve()
+    for label, path in (
+        ("run directory", run_dir),
+        ("bucket manifest", bucket_manifest_path),
+        ("initial checkpoint", init_checkpoint_path),
+        ("completion checkpoint", completion_checkpoint_path),
+    ):
+        exists = path.is_dir() if label == "run directory" else path.is_file()
+        if not exists:
+            raise FileNotFoundError(f"Stage211 {difficulty} {label} is unavailable: {path}")
+    if (
+        supplemental_profile is not None
+        and bucket_manifest_path
+        != Path(str(supplemental_profile["bucket_manifest_path"])).resolve()
+    ):
+        raise ValueError("Stage211 supplemental receipt manifest differs from its inventory.")
+
+    manifest = load_webdataset_bucket_manifest(bucket_manifest_path)
+    rows = sum(bucket.num_samples for bucket in manifest.splits.get("train", ()))
+    steps_per_epoch = estimate_bucket_manifest_steps(
+        manifest,
+        split="train",
+        batch_size=batch_size,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=frame_budget,
+        drop_last=False,
+    )
+    tail_padding_samples_per_epoch = estimate_bucket_manifest_tail_padding_samples(
+        manifest,
+        split="train",
+        batch_size=batch_size,
+        world_size=STAGE211_FULL_DATA_WORLD_SIZE,
+        frame_budget=frame_budget,
+    )
+    steps = steps_per_epoch * STAGE211_FULL_DATA_EPOCHS
+    expected_steps_per_epoch = (
+        int(batch_profile_admission["selected_coverage"]["steps_per_epoch"])
+        if batch_profile_admission is not None
+        else int(expected["steps_per_epoch"])
+    )
+    expected_steps = expected_steps_per_epoch * STAGE211_FULL_DATA_EPOCHS
+    expected_tail_padding = (
+        int(batch_profile_admission["selected_coverage"]["tail_padding_samples_per_epoch"])
+        if batch_profile_admission is not None
+        else int(expected["tail_padding_samples_per_epoch"])
+    )
+    if (
+        rows != int(expected["rows"])
+        or steps_per_epoch != expected_steps_per_epoch
+        or steps != expected_steps
+        or tail_padding_samples_per_epoch != expected_tail_padding
+    ):
+        raise ValueError(
+            f"Stage211 {difficulty} manifest coverage mismatch: "
+            f"rows={rows}/{expected['rows']} "
+            f"steps_per_epoch={steps_per_epoch}/{expected_steps_per_epoch} "
+            f"steps={steps}/{expected_steps} "
+            "tail_padding_samples_per_epoch="
+            f"{tail_padding_samples_per_epoch}/"
+            f"{expected_tail_padding}"
+        )
+    checkpoint_step = _checkpoint_step(completion_checkpoint_path)
+    if checkpoint_step != expected_steps:
+        raise ValueError(
+            f"Stage211 {difficulty} completion checkpoint step mismatch: "
+            f"actual={checkpoint_step} expected={expected_steps}"
+        )
+
+    provenance_path = run_dir / "stage211_provenance.json"
+    if not provenance_path.is_file():
+        raise ValueError(f"Stage211 curriculum run lacks immutable provenance: {provenance_path}")
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(f"Stage211 curriculum provenance is invalid: {provenance_path}") from error
+    if not isinstance(provenance, dict):
+        raise ValueError("Stage211 curriculum provenance must be a JSON object.")
+    admission_provenance_keys = (
+        "batch_profile_admission_path",
+        "batch_profile_admission_sha256",
+        "batch_profile_name",
+        "batch_size",
+        "frame_budget",
+        "num_workers",
+        "gradient_checkpointing",
+    )
+    if batch_profile_admission is not None:
+        expected_admission_provenance = {
+            "batch_profile_admission_path": batch_profile_admission["receipt_path"],
+            "batch_profile_admission_sha256": batch_profile_admission["receipt_sha256"],
+            "batch_profile_name": batch_profile_admission["selected_profile"]["name"],
+            "batch_size": batch_size,
+            "frame_budget": frame_budget,
+            "num_workers": num_workers,
+            "gradient_checkpointing": gradient_checkpointing,
+        }
+        if any(
+            provenance.get(key) != value for key, value in expected_admission_provenance.items()
+        ):
+            raise ValueError(f"Stage211 {difficulty} provenance batch-profile binding mismatch.")
+    elif any(provenance.get(key) is not None for key in admission_provenance_keys):
+        raise ValueError(f"Stage211 {difficulty} legacy provenance cannot bind a batch profile.")
+    train_config_path = run_dir / "train_config.yaml"
+    if not train_config_path.is_file():
+        raise ValueError(f"Stage211 curriculum run lacks train config: {train_config_path}")
+    train_config = load_yaml(train_config_path)
+    expected_train_config = {
+        "max_steps": expected_steps,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "batch_token_budget": frame_budget,
+        "length_bucket_frame_budget": frame_budget,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
+        "freeze_encoder": False,
+        "freeze_encoder_except_time_mixer": True,
+        "freeze_ctc_decoder": True,
+        "freeze_ctc_head": True,
+        "weight_decay": 0.0,
+        "gradient_checkpointing": gradient_checkpointing,
+    }
+    for key, value in expected_train_config.items():
+        if train_config.get(key) != value:
+            raise ValueError(
+                f"Stage211 {difficulty} train config {key} mismatch: "
+                f"actual={train_config.get(key)!r} expected={value!r}"
+            )
+    if batch_profile_admission is not None:
+        expected_admission_config = {
+            "stage211_batch_profile_admission_path": batch_profile_admission["receipt_path"],
+            "stage211_batch_profile_admission_sha256": batch_profile_admission["receipt_sha256"],
+            "stage211_batch_profile_name": batch_profile_admission["selected_profile"]["name"],
+            "stage211_batch_profile_num_workers": num_workers,
+            "stage211_batch_profile_gradient_checkpointing": gradient_checkpointing,
+        }
+        for key, value in expected_admission_config.items():
+            if train_config.get(key) != value:
+                raise ValueError(
+                    f"Stage211 {difficulty} train config {key} mismatch: "
+                    f"actual={train_config.get(key)!r} expected={value!r}"
+                )
+    elif any(
+        train_config.get(key) is not None
+        for key in (
+            "stage211_batch_profile_admission_path",
+            "stage211_batch_profile_admission_sha256",
+            "stage211_batch_profile_name",
+            "stage211_batch_profile_num_workers",
+            "stage211_batch_profile_gradient_checkpointing",
+        )
+    ):
+        raise ValueError(
+            f"Stage211 {difficulty} legacy receipt cannot bind an admitted batch profile."
+        )
+    validate_stage211_phase_train_config(train_config, phase=phase)
+    nano_teacher_checkpoint_path = resolve_stage211_nano_teacher_checkpoint(train_config)
+    tail_padding_sample_exposures = tail_padding_samples_per_epoch * STAGE211_FULL_DATA_EPOCHS
+    parameter_delta_audit = audit_stage211_checkpoint_delta(
+        init_checkpoint_path=init_checkpoint_path,
+        completion_checkpoint_path=completion_checkpoint_path,
+    )
+    runtime_epoch_coverage = audit_stage211_runtime_epoch_coverage(
+        run_dir=run_dir,
+        epochs=STAGE211_FULL_DATA_EPOCHS,
+        steps_per_epoch=steps_per_epoch,
+    )
+    receipt = {
+        "schema_version": receipt_schema_version,
+        "pipeline": "stage211",
+        "artifact": "curriculum_coverage",
+        "phase": phase,
+        "difficulty": difficulty,
+        "complete": True,
+        "full_data_profile": True,
+        "epochs": STAGE211_FULL_DATA_EPOCHS,
+        "batch_size": batch_size,
+        "world_size": STAGE211_FULL_DATA_WORLD_SIZE,
+        "frame_budget": frame_budget,
+        "length_bucket_drop_last": False,
+        "skip_oversized_samples": False,
+        "webdataset_skip_decode_errors": False,
+        "rows": rows,
+        "row_exposures": rows * STAGE211_FULL_DATA_EPOCHS,
+        "tail_padding_samples_per_epoch": tail_padding_samples_per_epoch,
+        "tail_padding_sample_exposures": tail_padding_sample_exposures,
+        "executed_sample_exposures": (
+            rows * STAGE211_FULL_DATA_EPOCHS + tail_padding_sample_exposures
+        ),
+        "hours": float(expected["hours"]),
+        "hour_exposures": float(expected["hours"]) * STAGE211_FULL_DATA_EPOCHS,
+        "steps_per_epoch": steps_per_epoch,
+        "steps": steps,
+        "run_dir": str(run_dir),
+        "provenance_path": str(provenance_path),
+        "provenance_sha256": sha256_file(provenance_path),
+        "train_config_path": str(train_config_path),
+        "train_config_sha256": sha256_file(train_config_path),
+        "nano_teacher_checkpoint_path": str(nano_teacher_checkpoint_path),
+        "nano_teacher_checkpoint_sha256": sha256_file(nano_teacher_checkpoint_path),
+        "bucket_manifest_path": str(bucket_manifest_path),
+        "bucket_manifest_sha256": sha256_file(bucket_manifest_path),
+        "init_checkpoint_path": str(init_checkpoint_path),
+        "init_checkpoint_sha256": sha256_file(init_checkpoint_path),
+        "completion_checkpoint_path": str(completion_checkpoint_path),
+        "completion_checkpoint_sha256": sha256_file(completion_checkpoint_path),
+        "parameter_delta_audit": parameter_delta_audit,
+        "runtime_epoch_coverage": runtime_epoch_coverage,
+    }
+    if supplemental_profile is not None:
+        receipt["supplemental_inventory_path"] = str(supplemental_profile["inventory_path"])
+        receipt["supplemental_inventory_sha256"] = str(supplemental_profile["inventory_sha256"])
+    if batch_profile_admission is not None:
+        receipt["batch_profile_admission_path"] = batch_profile_admission["receipt_path"]
+        receipt["batch_profile_admission_sha256"] = batch_profile_admission["receipt_sha256"]
+        receipt["batch_profile_name"] = batch_profile_admission["selected_profile"]["name"]
+        receipt["num_workers"] = num_workers
+        receipt["gradient_checkpointing"] = gradient_checkpointing
+    return receipt
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Create an immutable Stage211 full-data curriculum-segment receipt."
+    )
+    parser.add_argument("--phase", choices=("mixer", "block", "logits"), required=True)
+    parser.add_argument(
+        "--difficulty",
+        choices=(*tuple(STAGE211_AUDIO_CURRICULUM), STAGE211_SUPPLEMENTAL_DIFFICULTY),
+        required=True,
+    )
+    parser.add_argument("--supplemental-inventory", type=Path, default=None)
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--bucket-manifest", type=Path, required=True)
+    parser.add_argument("--init-checkpoint", type=Path, required=True)
+    parser.add_argument("--completion-checkpoint", type=Path, required=True)
+    parser.add_argument("--batch-profile-admission", type=Path, default=None)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+
+    receipt = build_receipt(
+        phase=str(args.phase),
+        difficulty=str(args.difficulty),
+        run_dir=args.run_dir,
+        bucket_manifest_path=args.bucket_manifest,
+        init_checkpoint_path=args.init_checkpoint,
+        completion_checkpoint_path=args.completion_checkpoint,
+        supplemental_inventory_path=args.supplemental_inventory,
+        batch_profile_admission_path=args.batch_profile_admission,
+    )
+    output_path = args.output.resolve()
+    write_immutable_json(output_path, receipt, label="coverage receipt")
+    print(
+        f"coverage_receipt={output_path} phase={receipt['phase']} "
+        f"difficulty={receipt['difficulty']} rows={receipt['rows']} steps={receipt['steps']}",
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
