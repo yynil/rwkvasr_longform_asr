@@ -10,11 +10,14 @@ from rwkvasr.eval.stage211_artifact_io import write_immutable_text
 from rwkvasr.eval.stage211_gate import (
     STAGE211_FIXED_ALIGNMENT_EVAL_SAMPLES,
     STAGE211_FULL_DATA_EPOCHS,
+    STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT,
+    STAGE211_PROMOTION_POLICY_STRICT,
     STAGE211_PUBLIC_BENCHMARKS,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
     STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
     STAGE211_SFT_STEP_EVAL_INTERVAL,
     STAGE211_STEP_EVAL_INTERVAL,
+    build_stage211_alignment_loss_nondivergence,
     build_stage211_correction_round_promotion_gate,
     sha256_file,
     validate_stage211_nano_public_baseline_receipt,
@@ -1008,16 +1011,44 @@ def _decoder_result(raw: Any, *, label: str) -> dict[str, Any] | None:
     }
 
 
+def _strict_quality_required(*, phase: str, phase_report: dict[str, Any]) -> bool:
+    policy = phase_report.get("promotion_policy", STAGE211_PROMOTION_POLICY_STRICT)
+    if phase_report.get("gate_passed") is not True:
+        raise ValueError(f"Stage211 {phase} promotion did not pass.")
+    if policy == STAGE211_PROMOTION_POLICY_STRICT:
+        return True
+    if policy != STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT or phase != "mixer":
+        raise ValueError(f"Stage211 {phase} has an unsupported promotion policy: {policy!r}.")
+    evidence = phase_report.get("alignment_loss_nondivergence")
+    if not isinstance(evidence, dict):
+        raise ValueError("Stage211 Mixer promotion lacks loss non-divergence evidence.")
+    replayed = build_stage211_alignment_loss_nondivergence(
+        baseline_source={"eval_loss": evidence.get("baseline_loss")},
+        candidate_source={"eval_loss": evidence.get("candidate_loss")},
+    )
+    if (
+        evidence != replayed
+        or replayed["gate_passed"] is not True
+        or not isinstance(phase_report.get("strict_metric_gate_passed"), bool)
+        or phase_report.get("correction_round_promotion")
+        != build_stage211_correction_round_promotion_gate(0)
+    ):
+        raise ValueError("Stage211 Mixer coverage/non-divergence promotion is inconsistent.")
+    return False
+
+
 def _trajectory_retention_result(
     *,
     phase: str,
     phase_report: dict[str, Any],
 ) -> dict[str, Any]:
+    strict_quality_required = _strict_quality_required(phase=phase, phase_report=phase_report)
     trajectory = phase_report.get("trajectory_retention")
     if (
         not isinstance(trajectory, dict)
-        or phase_report.get("trajectory_retention_gate_passed") is not True
-        or trajectory.get("gate_passed") is not True
+        or not isinstance(trajectory.get("gate_passed"), bool)
+        or phase_report.get("trajectory_retention_gate_passed") is not trajectory["gate_passed"]
+        or (strict_quality_required and trajectory["gate_passed"] is not True)
         or int(trajectory.get("fixed_eval_samples", -1)) != 256
         or float(trajectory.get("max_relative_regression_pct", float("nan"))) != 10.0
     ):
@@ -1039,7 +1070,8 @@ def _trajectory_retention_result(
     if candidate.get("checkpoint_sha256") != phase_report.get("checkpoint_sha256"):
         raise ValueError(f"Stage211 {phase} trajectory candidate checkpoint mismatch.")
     return {
-        "gate_passed": True,
+        "gate_passed": trajectory["gate_passed"],
+        "required_for_promotion": strict_quality_required,
         "fixed_eval_samples": 256,
         "source_order": [str(value) for value in source_order],
         "terminal_entries": len(entries),
@@ -1130,6 +1162,7 @@ def _step_eval_cadence_result(
 
 
 def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, Any]:
+    strict_quality_required = _strict_quality_required(phase=phase, phase_report=phase_report)
     record = phase_report.get("alignment_report")
     if not isinstance(record, dict):
         raise ValueError(f"Stage211 {phase} phase report lacks alignment evidence.")
@@ -1142,10 +1175,19 @@ def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, 
         source.get("pipeline") != "stage211"
         or source.get("artifact") != expected_artifact
         or source.get("phase") != phase
-        or source.get("gate_passed") is not True
-        or phase_report.get("alignment_gate_passed") is not True
+        or not isinstance(source.get("gate_passed"), bool)
+        or phase_report.get("alignment_gate_passed") is not source["gate_passed"]
+        or not isinstance(source.get("stratified_gate_passed"), bool)
+        or (strict_quality_required and source["gate_passed"] is not True)
     ):
         raise ValueError(f"Stage211 {phase} alignment disclosure source did not pass.")
+    if not strict_quality_required:
+        replayed = build_stage211_alignment_loss_nondivergence(
+            baseline_source={"eval_loss": source.get("baseline_eval_loss")},
+            candidate_source={"eval_loss": source.get("candidate_eval_loss")},
+        )
+        if phase_report["alignment_loss_nondivergence"] != replayed:
+            raise ValueError("Stage211 Mixer non-divergence loss differs from alignment evidence.")
     stratified = source.get("stratified_summary")
     if not isinstance(stratified, dict) or set(stratified.get("cells", {})) != set(ALIGNMENT_CELLS):
         raise ValueError(f"Stage211 {phase} alignment disclosure lacks nine-cell evidence.")
@@ -1153,7 +1195,11 @@ def _alignment_result(*, phase: str, phase_report: dict[str, Any]) -> dict[str, 
         "stage": phase,
         "label": STAGE_LABELS[phase],
         "objective": "ctc_logits" if phase == "logits" else "hidden_states",
-        "gate_passed": True,
+        "gate_passed": source["gate_passed"],
+        "phase_gate_passed": phase_report["gate_passed"],
+        "promotion_policy": phase_report.get("promotion_policy", STAGE211_PROMOTION_POLICY_STRICT),
+        "strict_metric_gate_passed": phase_report.get("strict_metric_gate_passed", True),
+        "alignment_loss_nondivergence": phase_report.get("alignment_loss_nondivergence"),
         "source_report_path": str(source_path),
         "source_report_sha256": sha256_file(source_path),
         "baseline_checkpoint_path": str(source["baseline_checkpoint_path"]),
@@ -2333,12 +2379,30 @@ def render_markdown(report: dict[str, Any]) -> str:
         )
     )
     for alignment in report["alignment_results"]:
+        status = "pass" if alignment["gate_passed"] else "fail (diagnostic)"
         lines.append(
             f"| {alignment['label']} | {int(alignment['fixed_eval_samples'])} | "
             f"{int(alignment['stratified_samples']):,} | "
             f"{len(alignment['stratified_cells'])} | "
-            f"`{alignment['source_report_sha256']}` | pass |"
+            f"`{alignment['source_report_sha256']}` | {status} |"
         )
+    for alignment in report["alignment_results"]:
+        if alignment["promotion_policy"] == STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT:
+            evidence = alignment["alignment_loss_nondivergence"]
+            strict_status = "pass" if alignment["strict_metric_gate_passed"] else "fail"
+            lines.extend(
+                (
+                    "",
+                    f"{alignment['label']} promotion: `{alignment['promotion_policy']}`; "
+                    f"strict quality: **{strict_status}** (diagnostic). "
+                    f"Fixed alignment loss {float(evidence['baseline_loss']):.6f} -> "
+                    f"{float(evidence['candidate_loss']):.6f}, ratio "
+                    f"{float(evidence['candidate_to_baseline_ratio']):.6f} <= "
+                    f"{float(evidence['maximum_ratio']):.2f}; zero replay corrections. "
+                    "Full-data coverage and all evaluation evidence remain required. "
+                    "Failed diagnostics are not passed quality gates.",
+                )
+            )
     lines.extend(
         (
             "",
@@ -2351,6 +2415,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     )
     for alignment in report["alignment_results"]:
         trajectory = alignment["trajectory_retention"]
+        status = "pass" if trajectory["gate_passed"] else "fail (diagnostic)"
         lines.append(
             f"| {alignment['label']} | {int(trajectory['terminal_entries'])} | "
             f"`{trajectory['best_prior_source']}` | "
@@ -2358,7 +2423,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"`{trajectory['candidate_source']}` | "
             f"{float(trajectory['candidate_loss']):.6f} | "
             f"{float(trajectory['relative_regression_pct']):+.3f}% | "
-            f"{float(trajectory['max_relative_regression_pct']):.3f}% | pass |"
+            f"{float(trajectory['max_relative_regression_pct']):.3f}% | {status} |"
         )
     lines.extend(
         (

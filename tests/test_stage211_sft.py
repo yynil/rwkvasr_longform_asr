@@ -2387,11 +2387,108 @@ def test_stepwise_cli_resolves_mixer_gate_from_final_report(
     )
 
 
+def _use_coverage_mixer_promotion(reports: dict[str, Path]) -> dict[str, object]:
+    path = reports["mixer"]
+    gate = json.loads(path.read_text(encoding="utf-8"))
+    gate["promotion_policy"] = stepwise_report.STAGE211_PROMOTION_POLICY_COVERAGE_NON_DIVERGENT
+    gate["strict_metric_gate_passed"] = False
+    gate["alignment_gate_passed"] = False
+    gate["trajectory_retention_gate_passed"] = False
+    gate["trajectory_retention"].update(
+        gate_passed=False,
+        candidate_loss=0.6,
+        relative_regression_pct=20.0,
+    )
+    gate["trajectory_retention"]["candidate"]["eval_loss"] = 0.6
+    alignment_path = Path(gate["alignment_report"]["path"])
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment.update(gate_passed=False, stratified_gate_passed=False)
+    alignment_path.write_text(json.dumps(alignment) + "\n", encoding="utf-8")
+    gate["alignment_report"]["sha256"] = sha256_file(alignment_path)
+    gate["alignment_loss_nondivergence"] = (
+        stepwise_report.build_stage211_alignment_loss_nondivergence(
+            baseline_source={"eval_loss": alignment["baseline_eval_loss"]},
+            candidate_source={"eval_loss": alignment["candidate_eval_loss"]},
+        )
+    )
+    path.write_text(json.dumps(gate) + "\n", encoding="utf-8")
+    sft = json.loads(reports["sft"].read_text(encoding="utf-8"))
+    sft["mixer_phase_gate_sha256"] = sha256_file(path)
+    reports["sft"].write_text(json.dumps(sft) + "\n", encoding="utf-8")
+    return gate
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "wrong_phase",
+        "unknown_policy",
+        "missing_loss",
+        "divergent_loss",
+        "changed_ratio",
+        "unbound_loss",
+        "corrections_started",
+        "missing_strict_decision",
+        "missing_trajectory",
+        "missing_alignment",
+        "strict_trajectory_failure",
+    ],
+)
+def test_stage211_stepwise_mixer_diagnostics_require_valid_promotion_evidence(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    _, reports = _write_stepwise_inputs(tmp_path)
+    gate = _use_coverage_mixer_promotion(reports)
+    phase = "mixer"
+    if damage == "wrong_phase":
+        phase = "block"
+    elif damage == "unknown_policy":
+        gate["promotion_policy"] = "unchecked"
+    elif damage == "missing_loss":
+        del gate["alignment_loss_nondivergence"]
+    elif damage == "divergent_loss":
+        gate["alignment_loss_nondivergence"] = (
+            stepwise_report.build_stage211_alignment_loss_nondivergence(
+                baseline_source={"eval_loss": 1.0},
+                candidate_source={"eval_loss": 1.3},
+            )
+        )
+    elif damage == "changed_ratio":
+        gate["alignment_loss_nondivergence"]["candidate_to_baseline_ratio"] = 0.1
+    elif damage == "unbound_loss":
+        gate["alignment_loss_nondivergence"] = (
+            stepwise_report.build_stage211_alignment_loss_nondivergence(
+                baseline_source={"eval_loss": 2.0},
+                candidate_source={"eval_loss": 0.5},
+            )
+        )
+    elif damage == "corrections_started":
+        gate["correction_round_promotion"] = build_stage211_correction_round_promotion_gate(3)
+    elif damage == "missing_strict_decision":
+        del gate["strict_metric_gate_passed"]
+    elif damage == "missing_trajectory":
+        del gate["trajectory_retention"]["gate_passed"]
+    elif damage == "missing_alignment":
+        del gate["alignment_gate_passed"]
+    elif damage == "strict_trajectory_failure":
+        gate["promotion_policy"] = stepwise_report.STAGE211_PROMOTION_POLICY_STRICT
+        with pytest.raises(ValueError, match="trajectory-retention"):
+            stepwise_report._trajectory_retention_result(phase=phase, phase_report=gate)
+        return
+    with pytest.raises(ValueError):
+        stepwise_report._alignment_result(phase=phase, phase_report=gate)
+
+
+@pytest.mark.parametrize("coverage_mixer", [False, True])
 def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    coverage_mixer: bool,
 ) -> None:
     checkpoints, reports = _write_stepwise_inputs(tmp_path)
+    if coverage_mixer:
+        _use_coverage_mixer_promotion(reports)
 
     def validate_phase(path: Path, *, expected_phase: str, checkpoint_path: Path):
         report = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -2763,6 +2860,19 @@ def test_stage211_stepwise_report_binds_ordered_metrics_and_checkpoint_chain(
     }
     assert len(report["dataset_results"]) == len(STAGE211_PUBLIC_BENCHMARKS)
     assert report["all_stage_alignment_results_complete"] is True
+    if coverage_mixer:
+        mixer_alignment = report["alignment_results"][0]
+        assert mixer_alignment["phase_gate_passed"] is True
+        assert mixer_alignment["gate_passed"] is False
+        assert mixer_alignment["stratified_gate_passed"] is False
+        assert mixer_alignment["strict_metric_gate_passed"] is False
+        assert mixer_alignment["trajectory_retention"]["gate_passed"] is False
+        assert mixer_alignment["trajectory_retention"]["required_for_promotion"] is False
+        assert report["coverage_results"][0]["correction_rounds"] == 0
+        markdown = output_markdown.read_text(encoding="utf-8")
+        assert "strict quality: **fail** (diagnostic)" in markdown
+        assert "| fail (diagnostic) |" in markdown
+        assert "Failed diagnostics are not passed quality gates." in markdown
     assert [row["stage"] for row in report["alignment_results"]] == [
         "mixer",
         "block",

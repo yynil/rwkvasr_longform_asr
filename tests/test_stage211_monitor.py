@@ -4,6 +4,7 @@ import hashlib
 import os
 import signal
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -11,6 +12,46 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MONITOR = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+
+
+def test_stage211_monitor_parses_progress_and_errors_without_ripgrep(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for command in ("dirname", "grep", "tail", "awk"):
+        (bin_dir / command).symlink_to(shutil.which(command))
+    log = tmp_path / "train.log"
+    log.write_text(
+        "[rwkvasr] Distributed init complete.\n"
+        "Traceback: stale failure\n"
+        "[rwkvasr] Distributed init complete.\n"
+        "[deepspeed-train] step=10 loss=0.2\n"
+        "[deepspeed-train] step=20 loss=0.1\n"
+        "CUDA OOM: current failure\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            shutil.which("bash"),
+            "-c",
+            'source "$1"; stage211_latest_training_record "$2"; '
+            'stage211_current_attempt_errors "$2"',
+            "monitor-test",
+            str(MONITOR),
+            str(log),
+        ],
+        env={**os.environ, "PATH": str(bin_dir)},
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5.0,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout.splitlines() == [
+        "[deepspeed-train] step=20 loss=0.1",
+        "4:CUDA OOM: current failure",
+    ]
 
 
 def test_stage211_monitor_daemon_is_singleton_but_one_shot_remains_available(

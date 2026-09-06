@@ -57,7 +57,7 @@ stage211_current_attempt_start() {
 
 stage211_latest_training_record() {
   local log_path="$1"
-  rg '\[deepspeed-train\] step=' "${log_path}" 2>/dev/null | tail -n 1 || true
+  grep -F '[deepspeed-train] step=' "${log_path}" 2>/dev/null | tail -n 1 || true
 }
 
 stage211_yaml_scalar() {
@@ -254,7 +254,7 @@ stage211_current_attempt_errors() {
   local attempt_start
   attempt_start="$(stage211_current_attempt_start "${log_path}")"
   tail -n "+${attempt_start}" "${log_path}" 2>/dev/null |
-    rg -n -i "${ERROR_PATTERN}" |
+    grep -n -i -E "${ERROR_PATTERN}" |
     tail -n 3 || true
 }
 
@@ -294,7 +294,7 @@ stage211_emit_artifact_status() {
 stage211_emit_sft_readiness() {
   local latest_record processed=0 kept=0 profile_total progress state finalizer_record
   latest_record="$(
-    rg 'ctc-align (progress|lengths complete) processed=[0-9]+ kept=[0-9]+' \
+    grep -E 'ctc-align (progress|lengths complete) processed=[0-9]+ kept=[0-9]+' \
       "${SFT_PREPARATION_LOG}" 2>/dev/null | tail -n 1 || true
   )"
   if [[ -n "${latest_record}" ]]; then
@@ -313,7 +313,7 @@ stage211_emit_sft_readiness() {
       kept="${profile_total}"
     fi
   fi
-  if rg -q -F 'CTC-aligned clean preprocessing complete' "${SFT_PREPARATION_LOG}" 2>/dev/null; then
+  if grep -q -F 'CTC-aligned clean preprocessing complete' "${SFT_PREPARATION_LOG}" 2>/dev/null; then
     state=complete
     processed="${SFT_EXPECTED_INPUT_SAMPLES}"
   elif pgrep -f "build_ctc_aligned_stage_lengths.py.*--output-dir ${SFT_LABELED_ROOT}" \
@@ -443,7 +443,7 @@ stage211_recent_formal_training_logs() {
         continue
         ;;
     esac
-    if rg -q -F "${ATTEMPT_MARKER}" "${log_path}" 2>/dev/null; then
+    if grep -q -F "${ATTEMPT_MARKER}" "${log_path}" 2>/dev/null; then
       printf '%s\0' "${log_path}"
     fi
   done < <(stage211_recent_logs "$@")

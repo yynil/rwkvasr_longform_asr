@@ -5623,6 +5623,7 @@ def test_stage211_stepwise_alignment_disclosure_accepts_deep_phase_evidence(
     assert disclosure["stratified_cells"] == list(stage211_stepwise_report.ALIGNMENT_CELLS)
     assert disclosure["trajectory_retention"] == {
         "gate_passed": True,
+        "required_for_promotion": True,
         "fixed_eval_samples": 256,
         "source_order": [
             "easy",
@@ -8667,6 +8668,23 @@ def _run_stage211_continuation_watcher_fixture(
         'mv "${output_json}.tmp" "${output_json}"\n'
         'jq -c \'(.coverage_results[] | select(.stage == "mixer" or .stage == "block" or .stage == "logits")) += {correction_rounds:3,correction_round_promotion:{schema_version:1,pipeline:"stage211",artifact:"correction_round_promotion_gate",correction_started:true,completed_rounds:3,guaranteed_rounds:3,gate_passed:true}}\' "${output_json}" >"${output_json}.tmp"\n'
         'mv "${output_json}.tmp" "${output_json}"\n'
+        'if [[ "${UV_MODE}" == mixer_coverage ]]; then\n'
+        '  jq \'(.alignment_results[] | select(.stage == "mixer")) += '
+        '{promotion_policy:"complete_coverage_nondivergent_loss",phase_gate_passed:true,'
+        "strict_metric_gate_passed:false,gate_passed:false,stratified_gate_passed:false,"
+        "fixed:{baseline_eval_loss:1,candidate_eval_loss:0.5},"
+        'alignment_loss_nondivergence:{schema_version:1,pipeline:"stage211",'
+        'artifact:"alignment_loss_nondivergence",gate_passed:true,baseline_loss:1,'
+        "candidate_loss:0.5,candidate_to_baseline_ratio:0.5,maximum_ratio:1.2}} | "
+        '(.alignment_results[] | select(.stage == "mixer")).trajectory_retention += '
+        "{gate_passed:false,required_for_promotion:false} | "
+        '(.coverage_results[] | select(.stage == "mixer")) += '
+        "{correction_rounds:0,correction_round_promotion:{schema_version:1,"
+        'pipeline:"stage211",artifact:"correction_round_promotion_gate",'
+        "correction_started:false,completed_rounds:0,guaranteed_rounds:3,gate_passed:true}}"
+        '\' "${output_json}" >"${output_json}.tmp"\n'
+        '  mv "${output_json}.tmp" "${output_json}"\n'
+        "fi\n"
         'if [[ "${UV_MODE}" == missing_alignment ]]; then\n'
         '  sed -i \'s/"all_stage_alignment_results_complete":true/"all_stage_alignment_results_complete":false/\' "${output_json}"\n'
         'elif [[ "${UV_MODE}" == missing_trajectory ]]; then\n'
@@ -8784,6 +8802,79 @@ def test_stage211_continuation_watcher_accepts_corrected_sft_proof(
     assert "SFT and stepwise proofs pass" in result.stdout
     assert "new-session" not in tmux_calls
     assert (phase_gate_root / "sft_corrected" / "stage211_stepwise_results.json").is_file()
+
+
+def test_stage211_continuation_watcher_accepts_approved_mixer_diagnostics(
+    tmp_path: Path,
+) -> None:
+    result, tmux_calls, _ = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="mixer_coverage",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SFT and stepwise proofs pass" in result.stdout
+    assert "new-session" not in tmux_calls
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_loss",
+        "bad_ratio",
+        "block_policy",
+        "block_trajectory",
+        "missing_trajectory",
+        "missing_round_receipt",
+        "zero_block_rounds",
+    ],
+)
+def test_stage211_continuation_watcher_rejects_invalid_diagnostic_exception(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    result, _, root = _run_stage211_continuation_watcher_fixture(
+        tmp_path,
+        uv_mode="mixer_coverage",
+    )
+    assert "SFT and stepwise proofs pass" in result.stdout
+    path = root / "sft/stage211_stepwise_results.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    mixer, block, _ = report["alignment_results"]
+    if damage == "missing_loss":
+        del mixer["alignment_loss_nondivergence"]
+    elif damage == "bad_ratio":
+        mixer["alignment_loss_nondivergence"]["candidate_to_baseline_ratio"] = 0.1
+    elif damage == "block_policy":
+        block["promotion_policy"] = mixer["promotion_policy"]
+    elif damage == "block_trajectory":
+        block["trajectory_retention"]["gate_passed"] = False
+    elif damage == "missing_trajectory":
+        del mixer["trajectory_retention"]["gate_passed"]
+    elif damage == "missing_round_receipt":
+        del report["coverage_results"][0]["correction_round_promotion"]
+    elif damage == "zero_block_rounds":
+        record = report["coverage_results"][1]
+        record["correction_rounds"] = 0
+        record["correction_round_promotion"] = (
+            stage211_stepwise_report.build_stage211_correction_round_promotion_gate(0)
+        )
+    path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    checked = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; stage211_trajectory_results_valid "$2"',
+            "test",
+            str(REPO_ROOT / "scripts/watch_stage211_strict_continuation.sh"),
+            str(path),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5.0,
+    )
+    assert checked.returncode != 0, checked.stdout
 
 
 def test_stage211_continuation_watcher_restarts_after_stepwise_failure(
