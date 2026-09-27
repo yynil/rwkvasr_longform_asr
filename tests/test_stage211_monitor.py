@@ -9,9 +9,50 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MONITOR = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run python -m rwkvasr.cli.train_ctc_deepspeed --config-yaml /tmp/stage211.yaml",
+        "python -m torch.distributed.run --nproc_per_node 4 "
+        "-m rwkvasr.cli.train_ctc_deepspeed --config-yaml /tmp/stage211.yaml",
+        "bash -c python -m rwkvasr.cli.train_ctc_deepspeed --config-yaml /tmp/stage211.yaml",
+        "python -c print(...) -m rwkvasr.cli.train_ctc_deepspeed --config-yaml /tmp/stage211.yaml",
+        "python unrelated.py -m rwkvasr.cli.train_ctc_deepspeed --config-yaml /tmp/stage211.yaml",
+        "python -m unrelated --config-yaml /tmp/stage211.yaml",
+        "python -m rwkvasr.cli.train_ctc_deepspeed --config-yaml /tmp/stage210.yaml",
+        "python -m rwkvasr.cli.train_ctc_deepspeed --run-name stage211",
+        "python -m rwkvasr.cli.train_ctc_deepspeed --config-yaml=",
+        "python -m rwkvasr.cli.train_ctc_deepspeed --config-yaml",
+        "python_not_a_trainer -m rwkvasr.cli.train_ctc_deepspeed --config-yaml /tmp/stage211.yaml",
+        "",
+    ],
+)
+def test_stage211_monitor_excludes_non_rank_processes(command: str) -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; ps() { printf "%s\\n" "$PS_RECORD"; }; '
+            "stage211_active_training_processes; stage211_active_config_paths",
+            "stage211-monitor-test",
+            str(MONITOR),
+        ],
+        env={**os.environ, "PS_RECORD": f"200 S 00:10 0 {command}" if command else ""},
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5.0,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
 
 
 def test_stage211_monitor_parses_progress_and_errors_without_ripgrep(tmp_path: Path) -> None:

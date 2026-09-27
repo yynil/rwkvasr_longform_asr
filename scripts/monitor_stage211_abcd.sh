@@ -199,17 +199,54 @@ stage211_emit_fixed_step_eval_progress() {
   fi
 }
 
-stage211_active_config_paths() {
-  ps -C python3 -o args= 2>/dev/null |
+stage211_active_training_processes() {
+  ps -eo pid=,stat=,etime=,pcpu=,args= 2>/dev/null |
     awk '
-      /rwkvasr\.cli\.train_ctc_deepspeed/ && /stage211/ {
-        for (field_index = 1; field_index <= NF; ++field_index) {
-          if ($field_index == "--config-yaml" && field_index < NF) {
-            print $(field_index + 1)
+      {
+        executable = $5
+        sub(/^.*\//, "", executable)
+        if (executable !~ /^python([0-9]+(\.[0-9]+)*)?$/) next
+        module = ""
+        config = ""
+        for (field_index = 6; field_index < NF; ++field_index) {
+          if ($field_index == "-c") break
+          if ($field_index == "-m") {
+            module = $(field_index + 1)
+            break
+          }
+          if ($field_index == "-W" || $field_index == "-X") {
+            ++field_index
+          } else if ($field_index !~ /^-/) {
+            break
           }
         }
+        if (module != "rwkvasr.cli.train_ctc_deepspeed") next
+        for (field_index = 6; field_index <= NF; ++field_index) {
+          if ($field_index == "--config-yaml" && field_index < NF) {
+            config = $(field_index + 1)
+          } else if ($field_index ~ /^--config-yaml=/) {
+            config = $field_index
+            sub(/^--config-yaml=/, "", config)
+          }
+        }
+        if (config ~ /stage211/) print
       }
-    ' |
+    ' || true
+}
+
+stage211_active_config_paths() {
+  stage211_active_training_processes |
+    awk '{
+      for (field_index = 6; field_index <= NF; ++field_index) {
+        if ($field_index == "--config-yaml" && field_index < NF) {
+          print $(field_index + 1)
+        } else if ($field_index ~ /^--config-yaml=/) {
+          config = $field_index
+          sub(/^--config-yaml=/, "", config)
+          print config
+        }
+      }
+    }' |
     sort -u || true
 }
 
@@ -455,8 +492,7 @@ stage211_emit_snapshot() {
   printf '%s\n' '-- sessions --'
   tmux list-sessions 2>&1 || true
   printf '%s\n' '-- training ranks --'
-  ps -C python3 -o pid=,stat=,etime=,pcpu=,args= 2>/dev/null |
-    awk '/rwkvasr\.cli\.train_ctc_deepspeed/ && /stage211/ { print }' || true
+  stage211_active_training_processes
   printf '%s\n' '-- active training progress --'
   local active_configs=0 config_path
   while IFS= read -r config_path; do

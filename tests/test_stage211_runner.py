@@ -2166,8 +2166,12 @@ def test_stage211_hourly_monitor_rejects_fixed_eval_step_filename_mismatch(
     assert "recorded_step=19 filename_step=20" in result.stdout
 
 
+@pytest.mark.parametrize("interpreter", ["python", "python3", "python3.12", "/venv/bin/python"])
+@pytest.mark.parametrize("config_separator", [" ", "="])
 def test_stage211_hourly_monitor_resolves_one_config_from_four_ranks(
     tmp_path: Path,
+    interpreter: str,
+    config_separator: str,
 ) -> None:
     monitor_script = REPO_ROOT / "scripts" / "monitor_stage211_abcd.sh"
     fake_bin = tmp_path / "bin"
@@ -2175,11 +2179,14 @@ def test_stage211_hourly_monitor_resolves_one_config_from_four_ranks(
     fake_ps = fake_bin / "ps"
     fake_ps.write_text(
         "#!/usr/bin/env bash\n"
+        '[[ "$*" == "-eo pid=,stat=,etime=,pcpu=,args=" ]] || exit 2\n'
         "for rank in 0 1 2 3; do\n"
-        "  printf '%s\\n' \"python3 -m rwkvasr.cli.train_ctc_deepspeed "
-        '--config-yaml /tmp/stage211_active.yaml --rank ${rank}"\n'
+        f"  printf '%s\\n' \"10${{rank}} R 00:10 100 {interpreter} -u -m "
+        "rwkvasr.cli.train_ctc_deepspeed "
+        f'--config-yaml{config_separator}/tmp/stage211_active.yaml --rank ${{rank}}"\n'
         "done\n"
-        "printf '%s\\n' 'python3 -m unrelated --config-yaml /tmp/ignored.yaml'\n",
+        "printf '%s\\n' '200 S 00:10 0 python3 -m unrelated "
+        "--config-yaml /tmp/stage211_ignored.yaml'\n",
         encoding="utf-8",
     )
     fake_ps.chmod(0o755)
@@ -2188,7 +2195,8 @@ def test_stage211_hourly_monitor_resolves_one_config_from_four_ranks(
         [
             "bash",
             "-c",
-            'source "$1"; stage211_active_config_paths',
+            'source "$1"; stage211_active_training_processes; '
+            'printf "configs\\n"; stage211_active_config_paths',
             "stage211-monitor-test",
             str(monitor_script),
         ],
@@ -2200,7 +2208,9 @@ def test_stage211_hourly_monitor_resolves_one_config_from_four_ranks(
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["/tmp/stage211_active.yaml"]
+    lines = result.stdout.splitlines()
+    assert [line.split()[0] for line in lines[:4]] == ["100", "101", "102", "103"]
+    assert lines[4:] == ["configs", "/tmp/stage211_active.yaml"]
 
 
 def test_stage211_hourly_monitor_invokes_social_pcm_progress_reporter(
