@@ -1,15 +1,26 @@
 import io
 import json
+import pickle
+import random
 import sys
 import tarfile
+import threading
 import types
 import wave
+import zipfile
+from collections import Counter
 from pathlib import Path
 
+import pytest
 import torch
+import soundfile
+
+import rwkvasr.data.webdataset as webdataset_module
+import rwkvasr.data.webdataset_bucketed as bucketed_webdataset_module
 
 from rwkvasr.data import (
     LengthBucketedBatchSampler,
+    LengthIndexedWebDatasetDataset,
     StableHashSplitConfig,
     WebDatasetASRIterableDataset,
     WebDatasetConfig,
@@ -17,6 +28,7 @@ from rwkvasr.data import (
     assign_split,
     estimate_length_bucketed_steps,
     estimate_bucket_manifest_steps,
+    estimate_bucket_manifest_tail_padding_samples,
     build_webdataset_dataloader,
     build_length_bucketed_webdataset_dataloader,
     inspect_webdataset,
@@ -25,8 +37,10 @@ from rwkvasr.data import (
     load_webdataset_bucket_manifest,
     load_webdataset_length_entries,
 )
+from rwkvasr.data.webdataset_lengths import parse_webdataset_length_entry
 from rwkvasr.data.webdataset_bucketed import (
     _BucketEntryStream,
+    _SourceInterleavedBucketEntryStream,
     _ThreadLocalTarReaderPool,
     WebDatasetBucket,
     WebDatasetBucketPart,
@@ -241,6 +255,32 @@ def test_webdataset_iterable_decodes_audio_and_tokenizes_text(tmp_path: Path) ->
     assert all(sample["features"].dim() == 2 for sample in samples)
     assert all(sample["features"].size(1) == 80 for sample in samples)
     assert [sample["target_length"] for sample in samples] == [4, 4, 4]
+
+
+def test_webdataset_audio_uses_ffmpeg_fallback_without_skipping(tmp_path: Path, monkeypatch) -> None:
+    root = _build_root(tmp_path)
+    fallback_calls: list[tuple[bytes, str]] = []
+
+    def fail_soundfile(*args, **kwargs):
+        raise soundfile.LibsndfileError(1, "forced failure")
+
+    def fake_ffmpeg(audio_bytes: bytes, *, key: str) -> tuple[torch.Tensor, int]:
+        fallback_calls.append((audio_bytes, key))
+        return torch.zeros(1, 16000, dtype=torch.float32), 16000
+
+    monkeypatch.setattr(soundfile, "read", fail_soundfile)
+    monkeypatch.setattr(webdataset_module, "_decode_audio_bytes_with_ffmpeg", fake_ffmpeg)
+    dataset = WebDatasetASRIterableDataset(
+        root,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(shuffle_shards=False, skip_decode_errors=False),
+    )
+
+    samples = list(dataset)
+
+    assert [sample["utt_id"] for sample in samples] == ["sid-1", "sid-2", "sid-3"]
+    assert [key for _, key in fallback_calls] == ["0000000001", "0000000002", "0000000003"]
+    assert all(audio_bytes.startswith(b"RIFF") for audio_bytes, _ in fallback_calls)
 
 
 def test_webdataset_ctc_label_override_changes_only_ctc_targets(tmp_path: Path) -> None:
@@ -523,6 +563,227 @@ def test_webdataset_supports_mp3_audio_members_and_random_access_length_reads(tm
 
     assert batch.features.shape[0] >= 1
     assert batch.features.shape[2] == 80
+
+
+def _supplemental_entry(
+    *,
+    shard_name: str,
+    storage_kind: str,
+    audio_member: str,
+    audio_size: int | None,
+    **storage_fields: object,
+) -> dict[str, object]:
+    return {
+        "shard_name": shard_name,
+        "key": "supplemental-1",
+        "utt_id": "supplemental-1",
+        "split": "train",
+        "num_frames": 100,
+        "audio_member": audio_member,
+        "audio_format": "wav",
+        "audio_size": audio_size,
+        "json_member": "",
+        "storage_kind": storage_kind,
+        "language": "en",
+        "sample_rate": 16000,
+        "source_dataset": "supplemental_test",
+        **storage_fields,
+    }
+
+
+def test_bucketed_loader_reads_audio_only_zip_and_forwards_teacher_bytes(tmp_path: Path) -> None:
+    root = tmp_path / "zip_root"
+    root.mkdir()
+    audio_bytes = _make_wav_bytes(16000)
+    zip_path = root / "supplemental.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("LJSpeech/wavs/sample.wav", audio_bytes)
+        info = archive.getinfo("LJSpeech/wavs/sample.wav")
+    entry = _supplemental_entry(
+        shard_name=zip_path.name,
+        storage_kind="zip",
+        audio_member=info.filename,
+        audio_size=info.file_size,
+        zip_crc32=info.CRC,
+        zip_compress_type=info.compress_type,
+    )
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[("train/bucket_0001/part_000000.jsonl", [entry])],
+    )
+    loader = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            split="train",
+            allow_missing_targets=True,
+        ),
+        batch_size=1,
+        num_workers=0,
+        rank=0,
+        world_size=1,
+    )
+
+    batch = next(iter(loader))
+
+    assert batch.utt_ids == ["supplemental-1"]
+    assert batch.features.shape == (1, 98, 80)
+    assert batch.ctc_teacher_audio_rows is not None
+    assert batch.ctc_teacher_audio_rows[0] is not None
+    assert batch.ctc_teacher_audio_rows[0]["storage_kind"] == "zip"
+    assert batch.ctc_teacher_audio_rows[0]["_audio_bytes"] == audio_bytes
+
+
+def test_bucketed_loader_reads_audio_only_parquet_and_forwards_teacher_bytes(
+    tmp_path: Path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "parquet_root"
+    root.mkdir()
+    audio_bytes = _make_wav_bytes(16000)
+    parquet_path = root / "supplemental.parquet"
+    audio_type = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    table = pa.table(
+        {
+            "id": pa.array(["supplemental-1"]),
+            "audio": pa.array(
+                [{"bytes": audio_bytes, "path": "supplemental-1.wav"}],
+                type=audio_type,
+            ),
+            "duration_ms": pa.array([1000], type=pa.int32()),
+            "text": pa.array(["not used by online distillation"]),
+        }
+    )
+    pq.write_table(table, parquet_path, row_group_size=1)
+    entry = _supplemental_entry(
+        shard_name=parquet_path.name,
+        storage_kind="parquet",
+        audio_member="supplemental-1.wav",
+        audio_size=None,
+        parquet_row_group=0,
+        parquet_row_index=0,
+        parquet_id="supplemental-1",
+    )
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[("train/bucket_0001/part_000000.jsonl", [entry])],
+    )
+    loader = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            split="train",
+            allow_missing_targets=True,
+        ),
+        batch_size=1,
+        num_workers=0,
+        rank=0,
+        world_size=1,
+    )
+
+    batch = next(iter(loader))
+
+    assert batch.utt_ids == ["supplemental-1"]
+    assert batch.features.shape == (1, 98, 80)
+    assert batch.ctc_teacher_audio_rows is not None
+    assert batch.ctc_teacher_audio_rows[0] is not None
+    assert batch.ctc_teacher_audio_rows[0]["storage_kind"] == "parquet"
+    assert batch.ctc_teacher_audio_rows[0]["_audio_bytes"] == audio_bytes
+
+
+def test_length_index_rejects_unknown_storage_and_incomplete_parquet_locator() -> None:
+    base = _supplemental_entry(
+        shard_name="supplemental.bin",
+        storage_kind="unknown",
+        audio_member="sample.wav",
+        audio_size=1,
+    )
+    with pytest.raises(ValueError, match="Unsupported length-index storage_kind"):
+        parse_webdataset_length_entry(base)
+
+    base["storage_kind"] = "parquet"
+    with pytest.raises(ValueError, match="parquet_row_group"):
+        parse_webdataset_length_entry(base)
+
+
+def test_length_index_dataset_pickle_drops_open_zip_reader_cache(tmp_path: Path) -> None:
+    audio_bytes = _make_wav_bytes(16000)
+    zip_path = tmp_path / "supplemental.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("sample.wav", audio_bytes)
+        info = archive.getinfo("sample.wav")
+    entry = parse_webdataset_length_entry(
+        _supplemental_entry(
+            shard_name=zip_path.name,
+            storage_kind="zip",
+            audio_member=info.filename,
+            audio_size=info.file_size,
+            zip_crc32=info.CRC,
+            zip_compress_type=info.compress_type,
+        )
+    )
+    dataset = LengthIndexedWebDatasetDataset(
+        tmp_path,
+        [entry],
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(allow_missing_targets=True),
+    )
+    assert dataset[0]["utt_id"] == "supplemental-1"
+    assert len(dataset._reader_cache) == 1
+
+    restored = pickle.loads(pickle.dumps(dataset))
+
+    assert len(restored._reader_cache) == 0
+    assert restored[0]["utt_id"] == "supplemental-1"
+
+
+def test_bucketed_loader_refuses_truncated_zip_archive(tmp_path: Path) -> None:
+    root = tmp_path / "bad_zip_root"
+    root.mkdir()
+    audio_bytes = _make_wav_bytes(16000)
+    zip_path = root / "truncated.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("sample.wav", audio_bytes)
+        info = archive.getinfo("sample.wav")
+    zip_path.write_bytes(zip_path.read_bytes()[:-22])
+    entry = _supplemental_entry(
+        shard_name=zip_path.name,
+        storage_kind="zip",
+        audio_member=info.filename,
+        audio_size=info.file_size,
+        zip_crc32=info.CRC,
+        zip_compress_type=info.compress_type,
+    )
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[("train/bucket_0001/part_000000.jsonl", [entry])],
+    )
+    loader = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            split="train",
+            allow_missing_targets=True,
+            skip_decode_errors=False,
+        ),
+        batch_size=1,
+        num_workers=0,
+        rank=0,
+        world_size=1,
+    )
+
+    with pytest.raises(zipfile.BadZipFile):
+        next(iter(loader))
 
 
 def test_length_bucketed_batch_sampler_splits_global_batches_across_ranks() -> None:
@@ -856,6 +1117,264 @@ def test_bucketed_webdataset_loader_splits_same_bucket_across_ranks(tmp_path: Pa
     assert batch1.utt_ids == ["sid-2"]
 
 
+def test_bucketed_schedule_locality_blocks_preserve_exact_epoch_coverage(tmp_path: Path) -> None:
+    root = tmp_path / "bucket_schedule_root"
+    root.mkdir()
+    entries_by_part = []
+    for bucket_id in range(2):
+        entries = [
+            {
+                "shard_name": f"source-{bucket_id}.tar",
+                "key": f"{bucket_id}-{index}",
+                "utt_id": f"sid-{bucket_id}-{index}",
+                "split": "train",
+                "num_frames": bucket_id * 80 + 40,
+                "audio_member": f"{bucket_id}-{index}.wav",
+                "audio_format": "wav",
+                "json_member": f"{bucket_id}-{index}.json",
+                "audio_offset": None,
+                "audio_size": None,
+                "json_offset": None,
+                "json_size": None,
+            }
+            for index in range(16)
+        ]
+        entries_by_part.append((f"train/bucket_{bucket_id:04d}/part.jsonl", entries))
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=entries_by_part,
+    )
+
+    def schedule(block_size: int) -> list[int]:
+        loader = build_bucketed_webdataset_loader(
+            root,
+            bucket_manifest_path=manifest_path,
+            config=WebDatasetConfig(
+                split="train",
+                seed=42,
+                length_bucket_schedule_block_size=block_size,
+            ),
+            batch_size=1,
+            num_workers=1,
+        )
+        return loader._build_schedule()
+
+    default_schedule = schedule(1)
+    historical_schedule = [0] * 16 + [1] * 16
+    random.Random(42).shuffle(historical_schedule)
+    blocked_schedule = schedule(4)
+
+    assert default_schedule == historical_schedule
+    assert Counter(blocked_schedule) == Counter(default_schedule)
+    assert len(blocked_schedule) == len(default_schedule)
+    default_switches = sum(left != right for left, right in zip(default_schedule, default_schedule[1:]))
+    blocked_switches = sum(left != right for left, right in zip(blocked_schedule, blocked_schedule[1:]))
+    assert blocked_switches < default_switches
+
+
+def test_source_interleave_locality_rotates_after_configured_batch_block(tmp_path: Path) -> None:
+    bucket_root = tmp_path / "source_blocks"
+    bucket_root.mkdir()
+    parts = []
+    for source in ("a", "b"):
+        path = bucket_root / f"{source}.jsonl"
+        rows = [
+            {
+                "shard_name": f"{source}.tar",
+                "key": f"{source}-{index}",
+                "utt_id": f"{source}-{index}",
+                "split": "train",
+                "num_frames": 40,
+                "audio_member": f"{source}-{index}.wav",
+                "audio_format": "wav",
+                "json_member": f"{source}-{index}.json",
+                "audio_offset": None,
+                "audio_size": None,
+                "json_offset": None,
+                "json_size": None,
+            }
+            for index in range(4)
+        ]
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        parts.append(
+            WebDatasetBucketPart(
+                path=path.name,
+                num_samples=len(rows),
+                first_shard=f"{source}.tar",
+                last_shard=f"{source}.tar",
+                source_label=source,
+            )
+        )
+    manifest_path = bucket_root / "manifest.json"
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    stream = _SourceInterleavedBucketEntryStream(
+        manifest_path,
+        WebDatasetBucket(split="train", bucket_id=0, num_samples=8, parts=tuple(parts)),
+        epoch=0,
+        batches_per_source=2,
+    )
+    try:
+        sources = [stream.take(1)[0].shard_name for _ in range(6)]
+    finally:
+        stream.reset()
+
+    assert sources == ["a.tar", "a.tar", "b.tar", "b.tar", "a.tar", "a.tar"]
+
+
+def test_bucketed_loader_serializes_payload_reads_but_parallelizes_decode(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "serialized_io_root"
+    root.mkdir()
+    root = _build_root(root)
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[
+            (
+                "train/bucket_0000/part_000000.jsonl",
+                [
+                    {
+                        "shard_name": "shard_00000000.tar",
+                        "key": f"{index:010d}",
+                        "utt_id": f"sid-{index}",
+                        "split": "train",
+                        "num_frames": 40,
+                        "audio_member": f"{index:010d}.wav",
+                        "audio_format": "wav",
+                        "json_member": f"{index:010d}.json",
+                        "audio_offset": None,
+                        "audio_size": None,
+                        "json_offset": None,
+                        "json_size": None,
+                    }
+                    for index in (1, 2)
+                ],
+            )
+        ],
+    )
+    read_threads = []
+    decode_threads = []
+    decode_barrier = threading.Barrier(2)
+    original_read = bucketed_webdataset_module._read_indexed_entry_payload
+    original_decode = bucketed_webdataset_module.decode_webdataset_sample
+
+    def tracked_read(*args, **kwargs):
+        read_threads.append(threading.current_thread().name)
+        return original_read(*args, **kwargs)
+
+    def tracked_decode(*args, **kwargs):
+        decode_threads.append(threading.current_thread().name)
+        decode_barrier.wait(timeout=5.0)
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(bucketed_webdataset_module, "_read_indexed_entry_payload", tracked_read)
+    monkeypatch.setattr(bucketed_webdataset_module, "decode_webdataset_sample", tracked_decode)
+    loader = build_bucketed_webdataset_loader(
+        root,
+        bucket_manifest_path=manifest_path,
+        tokenizer=DummyTokenizer(),
+        config=WebDatasetConfig(
+            shuffle_shards=False,
+            split="train",
+            bucket_serialize_reads=True,
+        ),
+        batch_size=2,
+        num_workers=2,
+    )
+
+    batch = next(iter(loader))
+
+    assert batch.utt_ids == ["sid-1", "sid-2"]
+    assert len(set(read_threads)) == 1
+    assert not read_threads[0].startswith("bucket-decode-")
+    assert set(decode_threads) == {"bucket-decode-r0_0", "bucket-decode-r0_1"}
+
+
+def test_bucketed_webdataset_loader_covers_all_rows_across_three_padded_epochs(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "bucket_loader_tail_root"
+    root.mkdir()
+    root = _build_root(root)
+    entries = [
+        {
+            "shard_name": f"shard_{shard_id:08d}.tar",
+            "key": f"{index:010d}",
+            "utt_id": f"sid-{index}",
+            "split": "train",
+            "num_frames": 40 + index,
+            "audio_member": f"{index:010d}.wav",
+            "audio_format": "wav",
+            "json_member": f"{index:010d}.json",
+            "audio_offset": None,
+            "audio_size": None,
+            "json_offset": None,
+            "json_size": None,
+        }
+        for index, shard_id in ((1, 0), (2, 0), (3, 1))
+    ]
+    manifest_path = _write_bucket_manifest(
+        tmp_path,
+        root=root,
+        entries_by_part=[("train/bucket_0000/part_000000.jsonl", entries)],
+    )
+    manifest = load_webdataset_bucket_manifest(manifest_path)
+    assert estimate_bucket_manifest_steps(
+        manifest,
+        split="train",
+        batch_size=4,
+        world_size=2,
+        frame_budget=80,
+        drop_last=False,
+    ) == 2
+    assert estimate_bucket_manifest_tail_padding_samples(
+        manifest,
+        split="train",
+        batch_size=4,
+        world_size=2,
+        frame_budget=80,
+    ) == 1
+
+    config = WebDatasetConfig(
+        shuffle_shards=False,
+        split="train",
+        bucket_source_interleave=True,
+        length_bucket_drop_last=False,
+        length_bucket_frame_budget=80,
+    )
+    loaders = [
+        build_bucketed_webdataset_loader(
+            root,
+            bucket_manifest_path=manifest_path,
+            tokenizer=DummyTokenizer(),
+            config=config,
+            batch_size=4,
+            num_workers=2,
+            rank=rank,
+            world_size=2,
+        )
+        for rank in range(2)
+    ]
+    for epoch in range(3):
+        for loader in loaders:
+            loader.set_epoch(epoch)
+        rank_ids = [[batch.utt_ids for batch in loader] for loader in loaders]
+
+        assert rank_ids[0] == [["sid-1"], ["sid-3"]]
+        assert rank_ids[1] == [["sid-2"], ["sid-3"]]
+        for loader in loaders:
+            resumed_iter, skipped = loader.iter_from_batch_offset(1)
+
+            assert skipped == 1
+            assert [batch.utt_ids for batch in resumed_iter] == [["sid-3"]]
+
+
 def test_bucketed_webdataset_loader_skips_corrupt_audio_when_configured(tmp_path: Path, capsys) -> None:
     root = tmp_path / "bucket_loader_skip_root"
     root.mkdir()
@@ -1056,6 +1575,52 @@ def test_bucket_entry_stream_closes_part_handle_between_takes(tmp_path: Path) ->
     assert [entry.key for entry in rest] == ["0000000001", "0000000002"]
     assert stream._handle is None
     assert stream.take(1) == []
+
+
+def test_source_interleaved_bucket_stream_prefers_explicit_part_labels(tmp_path: Path) -> None:
+    bucket_root = tmp_path / "webdataset_buckets"
+    bucket_root.mkdir()
+
+    def write_part(name: str, source: str) -> WebDatasetBucketPart:
+        path = bucket_root / name
+        with path.open("w", encoding="utf-8") as handle:
+            for idx in range(2):
+                key = f"{source}-{idx}"
+                handle.write(
+                    json.dumps(
+                        {
+                            "shard_name": f"/absolute/mixed-{idx}.tar",
+                            "key": key,
+                            "utt_id": key,
+                            "split": "train",
+                            "num_frames": 40,
+                            "audio_member": f"{key}.wav",
+                            "audio_format": "wav",
+                            "json_member": f"{key}.json",
+                        }
+                    )
+                    + "\n"
+                )
+        return WebDatasetBucketPart(
+            path=name,
+            num_samples=2,
+            first_shard="/absolute/mixed-0.tar",
+            last_shard="/absolute/mixed-1.tar",
+            source_label=source,
+        )
+
+    manifest_path = bucket_root / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    bucket = WebDatasetBucket(
+        split="train",
+        bucket_id=0,
+        num_samples=4,
+        parts=(write_part("source-a.jsonl", "source_a"), write_part("source-b.jsonl", "source_b")),
+    )
+    stream = _SourceInterleavedBucketEntryStream(manifest_path, bucket, epoch=0)
+
+    assert [entry.key for entry in stream.take(2)] == ["source_a-0", "source_a-1"]
+    assert [entry.key for entry in stream.take(2)] == ["source_b-0", "source_b-1"]
 
 
 def test_thread_local_tar_reader_pool_lru_closes_old_shards(tmp_path: Path) -> None:

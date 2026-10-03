@@ -20,6 +20,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--webdataset-hash-seed", default=None, type=int)
     parser.add_argument("--webdataset-split-by", default=None)
     parser.add_argument("--webdataset-utt-id-key", default=None)
+    parser.add_argument(
+        "--webdataset-skip-decode-errors",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--vocab-size", default=None, type=int)
     parser.add_argument("--tokenizer-type", default=None)
@@ -105,13 +110,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ctc-teacher-online-blank-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-mass-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-full-loss-weight", default=None, type=float)
+    parser.add_argument(
+        "--ctc-teacher-online-conditional-nonblank-loss-weight",
+        default=None,
+        type=float,
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-conditional-nonblank-hard-loss-weight",
+        default=None,
+        type=float,
+    )
     parser.add_argument("--ctc-teacher-online-full-temperature", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-full-nonblank-weight", default=None, type=float)
+    parser.add_argument(
+        "--ctc-teacher-online-full-frame-weight-mode",
+        default=None,
+        choices=("hard_top1", "posterior_nonblank"),
+    )
     parser.add_argument(
         "--ctc-teacher-online-full-frame-filter",
         default=None,
         choices=("all", "nonblank", "nonblank_neighbors"),
     )
+    parser.add_argument(
+        "--ctc-teacher-online-frame-balance-mode",
+        default=None,
+        choices=("all", "teacher_top1_balanced"),
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-blank-frame-balance-mode",
+        default=None,
+        choices=("all", "teacher_top1_balanced"),
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-hidden-frame-balance-mode",
+        default=None,
+        choices=("all", "teacher_top1_balanced"),
+    )
     parser.add_argument("--ctc-teacher-online-encoder-loss-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-decoder-hidden-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-sequence-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-sequence-presence-loss-weight", default=None, type=float)
     parser.add_argument("--ctc-teacher-online-sequence-window-loss-weight", default=None, type=float)
@@ -136,6 +173,70 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--ctc-teacher-online-device", default=None)
+    parser.add_argument(
+        "--ctc-teacher-online-use-batch-features",
+        dest="ctc_teacher_online_use_batch_features",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-keep-layer-hiddens-on-device",
+        dest="ctc_teacher_online_keep_layer_hiddens_on_device",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-keep-full-log-probs-on-device",
+        dest="ctc_teacher_online_keep_full_log_probs_on_device",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-compute-ctc-outputs",
+        dest="ctc_teacher_online_compute_ctc_outputs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-capture-layer-inputs",
+        dest="ctc_teacher_online_capture_layer_inputs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ctc-student-compute-ctc-logits",
+        dest="ctc_student_compute_ctc_logits",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--ctc-teacher-online-layer-mixer-loss-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-layer-ffn-loss-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-layer-block-loss-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-layer-normalized-mse-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-layer-cosine-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-layer-energy-mse-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-layer-log-rms-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-layer-raw-mse-weight", default=None, type=float)
+    parser.add_argument("--ctc-teacher-online-layer-sample-count", default=None, type=int)
+    parser.add_argument(
+        "--ctc-teacher-online-layer-boundary-id",
+        dest="ctc_teacher_online_layer_boundary_ids",
+        action="append",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--ctc-teacher-online-layer-include-boundaries",
+        dest="ctc_teacher_online_layer_include_boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--ctc-teacher-online-layer-frame-tolerance", default=None, type=int)
+    parser.add_argument(
+        "--ctc-teacher-online-layer-input-mode",
+        default=None,
+        choices=("stacked", "teacher_forced"),
+    )
     parser.add_argument("--ctc-decoder-type", default=None)
     parser.add_argument("--ctc-decoder-downsample-rate", default=None, type=int)
     parser.add_argument("--ctc-decoder-dim", default=None, type=int)
@@ -168,6 +269,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="funasr_nano_ctc_init_load_encoder_attention",
         action="store_false",
     )
+    parser.add_argument(
+        "--funasr-nano-ctc-init-load-rwkv-encoder-from-qkv",
+        dest="funasr_nano_ctc_init_load_rwkv_encoder_from_qkv",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--funasr-nano-ctc-init-rwkv-qkv-scale-mode",
+        default=None,
+        choices=("exact", "rwkv_norm"),
+    )
     parser.add_argument("--funasr-nano-ctc-init-load-decoder", dest="funasr_nano_ctc_init_load_decoder", action="store_true", default=None)
     parser.add_argument("--no-funasr-nano-ctc-init-load-decoder", dest="funasr_nano_ctc_init_load_decoder", action="store_false")
     parser.add_argument("--funasr-nano-ctc-init-load-head", dest="funasr_nano_ctc_init_load_head", action="store_true", default=None)
@@ -176,6 +288,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--funasr-nano-ctc-init-blank-bias-delta", default=None, type=float)
     parser.add_argument("--freeze-encoder", dest="freeze_encoder", action="store_true", default=None)
     parser.add_argument("--no-freeze-encoder", dest="freeze_encoder", action="store_false")
+    parser.add_argument(
+        "--freeze-encoder-except-time-mixer",
+        dest="freeze_encoder_except_time_mixer",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--freeze-ctc-decoder", dest="freeze_ctc_decoder", action="store_true", default=None)
     parser.add_argument("--no-freeze-ctc-decoder", dest="freeze_ctc_decoder", action="store_false")
     parser.add_argument("--freeze-ctc-head", dest="freeze_ctc_head", action="store_true", default=None)
@@ -183,11 +301,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", default=None, type=int)
     parser.add_argument("--epochs", default=None, type=int)
     parser.add_argument("--save-every", default=None, type=int)
+    parser.add_argument("--periodic-checkpoint-keep-last", default=None, type=int)
     parser.add_argument("--num-workers", default=None, type=int)
     parser.add_argument("--decoded-batch-prefetch", default=None, type=int)
     parser.add_argument("--max-open-shards-per-worker", default=None, type=int)
     parser.add_argument("--bucket-source-interleave", dest="bucket_source_interleave", action="store_true", default=None)
     parser.add_argument("--no-bucket-source-interleave", dest="bucket_source_interleave", action="store_false")
+    parser.add_argument("--length-bucket-schedule-block-size", default=None, type=int)
+    parser.add_argument("--bucket-source-interleave-block-size", default=None, type=int)
+    parser.add_argument("--bucket-serialize-reads", dest="bucket_serialize_reads", action="store_true", default=None)
+    parser.add_argument("--no-bucket-serialize-reads", dest="bucket_serialize_reads", action="store_false")
     parser.add_argument("--device", default=None)
     parser.add_argument("--encoder-init-checkpoint-path", default=None)
     parser.add_argument("--init-checkpoint-path", default=None)
@@ -206,6 +329,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-eval-every", default=None, type=int)
     parser.add_argument("--step-eval-samples", default=None, type=int)
     parser.add_argument("--step-eval-split", default=None)
+    parser.add_argument(
+        "--step-eval-shuffle",
+        dest="step_eval_shuffle",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--step-eval-at-start",
+        dest="step_eval_at_start",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--step-eval-cache-batches",
+        dest="step_eval_cache_batches",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--step-eval-feature-seed", default=None, type=int)
     parser.add_argument("--top-k-step-checkpoints", default=None, type=int)
     parser.add_argument(
         "--save-deepspeed-sharded-checkpoints",
@@ -224,6 +366,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
     parser.add_argument("--batch-token-budget", default=None, type=int)
     parser.add_argument("--length-bucket-frame-budget", default=None, type=int)
+    parser.add_argument(
+        "--length-bucket-drop-last",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--target-gpu-memory-gib", default=None, type=float)
     parser.add_argument("--skip-oversized-samples", dest="skip_oversized_samples", action="store_true", default=None)
     parser.add_argument(
@@ -253,6 +400,7 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "webdataset_hash_seed",
         "webdataset_split_by",
         "webdataset_utt_id_key",
+        "webdataset_skip_decode_errors",
         "output_dir",
         "vocab_size",
         "tokenizer_type",
@@ -331,9 +479,17 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "ctc_teacher_online_blank_loss_weight",
         "ctc_teacher_online_mass_loss_weight",
         "ctc_teacher_online_full_loss_weight",
+        "ctc_teacher_online_conditional_nonblank_loss_weight",
+        "ctc_teacher_online_conditional_nonblank_hard_loss_weight",
         "ctc_teacher_online_full_temperature",
+        "ctc_teacher_online_full_nonblank_weight",
+        "ctc_teacher_online_full_frame_weight_mode",
         "ctc_teacher_online_full_frame_filter",
+        "ctc_teacher_online_frame_balance_mode",
+        "ctc_teacher_online_blank_frame_balance_mode",
+        "ctc_teacher_online_hidden_frame_balance_mode",
         "ctc_teacher_online_encoder_loss_weight",
+        "ctc_teacher_online_decoder_hidden_loss_weight",
         "ctc_teacher_online_sequence_loss_weight",
         "ctc_teacher_online_sequence_presence_loss_weight",
         "ctc_teacher_online_sequence_window_loss_weight",
@@ -353,6 +509,25 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "ctc_teacher_online_audio_cache_dir",
         "ctc_teacher_online_keep_audio_cache",
         "ctc_teacher_online_device",
+        "ctc_teacher_online_use_batch_features",
+        "ctc_teacher_online_keep_layer_hiddens_on_device",
+        "ctc_teacher_online_keep_full_log_probs_on_device",
+        "ctc_teacher_online_compute_ctc_outputs",
+        "ctc_teacher_online_capture_layer_inputs",
+        "ctc_student_compute_ctc_logits",
+        "ctc_teacher_online_layer_mixer_loss_weight",
+        "ctc_teacher_online_layer_ffn_loss_weight",
+        "ctc_teacher_online_layer_block_loss_weight",
+        "ctc_teacher_online_layer_normalized_mse_weight",
+        "ctc_teacher_online_layer_cosine_weight",
+        "ctc_teacher_online_layer_energy_mse_weight",
+        "ctc_teacher_online_layer_log_rms_weight",
+        "ctc_teacher_online_layer_raw_mse_weight",
+        "ctc_teacher_online_layer_sample_count",
+        "ctc_teacher_online_layer_boundary_ids",
+        "ctc_teacher_online_layer_include_boundaries",
+        "ctc_teacher_online_layer_frame_tolerance",
+        "ctc_teacher_online_layer_input_mode",
         "ctc_decoder_type",
         "ctc_decoder_downsample_rate",
         "ctc_decoder_dim",
@@ -369,11 +544,14 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "funasr_nano_ctc_init_checkpoint_path",
         "funasr_nano_ctc_init_load_encoder",
         "funasr_nano_ctc_init_load_encoder_attention",
+        "funasr_nano_ctc_init_load_rwkv_encoder_from_qkv",
+        "funasr_nano_ctc_init_rwkv_qkv_scale_mode",
         "funasr_nano_ctc_init_load_decoder",
         "funasr_nano_ctc_init_load_head",
         "funasr_nano_ctc_teacher_blank_id",
         "funasr_nano_ctc_init_blank_bias_delta",
         "freeze_encoder",
+        "freeze_encoder_except_time_mixer",
         "freeze_ctc_decoder",
         "freeze_ctc_head",
         "max_steps",
@@ -383,6 +561,9 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "decoded_batch_prefetch",
         "max_open_shards_per_worker",
         "bucket_source_interleave",
+        "length_bucket_schedule_block_size",
+        "bucket_source_interleave_block_size",
+        "bucket_serialize_reads",
         "device",
         "encoder_init_checkpoint_path",
         "init_checkpoint_path",
@@ -400,13 +581,19 @@ def _resolve_deepspeed_train_config(args: argparse.Namespace) -> DeepSpeedTrainC
         "step_eval_every",
         "step_eval_samples",
         "step_eval_split",
+        "step_eval_shuffle",
+        "step_eval_at_start",
+        "step_eval_cache_batches",
+        "step_eval_feature_seed",
         "top_k_step_checkpoints",
+        "periodic_checkpoint_keep_last",
         "save_deepspeed_sharded_checkpoints",
         "log_every",
         "local_rank",
         "gradient_checkpointing",
         "batch_token_budget",
         "length_bucket_frame_budget",
+        "length_bucket_drop_last",
         "target_gpu_memory_gib",
         "skip_oversized_samples",
         "specaugment_enabled",

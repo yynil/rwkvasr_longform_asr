@@ -166,7 +166,6 @@ def _build_sampling_rwkv_model() -> RWKVCTCModel:
     if model.decoder is None:
         raise RuntimeError("Failed to construct RWKV decoder path for sampling test.")
 
-    vocab_size = int(model.config.vocab_size)
     hidden_size = int(model.decoder.hidden_size)
     logits_base = torch.tensor([0.0, 2.0, 1.9, -2.0], dtype=torch.float32)
 
@@ -713,6 +712,26 @@ def test_predict_ctc_labeled_uses_decoder_aware_ctc_logits(monkeypatch) -> None:
 
     assert model.used_decoder_aware_logits
     assert predictions[0].pred_token_ids == [2]
+
+
+def test_prediction_model_config_uses_native_backend_on_cpu() -> None:
+    config = RWKVCTCModelConfig(
+        input_dim=80,
+        n_embd=4,
+        dim_att=4,
+        dim_ff=8,
+        num_layers=1,
+        vocab_size=3,
+        backend="cuda_clampw",
+    )
+
+    resolved = predict_ctc_module._prediction_model_config_for_device(
+        config,
+        device=torch.device("cpu"),
+    )
+
+    assert resolved.backend == "native"
+    assert config.backend == "cuda_clampw"
 
 
 def test_write_labeled_predictions_jsonl_serializes_pairs(tmp_path: Path) -> None:

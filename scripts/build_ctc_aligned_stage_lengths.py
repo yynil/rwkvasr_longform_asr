@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import tarfile
@@ -39,6 +40,50 @@ def _language_from_metadata(metadata: dict[str, Any]) -> str:
     return _safe_name(str(metadata.get("language") or "unknown"))
 
 
+def _source_split_values(metadata: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for key in (
+        "source_split",
+        "dataset_split",
+        "original_split",
+        "split",
+        "subset",
+        "partition",
+    ):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        candidates = value if isinstance(value, (list, tuple, set)) else (value,)
+        values.update(
+            str(candidate).strip().lower() for candidate in candidates if str(candidate).strip()
+        )
+    return values
+
+
+def _parse_interleave_source_lanes(values: list[str]) -> dict[str, int]:
+    lanes: dict[str, int] = {}
+    for raw_value in values:
+        for item in str(raw_value).split(","):
+            stripped = item.strip()
+            if not stripped:
+                continue
+            source, separator, raw_count = stripped.partition(":")
+            source = _safe_name(source)
+            if not separator or source in lanes:
+                raise ValueError(f"Invalid or duplicate interleave source lane: {stripped!r}")
+            count = int(raw_count)
+            if count <= 0:
+                raise ValueError(f"Interleave source lane count must be positive: {stripped!r}")
+            lanes[source] = count
+    return dict(sorted(lanes.items()))
+
+
+def _interleave_lane(*, source: str, language: str, sample_id: str, lanes: int) -> str:
+    digest = hashlib.sha256(sample_id.encode("utf-8")).digest()
+    lane_id = int.from_bytes(digest[:8], "big") % int(lanes)
+    return f"{language}:{source}:lane_{lane_id:02d}"
+
+
 def _sample_id_from_entry(entry: dict[str, Any], metadata: dict[str, Any], utt_id_key: str) -> str:
     candidate_keys = [utt_id_key, "utt_id", "id", "audio_id", "sid", "key"]
     seen: set[str] = set()
@@ -68,7 +113,9 @@ def _load_label_cache(paths: list[str], *, text_key: str) -> dict[str, str]:
                 try:
                     row = json.loads(stripped)
                 except json.JSONDecodeError as exc:
-                    raise ValueError(f"Invalid JSONL in teacher cache {path}:{line_number}") from exc
+                    raise ValueError(
+                        f"Invalid JSONL in teacher cache {path}:{line_number}"
+                    ) from exc
                 text = row.get(text_key)
                 if text is None and text_key != "pred_text":
                     text = row.get("pred_text")
@@ -150,7 +197,9 @@ def _frontend_logit_length(num_frames: int, frontend_downsample: str) -> int:
 
 
 def _ctc_required_frames(token_ids: list[int]) -> int:
-    adjacent_repeats = sum(1 for left, right in zip(token_ids, token_ids[1:]) if int(left) == int(right))
+    adjacent_repeats = sum(
+        1 for left, right in zip(token_ids, token_ids[1:]) if int(left) == int(right)
+    )
     return int(len(token_ids) + adjacent_repeats)
 
 
@@ -257,6 +306,34 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-teacher-cer-vs-original", type=float, default=-1.0)
     parser.add_argument("--progress-every", type=int, default=25000)
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument(
+        "--forbid-stage211-non-pronunciation-tokens",
+        action="store_true",
+        help=(
+            "Drop targets containing any token suppressed by the Stage211 pronunciation-only "
+            "CTC support contract."
+        ),
+    )
+    parser.add_argument(
+        "--reject-source-split",
+        action="append",
+        default=[],
+        help="Reject source metadata carrying this split/subset label; may be repeated.",
+    )
+    parser.add_argument(
+        "--fail-on-error",
+        action="store_true",
+        help="Abort instead of silently dropping a row when metadata parsing/tokenization fails.",
+    )
+    parser.add_argument(
+        "--interleave-source-lanes",
+        action="append",
+        default=[],
+        help=(
+            "Deterministic accepted-row lane counts as source:count entries; may be repeated "
+            "or comma separated."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -268,20 +345,55 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = build_text_tokenizer(args.tokenizer_type, model_path=args.tokenizer_model_path)
-    unknown_id = int(args.unk_token_id) if args.unk_token_id is not None else _tokenizer_unknown_id(tokenizer)
+    unknown_id = (
+        int(args.unk_token_id)
+        if args.unk_token_id is not None
+        else _tokenizer_unknown_id(tokenizer)
+    )
+    forbidden_token_ids: set[int] = set()
+    forbidden_token_ids_sha256 = hashlib.sha256(b"").hexdigest()
+    if bool(args.forbid_stage211_non_pronunciation_tokens):
+        if str(args.tokenizer_type) != "sensevoice_tiktoken":
+            raise ValueError(
+                "Stage211 non-pronunciation-token filtering requires sensevoice_tiktoken."
+            )
+        from rwkvasr.eval.stage211_gate import (
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT,
+            STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256,
+            stage211_sft_ctc_suppressed_token_ids,
+        )
+
+        forbidden_token_ids = set(stage211_sft_ctc_suppressed_token_ids())
+        forbidden_token_ids_sha256 = hashlib.sha256(
+            ",".join(str(token_id) for token_id in sorted(forbidden_token_ids)).encode("ascii")
+        ).hexdigest()
+        if (
+            len(forbidden_token_ids) != STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_COUNT
+            or forbidden_token_ids_sha256 != STAGE211_SFT_CTC_SUPPRESSED_TOKEN_IDS_SHA256
+        ):
+            raise ValueError("Stage211 non-pronunciation token support fingerprint mismatch.")
+    rejected_source_splits = {
+        str(value).strip().lower() for value in args.reject_source_split if str(value).strip()
+    }
+    interleave_source_lanes = _parse_interleave_source_lanes(list(args.interleave_source_lanes))
     teacher_cache = _load_label_cache(
         [str(path) for path in (args.teacher_cache_path or [])],
         text_key=str(args.teacher_text_key),
     )
     reader = TarJsonReader(shard_root)
     output_lengths_path = output_dir / "webdataset_lengths.jsonl"
+    temporary_lengths_path = output_dir / ".webdataset_lengths.jsonl.tmp"
+    temporary_lengths_path.unlink(missing_ok=True)
     summary_path = output_dir / "webdataset_lengths.summary.json"
     index_path = output_dir / "webdataset_index.json"
     label_cache_path = Path(args.label_cache_path) if args.label_cache_path else None
     label_cache_output = None
+    temporary_label_cache_path = None
     if label_cache_path is not None:
         label_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        label_cache_output = label_cache_path.open("w", encoding="utf-8")
+        temporary_label_cache_path = label_cache_path.with_name(f".{label_cache_path.name}.tmp")
+        temporary_label_cache_path.unlink(missing_ok=True)
+        label_cache_output = temporary_label_cache_path.open("w", encoding="utf-8")
 
     counts: dict[str, Counter[Any]] = defaultdict(Counter)
     shard_counts: dict[str, Counter[str]] = defaultdict(Counter)
@@ -290,7 +402,7 @@ def main() -> None:
     started = time.monotonic()
 
     try:
-        with output_lengths_path.open("w", encoding="utf-8") as output:
+        with temporary_lengths_path.open("w", encoding="utf-8") as output:
             for entry in _iter_length_entries(length_index_path):
                 if args.max_samples and processed >= int(args.max_samples):
                     break
@@ -301,7 +413,25 @@ def main() -> None:
                     metadata = reader.read_json(entry)
                     language = _language_from_metadata(metadata)
                     source = _source_from_entry(entry, metadata)
+                    counts["input_source"][source] += 1
+                    counts["input_language"][language] += 1
+                    source_splits = _source_split_values(metadata)
+                    for source_split in source_splits:
+                        counts["source_split"][source_split] += 1
+                    rejected_splits = sorted(source_splits & rejected_source_splits)
+                    if rejected_splits:
+                        counts["drop_reason"]["rejected_source_split"] += 1
+                        counts["drop_source"][source] += 1
+                        counts["drop_language"][language] += 1
+                        for source_split in rejected_splits:
+                            counts["rejected_source_split"][source_split] += 1
+                        continue
                     sample_id = _sample_id_from_entry(entry, metadata, str(args.utt_id_key))
+                    if not sample_id:
+                        counts["drop_reason"]["missing_sample_id"] += 1
+                        counts["drop_source"][source] += 1
+                        counts["drop_language"][language] += 1
+                        continue
                     text = metadata.get(str(args.text_key))
                     teacher_text = _resolve_cached_label_text(
                         teacher_cache,
@@ -319,6 +449,8 @@ def main() -> None:
                     )
                     if text is None and not use_teacher:
                         counts["drop_reason"]["missing_text"] += 1
+                        counts["drop_source"][source] += 1
+                        counts["drop_language"][language] += 1
                         continue
                     original_normalized_text = (
                         normalize_asr_text(
@@ -349,17 +481,19 @@ def main() -> None:
                                 normalized_text,
                                 original_normalized_text,
                             )
-                            if (
-                                float(args.max_teacher_wer_vs_original) >= 0.0
-                                and teacher_original_wer > float(args.max_teacher_wer_vs_original)
+                            if float(
+                                args.max_teacher_wer_vs_original
+                            ) >= 0.0 and teacher_original_wer > float(
+                                args.max_teacher_wer_vs_original
                             ):
                                 counts["drop_reason"]["teacher_wer_vs_original"] += 1
                                 counts["drop_source"][source] += 1
                                 counts["drop_language"][language] += 1
                                 continue
-                            if (
-                                float(args.max_teacher_cer_vs_original) >= 0.0
-                                and teacher_original_cer > float(args.max_teacher_cer_vs_original)
+                            if float(
+                                args.max_teacher_cer_vs_original
+                            ) >= 0.0 and teacher_original_cer > float(
+                                args.max_teacher_cer_vs_original
                             ):
                                 counts["drop_reason"]["teacher_cer_vs_original"] += 1
                                 counts["drop_source"][source] += 1
@@ -368,16 +502,30 @@ def main() -> None:
                     token_ids = tokenizer.encode(normalized_text)
                     if not token_ids:
                         counts["drop_reason"]["empty_target"] += 1
+                        counts["drop_source"][source] += 1
+                        counts["drop_language"][language] += 1
                         continue
                     unk_count = 0
                     if unknown_id is not None:
-                        unk_count = sum(1 for token_id in token_ids if int(token_id) == int(unknown_id))
+                        unk_count = sum(
+                            1 for token_id in token_ids if int(token_id) == int(unknown_id)
+                        )
                     if bool(args.drop_unk_token) and unk_count > 0:
                         counts["drop_reason"]["unk_token"] += 1
                         counts["drop_source"][source] += 1
                         counts["drop_language"][language] += 1
                         counts["unk_source"][source] += unk_count
                         counts["unk_language"][language] += unk_count
+                        continue
+                    forbidden_count = sum(
+                        1 for token_id in token_ids if int(token_id) in forbidden_token_ids
+                    )
+                    if forbidden_count > 0:
+                        counts["drop_reason"]["non_pronunciation_token"] += 1
+                        counts["drop_source"][source] += 1
+                        counts["drop_language"][language] += 1
+                        counts["forbidden_source"][source] += forbidden_count
+                        counts["forbidden_language"][language] += forbidden_count
                         continue
                     required_frames = _ctc_required_frames(token_ids)
                     num_frames = int(entry["num_frames"])
@@ -394,6 +542,20 @@ def main() -> None:
                         counts["drop_language"][language] += 1
                         continue
 
+                    interleave_lane = None
+                    if interleave_source_lanes:
+                        source_lane_count = interleave_source_lanes.get(source)
+                        if source_lane_count is None:
+                            raise ValueError(
+                                f"Missing interleave lane count for accepted source={source!r}"
+                            )
+                        interleave_lane = _interleave_lane(
+                            source=source,
+                            language=language,
+                            sample_id=sample_id,
+                            lanes=source_lane_count,
+                        )
+
                     row = {
                         **entry,
                         "source_dataset": source,
@@ -403,11 +565,14 @@ def main() -> None:
                         "ctc_num_tokens": len(token_ids),
                         "ctc_adjacent_repeats": required_frames - len(token_ids),
                         "ctc_unk_tokens": unk_count,
+                        "ctc_forbidden_tokens": forbidden_count,
                         "ctc_required_frames": required_frames,
                         "ctc_logit_frames": logit_frames,
                         "ctc_logit_required_ratio": round(ratio, 6),
                         "ctc_label_source": label_source,
                     }
+                    if interleave_lane is not None:
+                        row["stage211_sft_interleave_lane"] = interleave_lane
                     if teacher_original_wer is not None:
                         row["teacher_original_wer"] = round(float(teacher_original_wer), 6)
                     if teacher_original_cer is not None:
@@ -451,8 +616,15 @@ def main() -> None:
                     counts["label_source"][label_source] += 1
                     counts["split_source"][(split, source)] += 1
                     counts["split_language"][(split, language)] += 1
+                    if interleave_lane is not None:
+                        counts["interleave_lane"][interleave_lane] += 1
                 except Exception as exc:
                     counts["drop_reason"][f"error:{type(exc).__name__}"] += 1
+                    if bool(args.fail_on_error):
+                        raise RuntimeError(
+                            "Failed strict CTC-label preparation for "
+                            f"shard={entry.get('shard_name')} key={entry.get('key')}"
+                        ) from exc
                     _log(
                         f"skipped CTC-align sample shard={entry.get('shard_name')} "
                         f"key={entry.get('key')}: {type(exc).__name__}: {exc}"
@@ -467,6 +639,10 @@ def main() -> None:
         reader.close()
         if label_cache_output is not None:
             label_cache_output.close()
+
+    temporary_lengths_path.replace(output_lengths_path)
+    if temporary_label_cache_path is not None and label_cache_path is not None:
+        temporary_label_cache_path.replace(label_cache_path)
 
     split_counts = dict(sorted(counts["split"].items()))
     index_payload = {
@@ -516,6 +692,14 @@ def main() -> None:
         "min_logit_required_ratio": float(args.min_logit_required_ratio),
         "drop_unk_token": bool(args.drop_unk_token),
         "unk_token_id": unknown_id,
+        "forbid_stage211_non_pronunciation_tokens": bool(
+            args.forbid_stage211_non_pronunciation_tokens
+        ),
+        "forbidden_token_ids_count": len(forbidden_token_ids),
+        "forbidden_token_ids_sha256": forbidden_token_ids_sha256,
+        "reject_source_splits": sorted(rejected_source_splits),
+        "fail_on_error": bool(args.fail_on_error),
+        "interleave_source_lanes": interleave_source_lanes,
         "label_cache_path": None if label_cache_path is None else str(label_cache_path),
         "label_cache_text_key": str(args.label_cache_text_key),
         "label_cache_include": str(args.label_cache_include),
@@ -531,12 +715,16 @@ def main() -> None:
         "num_dropped_samples": int(processed - kept),
         "counts": {
             "input_by_split": dict(sorted(counts["input_split"].items())),
+            "input_by_source": dict(sorted(counts["input_source"].items())),
+            "input_by_language": dict(sorted(counts["input_language"].items())),
+            "source_split_labels": dict(sorted(counts["source_split"].items())),
             "kept_by_split": split_counts,
             "kept_by_source": dict(sorted(counts["source"].items())),
             "kept_by_language": dict(sorted(counts["language"].items())),
             "kept_by_label_source": dict(sorted(counts["label_source"].items())),
             "kept_by_split_source": {
-                f"{split}/{source}": value for (split, source), value in sorted(counts["split_source"].items())
+                f"{split}/{source}": value
+                for (split, source), value in sorted(counts["split_source"].items())
             },
             "kept_by_split_language": {
                 f"{split}/{language}": value
@@ -547,6 +735,12 @@ def main() -> None:
             "dropped_by_language": dict(sorted(counts["drop_language"].items())),
             "dropped_unk_tokens_by_source": dict(sorted(counts["unk_source"].items())),
             "dropped_unk_tokens_by_language": dict(sorted(counts["unk_language"].items())),
+            "dropped_forbidden_tokens_by_source": dict(sorted(counts["forbidden_source"].items())),
+            "dropped_forbidden_tokens_by_language": dict(
+                sorted(counts["forbidden_language"].items())
+            ),
+            "rejected_source_split_labels": dict(sorted(counts["rejected_source_split"].items())),
+            "kept_by_interleave_lane": dict(sorted(counts["interleave_lane"].items())),
         },
     }
     _write_json(index_path, index_payload)
