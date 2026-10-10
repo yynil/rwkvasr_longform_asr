@@ -1,23 +1,49 @@
 import json
+import inspect
 import shutil
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
+from rwkvasr.data import ASRBatch
 from rwkvasr.cli.train_ctc_deepspeed import _resolve_deepspeed_train_config, build_parser
 from rwkvasr.config import load_yaml
 from rwkvasr.training.deepspeed_loop import (
     DeepSpeedTrainConfig,
+    _accumulate_layer_eval_metrics,
+    _build_step_eval_provenance,
+    _ctc_frame_group_mean,
+    _ctc_frame_group_sums,
+    _ctc_teacher_layer_hidden_loss,
+    _ctc_teacher_top1_nonblank_mask,
+    _capture_student_sensevoice_layer_hiddens,
+    _finalize_layer_eval_metrics,
     _maybe_load_initial_model_checkpoint,
+    _materialize_step_eval_batches,
     _build_deepspeed_optimizer,
     _normalize_deepspeed_config,
+    _online_teacher_ctc_outputs_required,
     _prune_deepspeed_step_checkpoint_artifacts,
+    _prune_periodic_step_checkpoint_artifacts,
+    _resolve_ctc_frame_balance_mode,
     _resolve_ctc_teacher_online_device,
+    _resolve_train_webdataset_skip_decode_errors,
     _resolve_max_steps as resolve_deepspeed_max_steps,
     _save_export_checkpoints,
+    _select_eval_layer_hidden_ids,
     _sample_direction_mask_distributed,
+    _select_layer_hidden_ids,
     _step_checkpoint_record_is_retained,
+    _student_ctc_logits_required,
+    _stage211_probe_start_state,
+    _teacher_forced_student_layer_hiddens,
+    _teacher_layer_capture_ids,
+    _validate_exact_batch_coverage,
+    _validate_online_ctc_teacher_projection_support,
     train_ctc_model_deepspeed,
 )
 from rwkvasr.modules import DirectionDropoutConfig, DirectionDropoutScheduler, RWKVCTCModel, RWKVCTCModelConfig
@@ -49,6 +75,1067 @@ def test_online_ctc_teacher_device_uses_cuda_zero_for_single_process_debug() -> 
     assert _resolve_ctc_teacher_online_device(None, torch.device("cuda", 2), local_rank=2) == "cuda:2"
     assert _resolve_ctc_teacher_online_device("cuda:1", torch.device("cuda"), local_rank=-1) == "cuda:1"
     assert _resolve_ctc_teacher_online_device(None, torch.device("cpu"), local_rank=-1) == "cpu"
+
+
+def test_stage211_probe_start_state_uses_formal_epoch_one() -> None:
+    config = DeepSpeedTrainConfig(
+        output_dir="probe",
+        deepspeed={},
+        stage211_batch_profile_probe_phase="block",
+        stage211_batch_profile_probe_epoch_batch_offset=50,
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+        webdataset_skip_decode_errors=False,
+    )
+
+    assert _stage211_probe_start_state(
+        config,
+        epoch_steps=100,
+        resume_from=None,
+        bucket_manifest_active=True,
+    ) == (1, 50)
+    assert _stage211_probe_start_state(
+        replace(config, stage211_batch_profile_probe_epoch_batch_offset=0),
+        epoch_steps=100,
+        resume_from=None,
+        bucket_manifest_active=True,
+    ) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("config_changes", "resume_from", "manifest_active", "error"),
+    (
+        ({"stage211_batch_profile_probe_phase": None}, None, True, "supported"),
+        ({}, "/checkpoint", True, "resume_from"),
+        ({}, None, False, "bucket manifest"),
+        ({"length_bucket_drop_last": True}, None, True, "exact-coverage"),
+        ({"stage211_batch_profile_probe_epoch_batch_offset": 100}, None, True, "exceeds"),
+        ({"stage211_batch_profile_probe_epoch_batch_offset": True}, None, True, "non-negative"),
+    ),
+)
+def test_stage211_probe_start_state_rejects_unsafe_offsets(
+    config_changes: dict[str, object],
+    resume_from: str | None,
+    manifest_active: bool,
+    error: str,
+) -> None:
+    config = DeepSpeedTrainConfig(
+        output_dir="probe",
+        deepspeed={},
+        stage211_batch_profile_probe_phase="block",
+        stage211_batch_profile_probe_epoch_batch_offset=50,
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+        webdataset_skip_decode_errors=False,
+    )
+    with pytest.raises(ValueError, match=error):
+        _stage211_probe_start_state(
+            replace(config, **config_changes),
+            epoch_steps=100,
+            resume_from=resume_from,
+            bucket_manifest_active=manifest_active,
+        )
+
+
+def test_online_ctc_teacher_projection_support_matches_pronunciation_mask() -> None:
+    _validate_online_ctc_teacher_projection_support(
+        suppress_non_pronunciation_tokens=True,
+        teacher_model_path="nano",
+        output_weights=(0.05, 0.10),
+        student_suppressed_token_ids=(3, 5, 7),
+        teacher_ignored_token_ids=[7, 3, 5],
+    )
+
+    with pytest.raises(ValueError, match="projection support must exactly match"):
+        _validate_online_ctc_teacher_projection_support(
+            suppress_non_pronunciation_tokens=True,
+            teacher_model_path="nano",
+            output_weights=(0.05, 0.10),
+            student_suppressed_token_ids=(3, 5, 7),
+            teacher_ignored_token_ids=(3, 5),
+        )
+
+
+def test_online_ctc_teacher_projection_support_is_irrelevant_without_output_loss() -> None:
+    _validate_online_ctc_teacher_projection_support(
+        suppress_non_pronunciation_tokens=True,
+        teacher_model_path="nano",
+        output_weights=(0.0, 0.0),
+        student_suppressed_token_ids=(3, 5, 7),
+        teacher_ignored_token_ids=(3,),
+    )
+
+
+def test_hidden_only_projection_elision_falls_back_for_ctc_objectives() -> None:
+    hidden_only = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        ctc_loss_weight=0.0,
+        decoder_loss_weight=0.0,
+        ctc_teacher_online_encoder_loss_weight=1.0,
+        ctc_teacher_online_decoder_hidden_loss_weight=1.0,
+        ctc_teacher_online_layer_block_loss_weight=1.0,
+        ctc_teacher_online_hidden_frame_balance_mode="all",
+    )
+    assert _online_teacher_ctc_outputs_required(hidden_only) is False
+    assert _student_ctc_logits_required(hidden_only) is False
+
+    online_logits = replace(hidden_only, ctc_teacher_online_full_loss_weight=1.0)
+    assert _online_teacher_ctc_outputs_required(online_logits) is True
+    assert _student_ctc_logits_required(online_logits) is True
+
+    cached_logits = replace(hidden_only, ctc_teacher_topk_loss_weight=1.0)
+    assert _student_ctc_logits_required(cached_logits) is True
+
+    supervised_ctc = replace(hidden_only, ctc_loss_weight=1.0)
+    assert _student_ctc_logits_required(supervised_ctc) is True
+
+    teacher_top1_balance = replace(
+        hidden_only,
+        ctc_teacher_online_hidden_frame_balance_mode="teacher_top1_balanced",
+    )
+    assert _online_teacher_ctc_outputs_required(teacher_top1_balance) is True
+    assert _student_ctc_logits_required(teacher_top1_balance) is False
+
+
+def test_deepspeed_loop_leaves_gradient_accumulation_to_engine() -> None:
+    source = inspect.getsource(train_ctc_model_deepspeed)
+
+    assert "engine.zero_grad()" not in source
+
+
+def test_exact_coverage_rejects_any_token_budget_truncation() -> None:
+    strict = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+        webdataset_skip_decode_errors=False,
+    )
+
+    with pytest.raises(RuntimeError, match="no executable sample"):
+        _validate_exact_batch_coverage(strict, None)
+    with pytest.raises(RuntimeError, match="skipped_samples=1"):
+        _validate_exact_batch_coverage(
+            strict,
+            SimpleNamespace(skipped_samples=1, dropped_tail_samples=0),
+        )
+    with pytest.raises(RuntimeError, match="dropped_tail_samples=2"):
+        _validate_exact_batch_coverage(
+            strict,
+            SimpleNamespace(skipped_samples=0, dropped_tail_samples=2),
+        )
+
+    _validate_exact_batch_coverage(
+        strict,
+        SimpleNamespace(skipped_samples=0, dropped_tail_samples=0),
+    )
+    _validate_exact_batch_coverage(
+        DeepSpeedTrainConfig(output_dir="unused", deepspeed={}),
+        None,
+    )
+
+
+def test_exact_coverage_requires_fail_fast_webdataset_decode() -> None:
+    permissive = DeepSpeedTrainConfig(output_dir="unused", deepspeed={})
+    assert _resolve_train_webdataset_skip_decode_errors(permissive) is True
+
+    exact = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+        webdataset_skip_decode_errors=False,
+    )
+    assert _resolve_train_webdataset_skip_decode_errors(exact) is False
+
+    invalid = DeepSpeedTrainConfig(
+        output_dir="unused",
+        deepspeed={},
+        length_bucket_drop_last=False,
+        skip_oversized_samples=False,
+        webdataset_skip_decode_errors=True,
+    )
+    with pytest.raises(ValueError, match="webdataset_skip_decode_errors=false"):
+        _resolve_train_webdataset_skip_decode_errors(invalid)
+
+
+def test_materialize_step_eval_batches_replays_exact_features() -> None:
+    class ChangingLoader:
+        def __init__(self) -> None:
+            self.iteration = 0
+
+        def __iter__(self):
+            self.iteration += 1
+            value = float(self.iteration)
+            yield ASRBatch(
+                features=torch.full((3, 4, 2), value),
+                feature_lengths=torch.tensor([4, 4, 4]),
+                targets=torch.tensor([1, 2, 3]),
+                target_lengths=torch.tensor([1, 1, 1]),
+                utt_ids=["a", "b", "c"],
+            )
+
+    loader = ChangingLoader()
+    batches, samples = _materialize_step_eval_batches(
+        loader,
+        None,
+        epoch=0,
+        max_eval_samples=2,
+    )
+
+    assert samples == 2
+    assert len(batches) == 1
+    assert batches[0].utt_ids == ["a", "b"]
+    first = batches[0].features.clone()
+    assert torch.equal(first, next(iter(batches)).features)
+    assert loader.iteration == 1
+
+
+def test_materialize_step_eval_batches_uses_scoped_feature_seed() -> None:
+    class RandomLoader:
+        def __iter__(self):
+            yield ASRBatch(
+                features=torch.rand(2, 4, 2),
+                feature_lengths=torch.tensor([4, 4]),
+                targets=torch.tensor([1, 2]),
+                target_lengths=torch.tensor([1, 1]),
+                utt_ids=["a", "b"],
+            )
+
+    torch.manual_seed(1234)
+    initial_state = torch.random.get_rng_state()
+    first, first_samples = _materialize_step_eval_batches(
+        RandomLoader(),
+        None,
+        epoch=0,
+        max_eval_samples=2,
+        feature_seed=99,
+    )
+    assert torch.equal(torch.random.get_rng_state(), initial_state)
+    second, second_samples = _materialize_step_eval_batches(
+        RandomLoader(),
+        None,
+        epoch=0,
+        max_eval_samples=2,
+        feature_seed=99,
+    )
+    different, different_samples = _materialize_step_eval_batches(
+        RandomLoader(),
+        None,
+        epoch=0,
+        max_eval_samples=2,
+        feature_seed=100,
+    )
+
+    assert first_samples == second_samples == different_samples == 2
+    assert torch.equal(first[0].features, second[0].features)
+    assert not torch.equal(first[0].features, different[0].features)
+
+
+def test_materialize_step_eval_batches_rejects_negative_feature_seed() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        _materialize_step_eval_batches(
+            [],
+            None,
+            epoch=0,
+            max_eval_samples=1,
+            feature_seed=-1,
+        )
+
+
+def test_layer_hidden_sampler_keeps_boundaries_and_covers_every_layer() -> None:
+    selections = [
+        _select_layer_hidden_ids(
+            step=step,
+            num_layers=70,
+            sample_count=8,
+            boundary_ids=(0, 49, 50, 69),
+        )
+        for step in range(70)
+    ]
+    boundary_selection = _select_layer_hidden_ids(
+        step=0,
+        num_layers=70,
+        sample_count=8,
+        boundary_ids=(0, 49, 50, 69),
+        include_boundaries=True,
+    )
+
+    assert all(len(selection) == 8 for selection in selections)
+    assert set().union(*map(set, selections)) == set(range(70))
+    counts = {
+        layer_id: sum(layer_id in selection for selection in selections) for layer_id in range(70)
+    }
+    assert set(counts.values()) == {8}
+    assert {0, 49, 50, 69}.issubset(boundary_selection)
+
+
+def test_stage211_layer_sampling_schedules_have_exact_full_coverage() -> None:
+    num_layers = 70
+    weak_layer_ids = (0, 11, 12, 17, 20, 49, 50, 69)
+
+    layer_period = 35
+    layer_period_counts = {
+        layer_id: sum(
+            layer_id
+            in _select_layer_hidden_ids(
+                step=step,
+                num_layers=num_layers,
+                sample_count=8,
+                boundary_ids=(),
+            )
+            for step in range(layer_period)
+        )
+        for layer_id in range(num_layers)
+    }
+    assert set(layer_period_counts.values()) == {4}
+
+    expected_full_segment_counts = {
+        29_946: (3_422, 3_423),
+        1_003_713: (114_710, 114_711),
+        966_315: (110_436, 110_436),
+        105: (12, 12),
+    }
+    for steps, expected_range in expected_full_segment_counts.items():
+        full_periods, remainder = divmod(steps, layer_period)
+        counts = {
+            layer_id: layer_period_counts[layer_id] * full_periods
+            for layer_id in range(num_layers)
+        }
+        for step in range(remainder):
+            for layer_id in _select_layer_hidden_ids(
+                step=step,
+                num_layers=num_layers,
+                sample_count=8,
+                boundary_ids=(),
+            ):
+                counts[layer_id] += 1
+        assert (min(counts.values()), max(counts.values())) == expected_range
+        assert all(count > 0 for count in counts.values())
+        assert sum(counts.values()) == steps * 8
+
+    logits_period = 31
+    logits_selections = [
+        _select_layer_hidden_ids(
+            step=step,
+            num_layers=num_layers,
+            sample_count=12,
+            boundary_ids=weak_layer_ids,
+            include_boundaries=True,
+        )
+        for step in range(logits_period)
+    ]
+    assert all(set(weak_layer_ids).issubset(selection) for selection in logits_selections)
+    logits_counts = {
+        layer_id: sum(layer_id in selection for selection in logits_selections)
+        for layer_id in range(num_layers)
+    }
+    assert {logits_counts[layer_id] for layer_id in weak_layer_ids} == {31}
+    assert {
+        logits_counts[layer_id]
+        for layer_id in range(num_layers)
+        if layer_id not in weak_layer_ids
+    } == {2}
+
+    sft_selection = _select_layer_hidden_ids(
+        step=0,
+        num_layers=num_layers,
+        sample_count=8,
+        boundary_ids=weak_layer_ids,
+        include_boundaries=True,
+    )
+    assert sft_selection == weak_layer_ids
+
+
+def test_specific_ctc_frame_balance_mode_overrides_legacy_fallback() -> None:
+    assert _resolve_ctc_frame_balance_mode(None, "teacher_top1_balanced") == (
+        "teacher_top1_balanced"
+    )
+    assert _resolve_ctc_frame_balance_mode("all", "teacher_top1_balanced") == "all"
+    with pytest.raises(ValueError, match="frame_balance_mode"):
+        _resolve_ctc_frame_balance_mode("invalid", "all")
+
+
+def test_layer_hidden_sampler_repeats_boundaries_with_wider_cyclic_coverage() -> None:
+    boundaries = {0, 49, 50, 69}
+    selections = [
+        _select_layer_hidden_ids(
+            step=step,
+            num_layers=70,
+            sample_count=24,
+            boundary_ids=tuple(sorted(boundaries)),
+            include_boundaries=True,
+        )
+        for step in range(70)
+    ]
+
+    assert all(len(selection) == 24 for selection in selections)
+    assert all(boundaries.issubset(selection) for selection in map(set, selections))
+    assert set().union(*map(set, selections)) == set(range(70))
+
+
+def test_fixed_eval_layer_sampler_covers_layers_uniformly_across_ranks() -> None:
+    selections = [
+        _select_eval_layer_hidden_ids(
+            batch_index=batch_index,
+            num_layers=70,
+            sample_count=8,
+            rank=rank,
+            world_size=4,
+        )
+        for batch_index in range(16)
+        for rank in range(4)
+    ]
+    counts = {
+        layer_id: sum(layer_id in selection for selection in selections)
+        for layer_id in range(70)
+    }
+
+    assert all(len(selection) == 8 for selection in selections)
+    assert set().union(*map(set, selections)) == set(range(70))
+    assert min(counts.values()) >= 7
+    assert max(counts.values()) <= 8
+
+
+def test_fixed_eval_layer_sampler_rejects_invalid_distributed_coordinates() -> None:
+    with pytest.raises(ValueError, match="world_size must be positive"):
+        _select_eval_layer_hidden_ids(
+            batch_index=0,
+            num_layers=70,
+            sample_count=8,
+            rank=0,
+            world_size=0,
+        )
+    with pytest.raises(ValueError, match="rank must be in"):
+        _select_eval_layer_hidden_ids(
+            batch_index=0,
+            num_layers=70,
+            sample_count=8,
+            rank=4,
+            world_size=4,
+        )
+
+
+def test_teacher_forced_layer_alignment_uses_teacher_inputs_and_layer_zero_v_first() -> None:
+    torch.manual_seed(2703)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    records: dict[str, dict[str, object]] = {}
+    for utt_id, length in (("utt-a", 5), ("utt-b", 3)):
+        records[utt_id] = {
+            "encoder_layer_hiddens": {
+                "0": {"input": torch.randn(length, 80)},
+                "1": {"input": torch.randn(length, 64)},
+                "2": {"input": torch.randn(length, 64)},
+            }
+        }
+
+    selected = (1, 2)
+    assert _teacher_layer_capture_ids(selected, input_mode="teacher_forced") == (0, 1, 2)
+    outputs, lengths = _teacher_forced_student_layer_hiddens(
+        model,
+        records,
+        ("utt-a", "utt-b"),
+        layer_ids=selected,
+        missing_policy="error",
+    )
+
+    assert torch.equal(lengths, torch.tensor([5, 3]))
+    assert set(outputs) == {1, 2}
+    for components in outputs.values():
+        assert set(components) == {"mixer", "ffn", "block"}
+        assert components["mixer"].shape == (2, 5, 64)
+    sum(component.sum() for components in outputs.values() for component in components.values()).backward()
+    encoder = model.encoder.sensevoice_encoder
+    assert encoder.layers[0].time_mixer.forward_mixer.value.weight.grad is not None
+    assert encoder.layers[1].time_mixer.forward_mixer.value.weight.grad is not None
+
+
+def test_teacher_forced_layer_alignment_matches_direct_layer_forwards() -> None:
+    torch.manual_seed(2704)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    row_lengths = (5, 3)
+    records: dict[str, dict[str, object]] = {}
+    for utt_id, length in zip(("utt-a", "utt-b"), row_lengths, strict=True):
+        records[utt_id] = {
+            "encoder_layer_hiddens": {
+                "0": {"input": torch.randn(length, 80)},
+                "1": {"input": torch.randn(length, 64)},
+                "2": {"input": torch.randn(length, 64)},
+            }
+        }
+
+    helper_outputs, helper_lengths = _teacher_forced_student_layer_hiddens(
+        model,
+        records,
+        ("utt-a", "utt-b"),
+        layer_ids=(0, 1, 2),
+        missing_policy="error",
+    )
+
+    encoder = model.encoder.sensevoice_encoder
+    direct_inputs: dict[int, torch.Tensor] = {}
+    for layer_id, feature_dim in ((0, 80), (1, 64), (2, 64)):
+        direct_input = torch.zeros(2, max(row_lengths), feature_dim)
+        for sample_idx, (utt_id, length) in enumerate(zip(("utt-a", "utt-b"), row_lengths, strict=True)):
+            direct_input[sample_idx, :length] = records[utt_id]["encoder_layer_hiddens"][str(layer_id)]["input"]
+        direct_inputs[layer_id] = direct_input
+
+    direct_lengths = torch.tensor(row_lengths)
+    direct_outputs: dict[int, dict[str, torch.Tensor]] = {}
+    v_first = None
+    for layer_id, layer in enumerate(encoder.layers):
+        captured: dict[str, torch.Tensor] = {}
+        mixer_handle = layer.time_mixer.register_forward_hook(
+            lambda _module, _args, output, target=captured: target.__setitem__("mixer", output[0])
+        )
+        ffn_handle = layer.feed_forward.register_forward_hook(
+            lambda _module, _args, output, target=captured: target.__setitem__("ffn", output)
+        )
+        try:
+            block, next_v_first, _ = layer(
+                direct_inputs[layer_id],
+                v_first=v_first,
+                lengths=direct_lengths,
+            )
+        finally:
+            mixer_handle.remove()
+            ffn_handle.remove()
+        direct_outputs[layer_id] = {**captured, "block": block}
+        if layer_id == 0:
+            v_first = next_v_first
+
+    assert torch.equal(helper_lengths, direct_lengths)
+    for layer_id in range(3):
+        for component in ("mixer", "ffn", "block"):
+            assert torch.equal(
+                helper_outputs[layer_id][component],
+                direct_outputs[layer_id][component],
+            )
+
+
+def test_stacked_layer_capture_reconstructs_same_forward_residuals() -> None:
+    torch.manual_seed(2705)
+    model = RWKVCTCModel(
+        RWKVCTCModelConfig(
+            input_dim=80,
+            n_embd=64,
+            encoder_output_dim=64,
+            dim_att=64,
+            dim_ff=128,
+            num_layers=3,
+            vocab_size=16,
+            head_size=32,
+            dropout=0.0,
+            frontend_type="sensevoice_rwkv",
+            sensevoice_tp_blocks=1,
+        )
+    )
+    encoder = model.encoder.sensevoice_encoder
+    selected = (0, 2)
+    layer_inputs: dict[int, torch.Tensor] = {}
+    input_handles = []
+    for layer_id in selected:
+        input_handles.append(
+            encoder.layers[layer_id].register_forward_pre_hook(
+                lambda _module, args, target_id=layer_id: layer_inputs.__setitem__(
+                    target_id,
+                    args[0],
+                )
+            )
+        )
+
+    try:
+        with _capture_student_sensevoice_layer_hiddens(model, selected) as captured:
+            _, encoded_lengths, _ = model.encoder(
+                torch.randn(2, 7, 80),
+                torch.tensor([7, 4]),
+            )
+    finally:
+        for handle in input_handles:
+            handle.remove()
+
+    assert torch.equal(encoded_lengths, torch.tensor([7, 4]))
+    assert set(captured) == set(selected)
+    assert set(layer_inputs) == set(selected)
+    for layer_id in selected:
+        assert set(captured[layer_id]) == {"mixer", "ffn", "block"}
+        post_mixer = captured[layer_id]["mixer"]
+        if encoder.layers[layer_id].input_dim == encoder.layers[layer_id].hidden_dim:
+            post_mixer = layer_inputs[layer_id] + post_mixer
+        assert torch.equal(
+            captured[layer_id]["block"],
+            post_mixer + captured[layer_id]["ffn"],
+        )
+
+
+def test_stacked_hidden_capture_preserves_loss_and_gradients_with_checkpointing() -> None:
+    torch.manual_seed(2706)
+    config = RWKVCTCModelConfig(
+        input_dim=80,
+        n_embd=64,
+        encoder_output_dim=64,
+        dim_att=64,
+        dim_ff=128,
+        num_layers=3,
+        vocab_size=16,
+        head_size=32,
+        dropout=0.0,
+        frontend_type="sensevoice_rwkv",
+        sensevoice_tp_blocks=1,
+    )
+    reference = RWKVCTCModel(config)
+    checkpointed = RWKVCTCModel(config)
+    checkpointed.load_state_dict(reference.state_dict())
+    features = torch.randn(2, 7, 80)
+    lengths = torch.tensor([7, 4])
+    selected = (0, 2)
+
+    def run(model: RWKVCTCModel, *, enabled: bool) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        model.enable_gradient_checkpointing(enabled)
+        model.train()
+        with _capture_student_sensevoice_layer_hiddens(model, selected) as captured:
+            encoded, _, _ = model.encoder(features, lengths)
+        loss = encoded.float().square().mean()
+        for layer_id in selected:
+            for component in ("mixer", "ffn", "block"):
+                loss = loss + captured[layer_id][component].float().square().mean()
+        loss.backward()
+        gradients = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        }
+        return loss.detach(), gradients
+
+    reference_loss, reference_gradients = run(reference, enabled=False)
+    checkpointed_loss, checkpointed_gradients = run(checkpointed, enabled=True)
+
+    assert torch.equal(reference_loss, checkpointed_loss)
+    assert checkpointed_gradients.keys() == reference_gradients.keys()
+    for name, expected in reference_gradients.items():
+        torch.testing.assert_close(checkpointed_gradients[name], expected, rtol=1e-5, atol=1e-6)
+
+
+def test_layer_hidden_loss_matches_identical_sampled_components() -> None:
+    student_hiddens = {
+        layer_id: {
+            component: torch.randn(2, 4, 6, requires_grad=True)
+            for component in ("mixer", "ffn", "block")
+        }
+        for layer_id in (0, 2)
+    }
+    records: dict[str, dict[str, object]] = {}
+    for sample_idx, (utt_id, length) in enumerate((("utt-a", 4), ("utt-b", 3))):
+        records[utt_id] = {
+            "encoder_layer_hiddens": {
+                str(layer_id): {
+                    component: student_hiddens[layer_id][component][sample_idx, :length].detach().clone()
+                    for component in ("mixer", "ffn", "block")
+                }
+                for layer_id in (0, 2)
+            }
+        }
+
+    result = _ctc_teacher_layer_hidden_loss(
+        student_hiddens,
+        torch.tensor([4, 3]),
+        ["utt-a", "utt-b"],
+        records,
+        layer_ids=(0, 2),
+        component_weights={"mixer": 1.0, "ffn": 0.0, "block": 0.5},
+        normalized_mse_weight=1.0,
+        cosine_weight=0.25,
+        energy_mse_weight=0.5,
+        log_rms_weight=0.1,
+        raw_mse_weight=0.1,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+
+    assert result.loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert result.matched_samples == 2
+    assert result.missing_samples == 0
+    assert result.events == 8
+    assert result.max_frame_delta == 0
+    result.loss.backward()
+    assert student_hiddens[0]["mixer"].grad is not None
+
+
+def test_layer_hidden_loss_packs_metric_kernels_by_layer_and_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(17)
+    batch_size = 4
+    layer_ids = (0, 2)
+    active_components = ("mixer", "block")
+    lengths = torch.tensor([5, 4, 3, 2])
+    student_hiddens = {
+        layer_id: {
+            component: torch.randn(batch_size, 5, 8, requires_grad=True)
+            for component in active_components
+        }
+        for layer_id in layer_ids
+    }
+    records = {
+        f"utt-{sample_idx}": {
+            "encoder_layer_hiddens": {
+                str(layer_id): {
+                    component: student_hiddens[layer_id][component][
+                        sample_idx, : int(lengths[sample_idx])
+                    ].detach().to(dtype=torch.float16)
+                    for component in active_components
+                }
+                for layer_id in layer_ids
+            }
+        }
+        for sample_idx in range(batch_size)
+    }
+    calls = {"layer_norm": 0, "cosine": 0}
+    original_layer_norm = F.layer_norm
+    original_cosine = F.cosine_similarity
+
+    def counted_layer_norm(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["layer_norm"] += 1
+        return original_layer_norm(*args, **kwargs)
+
+    def counted_cosine(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["cosine"] += 1
+        return original_cosine(*args, **kwargs)
+
+    monkeypatch.setattr(F, "layer_norm", counted_layer_norm)
+    monkeypatch.setattr(F, "cosine_similarity", counted_cosine)
+    result = _ctc_teacher_layer_hidden_loss(
+        student_hiddens,
+        lengths,
+        tuple(records),
+        records,
+        layer_ids=layer_ids,
+        component_weights={"mixer": 0.25, "ffn": 0.0, "block": 1.0},
+        normalized_mse_weight=1.0,
+        cosine_weight=0.25,
+        energy_mse_weight=0.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=0.0,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+
+    packed_groups = len(layer_ids) * len(active_components)
+    assert calls == {"layer_norm": packed_groups * 2, "cosine": packed_groups}
+    assert result.events == batch_size * packed_groups
+    assert result.matched_samples == batch_size
+    result.loss.backward()
+    assert all(
+        student_hiddens[layer_id][component].grad is not None
+        for layer_id in layer_ids
+        for component in active_components
+    )
+
+
+def test_layer_hidden_packed_reduction_matches_legacy_event_objective_and_gradients() -> None:
+    torch.manual_seed(31)
+    layer_ids = (0, 2)
+    components = ("mixer", "block")
+    lengths = torch.tensor([5, 4, 3])
+    base = {
+        layer_id: {
+            component: torch.randn(3, 5, 7)
+            for component in components
+        }
+        for layer_id in layer_ids
+    }
+    packed_student = {
+        layer_id: {
+            component: value.clone().requires_grad_()
+            for component, value in layer.items()
+        }
+        for layer_id, layer in base.items()
+    }
+    legacy_student = {
+        layer_id: {
+            component: value.clone().requires_grad_()
+            for component, value in layer.items()
+        }
+        for layer_id, layer in base.items()
+    }
+    records: dict[str, dict[str, object]] = {}
+    for sample_idx, student_time in enumerate(lengths.tolist()):
+        records[f"utt-{sample_idx}"] = {
+            "encoder_layer_hiddens": {
+                str(layer_id): {
+                    component: torch.randn(
+                        student_time - ((sample_idx + layer_id + component_idx) % 2),
+                        7,
+                    ).to(dtype=torch.float16)
+                    for component_idx, component in enumerate(components)
+                }
+                for layer_id in layer_ids
+            }
+        }
+    component_weights = {"mixer": 0.25, "ffn": 0.0, "block": 1.0}
+    metric_weights = {
+        "normalized_mse_weight": 1.0,
+        "cosine_weight": 0.25,
+        "energy_mse_weight": 0.5,
+        "log_rms_weight": 0.1,
+        "raw_mse_weight": 0.2,
+    }
+    result = _ctc_teacher_layer_hidden_loss(
+        packed_student,
+        lengths,
+        tuple(records),
+        records,
+        layer_ids=layer_ids,
+        component_weights=component_weights,
+        frame_tolerance=1,
+        missing_policy="error",
+        **metric_weights,
+    )
+
+    component_sums = {
+        component: legacy_student[layer_ids[0]][component].new_zeros(())
+        for component in components
+    }
+    component_frames = {component: 0 for component in components}
+    layer_sums = {
+        layer_id: legacy_student[layer_id][components[0]].new_zeros(())
+        for layer_id in layer_ids
+    }
+    layer_frames = {layer_id: 0.0 for layer_id in layer_ids}
+    for sample_idx, student_time in enumerate(lengths.tolist()):
+        teacher_layers = records[f"utt-{sample_idx}"]["encoder_layer_hiddens"]
+        assert isinstance(teacher_layers, dict)
+        for layer_id in layer_ids:
+            teacher_components = teacher_layers[str(layer_id)]
+            assert isinstance(teacher_components, dict)
+            for component in components:
+                teacher = torch.as_tensor(teacher_components[component], dtype=torch.float32)
+                aligned_time = min(student_time, int(teacher.size(0)))
+                student = legacy_student[layer_id][component][sample_idx, :aligned_time].float()
+                teacher = teacher[:aligned_time]
+                student_power = student.square().mean(dim=-1)
+                teacher_power = teacher.square().mean(dim=-1)
+                diff_power = (student - teacher).square().mean(dim=-1)
+                energy_mse = 2.0 * diff_power / (student_power + teacher_power + 1.0e-6)
+                log_rms_delta = 0.5 * (
+                    torch.log(student_power + 1.0e-6)
+                    - torch.log(teacher_power + 1.0e-6)
+                )
+                frame_loss = F.mse_loss(
+                    F.layer_norm(student, (7,)),
+                    F.layer_norm(teacher, (7,)),
+                    reduction="none",
+                ).mean(dim=-1)
+                frame_loss = frame_loss + (
+                    1.0 - F.cosine_similarity(student, teacher, dim=-1, eps=1.0e-6)
+                ) * metric_weights["cosine_weight"]
+                frame_loss = frame_loss + energy_mse * metric_weights["energy_mse_weight"]
+                frame_loss = frame_loss + F.smooth_l1_loss(
+                    log_rms_delta,
+                    torch.zeros_like(log_rms_delta),
+                    reduction="none",
+                    beta=0.25,
+                ) * metric_weights["log_rms_weight"]
+                frame_loss = frame_loss + F.mse_loss(
+                    student,
+                    teacher,
+                    reduction="none",
+                ).mean(dim=-1) * metric_weights["raw_mse_weight"]
+                component_sums[component] = component_sums[component] + frame_loss.sum()
+                component_frames[component] += aligned_time
+                weight = component_weights[component]
+                layer_sums[layer_id] = layer_sums[layer_id] + frame_loss.sum() * weight
+                layer_frames[layer_id] += aligned_time * weight
+    legacy_component_losses = {
+        component: component_sums[component] / component_frames[component]
+        for component in components
+    }
+    legacy_layer_losses = {
+        layer_id: layer_sums[layer_id] / layer_frames[layer_id]
+        for layer_id in layer_ids
+    }
+    legacy_loss = sum(
+        legacy_component_losses[component] * component_weights[component]
+        for component in components
+    )
+
+    torch.testing.assert_close(result.loss, legacy_loss, rtol=1.0e-6, atol=1.0e-7)
+    for component in components:
+        torch.testing.assert_close(
+            result.component_losses[component],
+            legacy_component_losses[component],
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+    for layer_id in layer_ids:
+        torch.testing.assert_close(
+            result.layer_losses[layer_id],
+            legacy_layer_losses[layer_id],
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+    packed_parameters = [
+        packed_student[layer_id][component]
+        for layer_id in layer_ids
+        for component in components
+    ]
+    legacy_parameters = [
+        legacy_student[layer_id][component]
+        for layer_id in layer_ids
+        for component in components
+    ]
+    packed_gradients = torch.autograd.grad(result.loss, packed_parameters)
+    legacy_gradients = torch.autograd.grad(legacy_loss, legacy_parameters)
+    for packed_gradient, legacy_gradient in zip(
+        packed_gradients,
+        legacy_gradients,
+        strict=True,
+    ):
+        torch.testing.assert_close(packed_gradient, legacy_gradient, rtol=1.0e-5, atol=1.0e-6)
+    assert result.events == len(lengths) * len(layer_ids) * len(components)
+    assert result.max_frame_delta == 1
+
+
+def test_teacher_top1_balanced_reduction_weights_blank_and_nonblank_equally() -> None:
+    frame_loss = torch.tensor([4.0, 1.0, 1.0, 1.0], requires_grad=True)
+    group_sums, group_denoms = _ctc_frame_group_sums(
+        frame_loss,
+        frame_balance_mode="teacher_top1_balanced",
+        teacher_nonblank_mask=torch.tensor([True, False, False, False]),
+    )
+    loss = _ctc_frame_group_mean(group_sums, group_denoms)
+
+    assert loss.item() == pytest.approx(2.5)
+    loss.backward()
+    assert frame_loss.grad is not None
+    assert frame_loss.grad.tolist() == pytest.approx([0.5, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0])
+
+
+def test_teacher_top1_nonblank_mask_excludes_blank_and_ignored_ids() -> None:
+    mask = _ctc_teacher_top1_nonblank_mask(
+        {
+            "topk_token_ids": torch.tensor([[5], [4], [2]]),
+            "topk_log_probs": torch.zeros(3, 1),
+            "project_blank_id": 5,
+            "project_ignored_token_ids": [4],
+        },
+        target_time=5,
+        blank_id=5,
+        device=torch.device("cpu"),
+    )
+
+    assert mask is not None
+    assert mask.tolist() == [False, False, False, True, True]
+
+
+def test_layer_hidden_loss_balances_teacher_nonblank_and_blank_frames() -> None:
+    student = torch.tensor(
+        [[[2.0, 2.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]],
+        requires_grad=True,
+    )
+    result = _ctc_teacher_layer_hidden_loss(
+        {0: {"mixer": student}},
+        torch.tensor([4]),
+        ["utt-a"],
+        {
+            "utt-a": {
+                "encoder_layer_hiddens": {"0": {"mixer": torch.zeros(4, 2)}},
+                "topk_token_ids": torch.tensor([[1], [5], [5], [5]]),
+                "topk_log_probs": torch.zeros(4, 1),
+                "project_blank_id": 5,
+                "project_ignored_token_ids": [4],
+            }
+        },
+        layer_ids=(0,),
+        component_weights={"mixer": 1.0},
+        normalized_mse_weight=0.0,
+        cosine_weight=0.0,
+        energy_mse_weight=0.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=1.0,
+        frame_tolerance=0,
+        missing_policy="error",
+        frame_balance_mode="teacher_top1_balanced",
+        blank_id=5,
+    )
+
+    assert result.loss.item() == pytest.approx(2.5)
+    result.loss.backward()
+    assert student.grad is not None
+    assert torch.count_nonzero(student.grad[0, 0]).item() == 2
+    assert torch.count_nonzero(student.grad[0, 1:]).item() == 6
+
+
+def test_layer_hidden_energy_mse_is_bounded_and_detects_scale_mismatch() -> None:
+    teacher = torch.randn(1, 3, 8)
+    student = (teacher * 10.0).requires_grad_()
+    result = _ctc_teacher_layer_hidden_loss(
+        {0: {"mixer": student}},
+        torch.tensor([3]),
+        ["utt-a"],
+        {
+            "utt-a": {
+                "encoder_layer_hiddens": {
+                    "0": {"mixer": teacher[0]},
+                }
+            }
+        },
+        layer_ids=(0,),
+        component_weights={"mixer": 1.0},
+        normalized_mse_weight=0.0,
+        cosine_weight=0.0,
+        energy_mse_weight=1.0,
+        log_rms_weight=0.0,
+        raw_mse_weight=0.0,
+        frame_tolerance=0,
+        missing_policy="error",
+    )
+
+    assert result.loss.item() == pytest.approx(162.0 / 101.0, rel=1.0e-4)
+    assert 0.0 < result.component_energy_mse["mixer"] <= 4.0
+    assert result.component_rms_ratio["mixer"] == pytest.approx(10.0, rel=1.0e-5)
+    assert result.component_log_rms["mixer"] > 0.0
+    assert result.component_cosine["mixer"] == pytest.approx(1.0, abs=1.0e-5)
+    accumulator = torch.zeros((2, 8), dtype=torch.float64)
+    _accumulate_layer_eval_metrics(accumulator, result)
+    _accumulate_layer_eval_metrics(accumulator, result)
+    layer_metrics = _finalize_layer_eval_metrics(accumulator, device=torch.device("cpu"))
+    assert set(layer_metrics) == {0}
+    assert layer_metrics[0]["loss"] == pytest.approx(result.layer_losses[0].item())
+    assert layer_metrics[0]["energy_mse"] == pytest.approx(result.layer_energy_mse[0])
+    assert layer_metrics[0]["cosine"] == pytest.approx(1.0, abs=1.0e-5)
+    assert layer_metrics[0]["rms_ratio"] == pytest.approx(10.0, rel=1.0e-5)
+    result.loss.backward()
+    assert student.grad is not None
 
 
 def test_deepspeed_cli_config_can_be_loaded_from_yaml_and_overridden(tmp_path: Path) -> None:
@@ -133,6 +1220,61 @@ def test_deepspeed_cli_accepts_init_checkpoint_override(tmp_path: Path) -> None:
     assert resolved.init_checkpoint_path == str(init_path)
 
 
+def test_deepspeed_cli_preserves_stage211_receipt_metadata(tmp_path: Path) -> None:
+    config_path = tmp_path / "train_ds.yaml"
+    metadata = {
+        "stage211_batch_profile_probe_phase": "mixer",
+        "stage211_batch_profile_admission_path": "/evidence/admission.json",
+        "stage211_batch_profile_admission_sha256": "a" * 64,
+        "stage211_batch_profile_name": "batch48_frames42k",
+        "stage211_batch_profile_num_workers": 8,
+        "stage211_batch_profile_gradient_checkpointing": False,
+        "stage211_post_coverage_correction_phase": "mixer",
+        "stage211_post_coverage_correction_round": 1,
+        "stage211_post_coverage_replay_receipt_path": "/evidence/replay.json",
+        "stage211_post_coverage_admission_gate_path": "/evidence/gate.json",
+        "stage211_post_coverage_admission_gate_sha256": "b" * 64,
+        "stage211_post_coverage_admission_mode": "failed_gate",
+        "stage211_post_coverage_layer_focus_path": "/evidence/focus.json",
+        "stage211_post_coverage_layer_focus_sha256": "c" * 64,
+        "stage211_post_coverage_layer_rotation_offset": 3,
+        "stage211_post_coverage_batch_profile_preflight_path": "/evidence/profile.json",
+        "stage211_post_coverage_batch_profile_preflight_sha256": "d" * 64,
+        "stage211_post_coverage_batch_profile_admission_path": "/evidence/round.json",
+        "stage211_post_coverage_batch_profile_admission_sha256": "e" * 64,
+        "stage211_post_coverage_batch_profile_name": "baseline",
+        "stage211_post_coverage_batch_size": 4,
+        "stage211_post_coverage_frame_budget": 4_000,
+        "stage211_post_coverage_num_workers": 8,
+        "stage211_post_coverage_gradient_checkpointing": True,
+        "stage211_post_coverage_original_coverage_unchanged": True,
+        "stage211_post_coverage_smoke_marker_path": "/evidence/smoke.json",
+        "stage211_post_coverage_smoke_marker_sha256": "f" * 64,
+        "stage211_sft_correction_profile_path": "/evidence/sft-profile.json",
+        "stage211_sft_correction_profile_sha256": "1" * 64,
+        "stage211_full_sft_completion_path": "/evidence/full-sft.json",
+        "stage211_full_sft_completion_sha256": "2" * 64,
+    }
+    config_path.write_text(
+        json.dumps(
+            {
+                "output_dir": str(tmp_path / "out"),
+                "device": "cpu",
+                "deepspeed": {"train_micro_batch_size_per_gpu": 1},
+                **metadata,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = _resolve_deepspeed_train_config(
+        build_parser().parse_args(["--config-yaml", str(config_path)])
+    )
+
+    for key, expected in metadata.items():
+        assert getattr(resolved, key) == expected
+
+
 def test_deepspeed_cli_accepts_decoder_text_token_budget(tmp_path: Path) -> None:
     config_path = tmp_path / "train_ds.yaml"
     config_path.write_text(
@@ -211,6 +1353,125 @@ def test_deepspeed_resolve_max_steps_supports_custom_utt_id_key(tmp_path: Path) 
     assert resolved_max_steps == 6
 
 
+def test_deepspeed_resolve_max_steps_uses_bucket_manifest_without_webdataset_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    bucket_manifest = tmp_path / "buckets" / "manifest.json"
+    bucket_manifest.parent.mkdir(parents=True)
+    bucket_manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "root": "/",
+                "source_length_index_path": str(tmp_path / "lengths.jsonl"),
+                "bucket_width": 200,
+                "entries_per_part": 100,
+                "splits": {
+                    "train": {
+                        "num_samples": 48,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": 48,
+                                "parts": [],
+                            }
+                        ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved_max_steps, steps_per_epoch = resolve_deepspeed_max_steps(
+        DeepSpeedTrainConfig(
+            output_dir=str(tmp_path / "out"),
+            deepspeed={"gradient_accumulation_steps": 1},
+            webdataset_root="/",
+            webdataset_bucket_manifest_path=str(bucket_manifest),
+            webdataset_length_index_path=str(tmp_path / "lengths.jsonl"),
+            webdataset_split="train",
+            batch_size=3,
+            epochs=2,
+        ),
+        grad_accum=1,
+    )
+
+    assert steps_per_epoch == 4
+    assert resolved_max_steps == 8
+
+
+def test_step_eval_provenance_binds_manifest_and_eval_parts(
+    tmp_path: Path,
+) -> None:
+    eval_part = tmp_path / "eval.jsonl"
+    eval_part.write_text('{"utt_id": "u1"}\n', encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "root": "/",
+                "source_length_index_path": str(tmp_path / "lengths.jsonl"),
+                "bucket_width": 200,
+                "entries_per_part": 100,
+                "splits": {
+                    "eval": {
+                        "num_samples": 256,
+                        "buckets": [
+                            {
+                                "bucket_id": 0,
+                                "num_samples": 256,
+                                "parts": [
+                                    {
+                                        "path": str(eval_part),
+                                        "num_samples": 256,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    provenance = _build_step_eval_provenance(
+        config=DeepSpeedTrainConfig(
+            output_dir=str(tmp_path / "out"),
+            deepspeed={},
+            step_eval_split="eval",
+            step_eval_samples=256,
+        ),
+        bucket_manifest_path=manifest,
+    )
+
+    assert provenance["split"] == "eval"
+    assert provenance["requested_samples"] == 256
+    assert provenance["feature_seed"] == 0
+    assert provenance["split_samples"] == 256
+    assert provenance["bucket_manifest_path"] == str(manifest.resolve())
+    assert len(provenance["bucket_manifest_sha256"]) == 64
+    assert len(provenance["parts"]) == 1
+    assert provenance["parts"][0]["path"] == str(eval_part.resolve())
+    assert len(provenance["parts"][0]["sha256"]) == 64
+    assert provenance["parts"][0]["num_samples"] == 256
+
+    provenance_from_config_string = _build_step_eval_provenance(
+        config=DeepSpeedTrainConfig(
+            output_dir=str(tmp_path / "out"),
+            deepspeed={},
+            step_eval_split="eval",
+            step_eval_samples=256,
+        ),
+        bucket_manifest_path=str(manifest),
+    )
+    assert provenance_from_config_string == provenance
+
+
 @pytest.mark.filterwarnings("ignore:Can't initialize NVML")
 def test_train_ctc_model_deepspeed_smoke_single_process(tmp_path: Path) -> None:
     pytest.importorskip("deepspeed")
@@ -224,6 +1485,7 @@ def test_train_ctc_model_deepspeed_smoke_single_process(tmp_path: Path) -> None:
             output_dir=str(out_dir),
             manifest_path=str(manifest),
             vocab_size=8,
+            tokenizer_type="synthetic",
             input_dim=80,
             n_embd=128,
             dim_att=128,
@@ -281,6 +1543,7 @@ def test_train_ctc_model_deepspeed_keeps_top_k_step_checkpoints(tmp_path: Path) 
             output_dir=str(out_dir),
             manifest_path=str(manifest),
             vocab_size=8,
+            tokenizer_type="synthetic",
             input_dim=80,
             n_embd=128,
             dim_att=128,
@@ -319,7 +1582,14 @@ def test_train_ctc_model_deepspeed_keeps_top_k_step_checkpoints(tmp_path: Path) 
     assert len(step_metrics["step_checkpoints"]) == 2
     assert len(step_metrics["best"]) == 1
     remaining = sorted(path.name for path in out_dir.glob("step-*.pt"))
-    assert len(remaining) == 1
+    assert remaining == [Path(step_metrics["best"][0]["checkpoint_path"]).name]
+    remaining_ds = sorted(path.name for path in (out_dir / "ds_checkpoints").glob("step-*"))
+    assert remaining_ds == [
+        Path(step_metrics["best"][0]["deepspeed_checkpoint_dir"]).name
+    ]
+    latest = load_yaml(out_dir / "latest_checkpoint.yaml")
+    assert Path(latest["checkpoint_path"]).name == "epoch-1.pt"
+    assert Path(latest["checkpoint_path"]).is_file()
 
 
 def test_normalize_deepspeed_config_does_not_force_cpu_offload() -> None:
@@ -513,6 +1783,29 @@ def test_prune_deepspeed_step_checkpoint_artifacts_ignores_missing_paths(tmp_pat
     assert not removed_dir.exists()
     assert kept_file.exists()
     assert kept_dir.exists()
+
+
+def test_prune_periodic_step_checkpoints_keeps_latest_and_ranked(tmp_path: Path) -> None:
+    for step in (2_000, 4_000, 6_000, 8_000, 10_000):
+        (tmp_path / f"step-{step}.pt").write_text(str(step), encoding="utf-8")
+        checkpoint_dir = tmp_path / "ds_checkpoints" / f"step-{step}"
+        checkpoint_dir.mkdir(parents=True)
+        (checkpoint_dir / "meta.txt").write_text(str(step), encoding="utf-8")
+
+    removed = _prune_periodic_step_checkpoint_artifacts(
+        output_dir=tmp_path,
+        current_step=10_000,
+        keep_last=2,
+        protected_records=[{"step": 4_000}],
+    )
+
+    assert removed == [2_000, 6_000]
+    for step in (4_000, 8_000, 10_000):
+        assert (tmp_path / f"step-{step}.pt").is_file()
+        assert (tmp_path / "ds_checkpoints" / f"step-{step}").is_dir()
+    for step in removed:
+        assert not (tmp_path / f"step-{step}.pt").exists()
+        assert not (tmp_path / "ds_checkpoints" / f"step-{step}").exists()
 
 
 def test_step_checkpoint_record_is_retained_matches_by_file_or_dir() -> None:

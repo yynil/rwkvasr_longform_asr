@@ -73,7 +73,9 @@ class ASRBatch:
             self.decoder_prompt_before_audio is not None
             and self.decoder_prompt_before_audio_lengths is not None
         ):
-            decoder_prompt_before_audio_lengths = self.decoder_prompt_before_audio_lengths[:num_samples]
+            decoder_prompt_before_audio_lengths = self.decoder_prompt_before_audio_lengths[
+                :num_samples
+            ]
             total_decoder_prompt_tokens = int(decoder_prompt_before_audio_lengths.sum().item())
             decoder_prompt_before_audio = self.decoder_prompt_before_audio[
                 :total_decoder_prompt_tokens
@@ -187,11 +189,15 @@ class WhisperMultilingualTokenizer:
     def encode(self, text: str) -> list[int]:
         token_ids = list(self.processor.encode(text))
         if any(int(token_id) >= self._text_vocab_size for token_id in token_ids):
-            raise ValueError("Text encoded to a Whisper special token outside the CTC text vocabulary.")
+            raise ValueError(
+                "Text encoded to a Whisper special token outside the CTC text vocabulary."
+            )
         return [int(token_id) for token_id in token_ids]
 
     def decode(self, token_ids: list[int]) -> str:
-        token_ids = [int(token_id) for token_id in token_ids if int(token_id) < self._text_vocab_size]
+        token_ids = [
+            int(token_id) for token_id in token_ids if int(token_id) < self._text_vocab_size
+        ]
         if hasattr(self.processor.encoding, "decode_bytes"):
             raw_bytes = self.processor.encoding.decode_bytes(token_ids)
             return raw_bytes.decode("utf-8", errors="ignore")
@@ -384,8 +390,10 @@ class SenseVoiceTiktokenTokenizer:
         ]
 
     def decode(self, token_ids: list[int]) -> str:
-        filtered = [int(token_id) for token_id in token_ids if 0 <= int(token_id) < self._timestamp_begin]
-        return str(self.processor.decode(filtered))
+        filtered = [
+            int(token_id) for token_id in token_ids if 0 <= int(token_id) < self._timestamp_begin
+        ]
+        return str(self.processor.decode(filtered)).replace("\ufffd", "")
 
     def ctc_suppressed_token_ids(self, *, blank_id: int | None = None) -> tuple[int, ...]:
         suppressed: list[int] = []
@@ -402,7 +410,6 @@ class SenseVoiceTiktokenTokenizer:
                 suppressed.append(token_id)
                 continue
             if "\ufffd" in text:
-                suppressed.append(token_id)
                 continue
             if not normalize_asr_text(text, mode="ctc").strip():
                 suppressed.append(token_id)
@@ -435,7 +442,9 @@ class QwenTokenizer:
 
     def decode(self, token_ids: list[int]) -> str:
         return str(
-            self.processor.decode([int(token_id) for token_id in token_ids], skip_special_tokens=True)
+            self.processor.decode(
+                [int(token_id) for token_id in token_ids], skip_special_tokens=True
+            )
         )
 
     @property
@@ -465,7 +474,9 @@ class RWKVTokenizer:
             self.idx2token[idx] = token
 
         self.token2idx = {token: int(idx) for idx, token in self.idx2token.items()}
-        self._vocab_size = max(self.OFFICIAL_VOCAB_SIZE, (max(self.idx2token) + 1) if self.idx2token else 0)
+        self._vocab_size = max(
+            self.OFFICIAL_VOCAB_SIZE, (max(self.idx2token) + 1) if self.idx2token else 0
+        )
         self.table = [[[] for _ in range(256)] for _ in range(256)]
         self.good = [set() for _ in range(256)]
         self.wlen = [0 for _ in range(256)]
@@ -636,14 +647,18 @@ class WenetFbankFeatureExtractor:
         elif waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
         if sample_rate != self.config.sample_rate:
-            waveform = torchaudio.functional.resample(waveform, sample_rate, self.config.sample_rate)
+            waveform = torchaudio.functional.resample(
+                waveform, sample_rate, self.config.sample_rate
+            )
             sample_rate = self.config.sample_rate
         return compute_wenet_fbank(waveform, sample_rate, self.config).float()
 
 
 def apply_lfr_stacking(features: Tensor, *, lfr_m: int = 7, lfr_n: int = 6) -> Tensor:
     if features.dim() != 2:
-        raise ValueError(f"LFR stacking expects [frames, bins] features, got {tuple(features.shape)}.")
+        raise ValueError(
+            f"LFR stacking expects [frames, bins] features, got {tuple(features.shape)}."
+        )
     lfr_m = int(lfr_m)
     lfr_n = int(lfr_n)
     if lfr_m <= 0 or lfr_n <= 0:
@@ -703,7 +718,9 @@ class FunASRWavFrontendFeatureExtractor:
         try:
             from funasr.frontends.wav_frontend import WavFrontend
         except ImportError as exc:  # pragma: no cover - dependency is present in the project env.
-            raise ImportError("funasr is required for feature_extractor_type='funasr_wav_frontend'.") from exc
+            raise ImportError(
+                "funasr is required for feature_extractor_type='funasr_wav_frontend'."
+            ) from exc
         self.sample_rate = int(sample_rate)
         self.frontend = WavFrontend(
             fs=int(sample_rate),
@@ -727,7 +744,9 @@ class FunASRWavFrontendFeatureExtractor:
         elif waveform.dim() == 2:
             waveform = waveform.squeeze(0)
         if waveform.dim() != 1:
-            raise ValueError(f"Expected audio waveform with shape [time] or [channels, time], got {tuple(waveform.shape)}.")
+            raise ValueError(
+                f"Expected audio waveform with shape [time] or [channels, time], got {tuple(waveform.shape)}."
+            )
         if int(sample_rate) != self.sample_rate:
             waveform = torchaudio.functional.resample(
                 waveform.unsqueeze(0),
@@ -751,7 +770,9 @@ class Qwen3ASRFeatureExtractor:
         elif waveform.dim() == 2:
             waveform = waveform.squeeze(0)
         if waveform.dim() != 1:
-            raise ValueError(f"Expected audio waveform with shape [time] or [channels, time], got {tuple(waveform.shape)}.")
+            raise ValueError(
+                f"Expected audio waveform with shape [time] or [channels, time], got {tuple(waveform.shape)}."
+            )
         if sample_rate != self.config.sample_rate:
             waveform = torchaudio.functional.resample(
                 waveform.unsqueeze(0),
@@ -766,7 +787,12 @@ def build_audio_feature_extractor(
     feature_extractor_type: str,
     *,
     input_dim: int,
-) -> WenetFbankFeatureExtractor | Qwen3ASRFeatureExtractor | SenseVoiceLFRFbankFeatureExtractor | FunASRWavFrontendFeatureExtractor:
+) -> (
+    WenetFbankFeatureExtractor
+    | Qwen3ASRFeatureExtractor
+    | SenseVoiceLFRFbankFeatureExtractor
+    | FunASRWavFrontendFeatureExtractor
+):
     normalized = feature_extractor_type.lower().replace("-", "_")
     if normalized in {"wenet", "wenet_fbank", "fbank"}:
         return WenetFbankFeatureExtractor(WenetFbankConfig(num_mel_bins=int(input_dim)))
@@ -774,11 +800,15 @@ def build_audio_feature_extractor(
         return Qwen3ASRFeatureExtractor(Qwen3ASRFeatureConfig(feature_size=int(input_dim)))
     if normalized in {"sensevoice", "sensevoice_fbank", "sensevoice_lfr_fbank"}:
         if int(input_dim) != 560:
-            raise ValueError("sensevoice_lfr_fbank emits 560-dimensional features; set input_dim=560.")
+            raise ValueError(
+                "sensevoice_lfr_fbank emits 560-dimensional features; set input_dim=560."
+            )
         return SenseVoiceLFRFbankFeatureExtractor(num_mel_bins=80, lfr_m=7, lfr_n=6)
     if normalized in {"funasr_wav_frontend", "funasr_nano_wav_frontend"}:
         if int(input_dim) != 560:
-            raise ValueError("funasr_wav_frontend emits 560-dimensional features; set input_dim=560.")
+            raise ValueError(
+                "funasr_wav_frontend emits 560-dimensional features; set input_dim=560."
+            )
         return FunASRWavFrontendFeatureExtractor(num_mel_bins=80, lfr_m=7, lfr_n=6)
     raise ValueError(f"Unsupported feature_extractor_type: {feature_extractor_type}")
 
@@ -833,7 +863,9 @@ def _load_audio_with_ffmpeg(audio_path: Path) -> tuple[Tensor, int]:
     loader_paths = ["/usr/lib/x86_64-linux-gnu/blas", "/usr/lib/x86_64-linux-gnu/lapack"]
     existing = env.get("LD_LIBRARY_PATH")
     env["LD_LIBRARY_PATH"] = ":".join([*loader_paths, existing] if existing else loader_paths)
-    result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    result = subprocess.run(
+        command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+    )
     if result.returncode != 0:
         message = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"ffmpeg failed to decode {audio_path}: {message}")
@@ -886,7 +918,9 @@ def decoder_language_confirmation(
     return f"This is {language_name} text."
 
 
-def infer_decoder_language_from_text(text: str | None, *, fallback: str | None = None) -> str | None:
+def infer_decoder_language_from_text(
+    text: str | None, *, fallback: str | None = None
+) -> str | None:
     if text is None:
         return fallback
     cjk_count, latin_count = _count_text_scripts(str(text))
@@ -977,13 +1011,19 @@ def maybe_dropout_ctc_draft_text(
     if not 0.0 <= dropout_prob <= 1.0:
         raise ValueError("decoder_ctc_draft_dropout_prob must be between 0.0 and 1.0")
     if not 0.0 <= mismatch_prob <= 1.0:
-        raise ValueError("decoder_ctc_draft_language_mismatch_dropout_prob must be between 0.0 and 1.0")
+        raise ValueError(
+            "decoder_ctc_draft_language_mismatch_dropout_prob must be between 0.0 and 1.0"
+        )
 
-    if dropout_prob > 0.0 and _stable_unit_interval(
-        seed=seed,
-        sample_id=sample_id,
-        salt="ctc_draft_dropout",
-    ) < dropout_prob:
+    if (
+        dropout_prob > 0.0
+        and _stable_unit_interval(
+            seed=seed,
+            sample_id=sample_id,
+            salt="ctc_draft_dropout",
+        )
+        < dropout_prob
+    ):
         return ""
 
     if mismatch_prob <= 0.0:
@@ -993,22 +1033,28 @@ def maybe_dropout_ctc_draft_text(
     )
     if reference_family in {"en", "zh"}:
         if _ctc_draft_has_reference_language_mismatch(draft, reference_family=reference_family):
-            if _stable_unit_interval(
-                seed=seed,
-                sample_id=sample_id,
-                salt="ctc_draft_language_mismatch_dropout",
-            ) < mismatch_prob:
+            if (
+                _stable_unit_interval(
+                    seed=seed,
+                    sample_id=sample_id,
+                    salt="ctc_draft_language_mismatch_dropout",
+                )
+                < mismatch_prob
+            ):
                 return ""
             return draft
         return draft
     draft_family = _decoder_language_family(infer_decoder_language_from_text(draft, fallback=None))
     if reference_family is None or draft_family is None or reference_family == draft_family:
         return draft
-    if _stable_unit_interval(
-        seed=seed,
-        sample_id=sample_id,
-        salt="ctc_draft_language_mismatch_dropout",
-    ) < mismatch_prob:
+    if (
+        _stable_unit_interval(
+            seed=seed,
+            sample_id=sample_id,
+            salt="ctc_draft_language_mismatch_dropout",
+        )
+        < mismatch_prob
+    ):
         return ""
     return draft
 
@@ -1052,7 +1098,9 @@ def load_ctc_draft_cache(path: str, *, text_key: str = "pred_text") -> dict[str,
             try:
                 raw = json.loads(stripped)
             except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSONL in CTC draft cache {cache_path}:{line_number}") from exc
+                raise ValueError(
+                    f"Invalid JSONL in CTC draft cache {cache_path}:{line_number}"
+                ) from exc
             draft = raw.get(text_key)
             if draft is None and text_key != "pred_text":
                 draft = raw.get("pred_text")
@@ -1094,7 +1142,9 @@ def resolve_ctc_draft_text(
     return ""
 
 
-def combine_decoder_prompt_templates(prompt_before_audio: str, ctc_draft_prompt_template: str) -> str:
+def combine_decoder_prompt_templates(
+    prompt_before_audio: str, ctc_draft_prompt_template: str
+) -> str:
     base = str(prompt_before_audio or "")
     draft_template = str(ctc_draft_prompt_template or "")
     if not draft_template:
@@ -1142,7 +1192,9 @@ class ASRManifestDataset(Dataset[dict[str, Any]]):
         self.decoder_append_eos = bool(decoder_append_eos)
         self.decoder_text_normalization = str(decoder_text_normalization)
         self.decoder_prompt_before_audio = str(decoder_prompt_before_audio)
-        self.decoder_prompt_before_audio_use_language = bool(decoder_prompt_before_audio_use_language)
+        self.decoder_prompt_before_audio_use_language = bool(
+            decoder_prompt_before_audio_use_language
+        )
         self.decoder_ctc_draft_cache_path = decoder_ctc_draft_cache_path
         self.decoder_ctc_draft_prompt_template = str(decoder_ctc_draft_prompt_template or "")
         self.decoder_ctc_draft_text_key = str(decoder_ctc_draft_text_key or "pred_text")
@@ -1161,8 +1213,12 @@ class ASRManifestDataset(Dataset[dict[str, Any]]):
         self.decoder_target_prefix_use_language = bool(decoder_target_prefix_use_language)
         self.decoder_language_confirmation_en = str(decoder_language_confirmation_en)
         self.decoder_language_confirmation_zh = str(decoder_language_confirmation_zh)
-        self.decoder_prompt_language_label_noise_prob = float(decoder_prompt_language_label_noise_prob)
-        self.decoder_prompt_language_label_noise_seed = int(decoder_prompt_language_label_noise_seed)
+        self.decoder_prompt_language_label_noise_prob = float(
+            decoder_prompt_language_label_noise_prob
+        )
+        self.decoder_prompt_language_label_noise_seed = int(
+            decoder_prompt_language_label_noise_seed
+        )
         self.entries = self._load_entries()
 
     def _load_entries(self) -> list[ManifestEntry]:
@@ -1183,7 +1239,9 @@ class ASRManifestDataset(Dataset[dict[str, Any]]):
                         language=str(language) if language is not None else None,
                         mode=self.text_normalization,
                     )
-                if token_ids is None or (raw_text is not None and self.text_normalization != "none"):
+                if token_ids is None or (
+                    raw_text is not None and self.text_normalization != "none"
+                ):
                     if text is None:
                         raise ValueError("Manifest entry needs token_ids or text with a tokenizer.")
                     if self.tokenizer is None:
@@ -1203,12 +1261,9 @@ class ASRManifestDataset(Dataset[dict[str, Any]]):
                         self.decoder_prompt_before_audio,
                         self.decoder_ctc_draft_prompt_template,
                     )
-                    if (
-                        prompt_template
-                        and (
-                            self.decoder_prompt_before_audio_use_language
-                            or self.decoder_ctc_draft_prompt_template
-                        )
+                    if prompt_template and (
+                        self.decoder_prompt_before_audio_use_language
+                        or self.decoder_ctc_draft_prompt_template
                     ):
                         prompt_language = maybe_flip_decoder_prompt_language_label(
                             str(language) if language is not None else None,
@@ -1241,7 +1296,9 @@ class ASRManifestDataset(Dataset[dict[str, Any]]):
                             chinese_confirmation=self.decoder_language_confirmation_zh,
                             ctc_draft=ctc_draft,
                         )
-                        decoder_prompt_before_audio_token_ids = self.decoder_tokenizer.encode(prompt_text)
+                        decoder_prompt_before_audio_token_ids = self.decoder_tokenizer.encode(
+                            prompt_text
+                        )
                     decoder_text = normalize_asr_text(
                         str(raw_text),
                         language=str(language) if language is not None else None,
@@ -1343,9 +1400,14 @@ class FeatureCollator:
         max_frames = max(int(sample["feature_length"]) for sample in samples)
         total_targets = sum(int(sample["target_length"]) for sample in samples)
         has_decoder_targets = any("decoder_targets" in sample for sample in samples)
-        has_decoder_prompt_before_audio = any("decoder_prompt_before_audio" in sample for sample in samples)
+        has_decoder_prompt_before_audio = any(
+            "decoder_prompt_before_audio" in sample for sample in samples
+        )
         total_decoder_targets = (
-            sum(int(sample.get("decoder_target_length", sample["target_length"])) for sample in samples)
+            sum(
+                int(sample.get("decoder_target_length", sample["target_length"]))
+                for sample in samples
+            )
             if has_decoder_targets
             else 0
         )
@@ -1403,7 +1465,9 @@ class FeatureCollator:
             targets[offset : offset + target_len] = target
             target_lengths[idx] = target_len
             if decoder_targets is not None and decoder_target_lengths is not None:
-                decoder_targets[decoder_offset : decoder_offset + decoder_target_len] = decoder_target
+                decoder_targets[decoder_offset : decoder_offset + decoder_target_len] = (
+                    decoder_target
+                )
                 decoder_target_lengths[idx] = decoder_target_len
                 decoder_offset += decoder_target_len
             if (
