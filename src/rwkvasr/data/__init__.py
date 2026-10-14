@@ -40,6 +40,7 @@ from .webdataset_bucketed import (
     build_bucketed_webdataset_loader,
     compute_bucket_local_batch_size,
     estimate_bucket_manifest_steps,
+    estimate_bucket_manifest_tail_padding_samples,
     load_webdataset_bucket_manifest,
     resolve_webdataset_bucket_manifest_path,
 )
@@ -113,6 +114,7 @@ __all__ = [
     "compute_bucket_local_batch_size",
     "estimate_length_bucketed_steps",
     "estimate_bucket_manifest_steps",
+    "estimate_bucket_manifest_tail_padding_samples",
     "format_num_bytes",
     "build_text_tokenizer",
     "build_audio_feature_extractor",

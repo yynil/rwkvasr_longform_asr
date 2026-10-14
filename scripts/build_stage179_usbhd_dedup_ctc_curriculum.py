@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import subprocess
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -155,6 +154,20 @@ def _frame_count(row: dict[str, Any]) -> int:
     if value is None:
         return 0
     return int(value)
+
+
+def _validate_audio_size(row: dict[str, Any], *, input_spec: InputSpec) -> None:
+    value = row.get("audio_size")
+    if value is None:
+        return
+    audio_size = int(value)
+    if audio_size <= 0:
+        sample_key = _utt_id(row) or str(row.get("key") or "unknown")
+        raise ValueError(
+            "Stage179 input contains a non-positive audio payload; repair the source "
+            "before constructing a curriculum: "
+            f"input={input_spec.name!r} key={sample_key!r} audio_size={audio_size}"
+        )
 
 
 def _resolve_tar_path(row: dict[str, Any], root: Path) -> Path:
@@ -395,6 +408,7 @@ def main() -> None:
                     skipped["nontrain"] += 1
                     continue
                 split_rows += 1
+                _validate_audio_size(row, input_spec=spec)
                 frames = _frame_count(row)
                 if frames < int(args.min_frames):
                     skipped["too_short"] += 1

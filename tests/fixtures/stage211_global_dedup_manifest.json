@@ -1,0 +1,269 @@
+{
+  "version": 1,
+  "root": "/",
+  "curriculum": "usbhd_dedup_audio_only_online_ctc_alignment",
+  "split": "train",
+  "seed": 20260628,
+  "min_frames": 20,
+  "dedupe_key": "blake2b16(root_or_tar_path + audio_member + audio_offset + audio_size)",
+  "inputs": {
+    "cv22": {
+      "length_index_path": "/media/usbhd/training_data/asr/curriculum/stage22_stage21_soup_clean_repair_mix/stages/stage178_cv22_audio_only_online_ctc_alignment/stage178a_cv22_large1m_online_ctc/webdataset_lengths.jsonl",
+      "root": "/media/usbhd/common_voice_22/webdataset",
+      "rows_scanned": 112603,
+      "split_rows": 112603,
+      "accepted_unique_audio_rows": 112603,
+      "duplicate_audio_rows": 0,
+      "accepted_hours": 158.931,
+      "accepted_counts_by_source": {
+        "cv22_en": 63625,
+        "cv22_zh": 48978
+      },
+      "accepted_hours_by_source": {
+        "cv22_en": 95.845,
+        "cv22_zh": 63.086
+      }
+    },
+    "clean_public": {
+      "length_index_path": "/media/usbhd/training_data/asr/curriculum/clean_ctc_voxbox_webdataset/webdataset_lengths.jsonl",
+      "root": "/media/usbhd/training_data/asr/curriculum/clean_ctc_voxbox_webdataset",
+      "rows_scanned": 1430801,
+      "split_rows": 1423636,
+      "accepted_unique_audio_rows": 1423636,
+      "duplicate_audio_rows": 0,
+      "accepted_hours": 2422.829,
+      "accepted_counts_by_source": {
+        "aishell3": 62952,
+        "commonvoice_cn": 32601,
+        "commonvoice_en": 1107167,
+        "librispeech": 220916
+      },
+      "accepted_hours_by_source": {
+        "aishell3": 62.863,
+        "commonvoice_cn": 45.776,
+        "commonvoice_en": 1572.005,
+        "librispeech": 742.186
+      }
+    },
+    "giga_wenet": {
+      "length_index_path": "/media/usbhd/training_data/asr/mix/gigaspeech_xl_wenetspeech_l_webdataset/webdataset_lengths.jsonl",
+      "root": "/media/usbhd/training_data/asr/mix/gigaspeech_xl_wenetspeech_l_webdataset",
+      "rows_scanned": 22904403,
+      "split_rows": 22695193,
+      "accepted_unique_audio_rows": 22695193,
+      "duplicate_audio_rows": 0,
+      "accepted_hours": 19809.868,
+      "accepted_counts_by_source": {
+        "gigaspeech": 8188778,
+        "wenetspeech": 14506415
+      },
+      "accepted_hours_by_source": {
+        "gigaspeech": 9883.829,
+        "wenetspeech": 9926.039
+      }
+    },
+    "emilia": {
+      "length_index_path": "/media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH/webdataset_lengths.jsonl",
+      "root": "/media/usbhd/training_data/asr/emilia/Emilia/MIX_EN_ZH",
+      "rows_scanned": 38105568,
+      "split_rows": 37840793,
+      "accepted_unique_audio_rows": 37840793,
+      "duplicate_audio_rows": 0,
+      "accepted_hours": 96073.532,
+      "accepted_counts_by_source": {
+        "emilia_en": 18040590,
+        "emilia_zh": 19800203
+      },
+      "accepted_hours_by_source": {
+        "emilia_en": 46586.802,
+        "emilia_zh": 49486.73
+      }
+    }
+  },
+  "skipped": {
+    "nontrain": 481150
+  },
+  "total_unique_audio_rows": 62072225,
+  "total_unique_hours": 118465.16068055555,
+  "total_unique_hours_rounded": 118465.161,
+  "rows_by_difficulty": {
+    "easy": 1174987,
+    "medium": 42247508,
+    "hard": 18649326,
+    "long": 404
+  },
+  "hours_by_difficulty": {
+    "easy": 1490.119,
+    "medium": 47771.242,
+    "hard": 69200.368,
+    "long": 3.432
+  },
+  "stages": {
+    "stage179a_easy_dedup_audio_only_online_ctc": {
+      "version": 1,
+      "stage_name": "stage179a_easy_dedup_audio_only_online_ctc",
+      "curriculum": "usbhd_dedup_audio_only_online_ctc_alignment",
+      "root": "/",
+      "difficulty": "easy",
+      "uses_text_labels": false,
+      "teacher": "FunASR-Nano-2512 online CTC logits",
+      "selected_rows": 1174987,
+      "selected_audio_unique_rows": 1174987,
+      "selected_hours": 1490.1186027777776,
+      "selected_counts": {
+        "aishell3": 62835,
+        "commonvoice_cn": 27031,
+        "commonvoice_en": 944383,
+        "cv22_en": 51370,
+        "cv22_zh": 41713,
+        "librispeech": 47655
+      },
+      "selected_hours_by_source": {
+        "aishell3": 62.549,
+        "commonvoice_cn": 32.951,
+        "commonvoice_en": 1209.105,
+        "cv22_en": 67.538,
+        "cv22_zh": 46.309,
+        "librispeech": 71.666
+      },
+      "num_shards": 176,
+      "num_frames_distribution": {
+        "count": 1174987,
+        "min": 24.0,
+        "p50": 458.0,
+        "p90": 641.0,
+        "p99": 733.0,
+        "max": 900.0,
+        "mean": 456.55202738413277
+      },
+      "length_index_path": "/media/usbhd/training_data/asr/curriculum/stage22_stage21_soup_clean_repair_mix/stages/stage179_usbhd_dedup_online_ctc_alignment/stage179a_easy_dedup_audio_only_online_ctc/webdataset_lengths.jsonl",
+      "bucket_manifest_path": "/media/usbhd/training_data/asr/curriculum/stage22_stage21_soup_clean_repair_mix/stages/stage179_usbhd_dedup_online_ctc_alignment/stage179a_easy_dedup_audio_only_online_ctc/webdataset_buckets_audio_text/manifest.json"
+    },
+    "stage179b_medium_dedup_audio_only_online_ctc": {
+      "version": 1,
+      "stage_name": "stage179b_medium_dedup_audio_only_online_ctc",
+      "curriculum": "usbhd_dedup_audio_only_online_ctc_alignment",
+      "root": "/",
+      "difficulty": "medium",
+      "uses_text_labels": false,
+      "teacher": "FunASR-Nano-2512 online CTC logits",
+      "selected_rows": 42247508,
+      "selected_audio_unique_rows": 42247508,
+      "selected_hours": 47771.24217222222,
+      "selected_counts": {
+        "aishell3": 117,
+        "commonvoice_cn": 5569,
+        "commonvoice_en": 162730,
+        "cv22_en": 12232,
+        "cv22_zh": 7260,
+        "emilia_en": 8974415,
+        "emilia_zh": 11022836,
+        "gigaspeech": 7440139,
+        "librispeech": 173228,
+        "wenetspeech": 14448982
+      },
+      "selected_hours_by_source": {
+        "aishell3": 0.315,
+        "commonvoice_cn": 12.82,
+        "commonvoice_en": 362.647,
+        "cv22_en": 28.201,
+        "cv22_zh": 16.752,
+        "emilia_en": 13418.208,
+        "emilia_zh": 16185.846,
+        "gigaspeech": 7353.214,
+        "librispeech": 670.344,
+        "wenetspeech": 9722.895
+      },
+      "num_shards": 6910,
+      "num_frames_distribution": {
+        "count": 42247508,
+        "min": 26.0,
+        "p50": 384.0,
+        "p90": 710.0,
+        "p99": 833.0,
+        "max": 1800.0,
+        "mean": 407.06891355580075
+      },
+      "length_index_path": "/media/usbhd/training_data/asr/curriculum/stage22_stage21_soup_clean_repair_mix/stages/stage179_usbhd_dedup_online_ctc_alignment/stage179b_medium_dedup_audio_only_online_ctc/webdataset_lengths.jsonl",
+      "bucket_manifest_path": "/media/usbhd/training_data/asr/curriculum/stage22_stage21_soup_clean_repair_mix/stages/stage179_usbhd_dedup_online_ctc_alignment/stage179b_medium_dedup_audio_only_online_ctc/webdataset_buckets_audio_text/manifest.json"
+    },
+    "stage179c_hard_dedup_audio_only_online_ctc": {
+      "version": 1,
+      "stage_name": "stage179c_hard_dedup_audio_only_online_ctc",
+      "curriculum": "usbhd_dedup_audio_only_online_ctc_alignment",
+      "root": "/",
+      "difficulty": "hard",
+      "uses_text_labels": false,
+      "teacher": "FunASR-Nano-2512 online CTC logits",
+      "selected_rows": 18649326,
+      "selected_audio_unique_rows": 18649326,
+      "selected_hours": 69200.3677611111,
+      "selected_counts": {
+        "commonvoice_cn": 1,
+        "commonvoice_en": 54,
+        "cv22_en": 23,
+        "cv22_zh": 5,
+        "emilia_en": 9066175,
+        "emilia_zh": 8776974,
+        "gigaspeech": 748639,
+        "librispeech": 33,
+        "wenetspeech": 57422
+      },
+      "selected_hours_by_source": {
+        "commonvoice_cn": 0.005,
+        "commonvoice_en": 0.252,
+        "cv22_en": 0.105,
+        "cv22_zh": 0.025,
+        "emilia_en": 33168.594,
+        "emilia_zh": 33297.606,
+        "gigaspeech": 2530.616,
+        "librispeech": 0.175,
+        "wenetspeech": 202.99
+      },
+      "num_shards": 6453,
+      "num_frames_distribution": {
+        "count": 18649326,
+        "min": 801.0,
+        "p50": 1204.0,
+        "p90": 1942.0,
+        "p99": 2915.0,
+        "max": 3000.0,
+        "mean": 1335.819449668047
+      },
+      "length_index_path": "/media/usbhd/training_data/asr/curriculum/stage22_stage21_soup_clean_repair_mix/stages/stage179_usbhd_dedup_online_ctc_alignment/stage179c_hard_dedup_audio_only_online_ctc/webdataset_lengths.jsonl",
+      "bucket_manifest_path": "/media/usbhd/training_data/asr/curriculum/stage22_stage21_soup_clean_repair_mix/stages/stage179_usbhd_dedup_online_ctc_alignment/stage179c_hard_dedup_audio_only_online_ctc/webdataset_buckets_audio_text/manifest.json"
+    },
+    "stage179d_long_dedup_audio_only_online_ctc": {
+      "version": 1,
+      "stage_name": "stage179d_long_dedup_audio_only_online_ctc",
+      "curriculum": "usbhd_dedup_audio_only_online_ctc_alignment",
+      "root": "/",
+      "difficulty": "long",
+      "uses_text_labels": false,
+      "teacher": "FunASR-Nano-2512 online CTC logits",
+      "selected_rows": 404,
+      "selected_audio_unique_rows": 404,
+      "selected_hours": 3.4321444444444444,
+      "selected_counts": {
+        "emilia_zh": 393,
+        "wenetspeech": 11
+      },
+      "selected_hours_by_source": {
+        "emilia_zh": 3.278,
+        "wenetspeech": 0.154
+      },
+      "num_shards": 96,
+      "num_frames_distribution": {
+        "count": 404,
+        "min": 3003.0,
+        "p50": 3003.0,
+        "p90": 3003.0,
+        "p99": 4298.0,
+        "max": 9644.0,
+        "mean": 3058.3465346534654
+      },
+      "length_index_path": "/media/usbhd/training_data/asr/curriculum/stage22_stage21_soup_clean_repair_mix/stages/stage179_usbhd_dedup_online_ctc_alignment/stage179d_long_dedup_audio_only_online_ctc/webdataset_lengths.jsonl",
+      "bucket_manifest_path": "/media/usbhd/training_data/asr/curriculum/stage22_stage21_soup_clean_repair_mix/stages/stage179_usbhd_dedup_online_ctc_alignment/stage179d_long_dedup_audio_only_online_ctc/webdataset_buckets_audio_text/manifest.json"
+    }
+  }
+}

@@ -8,10 +8,6 @@ from typing import Any
 
 from rwkvasr.data import normalize_asr_text
 
-_WER_TOKEN_PATTERN = re.compile(
-    r"[A-Za-z0-9]+|[\u4e00-\u9fff]"
-)
-
 _APOSTROPHE_CHARS = {"'", "\u2019", "\u02bc", "\uff07"}
 
 _METRIC_EQUIVALENCE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -64,7 +60,12 @@ def normalize_asr_text_for_metrics(
         text = strip_asr_language_confirmation_prefix(text)
     if normalization == "none":
         return text.strip()
-    return normalize_asr_text(text, language=language, mode=normalization).strip()
+    return normalize_asr_text(
+        text,
+        language=language,
+        mode=normalization,
+        strip_language_confirmation=strip_language_confirmation,
+    ).strip()
 
 
 def _is_ignored_metric_char(ch: str) -> bool:
@@ -92,7 +93,26 @@ def tokenize_for_wer(text: str) -> list[str]:
     normalized = _normalize_text_for_error_tokens(text)
     if not normalized:
         return []
-    return _WER_TOKEN_PATTERN.findall(normalized)
+    tokens: list[str] = []
+    word: list[str] = []
+
+    def flush_word() -> None:
+        if word:
+            tokens.append("".join(word))
+            word.clear()
+
+    for ch in normalized:
+        if "\u4e00" <= ch <= "\u9fff":
+            flush_word()
+            tokens.append(ch)
+        elif ch.isalnum():
+            word.append(ch)
+        elif word and unicodedata.category(ch).startswith("M"):
+            word.append(ch)
+        else:
+            flush_word()
+    flush_word()
+    return tokens
 
 
 def tokenize_for_cer(text: str) -> list[str]:
@@ -119,6 +139,58 @@ def edit_distance(source: list[str], target: list[str]) -> int:
             )
         prev = current
     return prev[-1]
+
+
+def edit_counts(reference: list[Any], hypothesis: list[Any]) -> tuple[int, int, int]:
+    """Return insertion, deletion, and substitution counts for one optimal edit path."""
+
+    rows = len(reference) + 1
+    columns = len(hypothesis) + 1
+    costs = [[0] * columns for _ in range(rows)]
+    for ref_index in range(1, rows):
+        costs[ref_index][0] = ref_index
+    for hyp_index in range(1, columns):
+        costs[0][hyp_index] = hyp_index
+    for ref_index, ref_token in enumerate(reference, start=1):
+        for hyp_index, hyp_token in enumerate(hypothesis, start=1):
+            substitution = costs[ref_index - 1][hyp_index - 1] + int(ref_token != hyp_token)
+            insertion = costs[ref_index][hyp_index - 1] + 1
+            deletion = costs[ref_index - 1][hyp_index] + 1
+            costs[ref_index][hyp_index] = min(substitution, insertion, deletion)
+
+    insertions = 0
+    deletions = 0
+    substitutions = 0
+    ref_index = len(reference)
+    hyp_index = len(hypothesis)
+    while ref_index > 0 or hyp_index > 0:
+        if (
+            ref_index > 0
+            and hyp_index > 0
+            and reference[ref_index - 1] == hypothesis[hyp_index - 1]
+            and costs[ref_index][hyp_index] == costs[ref_index - 1][hyp_index - 1]
+        ):
+            ref_index -= 1
+            hyp_index -= 1
+            continue
+        if (
+            ref_index > 0
+            and hyp_index > 0
+            and costs[ref_index][hyp_index] == costs[ref_index - 1][hyp_index - 1] + 1
+        ):
+            substitutions += 1
+            ref_index -= 1
+            hyp_index -= 1
+            continue
+        if ref_index > 0 and costs[ref_index][hyp_index] == costs[ref_index - 1][hyp_index] + 1:
+            deletions += 1
+            ref_index -= 1
+            continue
+        if hyp_index <= 0:
+            raise RuntimeError("Invalid edit-distance backtrace.")
+        insertions += 1
+        hyp_index -= 1
+    return insertions, deletions, substitutions
 
 
 def _load_normalized_records(
@@ -203,6 +275,61 @@ def compute_text_error_stats(
     }
 
 
+def compute_text_error_decomposition(
+    path: Path,
+    *,
+    language: str | None = None,
+    normalization: str = "ctc",
+    metric: str,
+    strip_language_confirmation: bool = True,
+) -> dict[str, Any]:
+    if metric not in {"wer", "cer"}:
+        raise ValueError("metric must be either 'wer' or 'cer'.")
+    records = _load_normalized_records(
+        path,
+        language=language,
+        normalization=normalization,
+        strip_language_confirmation=strip_language_confirmation,
+    )
+    if not records:
+        return {}
+
+    insertions = 0
+    deletions = 0
+    substitutions = 0
+    reference_units = 0
+    prediction_units = 0
+    tokenizer = tokenize_for_wer if metric == "wer" else tokenize_for_cer
+    for prediction, reference in records.values():
+        prediction_tokens = tokenizer(prediction)
+        reference_tokens = tokenizer(reference)
+        sample_insertions, sample_deletions, sample_substitutions = edit_counts(
+            reference_tokens,
+            prediction_tokens,
+        )
+        insertions += sample_insertions
+        deletions += sample_deletions
+        substitutions += sample_substitutions
+        reference_units += len(reference_tokens)
+        prediction_units += len(prediction_tokens)
+
+    denominator = max(1, reference_units)
+    return {
+        "sample_count": len(records),
+        "metric": metric,
+        "reference_units": reference_units,
+        "prediction_units": prediction_units,
+        "prediction_reference_unit_ratio": prediction_units / denominator,
+        "insertions": insertions,
+        "deletions": deletions,
+        "substitutions": substitutions,
+        "insertion_rate": insertions / denominator,
+        "deletion_rate": deletions / denominator,
+        "substitution_rate": substitutions / denominator,
+        "error_rate": (insertions + deletions + substitutions) / denominator,
+    }
+
+
 def compare_prediction_text_sets(
     baseline_jsonl: Path,
     candidate_jsonl: Path,
@@ -284,7 +411,9 @@ def compare_prediction_text_sets(
             unchanged += 1
         base_pred = baseline_preds.get(utt_id, ("", ""))[0]
         cand_pred = candidate_preds.get(utt_id, ("", ""))[0]
-        if _normalize_text_for_error_tokens(base_pred) != _normalize_text_for_error_tokens(cand_pred):
+        if _normalize_text_for_error_tokens(base_pred) != _normalize_text_for_error_tokens(
+            cand_pred
+        ):
             changed_prediction += 1
 
     baseline_avg_wer = baseline_stats.get("avg_wer")
@@ -296,17 +425,11 @@ def compare_prediction_text_sets(
     compare_cand = candidate_avg_wer if metric == "wer" else candidate_avg_cer
     if isinstance(compare_base, float) and isinstance(compare_cand, float):
         if compare_cand < compare_base - 0.01:
-            verdict = (
-                f"{candidate_label} improved preview ASR-content normalized {metric.upper()} vs {baseline_label}"
-            )
+            verdict = f"{candidate_label} improved preview ASR-content normalized {metric.upper()} vs {baseline_label}"
         elif compare_cand > compare_base + 0.01:
-            verdict = (
-                f"{baseline_label} remained better than {candidate_label} on preview ASR-content normalized {metric.upper()}"
-            )
+            verdict = f"{baseline_label} remained better than {candidate_label} on preview ASR-content normalized {metric.upper()}"
         else:
-            verdict = (
-                f"{baseline_label} and {candidate_label} were roughly neutral on preview ASR-content normalized {metric.upper()}"
-            )
+            verdict = f"{baseline_label} and {candidate_label} were roughly neutral on preview ASR-content normalized {metric.upper()}"
     return {
         "baseline_avg_wer": baseline_avg_wer,
         "candidate_avg_wer": candidate_avg_wer,

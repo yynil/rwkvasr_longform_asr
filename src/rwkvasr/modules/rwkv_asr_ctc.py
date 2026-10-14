@@ -802,6 +802,8 @@ class RWKVCTCModel(nn.Module):
         load_ctc_head: bool = True,
         load_encoder: bool = False,
         load_encoder_attention: bool = True,
+        load_rwkv_encoder_from_qkv: bool = False,
+        rwkv_qkv_projection_scale_mode: str = "exact",
         teacher_blank_id: int = 60514,
         project_ignored_token_ids: tuple[int, ...] | list[int] = (60514,),
         blank_bias_delta: float = 0.0,
@@ -817,6 +819,10 @@ class RWKVCTCModel(nn.Module):
             "encoder_loaded": 0,
             "encoder_skipped": 0,
             "encoder_attention_skipped": 0,
+            "rwkv_encoder_loaded": 0,
+            "rwkv_encoder_skipped": 0,
+            "rwkv_encoder_first_layer_reconstruction_errors": {},
+            "rwkv_encoder_qkv_projection_scale_mode": str(rwkv_qkv_projection_scale_mode),
             "ctc_bridge_loaded": 0,
             "ctc_bridge_skipped": 0,
             "ctc_decoder_loaded": 0,
@@ -842,6 +848,29 @@ class RWKVCTCModel(nn.Module):
             report["encoder_loaded"] = len(encoder_report["loaded"])
             report["encoder_skipped"] = len(encoder_report["skipped"])
             report["encoder_attention_skipped"] = len(encoder_report["attention_skipped"])
+        if load_rwkv_encoder_from_qkv:
+            sensevoice_encoder = getattr(self.encoder, "sensevoice_encoder", None)
+            if sensevoice_encoder is None:
+                raise ValueError(
+                    "frontend_type='sensevoice_rwkv' is required to initialize BiRWKV from Nano QKV weights."
+                )
+            non_attention_report = sensevoice_encoder.load_sensevoice_non_attention_state_dict(state_dict)
+            qkv_report = sensevoice_encoder.load_sensevoice_qkv_state_dict(
+                state_dict,
+                projection_scale_mode=rwkv_qkv_projection_scale_mode,
+            )
+            report["rwkv_encoder_loaded"] = len(
+                set(non_attention_report["loaded"]) | set(qkv_report["loaded"])
+            )
+            report["rwkv_encoder_skipped"] = len(
+                set(non_attention_report["skipped"]) | set(qkv_report["skipped"])
+            )
+            report["rwkv_encoder_first_layer_reconstruction_errors"] = qkv_report[
+                "first_layer_reconstruction_errors"
+            ]
+            report["rwkv_encoder_qkv_projection_scale_mode"] = qkv_report[
+                "projection_scale_mode"
+            ]
         if load_ctc_decoder:
             if self.ctc_decoder is None:
                 raise ValueError("ctc_decoder_type must be enabled before loading Nano ctc_decoder weights.")
@@ -1455,6 +1484,7 @@ class RWKVCTCModel(nn.Module):
         decoder_prompt_before_audio_lengths: Tensor | None = None,
         direction_mask: DirectionMask | None = None,
         state: RWKVConformerEncoderState | None = None,
+        compute_ctc_logits: bool = True,
     ) -> dict[str, Tensor | Tensor | RWKVConformerEncoderState | None]:
         encoded, encoded_lengths, next_state = self.encoder(
             features,
@@ -1464,12 +1494,19 @@ class RWKVCTCModel(nn.Module):
         )
         ctc_encoded, ctc_encoded_lengths = self.ctc_encoder_features_from_encoded(encoded, encoded_lengths)
         ctc_features, logit_lengths = self.ctc_features_from_ctc_encoded(ctc_encoded, ctc_encoded_lengths)
-        logits = self.apply_ctc_logit_mask(self.ctc_head(ctc_features))
         if logit_lengths is None:
             raise ValueError("CTC training/distillation requires feature lengths.")
         ctc_loss_weight = float(self.config.ctc_loss_weight)
         decoder_loss_weight = float(self.config.decoder_loss_weight)
-        zero_loss = logits.float().sum() * 0.0
+        if not compute_ctc_logits and ctc_loss_weight > 0.0:
+            raise ValueError("compute_ctc_logits=False requires ctc_loss_weight=0.")
+        logits = (
+            self.apply_ctc_logit_mask(self.ctc_head(ctc_features))
+            if compute_ctc_logits
+            else None
+        )
+        zero_source = logits if isinstance(logits, Tensor) else ctc_features
+        zero_loss = zero_source.float().sum() * 0.0
         ctc_loss = (
             self.ctc_loss(logits, logit_lengths, targets, target_lengths)
             if ctc_loss_weight > 0.0
@@ -1509,6 +1546,7 @@ class RWKVCTCModel(nn.Module):
         targets: Tensor,
         target_lengths: Tensor,
     ) -> Tensor:
+        self._validate_ctc_targets(targets, target_lengths)
         log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)
         return F.ctc_loss(
             log_probs,
@@ -1518,3 +1556,43 @@ class RWKVCTCModel(nn.Module):
             blank=self.config.blank_id,
             zero_infinity=True,
         )
+
+    def _validate_ctc_targets(self, targets: Tensor, target_lengths: Tensor) -> None:
+        if targets.dim() != 1 or target_lengths.dim() != 1:
+            raise ValueError(
+                "CTC training requires one-dimensional packed targets and target lengths."
+            )
+        if target_lengths.numel() and bool((target_lengths < 0).any().item()):
+            raise ValueError("CTC target lengths must be non-negative.")
+        packed_length = int(target_lengths.to(dtype=torch.long).sum().item())
+        if packed_length != int(targets.numel()):
+            raise ValueError(
+                "Packed CTC target length mismatch: "
+                f"target_lengths sum to {packed_length}, but targets contain {targets.numel()} tokens."
+            )
+        if targets.numel() == 0:
+            return
+
+        ctc_vocab_size = int(self.config.ctc_vocab_size)
+        out_of_range = targets[(targets < 0) | (targets >= ctc_vocab_size)]
+        if out_of_range.numel():
+            token_ids = sorted({int(token_id) for token_id in out_of_range.detach().cpu().tolist()})
+            raise ValueError(
+                f"CTC targets contain token ids outside [0, {ctc_vocab_size}): {token_ids}"
+            )
+
+        blank_id = int(self.config.blank_id)
+        if bool((targets == blank_id).any().item()):
+            raise ValueError(f"CTC targets must not contain the blank token id {blank_id}.")
+
+        suppressed = self.ctc_suppressed_token_ids
+        if suppressed.numel() == 0:
+            return
+        suppressed_targets = targets[
+            torch.isin(targets, suppressed.to(device=targets.device))
+        ]
+        if suppressed_targets.numel():
+            token_ids = sorted(
+                {int(token_id) for token_id in suppressed_targets.detach().cpu().tolist()}
+            )
+            raise ValueError(f"CTC targets contain suppressed non-pronunciation token ids: {token_ids}")

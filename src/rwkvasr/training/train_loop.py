@@ -207,6 +207,9 @@ class TrainConfig:
     decoded_batch_prefetch: int = 2
     max_open_shards_per_worker: int = 8
     bucket_source_interleave: bool = False
+    length_bucket_schedule_block_size: int = 1
+    bucket_source_interleave_block_size: int = 1
+    bucket_serialize_reads: bool = False
     lr: float = 4e-4
     weight_decay: float = 0.1
     beta1: float = 0.9
@@ -439,6 +442,9 @@ def _build_webdataset_config(
         decoded_batch_prefetch=config.decoded_batch_prefetch,
         max_open_shards_per_worker=config.max_open_shards_per_worker,
         bucket_source_interleave=config.bucket_source_interleave,
+        length_bucket_schedule_block_size=config.length_bucket_schedule_block_size,
+        bucket_source_interleave_block_size=config.bucket_source_interleave_block_size,
+        bucket_serialize_reads=config.bucket_serialize_reads,
         append_eos=config.tokenizer_append_eos,
         text_normalization=config.text_normalization,
         decoder_ctc_draft_cache_path=config.decoder_ctc_draft_cache_path,
@@ -963,7 +969,10 @@ def train_ctc_model(config: TrainConfig) -> dict[str, float | int | str]:
             f"path={active_bucket_manifest_path} "
             f"max_local_batch={config.batch_size} "
             f"frame_budget={frame_budget} "
-            f"decode_workers={max(1, config.num_workers)}"
+            f"decode_workers={max(1, config.num_workers)} "
+            f"schedule_block={max(1, config.length_bucket_schedule_block_size)} "
+            f"source_block={max(1, config.bucket_source_interleave_block_size)} "
+            f"serialized_reads={bool(config.bucket_serialize_reads)}"
         )
     elif active_length_index_path is not None:
         frame_budget = config.length_bucket_frame_budget

@@ -105,7 +105,13 @@ _LINE_PREFIX_METADATA_PATTERN = re.compile(
 _SUBTITLE_HEADER_PATTERN = re.compile(r"(?m)^\s*(?:webvtt|note)\s*$", re.IGNORECASE)
 
 
-def normalize_asr_text(text: str, *, language: str | None = None, mode: str = "none") -> str:
+def normalize_asr_text(
+    text: str,
+    *,
+    language: str | None = None,
+    mode: str = "none",
+    strip_language_confirmation: bool = True,
+) -> str:
     if mode == "none":
         return text
     if mode not in {"runtime", "ctc"}:
@@ -116,7 +122,11 @@ def normalize_asr_text(text: str, *, language: str | None = None, mode: str = "n
     if language == "en" or language.startswith(("en-", "en_")):
         normalized = _lowercase_outside_markup(normalized)
     if mode == "ctc":
-        return _normalize_ctc_target_text(normalized, language=language)
+        return _normalize_ctc_target_text(
+            normalized,
+            language=language,
+            strip_language_confirmation=strip_language_confirmation,
+        )
     return _cleanup_punctuation_spacing(normalized)
 
 
@@ -148,9 +158,17 @@ def _lowercase_outside_markup(text: str) -> str:
     return "".join(pieces)
 
 
-def _normalize_ctc_target_text(text: str, *, language: str = "") -> str:
+def _normalize_ctc_target_text(
+    text: str,
+    *,
+    language: str = "",
+    strip_language_confirmation: bool = True,
+) -> str:
     text = unicodedata.normalize("NFKC", text).casefold()
-    text = _remove_ctc_non_pronounced_spans(text)
+    text = _remove_ctc_non_pronounced_spans(
+        text,
+        strip_language_confirmation=strip_language_confirmation,
+    )
     text = _NON_SPEECH_ANNOTATION_PATTERN.sub(" ", text)
     text = _normalize_spoken_numbers(text, language=language)
     pieces: list[str] = []
@@ -165,12 +183,17 @@ def _normalize_ctc_target_text(text: str, *, language: str = "") -> str:
     return _cleanup_punctuation_spacing("".join(pieces))
 
 
-def _remove_ctc_non_pronounced_spans(text: str) -> str:
-    for _ in range(4):
-        updated = _PROJECT_LANGUAGE_CONFIRMATION_PATTERN.sub(" ", text, count=1)
-        if updated == text:
-            break
-        text = updated.lstrip()
+def _remove_ctc_non_pronounced_spans(
+    text: str,
+    *,
+    strip_language_confirmation: bool = True,
+) -> str:
+    if strip_language_confirmation:
+        for _ in range(4):
+            updated = _PROJECT_LANGUAGE_CONFIRMATION_PATTERN.sub(" ", text, count=1)
+            if updated == text:
+                break
+            text = updated.lstrip()
     text = _SUBTITLE_HEADER_PATTERN.sub(" ", text)
     text = _SUBTITLE_TIMESTAMP_RANGE_PATTERN.sub(" ", text)
     text = _BRACKETED_TIMESTAMP_PATTERN.sub(" ", text)
