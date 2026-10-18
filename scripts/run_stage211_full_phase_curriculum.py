@@ -454,7 +454,9 @@ def _automatic_profile_requires_admission(measured: dict[str, Any]) -> bool:
     selected = measured.get("selected_profile_row")
     if not isinstance(selected, dict) or not isinstance(selected.get("profile"), dict):
         raise ValueError("Stage211 automatic batch profile lacks its selected profile.")
-    base_config = load_yaml(Path(str(measured["base_config_path"])))
+    base_config = load_yaml(
+        Path(str(measured.get("validated_base_config_path", measured["base_config_path"])))
+    )
     profile = selected["profile"]
     return any(
         (

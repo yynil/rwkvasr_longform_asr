@@ -28,6 +28,7 @@ from rwkvasr.eval.stage211_gate import (
 STAGE211_BATCH_PROFILE_PREFLIGHT_LEGACY_SCHEMA_VERSION = 7
 STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION = 8
 STAGE211_BATCH_PROFILE_ADMISSION_SCHEMA_VERSION = 3
+STAGE211_BATCH_PROFILE_BASE_CONFIG_SNAPSHOT = "base_config_snapshot.yaml"
 STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION = 1
 STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION = 1
 STAGE211_BATCH_PROFILE_PHASES = ("mixer", "block", "logits")
@@ -868,8 +869,17 @@ def validate_stage211_batch_profile_preflight(
         git_commit_key="git_commit",
         label="Stage211 batch preflight benchmark script",
     )
+    snapshot_path = path.parent / STAGE211_BATCH_PROFILE_BASE_CONFIG_SNAPSHOT
+    base_binding = report
+    if snapshot_path.exists() or snapshot_path.is_symlink():
+        base_binding = {**report, "base_config_path": str(snapshot_path)}
+    base_config_path = _validate_bound_file(
+        base_binding,
+        path_key="base_config_path",
+        sha256_key="base_config_sha256",
+        label="Stage211 batch preflight base config",
+    )
     for path_key, sha_key, label in (
-        ("base_config_path", "base_config_sha256", "base config"),
         ("init_checkpoint_path", "init_checkpoint_sha256", "initial checkpoint"),
         ("bucket_manifest_path", "bucket_manifest_sha256", "bucket manifest"),
     ):
@@ -879,7 +889,7 @@ def validate_stage211_batch_profile_preflight(
             sha256_key=sha_key,
             label=f"Stage211 batch preflight {label}",
         )
-    base_config = load_yaml(Path(str(report["base_config_path"])))
+    base_config = load_yaml(base_config_path)
     validate_stage211_phase_train_config(base_config, phase=phase)
     if (
         Path(str(base_config.get("webdataset_bucket_manifest_path") or "")).resolve()
@@ -1196,6 +1206,7 @@ def validate_stage211_batch_profile_preflight(
             **report,
             "report_path": str(path),
             "report_sha256": sha256_file(path),
+            "validated_base_config_path": str(base_config_path),
             "selection_decision": decision,
             "selected_profile_name": baseline_name,
             "selected_profile_row": baseline,
@@ -1254,6 +1265,7 @@ def validate_stage211_batch_profile_preflight(
         **report,
         "report_path": str(path),
         "report_sha256": sha256_file(path),
+        "validated_base_config_path": str(base_config_path),
         "selection_decision": decision,
         "selected_profile_name": selected_name,
         "selected_profile_row": selected,
@@ -1394,7 +1406,7 @@ def validate_stage211_batch_profile_admission(
     ):
         raise ValueError("Stage211 batch profile admission uses another bucket manifest.")
     profile = receipt["selected_profile"]
-    base_config = load_yaml(Path(str(report["base_config_path"])))
+    base_config = load_yaml(Path(report["validated_base_config_path"]))
     worker_count_changed = int(profile["num_workers"]) != int(
         base_config.get("num_workers", 0) or 0
     )

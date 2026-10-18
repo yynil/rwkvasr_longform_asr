@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import sys
 from pathlib import Path
 
 import pytest
 
+from rwkvasr.config import load_yaml, save_yaml
 from rwkvasr.eval.stage211_gate import stage211_phase_train_config_contract
 from rwkvasr.training.deepspeed_loop import DeepSpeedTrainConfig
 
@@ -14,6 +16,54 @@ from rwkvasr.training.deepspeed_loop import DeepSpeedTrainConfig
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 probe = importlib.import_module("scripts.benchmark_stage211_batch_profiles")
+
+
+def test_dry_probe_binds_exact_snapshot_even_if_original_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    checkpoint = tmp_path / "init.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    base = tmp_path / "base.yaml"
+    save_yaml(base, {
+        **stage211_phase_train_config_contract("mixer"),
+        "num_workers": 8,
+        "deepspeed": {"gradient_accumulation_steps": 1},
+        "webdataset_bucket_manifest_path": str(manifest),
+    })
+    original_bytes = b"# Preserve comments and line endings.\r\n" + base.read_bytes()
+    base.write_bytes(original_bytes)
+    output = tmp_path / "preflight"
+    monkeypatch.setattr(sys, "argv", [
+        "benchmark", "--base-config", str(base), "--init-checkpoint", str(checkpoint),
+        "--output-root", str(output), "--phase", "mixer", "--dry-run",
+        "--profile", "baseline:36:24000",
+    ])
+    monkeypatch.setattr(probe, "_profile_full_coverage", lambda *args, **kwargs: {
+        "steps_per_epoch": 10, "formal_epochs": 3, "full_coverage_steps": 30,
+        "tail_padding_samples_per_epoch": 0,
+    })
+
+    def regenerate_original() -> list[str]:
+        base.write_text("batch_size: 999\n", encoding="utf-8")
+        return []
+
+    monkeypatch.setattr(probe, "_git_worktree_changes", regenerate_original)
+    assert probe.main() == 0
+    snapshot = output / "base_config_snapshot.yaml"
+    assert snapshot.read_bytes() == original_bytes
+    report = json.loads((output / "batch_throughput_preflight.json").read_text())
+    assert report["base_config_path"] == str(base)
+    assert report["base_config_sha256"] == probe.sha256_file(snapshot)
+    assert report["base_config_sha256"] != probe.sha256_file(base)
+    config = load_yaml(output / "baseline" / "train_config.yaml")
+    assert config["webdataset_bucket_manifest_path"] == str(manifest)
+    assert report["dry_run"] is True
+    assert report["formal_admission"] is False
+    with pytest.raises(FileExistsError, match="output root must be empty"):
+        probe.main()
+    assert snapshot.read_bytes() == original_bytes
 
 
 def test_default_profiles_cover_baseline_and_seven_larger_candidates() -> None:

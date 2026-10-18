@@ -356,6 +356,8 @@ def _report(
         {
             **stage211_phase_train_config_contract(phase),
             "webdataset_bucket_manifest_path": str(manifest),
+            "batch_size": 36,
+            "length_bucket_frame_budget": 24_000,
             "num_workers": 8,
         },
     )
@@ -530,6 +532,61 @@ def _worker_only_report(tmp_path: Path) -> Path:
     report["candidate_dominance"]["excluded_profiles"] = ["baseline", candidate_name]
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report_path
+
+
+@pytest.mark.parametrize("original_state", ["overwritten", "deleted"])
+@pytest.mark.parametrize("phase", ["mixer", "block", "logits"])
+def test_preflight_snapshot_preserves_admission_after_base_regeneration(
+    tmp_path: Path, original_state: str, phase: str,
+) -> None:
+    report_path = _report(tmp_path, phase=phase)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    original = Path(report["base_config_path"])
+    snapshot = report_path.parent / "base_config_snapshot.yaml"
+    snapshot.write_bytes(original.read_bytes())
+    receipt = build_stage211_batch_profile_admission(
+        report_path, phase=phase, admitted_by="test", reason="measured profile",
+    )
+    receipt_path = tmp_path / "admission.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    report_sha = sha256_file(report_path)
+    if original_state == "deleted":
+        original.unlink()
+    else:
+        regenerated = load_yaml(original)
+        regenerated.update(batch_size=48, length_bucket_frame_budget=42_000)
+        save_yaml(original, regenerated)
+
+    measured = validate_stage211_batch_profile_preflight(report_path, phase=phase)
+    assert measured["validated_base_config_path"] == str(snapshot)
+    assert measured["base_config_path"] == str(original)
+    assert measured["base_config_sha256"] == sha256_file(snapshot)
+    assert stage211_full_phase._automatic_profile_requires_admission(measured)
+    validated = validate_stage211_batch_profile_admission(receipt_path, phase=phase)
+    assert validated["base_config_path"] == str(original)
+    assert validated["selected_profile"] == receipt["selected_profile"]
+    assert sha256_file(report_path) == report_sha
+
+
+def test_preflight_rejects_corrupt_snapshot_even_with_intact_original(tmp_path: Path) -> None:
+    report_path = _report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    original = Path(report["base_config_path"])
+    snapshot = report_path.parent / "base_config_snapshot.yaml"
+    snapshot.write_bytes(original.read_bytes() + b"# different bytes\n")
+
+    with pytest.raises(ValueError, match="base config.*SHA-256 mismatch"):
+        validate_stage211_batch_profile_preflight(report_path, phase="mixer")
+
+
+def test_legacy_preflight_still_rejects_changed_original_without_snapshot(tmp_path: Path) -> None:
+    report_path = _report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    original = Path(report["base_config_path"])
+    original.write_bytes(original.read_bytes() + b"# changed\n")
+
+    with pytest.raises(ValueError, match="base config.*SHA-256 mismatch"):
+        validate_stage211_batch_profile_preflight(report_path, phase="mixer")
 
 
 def test_measured_phase_specific_profile_can_be_admitted(tmp_path: Path) -> None:
@@ -993,7 +1050,10 @@ def test_fixed_eval_requires_phase_complete_same_distribution_metrics(
             )
 
 
-def test_complete_measurement_can_retain_legacy_baseline(tmp_path: Path) -> None:
+@pytest.mark.parametrize("archive_base", [False, True])
+def test_complete_measurement_can_retain_legacy_baseline(
+    tmp_path: Path, archive_base: bool,
+) -> None:
     report_path = _report(tmp_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     candidate = report["profiles"][1]
@@ -1013,6 +1073,12 @@ def test_complete_measurement_can_retain_legacy_baseline(tmp_path: Path) -> None
     )
     report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
 
+    original = Path(report["base_config_path"])
+    if archive_base:
+        snapshot = report_path.parent / "base_config_snapshot.yaml"
+        snapshot.write_bytes(original.read_bytes())
+        original.unlink()
+
     measured = validate_stage211_batch_profile_preflight(
         report_path,
         phase="mixer",
@@ -1020,6 +1086,8 @@ def test_complete_measurement_can_retain_legacy_baseline(tmp_path: Path) -> None
     )
     assert measured["selection_decision"] == "keep_baseline"
     assert measured["selected_profile_name"] == "baseline"
+    assert measured["validated_base_config_path"] == str(snapshot if archive_base else original)
+    assert not stage211_full_phase._automatic_profile_requires_admission(measured)
     with pytest.raises(ValueError, match="no admissible larger profile"):
         validate_stage211_batch_profile_preflight(report_path, phase="mixer")
 

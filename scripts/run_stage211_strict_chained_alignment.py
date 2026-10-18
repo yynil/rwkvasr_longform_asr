@@ -2105,6 +2105,16 @@ def main() -> int:
         )
     print(f"latest_step={latest_step}", flush=True)
     print(f"init_checkpoint={init_checkpoint}", flush=True)
+    runtime_data_binding = audio_data_audit
+    if args.dry_run and not phase.requires_labels:
+        # Bind the real manifest paths without claiming a completed storage audit.
+        manifest = load_webdataset_bucket_manifest(bucket_manifest)
+        runtime_data_binding = {
+            "webdataset_root": str(_resolve_manifest_recorded_path(bucket_manifest, manifest.root)),
+            "length_index_path": str(_resolve_manifest_recorded_path(
+                bucket_manifest, manifest.source_length_index_path,
+            )),
+        }
     for segment in _segments(
         phase=phase,
         smoke=bool(args.smoke),
@@ -2131,7 +2141,7 @@ def main() -> int:
             nano_checkpoint=args.nano_checkpoint,
             labeled_webdataset_root=args.labeled_webdataset_root,
             labeled_length_index=args.labeled_length_index,
-            audio_data_audit=audio_data_audit,
+            audio_data_audit=runtime_data_binding,
             full_data_profile=bool(args.full_data_profile),
             batch_profile_admission=batch_profile_admission,
         )

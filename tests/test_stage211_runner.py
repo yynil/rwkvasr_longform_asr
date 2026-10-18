@@ -3408,11 +3408,22 @@ def test_stage211_block_entrypoint_requires_passing_promotion_receipt(
     assert "requires a passing promotion receipt" in result.stderr
 
 
-def test_stage211_mixer_entrypoint_dry_run_is_runnable(tmp_path: Path) -> None:
+@pytest.mark.parametrize("relative_paths", [False, True])
+def test_stage211_mixer_entrypoint_dry_run_is_runnable(
+    tmp_path: Path, relative_paths: bool,
+) -> None:
     checkpoint = tmp_path / "selected.pt"
     checkpoint.touch()
     manifest = tmp_path / "manifest.json"
-    manifest.write_text("{}", encoding="utf-8")
+    root = tmp_path / "audio-not-mounted"
+    length_index = tmp_path / "actual-lengths.jsonl"
+    manifest.write_text(json.dumps({
+        "root": root.name if relative_paths else str(root),
+        "source_length_index_path": length_index.name if relative_paths else str(length_index),
+        "bucket_width": 100,
+        "entries_per_part": 1000,
+        "splits": {},
+    }), encoding="utf-8")
     result = subprocess.run(
         [
             sys.executable,
@@ -3439,6 +3450,16 @@ def test_stage211_mixer_entrypoint_dry_run_is_runnable(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "phase=mixer" in result.stdout
     assert "target_step=30064" in result.stdout
+    assert "audio_data_audit=" not in result.stdout
+    configs = list((tmp_path / "config").rglob("*.yaml"))
+    assert configs
+    for config_path in configs:
+        config = load_yaml(config_path)
+        assert config["webdataset_root"] == str(root.resolve())
+        assert config["webdataset_length_index_path"] == str(length_index.resolve())
+        assert config["webdataset_bucket_manifest_path"] == str(manifest)
+    assert not root.exists()
+    assert not length_index.exists()
 
 
 def _write_runtime_epoch_coverage(
@@ -3764,7 +3785,13 @@ def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
     nano_checkpoint = nano_dir / "model.pt"
     nano_checkpoint.write_bytes(b"nano")
     manifest = tmp_path / "manifest.json"
-    manifest.write_text("{}", encoding="utf-8")
+    manifest.write_text(json.dumps({
+        "root": str(tmp_path / "webdataset"),
+        "source_length_index_path": str(tmp_path / "medium-lengths.jsonl"),
+        "bucket_width": 100,
+        "entries_per_part": 1000,
+        "splits": {},
+    }), encoding="utf-8")
     command = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "run_stage211_strict_chained_alignment.py"),
@@ -3836,6 +3863,11 @@ def test_stage211_medium_curriculum_requires_receipt_and_uses_full_steps(
     assert "loader_split=train" in admitted.stdout
     assert "split=easy" not in admitted.stdout
     assert "target_step=1003713" in admitted.stdout
+    config_paths = list((tmp_path / "config").rglob("*.yaml"))
+    assert config_paths
+    for config_path in config_paths:
+        config = load_yaml(config_path)
+        assert config["webdataset_length_index_path"] == str(tmp_path / "medium-lengths.jsonl")
 
 
 def test_stage211_medium_config_uses_fixed_eval_split(tmp_path: Path) -> None:

@@ -26,6 +26,7 @@ from rwkvasr.data import (
 )
 from rwkvasr.eval.stage211_batch_profile import (
     CandidateDominancePolicy,
+    STAGE211_BATCH_PROFILE_BASE_CONFIG_SNAPSHOT,
     STAGE211_BATCH_PROFILE_PREFLIGHT_SCHEMA_VERSION,
     STAGE211_PROBE_ARTIFACT_CLEANUP_SCHEMA_VERSION,
     STAGE211_PROBE_FIXED_EVAL_CAPTURE_SCHEMA_VERSION,
@@ -1100,7 +1101,13 @@ def main() -> int:
         raise FileExistsError(f"probe output root must be empty: {output_root}")
     output_root.mkdir(parents=True, exist_ok=True)
 
-    base_config = load_yaml(base_config_path)
+    # The formal generator may later reuse and overwrite the input YAML path.
+    snapshot_path = output_root / STAGE211_BATCH_PROFILE_BASE_CONFIG_SNAPSHOT
+    with snapshot_path.open("xb") as snapshot:
+        snapshot.write(base_config_path.read_bytes())
+        snapshot.flush()
+        os.fsync(snapshot.fileno())
+    base_config = load_yaml(snapshot_path)
     configured_gradient_checkpointing = base_config.get("gradient_checkpointing")
     if type(configured_gradient_checkpointing) is not bool:
         raise ValueError(
@@ -1225,7 +1232,7 @@ def main() -> int:
         "script_path": str(script_path),
         "script_sha256": sha256_file(script_path),
         "base_config_path": str(base_config_path),
-        "base_config_sha256": sha256_file(base_config_path),
+        "base_config_sha256": sha256_file(snapshot_path),
         "init_checkpoint_path": str(init_checkpoint),
         "init_checkpoint_sha256": sha256_file(init_checkpoint),
         "bucket_manifest_path": str(manifest_path),
