@@ -2252,8 +2252,9 @@ def _ctc_teacher_layer_hidden_loss(
         layer_id: {key: reference.new_zeros((), dtype=torch.float32) for key in stat_keys}
         for layer_id in layer_ids
     }
-    matched_ids: set[str] = set()
-    missing_ids: set[str] = set()
+    # Sampler padding can repeat an utterance ID at distinct batch positions.
+    matched_positions: set[int] = set()
+    missing_positions: set[int] = set()
     events = 0
     max_frame_delta = 0
     packed_events: dict[
@@ -2272,13 +2273,13 @@ def _ctc_teacher_layer_hidden_loss(
         utt_id = str(utt_ids[sample_idx])
         record = teacher_records.get(utt_id)
         if record is None:
-            missing_ids.add(utt_id)
+            missing_positions.add(sample_idx)
             if missing_policy == "error":
                 raise KeyError(f"Missing Nano layer hidden record for utt_id={utt_id!r}.")
             continue
         teacher_layers = record.get("encoder_layer_hiddens")
         if not isinstance(teacher_layers, dict):
-            missing_ids.add(utt_id)
+            missing_positions.add(sample_idx)
             if missing_policy == "error":
                 raise ValueError(f"Nano record has no encoder_layer_hiddens for utt_id={utt_id!r}.")
             continue
@@ -2296,7 +2297,7 @@ def _ctc_teacher_layer_hidden_loss(
             else None
         )
         if group_count == 2 and teacher_nonblank_mask is None:
-            missing_ids.add(utt_id)
+            missing_positions.add(sample_idx)
             if missing_policy == "error":
                 raise ValueError(
                     f"Nano record has no top-1 CTC path for balanced layer loss utt_id={utt_id!r}."
@@ -2353,7 +2354,7 @@ def _ctc_teacher_layer_hidden_loss(
                 events += 1
                 sample_had_event = True
         if sample_had_event:
-            matched_ids.add(utt_id)
+            matched_positions.add(sample_idx)
 
     if events <= 0:
         raise RuntimeError("Layer hidden distillation produced no matched layer/component events.")
@@ -2547,8 +2548,8 @@ def _ctc_teacher_layer_hidden_loss(
             for layer_id, stat in layer_stats_float.items()
             if stat["elements"] > 0.0
         },
-        matched_samples=len(matched_ids),
-        missing_samples=len(missing_ids),
+        matched_samples=len(matched_positions),
+        missing_samples=len(missing_positions),
         events=events,
         max_frame_delta=max_frame_delta,
     )
@@ -5900,8 +5901,9 @@ def _ctc_teacher_decoder_hidden_loss(
     state_denoms = {
         name: reference.new_zeros((group_count,), dtype=torch.float32) for name in state_names
     }
-    matched_ids: set[str] = set()
-    missing_ids: set[str] = set()
+    # Count exposures, consistently with the per-position hidden-loss events.
+    matched_positions: set[int] = set()
+    missing_positions: set[int] = set()
     events = 0
     max_frame_delta = 0
     packed_events: dict[
@@ -5915,7 +5917,7 @@ def _ctc_teacher_decoder_hidden_loss(
         record = teacher_records.get(utt_id)
         teacher_hiddens = record.get("ctc_decoder_hiddens") if isinstance(record, dict) else None
         if not isinstance(teacher_hiddens, dict):
-            missing_ids.add(utt_id)
+            missing_positions.add(sample_idx)
             if missing_policy == "error":
                 raise ValueError(f"Nano record has no ctc_decoder_hiddens for utt_id={utt_id!r}.")
             continue
@@ -5933,7 +5935,7 @@ def _ctc_teacher_decoder_hidden_loss(
             else None
         )
         if group_count == 2 and teacher_nonblank_mask is None:
-            missing_ids.add(utt_id)
+            missing_positions.add(sample_idx)
             if missing_policy == "error":
                 raise ValueError(
                     f"Nano record has no top-1 CTC path for balanced decoder loss utt_id={utt_id!r}."
@@ -5981,7 +5983,7 @@ def _ctc_teacher_decoder_hidden_loss(
             events += 1
             sample_had_event = True
         if sample_had_event:
-            matched_ids.add(utt_id)
+            matched_positions.add(sample_idx)
 
     if events <= 0:
         raise RuntimeError("CTC decoder hidden distillation produced no matched state events.")
@@ -6034,8 +6036,8 @@ def _ctc_teacher_decoder_hidden_loss(
             name: _ctc_frame_group_mean(state_sums[name], state_denoms[name])
             for name in state_names
         },
-        matched_samples=len(matched_ids),
-        missing_samples=len(missing_ids),
+        matched_samples=len(matched_positions),
+        missing_samples=len(missing_positions),
         events=events,
         max_frame_delta=max_frame_delta,
     )
