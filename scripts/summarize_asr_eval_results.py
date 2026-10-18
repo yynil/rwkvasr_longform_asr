@@ -11,10 +11,26 @@ from rwkvasr.eval import compute_text_error_stats
 
 DATASETS: dict[str, dict[str, str]] = {
     "aishell1_test": {"language": "zh", "condition": "clean", "label": "AISHELL-1 test"},
-    "librispeech_test_clean": {"language": "en", "condition": "clean", "label": "LibriSpeech test-clean"},
-    "librispeech_test_other": {"language": "en", "condition": "clean", "label": "LibriSpeech test-other"},
-    "commonvoice_en_test": {"language": "en", "condition": "non_clean", "label": "Common Voice 22 en test"},
-    "wenetspeech_test_net": {"language": "zh", "condition": "non_clean", "label": "WenetSpeech TEST_NET"},
+    "librispeech_test_clean": {
+        "language": "en",
+        "condition": "clean",
+        "label": "LibriSpeech test-clean",
+    },
+    "librispeech_test_other": {
+        "language": "en",
+        "condition": "clean",
+        "label": "LibriSpeech test-other",
+    },
+    "commonvoice_en_test": {
+        "language": "en",
+        "condition": "non_clean",
+        "label": "Common Voice 22 en test",
+    },
+    "wenetspeech_test_net": {
+        "language": "zh",
+        "condition": "non_clean",
+        "label": "WenetSpeech TEST_NET",
+    },
 }
 
 
@@ -23,7 +39,9 @@ def _format_rate(value: Any) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Summarize normalized WER/CER from benchmark pred/ref JSONL files.")
+    parser = argparse.ArgumentParser(
+        description="Summarize normalized WER/CER from benchmark pred/ref JSONL files."
+    )
     parser.add_argument("--prediction-dir", default="artifacts/eval_benchmarks/predictions")
     parser.add_argument("--output-json", default="artifacts/eval_benchmarks/metrics.json")
     parser.add_argument("--output-md", default="artifacts/eval_benchmarks/metrics.md")
@@ -41,6 +59,7 @@ def main() -> None:
                 path,
                 language=info["language"],
                 normalization=args.normalization,
+                strip_language_confirmation=branch != "ctc",
             )
             rows.append(
                 {
@@ -49,6 +68,7 @@ def main() -> None:
                     "condition": info["condition"],
                     "language": info["language"],
                     "branch": branch,
+                    "strip_language_confirmation": branch != "ctc",
                     "path": str(path),
                     "samples": stats.get("sample_count"),
                     "wer": stats.get("avg_wer"),
@@ -58,7 +78,9 @@ def main() -> None:
 
     output_json = Path(args.output_json)
     output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps({"results": rows}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output_json.write_text(
+        json.dumps({"results": rows}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
     lines = [
         "# ASR Eval Metrics",

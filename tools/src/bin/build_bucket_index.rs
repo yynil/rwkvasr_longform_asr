@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File};
@@ -18,6 +19,7 @@ struct Config {
     text_cost_weight: f64,
     json_size_text_offset: u64,
     json_size_bytes_per_token: f64,
+    source_field: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +35,8 @@ struct LengthEntry {
     text_bytes: Option<u64>,
     #[serde(default)]
     json_size: Option<u64>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,6 +51,8 @@ struct BucketManifest {
     json_size_text_offset: u64,
     json_size_bytes_per_token: f64,
     entries_per_part: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_field: Option<String>,
     splits: BTreeMap<String, SplitManifest>,
 }
 
@@ -106,11 +112,14 @@ struct PartInfo {
     num_samples: u64,
     first_shard: Option<String>,
     last_shard: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_label: Option<String>,
 }
 
 struct BucketWriter {
     split: String,
     bucket_id: u64,
+    source_label: Option<String>,
     output_dir: PathBuf,
     entries_per_part: u64,
     part_index: u64,
@@ -124,10 +133,17 @@ struct BucketWriter {
 }
 
 impl BucketWriter {
-    fn new(split: String, bucket_id: u64, output_dir: PathBuf, entries_per_part: u64) -> Self {
+    fn new(
+        split: String,
+        bucket_id: u64,
+        source_label: Option<String>,
+        output_dir: PathBuf,
+        entries_per_part: u64,
+    ) -> Self {
         Self {
             split,
             bucket_id,
+            source_label,
             output_dir,
             entries_per_part,
             part_index: 0,
@@ -172,7 +188,14 @@ impl BucketWriter {
     }
 
     fn open_new_part(&mut self) -> Result<(), String> {
-        let relative_dir = PathBuf::from(&self.split).join(format!("bucket_{:04}", self.bucket_id));
+        let mut relative_dir =
+            PathBuf::from(&self.split).join(format!("bucket_{:04}", self.bucket_id));
+        if let Some(source_label) = &self.source_label {
+            relative_dir = relative_dir.join(format!(
+                "source_{}",
+                encode_path_component(source_label.as_bytes())
+            ));
+        }
         let relative_path = relative_dir.join(format!("part_{:06}.jsonl", self.part_index));
         let full_path = self.output_dir.join(&relative_path);
         if let Some(parent) = full_path.parent() {
@@ -211,6 +234,7 @@ impl BucketWriter {
                 num_samples: self.current_count,
                 first_shard: self.current_first_shard.take(),
                 last_shard: self.current_last_shard.take(),
+                source_label: self.source_label.clone(),
             });
         }
         self.current_count = 0;
@@ -246,7 +270,7 @@ fn run() -> Result<(), String> {
             .map_err(|err| format!("Failed to create manifest dir {}: {err}", parent.display()))?;
     }
 
-    let mut writers = BTreeMap::<(String, u64), BucketWriter>::new();
+    let mut writers = BTreeMap::<(String, u64, String), BucketWriter>::new();
     let input = BufReader::new(File::open(&config.length_index_path).map_err(|err| {
         format!(
             "Failed to open {}: {err}",
@@ -265,11 +289,14 @@ fn run() -> Result<(), String> {
             .map_err(|err| format!("Invalid length index JSON: {err}"))?;
         let bucket_cost = combined_bucket_cost(&entry, &config);
         let bucket_id = bucket_cost / config.bucket_width;
-        let key = (entry.split.clone(), bucket_id);
+        let source_label = entry_source_label(&entry, config.source_field.as_deref());
+        let source_key = source_label.clone().unwrap_or_default();
+        let key = (entry.split.clone(), bucket_id, source_key);
         let writer = writers.entry(key).or_insert_with(|| {
             BucketWriter::new(
                 entry.split.clone(),
                 bucket_id,
+                source_label,
                 config.output_dir.clone(),
                 config.entries_per_part,
             )
@@ -285,9 +312,22 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let mut splits = BTreeMap::<String, SplitManifest>::new();
-    for ((split_name, _bucket_id), writer) in writers {
+    let mut merged_buckets = BTreeMap::<(String, u64), BucketInfo>::new();
+    for ((split_name, bucket_id, _source_key), writer) in writers {
         let bucket = writer.finalize()?;
+        let merged = merged_buckets
+            .entry((split_name, bucket_id))
+            .or_insert_with(|| BucketInfo {
+                bucket_id,
+                num_samples: 0,
+                parts: Vec::new(),
+            });
+        merged.num_samples += bucket.num_samples;
+        merged.parts.extend(bucket.parts);
+    }
+
+    let mut splits = BTreeMap::<String, SplitManifest>::new();
+    for ((split_name, _bucket_id), bucket) in merged_buckets {
         let split_entry = splits.entry(split_name).or_default();
         split_entry.num_samples += bucket.num_samples;
         split_entry.buckets.push(bucket);
@@ -313,6 +353,7 @@ fn run() -> Result<(), String> {
         json_size_text_offset: config.json_size_text_offset,
         json_size_bytes_per_token: config.json_size_bytes_per_token,
         entries_per_part: config.entries_per_part,
+        source_field: config.source_field.clone(),
         splits,
     };
     let writer = BufWriter::new(File::create(&config.manifest_path).map_err(|err| {
@@ -346,6 +387,7 @@ fn parse_args() -> Result<Config, String> {
     let mut text_cost_weight = 0.0_f64;
     let mut json_size_text_offset = 256_u64;
     let mut json_size_bytes_per_token = 4.0_f64;
+    let mut source_field: Option<String> = None;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -384,6 +426,7 @@ fn parse_args() -> Result<Config, String> {
                     .parse::<f64>()
                     .map_err(|err| format!("Invalid --json-size-bytes-per-token: {err}"))?;
             }
+            "--source-field" => source_field = Some(next_value(&mut args, &arg)?),
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -423,6 +466,7 @@ fn parse_args() -> Result<Config, String> {
         text_cost_weight,
         json_size_text_offset,
         json_size_bytes_per_token,
+        source_field,
     })
 }
 
@@ -446,11 +490,37 @@ fn print_help() {
     println!(
         "  --json-size-bytes-per-token FLOAT  json bytes per estimated text token; default: 4.0"
     );
+    println!("  --source-field FIELD         group parts by this JSON field; default: disabled");
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     args.next()
         .ok_or_else(|| format!("Missing value for {flag}."))
+}
+
+fn entry_source_label(entry: &LengthEntry, source_field: Option<&str>) -> Option<String> {
+    let source_field = source_field?;
+    let label = entry.extra.get(source_field).and_then(|value| match value {
+        Value::String(value) => Some(value.trim().to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    });
+    Some(
+        label
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| String::from("unknown")),
+    )
+}
+
+fn encode_path_component(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn combined_bucket_cost(entry: &LengthEntry, config: &Config) -> u64 {
@@ -482,4 +552,49 @@ fn json_size_proxy_units(entry: &LengthEntry, config: &Config) -> Option<f64> {
     let json_size = entry.json_size?;
     let text_bytes = json_size.saturating_sub(config.json_size_text_offset);
     Some(text_bytes as f64 / config.json_size_bytes_per_token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn length_entry(payload: &str) -> LengthEntry {
+        serde_json::from_str(payload).expect("valid length entry")
+    }
+
+    #[test]
+    fn source_label_reads_dynamic_string_field() {
+        let entry = length_entry(
+            r#"{"shard_name":"x.tar","split":"train","num_frames":100,"dataset":"cv22_en"}"#,
+        );
+
+        assert_eq!(
+            entry_source_label(&entry, Some("dataset")).as_deref(),
+            Some("cv22_en")
+        );
+        assert_eq!(entry_source_label(&entry, None), None);
+    }
+
+    #[test]
+    fn source_label_maps_missing_or_empty_values_to_unknown() {
+        let missing = length_entry(r#"{"shard_name":"x.tar","split":"train","num_frames":100}"#);
+        let empty = length_entry(
+            r#"{"shard_name":"x.tar","split":"train","num_frames":100,"dataset":"  "}"#,
+        );
+
+        assert_eq!(
+            entry_source_label(&missing, Some("dataset")).as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            entry_source_label(&empty, Some("dataset")).as_deref(),
+            Some("unknown")
+        );
+    }
+
+    #[test]
+    fn source_path_component_is_unambiguous_hex() {
+        assert_eq!(encode_path_component(b"cv22/en"), "637632322f656e");
+        assert_ne!(encode_path_component(b"/"), encode_path_component(b"2f"));
+    }
 }

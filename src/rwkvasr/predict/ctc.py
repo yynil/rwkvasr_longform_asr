@@ -9,7 +9,7 @@ import random
 import sys
 import tarfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -833,9 +833,10 @@ def _load_prediction_model(
     *,
     device: torch.device,
 ) -> tuple[RWKVCTCModel, torch.dtype | None]:
-    frontend_type = str(config.model_config.frontend_type or "")
+    model_config = _prediction_model_config_for_device(config.model_config, device=device)
+    frontend_type = str(model_config.frontend_type or "")
     feature_dtype = torch.bfloat16 if device.type == "cuda" and frontend_type != "funasr_nano_encoder" else None
-    model = RWKVCTCModel(config.model_config)
+    model = RWKVCTCModel(model_config)
     load_checkpoint(config.checkpoint_path, model=model, map_location="cpu")
     if feature_dtype is not None:
         model = model.to(device=device, dtype=feature_dtype)
@@ -843,6 +844,16 @@ def _load_prediction_model(
         model = model.to(device)
     model.eval()
     return model, feature_dtype
+
+
+def _prediction_model_config_for_device(
+    model_config: RWKVCTCModelConfig,
+    *,
+    device: torch.device,
+) -> RWKVCTCModelConfig:
+    if device.type != "cuda" and str(model_config.backend).startswith("cuda"):
+        return replace(model_config, backend="native")
+    return model_config
 
 
 def _parse_hotword_line(raw_line: str, *, default_weight: float) -> tuple[str, float] | None:
